@@ -1,0 +1,28 @@
+version: '3'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mycelia_prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--web.listen-address=:19090'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    # Use host network to easily access localhost ports 8000/8100 
+    # where Python scripts run.
+    network_mode: "host"
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: mycelia_grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_HTTP_PORT=3033
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    # Use host network for simple DB connection to Prometheus on Linux
+    network_mode: "host"

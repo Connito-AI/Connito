@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "subnet-moe"
+version = "0.1.0"
+description = "Distributed LLM training with mixture of experts."
+readme = "README.md"
+# license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+authors = [
+  { name = "Crucible Labs" },
+]
+
+keywords = ["llm", "federated", "training", "validator", "blockchain", "MoE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+#  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Framework :: FastAPI",
+]
+
+[project.urls]
+Homepage = "https://github.com/CrucibleAILabs/subnet-MoE"
+Issues = "https://github.com/CrucibleAILabs/subnet-MoE/issues"
+
+# Console entry points (match the package layout shown earlier)
+[project.scripts]
+weightnet-miner = "connito.miner.cli:main"
+weightnet-validator = "connito.validator.cli:main"
+
+# Hatch build config — package only our src tree
+[tool.hatch.build.targets.wheel]
+packages = ["connito"]
+
+# ---- Tooling (opinionated but helpful) ----
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+lint.select = ["E", "F", "I", "W", "B", "UP"]
+lint.ignore = ["E203", "E266"]
+exclude = ["infra/grafana/**", "infra/prometheus.yml", "**.ipynb"]
+format.quote-style = "double"
+format.indent-style = "space"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+exclude = "infra/|tests/fixtures/"
+plugins = []
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --disable-warnings"
+testpaths = ["tests"]
+
+# Example env-driven defaults (documented in README / .env.example)
+[tool.connito.defaults]
+model_name = "meta-llama/Llama-3-8B"
+device = "cuda"
+seed = 42
+metrics_port_miner = 8002
+metrics_port_validator = 8003
+broker_url = "redis://localhost:6379/0"
+artifact_store = "s3://mycelia"

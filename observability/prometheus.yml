@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'mycelia_validator_metrics'
+    static_configs:
+      # Expecting validator 0 on 8200, validator 1 on 8201, etc.
+      - targets: ['localhost:8200', 'localhost:8201', 'localhost:8120']
+
+  - job_name: 'mycelia_miner_metrics'
+    static_configs:
+      # Expecting miner 0 on 8100, miner 1 on 8101, etc.
+      - targets: ['localhost:8100']
