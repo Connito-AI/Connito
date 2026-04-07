@@ -32,6 +32,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, parse_args
+from connito.shared.cycle import wait_till, PhaseNames
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
@@ -225,7 +226,9 @@ def setup_training(
 
 
 from connito.shared.telemetry import TelemetryManager, SystemStatePoller
-from connito.sn_owner.cycle import PhaseManager
+from connito.sn_owner.cycle import PhaseManager, PhaseNames
+from connito.shared.cycle import wait_till
+import time
 
 def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     """
@@ -290,241 +293,220 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     total_training_time = 0
     training_start_time = None
 
-    inner_optimizer.zero_grad()
-    try:
-        start_inner_opt = current_model_meta.inner_opt if current_model_meta is not None else 0
-        
-        for step, batch in enumerate(
-            iterable=train_dataloader,
-            # start=max(0, current_model_meta.inner_opt) * config.local_par.gradient_accumulation_steps,
-            start=max(0, start_inner_opt) * config.local_par.gradient_accumulation_steps,
-        ):
-            # for each step, we run 1 backward
-            # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
-            # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
+    while True:
+        inner_optimizer.zero_grad()
+        try:
+            start_inner_opt = current_model_meta.inner_opt if current_model_meta is not None else 0
 
-            inner_opt_step = step // config.local_par.gradient_accumulation_steps
-            is_inner_optimizer_step = step % config.local_par.gradient_accumulation_steps == 0
-            
-            # is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
-            # current_model_meta.inner_opt = inner_opt_step
-            
-            if current_model_meta:
-                is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
-                current_model_meta.inner_opt = inner_opt_step
-            else:
-        	    is_start_step = False # Default for new runs
+            for step, batch in enumerate(
+                iterable=train_dataloader,
+                # start=max(0, current_model_meta.inner_opt) * config.local_par.gradient_accumulation_steps,
+                start=max(0, start_inner_opt) * config.local_par.gradient_accumulation_steps,
+            ):
+                # for each step, we run 1 backward
+                # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
+                # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
-            # === Training and inner optimization ===
-            if (
-                not is_start_step
-            ):  # skip training when it is the start step, so that we can benchamrk the original model first
-                model.train()
-                if training_start_time is None:
-                    training_start_time = time.time()
-                batch_device = {}
-                for key in batch.keys():
-                    batch_device[key] = batch[key].to(device)
-                labels = batch_device.get("labels")
-                if labels is not None:
-                    valid_labels = labels.ne(-100)
-                    num_valid = int(valid_labels.sum().item())
-                    if num_valid == 0:
-                        logger.warning("Skipping batch with no valid labels", step=step)
+                inner_opt_step = step // config.local_par.gradient_accumulation_steps
+                is_inner_optimizer_step = step % config.local_par.gradient_accumulation_steps == 0
+
+                # is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
+                # current_model_meta.inner_opt = inner_opt_step
+
+                if current_model_meta:
+                    is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
+                    current_model_meta.inner_opt = inner_opt_step
+                else:
+            	    is_start_step = False # Default for new runs
+
+                # === Training and inner optimization ===
+                if (
+                    not is_start_step
+                ):  # skip training when it is the start step, so that we can benchamrk the original model first
+                    model.train()
+                    if training_start_time is None:
+                        training_start_time = time.time()
+                    batch_device = {}
+                    for key in batch.keys():
+                        batch_device[key] = batch[key].to(device)
+                    labels = batch_device.get("labels")
+                    if labels is not None:
+                        valid_labels = labels.ne(-100)
+                        num_valid = int(valid_labels.sum().item())
+                        if num_valid == 0:
+                            logger.warning("Skipping batch with no valid labels", step=step)
+                            continue
+
+                    with torch.amp.autocast(autocast_device, enabled=amp_enabled, dtype=autocast_dtype):
+                        outputs = model(**batch_device)
+
+                        loss = outputs.loss / config.local_par.gradient_accumulation_steps
+                        # aux_loss = outputs.aux_loss / config.local_par.gradient_accumulation_steps if outputs.aux_loss is not None else torch.tensor(0)
+                        aux_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+                    if not torch.isfinite(loss):
+                        logits = outputs.logits
+                        logits_finite = torch.isfinite(logits)
+                        logits_finite_ratio = float(logits_finite.float().mean().item())
+                        logits_min = float(logits.min().item())
+                        logits_max = float(logits.max().item())
+                        label_min = None
+                        label_max = None
+                        if labels is not None and num_valid > 0:
+                            label_min = int(labels[valid_labels].min().item())
+                            label_max = int(labels[valid_labels].max().item())
+                        logger.warning(
+                            "Non-finite loss detected, skipping batch",
+                            loss=float(loss.item()) if loss.numel() == 1 else None,
+                            logits_min=logits_min,
+                            logits_max=logits_max,
+                            logits_finite_ratio=logits_finite_ratio,
+                            label_min=label_min,
+                            label_max=label_max,
+                            num_valid_labels=num_valid if labels is not None else None,
+                            precision=precision,
+                            step=step,
+                        )
+                        del loss, aux_loss, batch_device, outputs
+                        gc.collect()
                         continue
+                    logger.info("batch loss", loss = loss.item(), inner_opt_step = inner_opt_step)
 
-                with torch.amp.autocast(autocast_device, enabled=amp_enabled, dtype=autocast_dtype):
-                    outputs = model(**batch_device)
+                    loss_batch += loss.item()
+                    aux_loss_batch += aux_loss.item()
 
-                    loss = outputs.loss / config.local_par.gradient_accumulation_steps
-                    # aux_loss = outputs.aux_loss / config.local_par.gradient_accumulation_steps if outputs.aux_loss is not None else torch.tensor(0)
-                    aux_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+                    inner_scaler.scale(loss).backward()
 
-                if not torch.isfinite(loss):
-                    logits = outputs.logits
-                    logits_finite = torch.isfinite(logits)
-                    logits_finite_ratio = float(logits_finite.float().mean().item())
-                    logits_min = float(logits.min().item())
-                    logits_max = float(logits.max().item())
-                    label_min = None
-                    label_max = None
-                    if labels is not None and num_valid > 0:
-                        label_min = int(labels[valid_labels].min().item())
-                        label_max = int(labels[valid_labels].max().item())
-                    logger.warning(
-                        "Non-finite loss detected, skipping batch",
-                        loss=float(loss.item()) if loss.numel() == 1 else None,
-                        logits_min=logits_min,
-                        logits_max=logits_max,
-                        logits_finite_ratio=logits_finite_ratio,
-                        label_min=label_min,
-                        label_max=label_max,
-                        num_valid_labels=num_valid if labels is not None else None,
-                        precision=precision,
-                        step=step,
-                    )
+                    grad_total = sum_model_gradients(model)
+                    sample_grads = []
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            p_norm = param.norm().item()
+                            grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+                            sample_grads.append((name, grad_norm, p_norm))
+                            if len(sample_grads) >= 5:
+                                break
+
+                    # === Aggressively free intermediate tensors ===
                     del loss, aux_loss, batch_device, outputs
                     gc.collect()
-                    continue
-                logger.info("batch loss", loss = loss.item(), inner_opt_step = inner_opt_step)
 
-                loss_batch += loss.item()
-                aux_loss_batch += aux_loss.item()
-
-                inner_scaler.scale(loss).backward()
-
-                grad_total = sum_model_gradients(model)
-                sample_grads = []
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        p_norm = param.norm().item()
-                        grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
-                        sample_grads.append((name, grad_norm, p_norm))
-                        if len(sample_grads) >= 5:
-                            break
-
-                # === Aggressively free intermediate tensors ===
-                del loss, aux_loss, batch_device, outputs
-                gc.collect()
-
-            # === inner optimizer ===
-            if not is_start_step and is_inner_optimizer_step:
-                logger.info(
-                    "(1) Start epoch training",
-                    step=step,
-                    inner_opt_step=inner_opt_step,
-                    is_inner_optimizer_step=is_inner_optimizer_step,
-                    gradient_accumulation_steps=config.local_par.gradient_accumulation_steps,
-                    current_model_meta=current_model_meta,
-                )
-                old_model_hash = get_model_hash(model.state_dict(), hex=True)
-
-                non_finite_grad_params = []
-                for n, p in model.named_parameters():
-                    if p.grad is None:
-                        continue
-                    if not torch.isfinite(p.grad).all():
-                        non_finite_grad_params.append(n)
-                        p.grad = None
-                        continue
-                    # dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                    p.grad.div_(world_size)
-
-                if non_finite_grad_params:
-                    logger.warning(
-                        "Non-finite gradients detected; dropping affected gradients",
-                        count=len(non_finite_grad_params),
-                        sample_param_names=non_finite_grad_params[:5],
-                    )
-
-                inner_scaler.unscale_(optimizer=inner_optimizer)
-
-                grad_params = [p for p in model.parameters() if p.grad is not None]
-                if len(grad_params) == 0:
-                    logger.warning("No finite gradients available; skipping optimizer step", step=step)
-                    inner_optimizer.zero_grad()
-                    inner_scaler.update()
-                    continue
-
-                grad_norm = clip_grad_norm_(grad_params, 1.0, error_if_nonfinite=False)
-                grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
-                if not math.isfinite(grad_norm_value):
-                    logger.warning("Non-finite grad norm detected; skipping optimizer step", step=step)
-                    inner_optimizer.zero_grad()
-                    inner_scaler.update()
-                    continue
-
-                scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
-                scale_after = None
-                if inner_scaler.is_enabled():
-                    inner_scaler.step(inner_optimizer)
-                    inner_scaler.update()
-                    scale_after = inner_scaler.get_scale()
-                    # GradScaler skip is indicated by a scale drop after update.
-                    step_skipped = scale_after < scale_before
-                else:
-                    inner_optimizer.step()
-                    step_skipped = False
-
-                logger.info(
-                    "GradScaler for optimizer step",
-                    grad_norm=grad_norm,
-                    grad_sum=sum_model_gradients(model),
-                    scale_before=scale_before,
-                    scale_after=scale_after,
-                    skipped=step_skipped,
-                )
-
-                if inner_scaler.is_enabled():
-                    logger.info("Scaler updated", scale_after=scale_after)
-
-                if step_skipped:
-                    logger.warning("GradScaler skipped optimizer step due to non-finite gradients", step=step)
-
-                if not step_skipped:
-                    scheduler.step()
-                    logger.info("scheduler step", lr=inner_optimizer.param_groups[0]["lr"])
-                else:
-                    logger.warning("Skipping scheduler step because optimizer step was skipped", step=step)
-
-                inner_optimizer.zero_grad()
-
-                non_finite_params = []
-                for name, param in model.named_parameters():
-                    if not param.requires_grad:
-                        continue
-                    if not torch.isfinite(param).all():
-                        non_finite_params.append(name)
-                        if len(non_finite_params) >= 5:
-                            break
-                if non_finite_params:
-                    logger.error(
-                        "Non-finite trainable parameters detected after optimizer step",
-                        sample_param_names=non_finite_params,
+                # === inner optimizer ===
+                if not is_start_step and is_inner_optimizer_step:
+                    logger.info(
+                        "(1) Start epoch training",
                         step=step,
+                        inner_opt_step=inner_opt_step,
+                        is_inner_optimizer_step=is_inner_optimizer_step,
+                        gradient_accumulation_steps=config.local_par.gradient_accumulation_steps,
+                        current_model_meta=current_model_meta,
                     )
-                    raise FloatingPointError("Non-finite trainable parameters detected after optimizer step")
+                    old_model_hash = get_model_hash(model.state_dict(), hex=True)
 
-                training_time = time.time() - training_start_time
-                total_training_time += training_time
-                training_start_time = None
+                    non_finite_grad_params = []
+                    for n, p in model.named_parameters():
+                        if p.grad is None:
+                            continue
+                        if not torch.isfinite(p.grad).all():
+                            non_finite_grad_params.append(n)
+                            p.grad = None
+                            continue
+                        # dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(world_size)
 
-                # === Clear memory after optimizer step ===
-                gc.collect()
-                torch.cuda.empty_cache()
+                    if non_finite_grad_params:
+                        logger.warning(
+                            "Non-finite gradients detected; dropping affected gradients",
+                            count=len(non_finite_grad_params),
+                            sample_param_names=non_finite_grad_params[:5],
+                        )
 
-                new_model_hash = get_model_hash(model.state_dict(), hex=True)
-                logger.info("Updated model", old_model_hash=old_model_hash, new_model_hash=new_model_hash)
+                    inner_scaler.unscale_(optimizer=inner_optimizer)
 
-            # === Log metric ===
-            if (
-                is_inner_optimizer_step
-                and inner_opt_step % max(round(config.local_par.global_opt_interval * 0.02), 1) == 0
-            ):
-                logger.info("(2) Logging step", loss_batch=loss_batch, aux_loss_batch=aux_loss_batch)
-                metrics = get_status(
-                    config=config,
-                    model=model,
-                    step=step,
-                    inner_opt_step=inner_opt_step,
-                    training_time=training_time,
-                    total_training_time=total_training_time,
-                    inner_optimizer=inner_optimizer,
-                    loss_batch=loss_batch,
-                    aux_loss_batch=aux_loss_batch,
-                )
-                metric_logger.log(metrics, print_log=False)
+                    grad_params = [p for p in model.parameters() if p.grad is not None]
+                    if len(grad_params) == 0:
+                        logger.warning("No finite gradients available; skipping optimizer step", step=step)
+                        inner_optimizer.zero_grad()
+                        inner_scaler.update()
+                        continue
 
-            # === local validation and log metric ===
-            if is_inner_optimizer_step and inner_opt_step % config.log.metric_interval == 0:
-                logger.info("(3) Local evaluation")
+                    grad_norm = clip_grad_norm_(grad_params, 1.0, error_if_nonfinite=False)
+                    grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+                    if not math.isfinite(grad_norm_value):
+                        logger.warning("Non-finite grad norm detected; skipping optimizer step", step=step)
+                        inner_optimizer.zero_grad()
+                        inner_scaler.update()
+                        continue
 
-                val_metric = evaluate_model(
-                    rank=rank, step=inner_opt_step, model=model, eval_dataloader=train_dataloader, device=device
-                )
+                    scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
+                    scale_after = None
+                    if inner_scaler.is_enabled():
+                        inner_scaler.step(inner_optimizer)
+                        inner_scaler.update()
+                        scale_after = inner_scaler.get_scale()
+                        # GradScaler skip is indicated by a scale drop after update.
+                        step_skipped = scale_after < scale_before
+                    else:
+                        inner_optimizer.step()
+                        step_skipped = False
 
-                metrics = (
-                    get_status(
+                    logger.info(
+                        "GradScaler for optimizer step",
+                        grad_norm=grad_norm,
+                        grad_sum=sum_model_gradients(model),
+                        scale_before=scale_before,
+                        scale_after=scale_after,
+                        skipped=step_skipped,
+                    )
+
+                    if inner_scaler.is_enabled():
+                        logger.info("Scaler updated", scale_after=scale_after)
+
+                    if step_skipped:
+                        logger.warning("GradScaler skipped optimizer step due to non-finite gradients", step=step)
+
+                    if not step_skipped:
+                        scheduler.step()
+                        logger.info("scheduler step", lr=inner_optimizer.param_groups[0]["lr"])
+                    else:
+                        logger.warning("Skipping scheduler step because optimizer step was skipped", step=step)
+
+                    inner_optimizer.zero_grad()
+
+                    non_finite_params = []
+                    for name, param in model.named_parameters():
+                        if not param.requires_grad:
+                            continue
+                        if not torch.isfinite(param).all():
+                            non_finite_params.append(name)
+                            if len(non_finite_params) >= 5:
+                                break
+                    if non_finite_params:
+                        logger.error(
+                            "Non-finite trainable parameters detected after optimizer step",
+                            sample_param_names=non_finite_params,
+                            step=step,
+                        )
+                        raise FloatingPointError("Non-finite trainable parameters detected after optimizer step")
+
+                    training_time = time.time() - training_start_time
+                    total_training_time += training_time
+                    training_start_time = None
+
+                    # === Clear memory after optimizer step ===
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    new_model_hash = get_model_hash(model.state_dict(), hex=True)
+                    logger.info("Updated model", old_model_hash=old_model_hash, new_model_hash=new_model_hash)
+
+                # === Log metric ===
+                if (
+                    is_inner_optimizer_step
+                    and inner_opt_step % max(round(config.local_par.global_opt_interval * 0.02), 1) == 0
+                ):
+                    logger.info("(2) Logging step", loss_batch=loss_batch, aux_loss_batch=aux_loss_batch)
+                    metrics = get_status(
                         config=config,
                         model=model,
                         step=step,
@@ -535,127 +517,155 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         loss_batch=loss_batch,
                         aux_loss_batch=aux_loss_batch,
                     )
-                    | val_metric
-                )
+                    metric_logger.log(metrics, print_log=False)
 
-                metric_logger.log(metrics)
+                # === local validation and log metric ===
+                if is_inner_optimizer_step and inner_opt_step % config.log.metric_interval == 0:
+                    logger.info("(3) Local evaluation")
 
-                logger.info("reached barrier, waiting for partial validation and metric logging to complete")
-                # dist.barrier(device_ids=[rank])
-
-            # === save checkpoint ===
-            if (
-                is_inner_optimizer_step
-                and config.ckpt.checkpoint_interval is not None
-                and inner_opt_step % config.ckpt.checkpoint_interval == 0
-            ):
-                logger.info("(4) Saving checkpoint")
-
-                # ckpt_path = os.path.join(
-                #     config.ckpt.checkpoint_path,
-                #     f"globalver_{current_model_meta.global_ver}_inneropt_{inner_opt_step}",
-                # )
-                
-                current_ver = current_model_meta.global_ver if current_model_meta else 0
-
-                ckpt_path = os.path.join(
-                    config.ckpt.checkpoint_path,
-                    f"globalver_{current_ver}_inneropt_{inner_opt_step}",
-                )
-
-                save_checkpoint(
-                    checkpoint_path=ckpt_path,
-                    model=model,
-                    inner_optimizer=inner_optimizer,
-                    scheduler=scheduler,
-                    loss=loss_batch.item(),
-                    inner_scaler=inner_scaler,
-                    data_loader=train_dataloader,
-                    save_global_state=rank == 0,
-                    rank=rank,
-                    save_model_by_expert_group=True,
-                    expert_manager=expert_manager,
-                    strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
-                    active_expert_group_id=config.task.exp.group_id,
-                )
-
-                if config.ckpt.checkpoint_topk is not None:
-                    ckpt_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, config.ckpt.checkpoint_topk)
-                    if ckpt_deleted:
-                        logger.info(f"Deleted old checkpoints: {ckpt_deleted}")
-
-                logger.info("reached barrier, waiting for complete checkpoint saving")
-                # dist.barrier(device_ids=[rank])
-
-            # === reload model ===
-            if is_inner_optimizer_step:
-                logger.info("(5) Reload Model")
-
-                newest_checkpoint = select_best_checkpoint(
-                    primary_dir=config.ckpt.validator_checkpoint_path,
-                    secondary_dir=config.ckpt.checkpoint_path,
-                )
-
-                if current_model_meta is None or newest_checkpoint > current_model_meta:
-                    logger.info(
-                        "Should reload model",
-                        newest_checkpoint=newest_checkpoint,
-                        current_model_meta=current_model_meta,
-                    )
-                    # dist.barrier(device_ids=[rank])  # make sure everything is saved and everyone is ready to load
-                    logger.info("freeing cuda memory")
-                    free_cuda_models(models=[model], optimizers=[inner_optimizer], devices=[device])
-                    logger.info(
-                        "restarting model",
-                        current_model_meta=current_model_meta,
-                        largest_avail_model=select_best_checkpoint(
-                            primary_dir=config.ckpt.validator_checkpoint_path,
-                            secondary_dir=config.ckpt.checkpoint_path,
-                        ),
-                    )
-                    (
-                        model,
-                        inner_optimizer,
-                        inner_scaler,
-                        scheduler,
-                        expert_manager,
-                        train_dataloader,
-                        current_model_meta,
-                    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
-                else:
-                    logger.info(
-                        "No need to reload model",
-                        newest_checkpoint=newest_checkpoint,
-                        current_model_meta=current_model_meta,
+                    val_metric = evaluate_model(
+                        rank=rank, step=inner_opt_step, model=model, eval_dataloader=train_dataloader, device=device
                     )
 
-            # === Clean up ===
-            if is_inner_optimizer_step:
-                logger.info("(6) Clean up")
-                loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
-                aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
-                gc.collect()
-                torch.cuda.empty_cache()
-                logger.info("Clean up completed")
+                    metrics = (
+                        get_status(
+                            config=config,
+                            model=model,
+                            step=step,
+                            inner_opt_step=inner_opt_step,
+                            training_time=training_time,
+                            total_training_time=total_training_time,
+                            inner_optimizer=inner_optimizer,
+                            loss_batch=loss_batch,
+                            aux_loss_batch=aux_loss_batch,
+                        )
+                        | val_metric
+                    )
 
-        logger.info("used up train dataloader")
+                    metric_logger.log(metrics)
 
-    except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt received, shutting down miner loop")
-        poller.stop()
-        metric_logger.close()
-        free_cuda_models([model, eval_rref])
-        torch.cuda.empty_cache()
-        raise
-    except Exception:
-        logger.error("Quit training", exc_info=True)
-        poller.stop()
-        # dist.destroy_process_group()
-        torch.cuda.synchronize()
-        metric_logger.close()
+                    logger.info("reached barrier, waiting for partial validation and metric logging to complete")
+                    # dist.barrier(device_ids=[rank])
 
-        if rank == 0:
-            torch.save(model.state_dict(), "mycelia_final.pt")
+                # === save checkpoint ===
+                if (
+                    is_inner_optimizer_step
+                    and config.ckpt.checkpoint_interval is not None
+                    and inner_opt_step % config.ckpt.checkpoint_interval == 0
+                ):
+                    logger.info("(4) Saving checkpoint")
+
+                    # ckpt_path = os.path.join(
+                    #     config.ckpt.checkpoint_path,
+                    #     f"globalver_{current_model_meta.global_ver}_inneropt_{inner_opt_step}",
+                    # )
+
+                    current_ver = current_model_meta.global_ver if current_model_meta else 0
+
+                    ckpt_path = os.path.join(
+                        config.ckpt.checkpoint_path,
+                        f"globalver_{current_ver}_inneropt_{inner_opt_step}",
+                    )
+
+                    save_checkpoint(
+                        checkpoint_path=ckpt_path,
+                        model=model,
+                        inner_optimizer=inner_optimizer,
+                        scheduler=scheduler,
+                        loss=loss_batch.item(),
+                        inner_scaler=inner_scaler,
+                        data_loader=train_dataloader,
+                        save_global_state=rank == 0,
+                        rank=rank,
+                        save_model_by_expert_group=True,
+                        expert_manager=expert_manager,
+                        strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
+                        active_expert_group_id=config.task.exp.group_id,
+                    )
+
+                    if config.ckpt.checkpoint_topk is not None:
+                        ckpt_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, config.ckpt.checkpoint_topk)
+                        if ckpt_deleted:
+                            logger.info(f"Deleted old checkpoints: {ckpt_deleted}")
+
+                    logger.info("reached barrier, waiting for complete checkpoint saving")
+                    # dist.barrier(device_ids=[rank])
+
+                # === reload model ===
+                if is_inner_optimizer_step:
+                    logger.info("(5) Reload Model")
+
+                    newest_checkpoint = select_best_checkpoint(
+                        primary_dir=config.ckpt.validator_checkpoint_path,
+                        secondary_dir=config.ckpt.checkpoint_path,
+                    )
+
+                    if current_model_meta is None or newest_checkpoint > current_model_meta:
+                        logger.info(
+                            "Should reload model",
+                            newest_checkpoint=newest_checkpoint,
+                            current_model_meta=current_model_meta,
+                        )
+                        # dist.barrier(device_ids=[rank])  # make sure everything is saved and everyone is ready to load
+                        logger.info("freeing cuda memory")
+                        free_cuda_models(models=[model], optimizers=[inner_optimizer], devices=[device])
+                        logger.info(
+                            "restarting model",
+                            current_model_meta=current_model_meta,
+                            largest_avail_model=select_best_checkpoint(
+                                primary_dir=config.ckpt.validator_checkpoint_path,
+                                secondary_dir=config.ckpt.checkpoint_path,
+                            ),
+                        )
+                        (
+                            model,
+                            inner_optimizer,
+                            inner_scaler,
+                            scheduler,
+                            expert_manager,
+                            train_dataloader,
+                            current_model_meta,
+                        ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
+                    else:
+                        logger.info(
+                            "No need to reload model",
+                            newest_checkpoint=newest_checkpoint,
+                            current_model_meta=current_model_meta,
+                        )
+
+                # === Clean up ===
+                if is_inner_optimizer_step:
+                    logger.info("(6) Clean up")
+                    loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
+                    aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    logger.info("Clean up completed")
+
+            logger.info("used up train dataloader")
+            (model, inner_optimizer, inner_scaler, scheduler, expert_manager, train_dataloader, current_model_meta) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
+
+        except KeyboardInterrupt:
+            logger.warning("KeyboardInterrupt received, shutting down miner loop")
+            poller.stop()
+            metric_logger.close()
+            free_cuda_models([model, eval_rref])
+            torch.cuda.empty_cache()
+            raise
+        except Exception as e:
+            logger.error(f"Training loop crashed with network/dataloader error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
+            logger.info("Sleeping until PhaseNames.distribute starts...")
+            wait_till(config, phase_name=PhaseNames.distribute)
+            
+            time.sleep(15)
+            free_cuda_models([model])
+            torch.cuda.empty_cache()
+            
+            # Rebuild dataloader
+            (
+                model, inner_optimizer, inner_scaler, scheduler,
+                expert_manager, train_dataloader, current_model_meta
+            ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
 
 def run_distributed_training() -> None:

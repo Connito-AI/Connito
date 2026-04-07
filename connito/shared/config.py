@@ -190,7 +190,7 @@ class ModelCfg(BaseConfig):
     foundation: bool = True
     torch_compile: bool = False
     attn_implementation: str = "sdpa"
-    precision: str = "fp16-mixed"
+    precision: str = "bf16-mixed"
     device: str = "cuda"
 
 
