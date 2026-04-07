@@ -652,20 +652,18 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             free_cuda_models([model, eval_rref])
             torch.cuda.empty_cache()
             raise
-        except Exception as e:
-            logger.error(f"Training loop crashed with network/dataloader error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
+        except (FileNotFoundError, ConnectionError, TimeoutError) as e:
+            logger.error(f"Dataloader network streaming error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
             logger.info("Sleeping until PhaseNames.distribute starts...")
             wait_till(config, phase_name=PhaseNames.distribute)
             
             time.sleep(15)
-            free_cuda_models([model])
-            torch.cuda.empty_cache()
             
-            # Rebuild dataloader
-            (
-                model, inner_optimizer, inner_scaler, scheduler,
-                expert_manager, train_dataloader, current_model_meta
-            ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+            # Rebuild ONLY the dataloader to recover the network stream
+            logger.info("Rebuilding dataloader after network timeout...")
+            train_dataloader = get_dataloader(
+                config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+            )
 
 
 def run_distributed_training() -> None:
