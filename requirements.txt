@@ -10,7 +10,7 @@ pydantic-settings==2.2.1
 structlog==24.1.0
 prometheus-client==0.20.0
 PyYAML==6.0.1
-typer==0.12.3
+typer==0.24.1
 python-dotenv==1.1.0
 cryptography==46.0.5
 varint==1.0.2
