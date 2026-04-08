@@ -555,7 +555,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 try:
                     uid = metagraph.hotkeys.index(expected_hotkey)
                     if uid not in submitted_uids:
-                        score_aggregator.add_score(uid=str(uid), hotkey=expected_hotkey, score=0.0)
+                        score_aggregator.add_score(uid=uid, hotkey=expected_hotkey, score=0.0)
                         logger.info("Penalizing missing submission", uid=uid, hotkey=expected_hotkey[:6], score=0.0)
                 except ValueError:
                     continue
