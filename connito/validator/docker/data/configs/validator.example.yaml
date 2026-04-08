@@ -1,0 +1,49 @@
+# Example validator config for the containerized SN102 validator.
+#
+# Copy this file to `validator.yaml` in the same directory and edit
+# the values for your wallet, expert group, and ports:
+#
+#   cp validator.example.yaml validator.yaml
+#   $EDITOR validator.yaml
+#
+# This file is read by `connito.shared.config.ValidatorConfig.from_path`
+# (see connito/shared/config.py) and the schema is the same one
+# documented at https://www.connito.ai/docs/validator/running.
+#
+# IMPORTANT: every path in this file must use the CONTAINER view of the
+# filesystem (i.e. /data/...), not your host paths. The compose file
+# bind-mounts your DATA_DIR onto /data inside the container, so anything
+# you write outside /data/ is lost on every Watchtower upgrade.
+
+chain:
+  netuid: 102
+  network: finney            # or "archive"
+  hotkey_name: CHANGE_ME     # must match `btcli wallet list`
+  coldkey_name: CHANGE_ME    # must match `btcli wallet list`
+  ip: 0.0.0.0
+  port: 8000                 # bittensor serve port — open in firewall
+
+dht:
+  port: 6000                 # hivemind DHT — open BOTH tcp and udp
+
+task:
+  expert_group_name: exp_math
+  base_path: /data/expert_groups
+  exp:
+    group_id: 0              # CHANGE to your assigned expert group
+
+ckpt:
+  base_checkpoint_path: /data/checkpoints
+  checkpoint_path: /data/checkpoints/active
+  miner_submission_path: /data/checkpoints/miner_submissions
+  miner_submission_archive_path: /data/checkpoints/miner_submission_archive
+  checkpoint_topk: 5
+
+log:
+  base_metric_path: /data/logs
+
+run:
+  top_k_miners_to_merge: 5
+  top_k_miners_to_reward: 10
+  averager_step_timeout_sec: 300
+  averager_step_max_retries: 3

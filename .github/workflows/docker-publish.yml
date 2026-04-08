@@ -1,0 +1,97 @@
+name: Build & publish validator image
+
+# Builds the validator container on every push to master and on tagged
+# releases, then pushes it to GHCR. Watchtower running on validator hosts
+# polls this image and restarts the container automatically.
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*.*.*"]
+    # Only rebuild when something that actually ends up in the validator
+    # image changes. Miner-only or doc-only edits skip the build.
+    paths:
+      - "connito/validator/**"
+      - "connito/shared/**"
+      - "connito/sn_owner/**"
+      - "connito/__init__.py"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "connito/validator/docker/Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker-publish.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/connito-validator
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Computes:
+      #   - `latest` (only on master)
+      #   - `master-<short-sha>` (always on master)
+      #   - `<git-tag>` for v* tags
+      # Watchtower watches `latest` by default; pin to a sha tag in
+      # docker-compose.yml if you want manual upgrades.
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=master-,enable={{is_default_branch}}
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.title=connito-validator
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # Build context is the repo root so the Dockerfile can COPY
+          # requirements.txt and connito/. Only the Dockerfile lives under
+          # connito/validator/docker/ — miners are not containerized.
+          context: .
+          file: ./connito/validator/docker/Dockerfile
+          push: true
+          # linux/amd64 only — torch CUDA wheels are x86_64. Add arm64 here
+          # only if you publish a separate jetson-style image.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Use the GitHub Actions cache backend so subsequent builds reuse
+          # the heavy pip-install layer (torch + transformers + hivemind).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
