@@ -55,7 +55,9 @@ def evaluate_model(
             if device_batch.get("attention_mask") is None and "input_ids" in device_batch:
                 device_batch["attention_mask"] = torch.ones_like(device_batch["input_ids"])
 
-            with torch.amp.autocast("cuda", dtype=torch.float16):
+            autocast_device = "cuda" if device.type == "cuda" else "cpu"
+            eval_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+            with torch.amp.autocast(autocast_device, dtype=eval_dtype):
                 outputs = model(**device_batch)
 
                 if not torch.isnan(outputs.loss):
@@ -80,4 +82,7 @@ def evaluate_model(
             batches=batch_step,
             step=step,
         )
-    return {"val_loss": (loss_sum - aux_loss_sum) / batch_step, "val_aux_loss": aux_loss_sum / batch_step}
+    
+    # Avoid zero division if dataloader was empty or evaluated only 1 batch (batch_step is 0-indexed)
+    total_batches = batch_step + 1 if batch_step is not None else 1
+    return {"val_loss": (loss_sum - aux_loss_sum) / total_batches, "val_aux_loss": aux_loss_sum / total_batches}
