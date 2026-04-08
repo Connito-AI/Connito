@@ -6,7 +6,7 @@ name: Build & publish validator image
 
 on:
   push:
-    branches: [master]
+    branches: [master, staging]
     tags: ["v*.*.*"]
     # Only rebuild when something that actually ends up in the validator
     # image changes. Miner-only or doc-only edits skip the build.
