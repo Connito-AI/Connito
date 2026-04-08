@@ -1,8 +1,15 @@
 name: Build & publish validator image
 
-# Builds the validator container on every push to master and on tagged
-# releases, then pushes it to GHCR. Watchtower running on validator hosts
-# polls this image and restarts the container automatically.
+# Builds the validator container on every push to master/staging and on
+# tagged releases, then pushes it to GHCR.
+#
+# Tagging model:
+#   - master push   → :master, :master-<sha>     (build artifact, not consumed by operators)
+#   - staging push  → :staging, :staging-<sha>   (opt-in pre-release channel for operators)
+#   - vX.Y.Z tag    → :vX.Y.Z, :stable           (THIS is what Watchtower ships to operators)
+#
+# Operators run :stable. Cutting a release = `git tag vX.Y.Z && git push --tags`.
+# There is intentionally no :latest tag — see validator-docker-maintainers.md.
 
 on:
   push:
@@ -57,20 +64,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Computes:
-      #   - `latest` (only on master)
-      #   - `master-<short-sha>` (always on master)
-      #   - `<git-tag>` for v* tags
-      # Watchtower watches `latest` by default; pin to a sha tag in
-      # docker-compose.yml if you want manual upgrades.
+      #   - `master` + `master-<short-sha>` (only on master pushes; build artifact)
+      #   - `staging` + `staging-<short-sha>` (only on staging pushes; opt-in channel)
+      #   - `vX.Y.Z` + `stable` (only on v* tag pushes; this is the operator-facing release)
+      # Operators run `:stable`. To cut a release: `git tag vX.Y.Z && git push --tags`.
       - name: Compute image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=master,enable={{is_default_branch}}
             type=sha,prefix=master-,enable={{is_default_branch}}
+            type=raw,value=staging,enable=${{ github.ref == 'refs/heads/staging' }}
+            type=sha,prefix=staging-,enable=${{ github.ref == 'refs/heads/staging' }}
             type=ref,event=tag
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=connito-validator
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

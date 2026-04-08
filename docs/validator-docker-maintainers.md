@@ -82,11 +82,12 @@ workflow.
 
 ### Triggers
 
-| Trigger | Tags pushed |
-|---------|-------------|
-| Push to `master` | `latest`, `master-<short-sha>` |
-| Push of `vX.Y.Z` tag | `vX.Y.Z` |
-| Manual `workflow_dispatch` | Whatever the source ref produces |
+| Trigger | Tags pushed | Operator impact |
+|---------|-------------|-----------------|
+| Push to `master` | `master`, `master-<short-sha>` | None — build artifact only. |
+| Push to `staging` | `staging`, `staging-<short-sha>` | Operators on `:staging` (opt-in) auto-upgrade. |
+| Push of `vX.Y.Z` tag | `vX.Y.Z`, `stable` | **Production release.** All operators on `:stable` auto-upgrade within ~5 min. |
+| Manual `workflow_dispatch` | Whatever the source ref produces | Same as the equivalent push. |
 
 The workflow has a `paths:` filter so it only runs when something that
 actually ends up in the image changes (validator code, shared code,
@@ -97,17 +98,35 @@ file that should trigger the build but isn't in the list, add it to
 
 ### Tagging strategy
 
-Operators run `:latest` by default. This means **every push to master is
-a production release within 5 minutes**. If you want a staging gate:
+Operators run `:stable` by default. `:stable` only moves when a `vX.Y.Z`
+tag is pushed, so **a push to `master` is not a release** — it produces
+`:master` and `:master-<sha>` build artifacts, nothing more. This gives
+us a staging gate with no second workflow and no manual re-tagging.
 
-1. Change the workflow trigger to `tags: ["v*.*.*"]` only.
-2. Have operators set `IMAGE=ghcr.io/connito-ai/connito-validator:stable`
-   in their `.env`.
-3. Cut releases by tagging `vX.Y.Z` and re-tagging the resulting image
-   as `:stable` (manually or via a second workflow).
+There is intentionally **no `:latest` tag**. If you see one in operator
+configs, it's stale — point them at `:stable`.
 
-We currently do not do this — `master` is the release channel. Treat it
-accordingly.
+To cut a release:
+
+```bash
+git checkout master
+git pull
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+The workflow builds the image, tags it `:v1.2.3` and `:stable`, and
+within `WATCHTOWER_POLL_INTERVAL` seconds every operator on `:stable`
+auto-upgrades. Pre-release validation flow:
+
+1. Merge the change to `staging` first.
+2. Confirm `:staging` builds clean and runs on a staging hotkey for at
+   least one validation cycle (operators on the staging channel will
+   pick it up automatically and can act as canaries).
+3. Fast-forward `master` to `staging` (or merge), then tag `vX.Y.Z`.
+
+Operators who want early access to the staging channel set
+`IMAGE=ghcr.io/connito-ai/connito-validator:staging` in their `.env`.
 
 ### GitHub repo setup (before the first build)
 
@@ -162,12 +181,16 @@ setting this up from scratch, do them now.
    *Container* package creation for this repo (or for all repos).
    Personal-account repos don't have this restriction.
 
-6. **Branch protection on `master` (recommended, not required).** Because
-   every push to `master` ships to every operator within ~5 min, you
-   probably want at minimum a "require PR + 1 review" rule and "require
-   `docker-publish` to pass" before merging. Otherwise a force-push or a
-   `git commit -am && git push` straight to master is a production
-   deploy with no review.
+6. **Branch protection on `master` (recommended, not required).** A
+   push to `master` is no longer a production deploy — `:stable` only
+   moves on `vX.Y.Z` tags — so the urgency is lower than it used to be.
+   That said, you still want at minimum a "require PR + 1 review" rule
+   on `master` and "require `docker-publish` to pass" before merging,
+   otherwise a broken `:master` build can sit on the default branch
+   waiting to bite the next person who tags off it. **Tag pushes are the
+   real risk surface now**: there's no such thing as branch protection
+   for tags, so treat `git push origin vX.Y.Z` with the same care you'd
+   treat a deploy command (because that's what it is).
 
 ### GHCR package settings (one-time, after the first successful build)
 
@@ -199,15 +222,19 @@ After the GitHub setup above, the smoke test is:
    validator image**. First run will be slow (~30+ min cold cache);
    subsequent runs are 3-5 min.
 4. When green: GitHub → **Packages** → `connito-validator` → confirm
-   the new tags `latest`, `master-<sha>` exist and the digests match.
+   the new tags `master`, `master-<sha>` exist and the digests match.
 5. From any host with docker installed:
    ```bash
-   docker pull ghcr.io/connito-ai/connito-validator:latest
+   docker pull ghcr.io/connito-ai/connito-validator:master
    ```
    should succeed (with `docker login` if private).
-6. Bonus: spin up the operator stack on a staging host and confirm
-   Watchtower picks up the new digest within `WATCHTOWER_POLL_INTERVAL`
-   seconds.
+6. Now exercise the release path: `git tag v0.0.1-smoke && git push
+   origin v0.0.1-smoke`. Confirm the workflow runs again and produces
+   `:v0.0.1-smoke` and `:stable`. (Delete the smoke tag afterwards both
+   locally and on the remote so it doesn't pollute the release history.)
+7. Bonus: spin up the operator stack on a staging host with the default
+   `IMAGE=...:stable` and confirm Watchtower picks up the new digest
+   within `WATCHTOWER_POLL_INTERVAL` seconds.
 
 If any of those steps fail, fix it **before** announcing this to
 operators — the pipeline working end-to-end on day one is the whole
@@ -273,29 +300,41 @@ cached layer.
 
 Two paths, depending on how bad it is:
 
-### "Soft" rollback — push a fix forward
+### "Soft" rollback — re-tag a known-good release
 
-Revert the offending commit on master, let the workflow rebuild
-`:latest`, Watchtower picks it up within 5 min. This is the default. It
-works because `:latest` is just whatever the most recent green build
-produced.
+Find the last known-good `vX.Y.Z` tag, then cut a new patch tag pointing
+at the same commit:
 
-### "Hard" rollback — pin all hosts to a known-good sha
+```bash
+git tag v1.2.4 v1.2.3   # v1.2.3 is the last good release
+git push origin v1.2.4
+```
+
+The workflow rebuilds and re-points `:stable` at `v1.2.4`. Watchtower
+picks it up within 5 min. This is the default rollback. It's slightly
+more ceremony than the old "revert and push" flow, but it gives you a
+clean audit trail of what was deployed when.
+
+(You can also revert the offending commit on `master`, then tag — same
+result, useful when the regression is several commits deep.)
+
+### "Hard" rollback — pin all hosts to a known-good version
 
 If the bad image is *actively breaking* validators (e.g. crashloop on
 startup), Watchtower will keep restarting them but they'll never come
 up. Operators need to:
 
-1. Find the last known-good `master-<sha>` tag in the GHCR UI.
-2. Set `IMAGE=ghcr.io/connito-ai/connito-validator:master-<sha>` in
-   their `.env`.
+1. Find the last known-good `vX.Y.Z` tag in the GHCR UI (or just the
+   previous release).
+2. Set `IMAGE=ghcr.io/connito-ai/connito-validator:vX.Y.Z` in their
+   `.env`. (A `master-<sha>` from before the regression also works.)
 3. `docker compose up -d`.
 
 You should **post the known-good sha in the operators channel** the
 moment you know there's a regression — don't make 30 operators each go
 hunting for it.
 
-Then push the revert through the normal pipeline so `:latest` becomes
+Then cut a new release tag (soft rollback above) so `:stable` becomes
 healthy again, and operators can drop their `IMAGE` pin at their leisure.
 
 ## Knobs you can turn safely
@@ -362,8 +401,9 @@ When in doubt: announce it, then push.
   branch protection so a failing `docker-publish` blocks merges if you
   want; right now it doesn't.
 - **GHCR** shows the published tags and pull counts. You can see how
-  many distinct hosts pulled `:latest` in the last day, which is a
-  rough proxy for "how many validators run our image."
+  many distinct hosts pulled `:stable` in the last day, which is a
+  rough proxy for "how many validators run our image." `:staging` pulls
+  tell you how many operators have opted into the canary channel.
 - **Watchtower notifications** (Slack) on the operator side will tell
   you when an upgrade actually rolls out — but you only see your own,
   not the fleet. If you want fleet-wide visibility, ask operators to
@@ -372,14 +412,18 @@ When in doubt: announce it, then push.
 
 ## When to bump versions
 
+Every operator-visible release is a `vX.Y.Z` tag — that's the only way
+`:stable` moves. Use SemVer to choose which component to bump:
+
 - **Patch** (`v1.2.3` → `v1.2.4`): bug fix, no schema/protocol change.
-  Free to push to master and let `:latest` roll out immediately.
+  Tag and push; auto-rolls to all operators within 5 min.
 - **Minor** (`v1.2.x` → `v1.3.0`): new feature, no breaking config or
-  protocol change. Push to master, but post in operators channel so
+  protocol change. Tag and push, but post in the operators channel so
   they know what changed.
 - **Major** (`v1.x` → `v2.0`): breaking config / protocol / chain
-  interaction. Cut a tag, give operators a deadline to upgrade,
-  consider gating via a `:stable` tag temporarily.
+  interaction. Bake on `:staging` for at least one validation cycle
+  with canary operators, give operators a deadline to read the changelog,
+  *then* tag.
 
 We're not currently using SemVer rigorously. If you start, document the
 contract here.

@@ -15,17 +15,15 @@ lands.
 ## What you get
 
 ```
-GitHub push to master
+Maintainer cuts a release: `git tag vX.Y.Z && git push --tags`
         │
         ▼
-GitHub Actions builds + pushes the image
-        │
-        ▼
-ghcr.io/connito-ai/connito-validator:latest
+GitHub Actions builds + pushes the image as
+ghcr.io/connito-ai/connito-validator:stable  (and :vX.Y.Z)
         │
         ▼
 Watchtower on your validator host
-        │  polls every 5 min, sees new digest
+        │  polls every 5 min, sees new :stable digest
         ▼
 docker pull + recreate `connito-validator`
         │  bind mounts (wallets, /data) preserved
@@ -35,6 +33,12 @@ Validator resumes from the latest checkpoint
 
 You don't have to `git pull && pip install && pkill && python -m ...`
 ever again. Watchtower does that for you.
+
+**Note:** `:stable` only moves on tagged releases — not on every push to
+`master`. Pushes to `master` do build an image (`:master`, `:master-<sha>`)
+but those are build artifacts, not something Watchtower will pick up. If
+you want early access to pre-release builds, set `IMAGE=...:staging` in
+your `.env` to opt into the staging channel.
 
 ## Files you'll touch
 
@@ -219,9 +223,14 @@ Optional:
 - `WANDB_API_KEY` if you want metrics in Weights & Biases.
 - `WATCHTOWER_NOTIFICATIONS=slack` and `WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL`
   if you want a Slack ping every time Watchtower upgrades the container.
-- `IMAGE` — leave on `:latest` for auto-upgrades, or pin to
-  `ghcr.io/connito-ai/connito-validator:master-<sha>` to freeze a
-  specific build (Watchtower will not upgrade off a pinned tag).
+- `IMAGE` — leave on `:stable` for auto-upgrades on tagged releases.
+  Other choices:
+  - `ghcr.io/connito-ai/connito-validator:staging` — opt into the
+    pre-release channel; Watchtower will track it.
+  - `ghcr.io/connito-ai/connito-validator:vX.Y.Z` — pin to a specific
+    release. Watchtower will not upgrade off a pinned tag.
+  - `ghcr.io/connito-ai/connito-validator:master-<sha>` — pin to a
+    specific master build. Same: Watchtower will not upgrade.
 
 ### 7. Open firewall ports
 
@@ -251,8 +260,8 @@ reachable.
 
 ## Verifying the auto-update loop
 
-1. Wait for the next push to `master` (or coordinate with the maintainers
-   to push a trivial change).
+1. Wait for the next tagged release (or coordinate with the maintainers
+   to cut a trivial `vX.Y.Z` tag against staging).
 2. Within `WATCHTOWER_POLL_INTERVAL` seconds (default 5 min) after the
    GitHub Actions build finishes:
    ```bash
@@ -326,7 +335,7 @@ reachable.
 | `permission denied while trying to connect to the Docker daemon socket` | You forgot `usermod -aG docker $USER` + `newgrp docker` from step 1. |
 | Validator logs spam `wallet not found` | `BITTENSOR_WALLET_PATH` in `.env` doesn't point at the right host path, or `WALLET_NAME` / `HOTKEY_NAME` don't match what's actually under that dir. |
 | Validator can't reach hivemind peers | Firewall step 7 not done, or `dht.port` in `validator.yaml` doesn't match what you opened. Both **TCP and UDP** must be open. |
-| Watchtower never upgrades | Either the registry is private and Watchtower has no creds (mount `~/.docker/config.json`), or you pinned `IMAGE` to a sha tag (Watchtower only follows moving tags like `latest`). |
+| Watchtower never upgrades | Either the registry is private and Watchtower has no creds (mount `~/.docker/config.json`), or you pinned `IMAGE` to a sha or `vX.Y.Z` tag (Watchtower only follows moving tags like `:stable` or `:staging`), or no new tagged release has been cut since you started. |
 | Image pull fails with `denied` | GHCR package is private and you haven't run `docker login ghcr.io` on the host. |
 | `CUDA error: no kernel image is available for execution on the device` | Your GPU is too old for the CUDA runtime in the image, or your host driver is < 550. |
 

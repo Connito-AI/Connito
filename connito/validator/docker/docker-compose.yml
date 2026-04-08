@@ -17,10 +17,11 @@
 
 services:
   validator:
-    # Pulled from GHCR by default. Override with `IMAGE=...` in .env
-    # to use a private registry, a fork, or a pinned tag (e.g.
-    # `master-<sha>` for manual upgrades).
-    image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:latest}
+    # Pulled from GHCR by default. `:stable` only moves when maintainers
+    # cut a release (`git tag vX.Y.Z`) — Watchtower auto-upgrades when it
+    # does. Override with `IMAGE=...` in .env to track `:staging`, pin to
+    # a specific `vX.Y.Z`, or freeze on a `master-<sha>` build artifact.
+    image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:stable}
     container_name: connito-validator
     restart: unless-stopped
     pull_policy: always
