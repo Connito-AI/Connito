@@ -57,7 +57,10 @@ substrate-interface==1.8.1
 # Observability
 # -----------------------------
 wandb==0.25.1
-pandas==2.0.3
+# pandas >=2.2.2 is required for numpy 2.x compatibility (PyArray_Descr
+# ABI break). We're on numpy 2.x via the unpinned transitive resolution;
+# do not downgrade pandas below 2.2.2 without also pinning numpy<2.
+pandas==2.2.3
 
 # ------------------------------
 # Dev & Testing

@@ -240,6 +240,108 @@ If any of those steps fail, fix it **before** announcing this to
 operators — the pipeline working end-to-end on day one is the whole
 point of this setup.
 
+## Installing Docker (maintainer host)
+
+You only need Docker locally if you want to build or run the image
+outside CI — the release pipeline itself runs on GitHub-hosted runners
+and needs nothing on your machine. But for the smoke tests and dep-bump
+validation in the next section, you do need a local Docker with Buildx.
+
+### Linux (recommended — matches the runners)
+
+```bash
+# Docker Engine + Compose plugin + Buildx (bundled with modern Docker).
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify:
+docker version
+docker compose version
+docker buildx version
+```
+
+If `docker buildx version` fails, your Docker is too old — upgrade to
+Docker Engine ≥ 23.0 (Buildx is bundled from that version on).
+
+**Gotcha: `permission denied ... /var/run/docker.sock` in a new shell.**
+`usermod -aG docker $USER` updates the group database, but your
+*already-running* shell sessions keep the group set they were launched
+with. So even after `newgrp docker` works in the shell where you ran it,
+any **other** terminal tab, tmux pane, or IDE terminal opened before the
+usermod call will still hit:
+
+```
+permission denied while trying to connect to the Docker API at unix:///var/run/docker.sock
+```
+
+Fix for that stale shell specifically:
+
+```bash
+newgrp docker
+```
+
+Or log out and back in once (reboot works too) so every new shell picks
+up the group cleanly without needing `newgrp`. Check which groups the
+current shell actually has with `groups` or `id` — if `docker` isn't in
+the output, the shell is stale regardless of what `getent group docker`
+says.
+
+### macOS (only for CPU-only smoke tests)
+
+Install **Docker Desktop** from <https://www.docker.com/products/docker-desktop/>.
+It ships with Buildx and Compose v2. Two caveats matching the landmines
+section below:
+
+- **`network_mode: host` is ignored on macOS.** The validator will start,
+  but the hivemind DHT and chain serve ports won't bind to the host. Fine
+  for "does the entrypoint import cleanly" tests, useless for anything
+  touching the chain.
+- **No GPU passthrough.** You can't run `--gpus all` on macOS regardless
+  of what the host hardware is. CPU-only smoke tests work; real
+  validation cycles do not.
+
+For any test beyond "does `import connito.validator.run` succeed," do it
+on a Linux box. A cheap GPU VM or a dedicated staging host is worth it.
+
+### NVIDIA Container Toolkit (only if you want GPU smoke tests locally)
+
+Required only if you're going to run the image against a real wallet on
+your workstation. If you'll do that on a staging host instead, skip this.
+
+```bash
+distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# Verify:
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+This is the same installation the operator doc walks through at
+[validator-docker-operators.md:63-89](validator-docker-operators.md) —
+if you've already set up a validator host for testing, you don't need
+to repeat it.
+
+### Authenticating to GHCR locally
+
+Only needed if the package is private (see "GHCR package settings" above).
+Use a PAT with `read:packages` scope at minimum, or `write:packages` if
+you intend to push images manually (rarely needed — the workflow does it):
+
+```bash
+echo "<github_pat>" | docker login ghcr.io -u <your-github-username> --password-stdin
+```
+
+Credentials are written to `~/.docker/config.json`.
+
 ## Local dev loop
 
 ```bash
