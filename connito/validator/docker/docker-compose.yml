@@ -108,6 +108,8 @@ services:
       - ${HOME}/.docker/config.json:/config.json:ro
 
     environment:
+      # Match the host Docker daemon API version (docker version → API version).
+      DOCKER_API_VERSION: "1.44"
       # Only act on containers with the opt-in label above.
       WATCHTOWER_LABEL_ENABLE: "true"
       # Poll every 5 minutes — tweak with WATCHTOWER_POLL_INTERVAL in .env.
