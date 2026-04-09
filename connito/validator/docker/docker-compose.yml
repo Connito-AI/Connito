@@ -3,8 +3,8 @@
 # This compose file lives at connito/validator/docker/docker-compose.yml.
 # Run from this directory:
 #
+#   python connito/shared/config.py create_config --role validator ...
 #   cd connito/validator/docker
-#   cp .env.example .env       # then edit .env
 #   docker compose up -d
 #
 # - `validator`  runs the containerized validator built from this repo.
@@ -73,10 +73,13 @@ services:
       # Wallets — read-only is safest; the validator only signs with the hotkey.
       - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
       # Persistent state: checkpoints, expert groups, hf cache, wandb runs.
-      - ${DATA_DIR:-./data}:/data
+      # Defaults to the repo root, which already contains checkpoints/,
+      # expert_groups/, wandb/, etc. Override with DATA_DIR in .env for
+      # production hosts that want a path outside the repo.
+      - ${DATA_DIR:-../../..}:/data
       # Validator config YAML — bind mount so you can edit on the host
       # without rebuilding the image.
-      - ${CONFIG_PATH:-./data/configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
 
     command: ["--path", "/data/configs/validator.yaml"]
 
