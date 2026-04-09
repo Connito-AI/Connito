@@ -44,13 +44,14 @@ services:
     network_mode: "host"
 
     # NVIDIA GPU access. Requires nvidia-container-toolkit on the host.
-    # Pin to specific GPUs by replacing `count: all` with `device_ids: ["0"]`.
+    # Set VALIDATOR_GPU_ID in .env to pin to a specific GPU (e.g. "4").
+    # Defaults to all GPUs if not set.
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["${VALIDATOR_GPU_ID:-0}"]
               capabilities: [gpu]
 
     # Shared memory for PyTorch DataLoader workers; default 64MB is too small.
@@ -58,6 +59,10 @@ services:
     ipc: host
 
     environment:
+      # Docker passes in only the GPU selected by device_ids above.
+      # Inside the container it always appears as device 0, regardless of
+      # which host GPU it is. Do not change this to match the host GPU ID.
+      CUDA_VISIBLE_DEVICES: "0"
       # Bittensor wallet selection — must match what `btcli wallet list` shows.
       WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
       HOTKEY_NAME: ${HOTKEY_NAME:?set HOTKEY_NAME in .env}
@@ -115,13 +120,14 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["${SERVER_GPU_ID:-0}"]
               capabilities: [gpu]
 
     shm_size: "16gb"
     ipc: host
 
     environment:
+      CUDA_VISIBLE_DEVICES: "0"
       WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
       HOTKEY_NAME: ${HOTKEY_NAME:?set HOTKEY_NAME in .env}
       WANDB_API_KEY: ${WANDB_API_KEY:-}
