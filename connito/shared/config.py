@@ -26,6 +26,11 @@ logger = structlog.get_logger(__name__)
 # ---------------------------
 # Utilities
 # ---------------------------
+def is_running_in_docker() -> bool:
+    """Return True if we are inside a Docker container."""
+    return Path("/.dockerenv").exists()
+
+
 def find_project_root(start: Path | None = None) -> Path:
     """Walk up until we see a repo/config marker."""
     start = (start or Path(".")).expanduser().resolve(strict=True)
@@ -360,6 +365,11 @@ class WorkerConfig(BaseConfig):
         # Fill keys (best-effort)
         self._fill_wallet_data()
 
+        # When running inside Docker, override host paths to container paths.
+        # The compose file mounts: repo root → /data, expert_groups → /app/expert_groups.
+        if is_running_in_docker():
+            self._apply_docker_paths()
+
         # Derive paths
         self._refresh_paths()
 
@@ -368,6 +378,27 @@ class WorkerConfig(BaseConfig):
 
         # Create directories
         self._ensure_runtime_dirs()
+
+    def _apply_docker_paths(self) -> None:
+        """Remap host paths to container paths for Docker runs."""
+        self.run.root_path = Path("/data")
+        # Absolute path so _refresh_paths()'s `root / base_path` keeps it as-is.
+        self.task.base_path = Path("/app/expert_groups")
+        self.task.path = None
+
+        # Reset derived paths to defaults so _refresh_paths() recomputes them
+        # from the new root_path instead of re-joining absolute host paths.
+        self.ckpt.base_checkpoint_path = Path(type(self.ckpt).model_fields["base_checkpoint_path"].default)
+        self.ckpt.checkpoint_path = None
+        self.ckpt.validator_checkpoint_path = Path(type(self.ckpt).model_fields["validator_checkpoint_path"].default)
+        self.log.base_metric_path = Path(type(self.log).model_fields["base_metric_path"].default)
+        self.log.metric_path = None
+        if hasattr(self.ckpt, "miner_submission_path"):
+            self.ckpt.miner_submission_path = Path(type(self.ckpt).model_fields["miner_submission_path"].default)
+        if hasattr(self.ckpt, "miner_submission_archive_path"):
+            self.ckpt.miner_submission_archive_path = Path(type(self.ckpt).model_fields["miner_submission_archive_path"].default)
+
+        logger.info("Docker detected — paths remapped", root_path=str(self.run.root_path))
 
     # -----------------------
     # Derived paths / IO
