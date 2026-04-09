@@ -216,19 +216,21 @@ async def aggregate_miner_gradient_change(
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
     score_aggregator: MinerScoreAggregator,
-):
+) -> list[str]:
     global_model.to(device)
     miner_models: dict[str, nn.Module] = {}
     for miner_job in miner_jobs:
         if score_aggregator.is_in_top(uid=str(miner_job.uid), cutoff=config.run.top_k_miners_to_merge, how="avg"):
-            miner_models[miner_job.uid] = await asyncio.to_thread(
+            miner_models[str(miner_job.uid)] = await asyncio.to_thread(
                 load_model_from_path, miner_job.model_path, global_model, device
             )
+
+    merged_uids = list(miner_models.keys())
 
     # each validator is only expected to validate 1 expert group at a time
     for _, miner_model in miner_models.items():
         pre_grad_sum = sum_model_gradients(global_model)
-        populate_global_grads_from_local(global_model, miner_model, weight=1 / len(miner_models))
+        populate_global_grads_from_local(global_model, miner_model, weight=1 / max(1, len(miner_models)))
         post_grad_sum = sum_model_gradients(global_model)
         logger.info(
             "Miner gradient aggregated",
@@ -236,6 +238,8 @@ async def aggregate_miner_gradient_change(
             post_grad_sum=round(post_grad_sum, 6),
             grad_delta=round(post_grad_sum - pre_grad_sum, 6),
         )
+
+    return merged_uids
 
 def sync_grad_across_validators(
     config: ValidatorConfig,
@@ -577,7 +581,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
             logger.info("(3) Aggregating miner gradient change locally")
-            asyncio.run(
+            merged_uids = asyncio.run(
                 aggregate_miner_gradient_change(
                     config=config,
                     global_model=global_model.to("cpu"),
@@ -587,6 +591,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     miner_jobs=miner_jobs,
                     score_aggregator=score_aggregator,
                 )
+            )
+            
+            logger.info(
+                "Aggregated miner gradients locally", 
+                merged_uids=merged_uids, 
+                model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6]
             )
 
             cleanup(global_model, base_model)
