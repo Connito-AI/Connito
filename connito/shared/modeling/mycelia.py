@@ -70,6 +70,7 @@ def load_pretrained_model_low_mem(
     model_class: type[nn.Module],
     model_path: str,
     moe_config,
+    model_dtype: torch.dtype = torch.float16,
 ) -> nn.Module:
     """Load pretrained weights directly into the custom model with low CPU memory usage."""
     if bool(getattr(moe_config, "full", False)):
@@ -80,13 +81,13 @@ def load_pretrained_model_low_mem(
         model = model_class(moe_config)
         pretrained_sd = load_pretrained_state_dict(model_path)
         model.load_state_dict(pretrained_sd, strict=False)
-        logger.info("Loaded full model via explicit state_dict", path=model_path, dtype="float16")
+        logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
         return model
 
     model = model_class.from_pretrained(
         model_path,
         config=moe_config,
-        dtype=torch.float16,
+        dtype=model_dtype,
         low_cpu_mem_usage=False,
         ignore_mismatched_sizes=True,
     )
@@ -110,7 +111,7 @@ def load_pretrained_model_low_mem(
         pretrained_sd = load_pretrained_state_dict(model_path)
         model.load_state_dict(pretrained_sd, strict=False)
 
-    logger.info("Loaded pretrained model directly", path=model_path, dtype="float16")
+    logger.info("Loaded pretrained model directly", path=model_path, dtype=str(model_dtype))
     return model
 
 
@@ -128,6 +129,11 @@ def get_base_model(
     Miners: Load standard model for training
     """
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+    precision = getattr(config.model, "precision", "fp16-mixed")
+    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        precision = "fp16-mixed"
+    model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
     topk = config.moe.partial_topk if partial else config.moe.full_topk
     model_path = config.model.model_path.lower()
@@ -150,7 +156,7 @@ def get_base_model(
                 model, _ = FastLanguageModel.from_pretrained(
                     model_name=config.model.model_path,
                     max_seq_length=moe_config.max_position_embeddings,
-                    dtype=torch.float16,
+                    dtype=model_dtype,
                     load_in_4bit=True,
                     device_map="auto",
                 )
@@ -163,7 +169,7 @@ def get_base_model(
         # Fallback to BitsAndBytes
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=model_dtype,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
@@ -179,7 +185,7 @@ def get_base_model(
             device_map="auto",
             max_memory=max_memory,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,
+            torch_dtype=model_dtype,
         )
         logger.info("✓ Loaded with BitsAndBytes quantization")
         return model
@@ -192,6 +198,7 @@ def get_base_model(
             model_class=_CausalLMClass,
             model_path=config.model.model_path,
             moe_config=moe_config,
+            model_dtype=model_dtype,
         )
     else:
         model = _CausalLMClass(moe_config)

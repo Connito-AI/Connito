@@ -77,6 +77,7 @@ def save_state_dict_by_expert_group(
     save_dir: str | Path,
     strict_sharding: bool = False,
     active_expert_group_id: int | None = None,
+    save_dtype: torch.dtype = torch.float16,
 ):
     """
     Split a full model state_dict into checkpoint shards.
@@ -194,7 +195,7 @@ def save_state_dict_by_expert_group(
         layer_id, expert_id = get_layer_expert_id(name)
         # CASE 1: Not an expert parameter
         if layer_id is None or expert_id is None:
-            t = tensor.detach().to(dtype=torch.float16, device="cpu", non_blocking=True).contiguous()
+            t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
             grouped_state["shared"][name] = t
             group_param_count["shared"] += 1
             group_bytes["shared"] += t.nelement() * t.element_size()
@@ -209,7 +210,7 @@ def save_state_dict_by_expert_group(
             allowed_my = active_my_ids_by_layer.get(layer_key, set())
             allowed_org = active_org_ids_by_layer.get(layer_key, set())
             if expert_key in allowed_my or expert_key in allowed_org:
-                t = tensor.detach().to(dtype=torch.float16, device="cpu", non_blocking=True).contiguous()
+                t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
                 grouped_state[active_expert_group_id][name] = t
                 group_param_count[active_expert_group_id] += 1
                 group_bytes[active_expert_group_id] += t.nelement() * t.element_size()
@@ -231,14 +232,14 @@ def save_state_dict_by_expert_group(
             # expert exists but not assigned to any group.
             # In full-shard mode these go to shared for backward compatibility.
             if has_shared_bucket:
-                t = tensor.detach().to(dtype=torch.float16, device="cpu", non_blocking=True).contiguous()
+                t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
                 grouped_state["shared"][name] = t
                 group_param_count["shared"] += 1
                 group_bytes["shared"] += t.nelement() * t.element_size()
                 reason = "ambiguous_local_id" if key in ambiguous_my_expert_keys else "unmapped"
                 unassigned_experts.append(f"{name} (layer={layer_id}, expert={expert_id}, reason={reason})")
         else:
-            t = tensor.detach().to(dtype=torch.float16, device="cpu", non_blocking=True).contiguous()
+            t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
             grouped_state[gid][name] = t
             group_param_count[gid] += 1
             group_bytes[gid] += t.nelement() * t.element_size()
@@ -415,6 +416,7 @@ def save_checkpoint(
     write_path = tmp_checkpoint_path
 
     # === save model, optimizer ===
+    model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
 
     if save_model_by_expert_group and expert_manager is not None:
         state_dict = model.state_dict()
@@ -424,13 +426,14 @@ def save_checkpoint(
             write_path,
             strict_sharding=strict_sharding,
             active_expert_group_id=active_expert_group_id,
+            save_dtype=model_dtype,
         )
         del state_dict
         gc.collect()
 
     else:
         checkpoint = {
-            "model_state_dict": {k: v.detach().half().to("cpu", non_blocking=True) for k, v in model.state_dict().items()},
+            "model_state_dict": {k: v.detach().to(dtype=model_dtype, device="cpu", non_blocking=True) for k, v in model.state_dict().items()},
             "loss": loss,
         }
         target = write_path / "model.pt"
@@ -617,12 +620,17 @@ def load_checkpoint(
     """
 
     if model is not None:
+        precision = getattr(config.model, "precision", "fp16-mixed")
+        if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            precision = "fp16-mixed"
+        model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
+
         full_state_dict = compile_full_state_dict_from_path(checkpoint_path, expert_groups=expert_groups)
         for key, value in full_state_dict.items():
-            if torch.is_tensor(value) and torch.is_floating_point(value) and value.dtype != torch.float16:
-                full_state_dict[key] = value.to(dtype=torch.float16)
+            if torch.is_tensor(value) and torch.is_floating_point(value) and value.dtype != model_dtype:
+                full_state_dict[key] = value.to(dtype=model_dtype)
         model.load_state_dict(full_state_dict, strict=False)
-        model.to(device=device, dtype=torch.float16)
+        model.to(device=device, dtype=model_dtype)
 
     if inner_optimizer is not None:
         load_optimizer(os.path.join(checkpoint_path, "inner_optimizer*.pt"), inner_optimizer)

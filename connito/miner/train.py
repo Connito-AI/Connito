@@ -22,6 +22,7 @@ from transformers import (
 from connito.miner.train_helper import free_cuda_models, get_status
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
+from connito.shared.cycle import wait_till, PhaseNames
 from connito.shared.checkpoint_helper import (
     load_checkpoint,
     save_checkpoint,
@@ -304,7 +305,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
             inner_opt_step = step // config.local_par.gradient_accumulation_steps
-            is_inner_optimizer_step = step % config.local_par.gradient_accumulation_steps == 0
+            is_inner_optimizer_step = (step + 1) % config.local_par.gradient_accumulation_steps == 0
             
             # is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
             # current_model_meta.inner_opt = inner_opt_step
@@ -353,7 +354,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         label_max = int(labels[valid_labels].max().item())
                     logger.warning(
                         "Non-finite loss detected, skipping batch",
-                        loss=float(loss.item()) if loss.numel() == 1 else None,
+                        loss=float(outputs.loss.item()) if outputs.loss.numel() == 1 else None,
                         logits_min=logits_min,
                         logits_max=logits_max,
                         logits_finite_ratio=logits_finite_ratio,
@@ -366,7 +367,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     del loss, aux_loss, batch_device, outputs
                     gc.collect()
                     continue
-                logger.info("batch loss", loss = loss.item(), inner_opt_step = inner_opt_step)
+                logger.info("batch loss", loss=outputs.loss.item(), inner_opt_step=inner_opt_step)
 
                 loss_batch += loss.item()
                 aux_loss_batch += aux_loss.item()
@@ -519,10 +520,49 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             if is_inner_optimizer_step and inner_opt_step % config.log.metric_interval == 0:
                 logger.info("(3) Local evaluation")
 
-                val_metric = evaluate_model(
-                    rank=rank, step=inner_opt_step, model=model, eval_dataloader=train_dataloader, device=device
-                )
+                try:
+                    val_metric = evaluate_model(
+                        rank=rank, step=inner_opt_step, model=model, eval_dataloader=train_dataloader, device=device
+                    )
 
+                except (FileNotFoundError, ConnectionError, TimeoutError, RuntimeError) as e:
+                    error_msg = str(e).lower()
+                    
+                    # Make sure a RuntimeError is actually an HTTP/Network error before sleeping
+                    is_network_error = not isinstance(e, RuntimeError) or "hfhubhttperror" in error_msg or "50" in error_msg
+                    
+                    if is_network_error:
+                        logger.error(f"Dataloader network streaming error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
+                        logger.info("Sleeping until PhaseNames.distribute starts...")
+                        wait_till(config, phase_name=PhaseNames.distribute)
+                    
+                        time.sleep(15)
+                    
+                        # Rebuild ONLY the dataloader to recover the network stream
+                        logger.info("Rebuilding dataloader after network timeout...")
+                        train_dataloader = get_dataloader(
+                            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+                        )
+                        break
+                    else:
+                        # If it's a CUDA Out of Memory or shape mismatch, crash normally
+                        raise
+                except Exception as e:
+                    if "server error" in str(e).lower() or "503" in str(e).lower():
+                        logger.error(f"Dataloader HF server streaming error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
+                        logger.info("Sleeping until PhaseNames.distribute starts...")
+                        wait_till(config, phase_name=PhaseNames.distribute)
+                    
+                        time.sleep(15)
+                    
+                        # Rebuild ONLY the dataloader to recover the network stream
+                        logger.info("Rebuilding dataloader after network timeout...")
+                        train_dataloader = get_dataloader(
+                            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+                        )
+                        break
+                    raise
+                
                 metrics = (
                     get_status(
                         config=config,
@@ -638,7 +678,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 torch.cuda.empty_cache()
                 logger.info("Clean up completed")
 
-        logger.info("used up train dataloader")
+        logger.info("used up train dataloader, rebuilding for next epoch")
+        train_dataloader = get_dataloader(
+            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+        )
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down miner loop")

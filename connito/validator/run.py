@@ -216,19 +216,21 @@ async def aggregate_miner_gradient_change(
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
     score_aggregator: MinerScoreAggregator,
-):
+) -> list[str]:
     global_model.to(device)
     miner_models: dict[str, nn.Module] = {}
     for miner_job in miner_jobs:
-        if score_aggregator.is_in_top(uid=miner_job.uid, cutoff=config.run.top_k_miners_to_merge, how="ema"):
-            miner_models[miner_job.uid] = await asyncio.to_thread(
+        if score_aggregator.is_in_top(uid=str(miner_job.uid), cutoff=config.run.top_k_miners_to_merge, how="avg"):
+            miner_models[str(miner_job.uid)] = await asyncio.to_thread(
                 load_model_from_path, miner_job.model_path, global_model, device
             )
+
+    merged_uids = list(miner_models.keys())
 
     # each validator is only expected to validate 1 expert group at a time
     for _, miner_model in miner_models.items():
         pre_grad_sum = sum_model_gradients(global_model)
-        populate_global_grads_from_local(global_model, miner_model, weight=1 / len(miner_models))
+        populate_global_grads_from_local(global_model, miner_model, weight=1 / max(1, len(miner_models)))
         post_grad_sum = sum_model_gradients(global_model)
         logger.info(
             "Miner gradient aggregated",
@@ -236,6 +238,8 @@ async def aggregate_miner_gradient_change(
             post_grad_sum=round(post_grad_sum, 6),
             grad_delta=round(post_grad_sum - pre_grad_sum, 6),
         )
+
+    return merged_uids
 
 def sync_grad_across_validators(
     config: ValidatorConfig,
@@ -419,7 +423,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     global_opt_step = start_step
 
     # === set up score aggregator ===
-    score_aggregator = MinerScoreAggregator()
+    score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
+    if score_path.exists():
+        try:
+            with open(score_path, "r") as f:
+                score_aggregator = MinerScoreAggregator.from_json(f.read())
+            logger.info("Loaded previous MinerScoreAggregator state from disk")
+        except Exception as e:
+            logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
+            score_aggregator = MinerScoreAggregator()
+    else:
+        score_aggregator = MinerScoreAggregator()
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
@@ -527,13 +541,29 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     device=device,  # operate at cuda
                     miners=miner_jobs,
                     score_aggregator=score_aggregator,
-                    base_model=base_model.to("cpu"),
+                    base_model=global_model.to("cpu"),
                     tokenizer=tokenizer,
                     combinded_seed=get_combined_validator_seed(config, subtensor),
                 )
             )
 
             cleanup(global_model, base_model)
+            
+            # Penalize assigned miners that missed their submission
+            from connito.shared.cycle import get_validator_miner_assignment
+            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+            miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
+            submitted_uids = {job.uid for job in miner_jobs}
+            metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+            for expected_hotkey in miner_assignment:
+                try:
+                    uid = metagraph.hotkeys.index(expected_hotkey)
+                    if uid not in submitted_uids:
+                        score_aggregator.add_score(uid=uid, hotkey=expected_hotkey, score=0.0)
+                        logger.info("Penalizing missing submission", uid=uid, hotkey=expected_hotkey[:6], score=0.0)
+                except ValueError:
+                    continue
+
             uid_scores = score_aggregator.uid_score_pairs()
             logger.info(
                 "Evaluation results",
@@ -541,10 +571,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 scores={uid: round(s, 4) for uid, s in uid_scores.items()},
             )
 
+            # Persist aggregator state locally for restarts
+            try:
+                with open(score_path, "w") as f:
+                    f.write(score_aggregator.to_json())
+            except Exception as e:
+                logger.warning(f"Failed to save score_aggregator.json: {e}")
+
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
             logger.info("(3) Aggregating miner gradient change locally")
-            asyncio.run(
+            merged_uids = asyncio.run(
                 aggregate_miner_gradient_change(
                     config=config,
                     global_model=global_model.to("cpu"),
@@ -554,6 +591,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     miner_jobs=miner_jobs,
                     score_aggregator=score_aggregator,
                 )
+            )
+            
+            logger.info(
+                "Aggregated miner gradients locally", 
+                merged_uids=merged_uids, 
+                model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6]
             )
 
             cleanup(global_model, base_model)
@@ -653,6 +696,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             # === Set weight to chain ===
             logger.info("(9) Set weight to chain")
             uid_weights = score_aggregator.uid_score_pairs(how="avg")
+            logger.info(
+                "Submitting weights derived from avg scores",
+                top_weights={str(k): round(v, 4) for k, v in sorted(uid_weights.items(), key=lambda item: item[1], reverse=True)[:5]}
+            )
             submit_weights(
                 config=config,
                 wallet=wallet,
