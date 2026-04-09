@@ -722,24 +722,22 @@ def parse_args():
     # --- create_config ---
     create_cfg = subparsers.add_parser("create_config", help="Generate a template config file")
     create_cfg.add_argument("--role", choices=["miner", "validator"], required=True, help="Role to generate config for")
-    create_cfg.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
-    create_cfg.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
     create_cfg.add_argument("--run_name", type=str, help="Run name")
 
     # --- create_docker_env ---
     create_env = subparsers.add_parser("create_docker_env", help="Generate Docker compose .env from an existing config")
-    create_env.add_argument("--path", type=str, required=True, help="Path to existing validator YAML config file")
-    create_env.add_argument(
+
+    # --- Top-level flags used by connito.validator.run (Docker entrypoint) ---
+    parser.add_argument("--path", type=str, help="Path to validator YAML config file")
+    parser.add_argument(
         "--auto_update_config",
         action="store_true",
         help="Auto-reset locked config fields to defaults without prompting.",
     )
 
     # --- Legacy flags (kept for backwards compatibility with --get_template) ---
-    parser.add_argument("--get_template", choices=["miner", "validator"], help="(legacy) Get a template config")
     parser.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
     parser.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
-    parser.add_argument("--run_name", type=str, help="Run name")
     parser.add_argument("--dht_port", type=int, default=7002, help="DHT port for owner DHT bootstrap service")
     parser.add_argument("--dht_public_ip", type=str, help="Public IP address for DHT peer discovery")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite current config with on-disk one.")
