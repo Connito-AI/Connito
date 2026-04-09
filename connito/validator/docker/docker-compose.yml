@@ -64,8 +64,9 @@ services:
       # Optional: Weights & Biases logging
       WANDB_API_KEY: ${WANDB_API_KEY:-}
       WANDB_MODE: ${WANDB_MODE:-online}
-      # Hugging Face cache lives on the bind-mounted volume so model
-      # downloads survive Watchtower-triggered restarts.
+      # Hugging Face: token for gated datasets, cache on the bind-mounted
+      # volume so model downloads survive Watchtower-triggered restarts.
+      HF_TOKEN: ${HF_TOKEN:-}
       HF_HOME: /data/hf
       TRANSFORMERS_CACHE: /data/hf
 
