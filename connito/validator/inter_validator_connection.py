@@ -166,7 +166,10 @@ def select_tensors(model, include_globs=(), exclude_globs=()):
 
 
 # --- packaging gradient buff ---
-def build_buff_from_params(param_dict, buffer_dtype: torch.dtype = torch.float16):
+def build_buff_from_params(param_dict, buffer_dtype: torch.dtype | None = None):
+    if buffer_dtype is None:
+        buffer_dtype = next(iter(param_dict.values())).dtype if len(param_dict) > 0 else torch.float16
+        
     param_names = list(param_dict.keys())
     numels = [p.numel() for p in param_dict.values()]
     offsets = [0]
@@ -213,8 +216,10 @@ def build_grad_buff_from_model(
     model: nn.Module,
     expert_group_assignment: dict[int, dict[int, list[int]]],
     include_shared: bool = False,
-    buffer_dtype: torch.dtype = torch.float16,
+    buffer_dtype: torch.dtype | None = None,
 ) -> dict[str | int, dict]:
+    if buffer_dtype is None:
+        buffer_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
     """
     Returns:
       - group_averagers: dict[group_id] -> DecentralizedAverager averaging *all* experts in that group

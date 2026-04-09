@@ -26,6 +26,10 @@ class MinerSeries:
             self.points[i] = (ts, score)  # overwrite same-ts
         else:
             self.points.insert(i, (ts, score))
+            
+        # Keep only the last 4 phases (points) per miner to compute rolling average
+        if len(self.points) > 4:
+            self.points = self.points[-4:]
 
     def slice(self, start: datetime | None, end: datetime | None) -> list[tuple[datetime, float]]:
         if start and start.tzinfo is None:

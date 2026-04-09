@@ -172,14 +172,16 @@ async def evaluator_worker(
 
             metrics = await asyncio.to_thread(run_eval_with_telemetry)
 
-            # choose a primary score (here 'accuracy'); adjust if your evaluate_model returns other keys
-            score = float(metrics.get("val_loss", 100))
+            # We use 1.0 / loss as the score because MinerScoreAggregator and submit_weights assume higher is better.
+            val_loss = float(metrics.get("val_loss", 100))
+            score = 1.0 / max(val_loss, 1e-6)
             aggregator.add_score(job.uid, job.hotkey, score)
             logger.info(
                 f"{name}: evaluation complete",
                 uid=job.uid,
                 hotkey=job.hotkey[:6],
-                val_loss=round(score, 4),
+                val_loss=round(val_loss, 4),
+                score=round(score, 4),
             )
 
             # Explicit cleanup
