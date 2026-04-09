@@ -95,6 +95,55 @@ services:
       retries: 5
       start_period: 300s
 
+  server:
+    # Model distribution server — serves checkpoints to miners and accepts
+    # submissions. Same image as the validator, different entrypoint.
+    image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:stable}
+    container_name: connito-server
+    restart: unless-stopped
+
+    entrypoint: ["python", "-m", "connito.validator.server"]
+    command: ["--path", "/data/configs/validator.yaml"]
+
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+    network_mode: "host"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    shm_size: "16gb"
+    ipc: host
+
+    environment:
+      WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
+      HOTKEY_NAME: ${HOTKEY_NAME:?set HOTKEY_NAME in .env}
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+      WANDB_MODE: ${WANDB_MODE:-online}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /data/hf
+      TRANSFORMERS_CACHE: /data/hf
+
+    volumes:
+      - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      - ${DATA_DIR:-../../..}:/data
+      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
+
+    # Liveness check on the server port (default 8000).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/docs"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
   watchtower:
     image: containrrr/watchtower:1.7.1
     container_name: connito-watchtower
