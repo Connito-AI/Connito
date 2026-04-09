@@ -80,6 +80,9 @@ services:
       # Validator config YAML — bind mount so you can edit on the host
       # without rebuilding the image.
       - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      # Expert group configs — shipped with the repo, mounted read-only so
+      # the code can load them at /app/expert_groups/<group>/config.yaml.
+      - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
 
     command: ["--path", "/data/configs/validator.yaml"]
 
