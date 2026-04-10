@@ -122,9 +122,9 @@ class MetricLogger:
             if "loss" in flat and isinstance(flat["loss"], (int, float)):
                 group_name = str(flat.get("expert_group_name", "unknown_group"))
                 MINER_TRAINING_LOSS.labels(expert_group=group_name).set(flat["loss"])
-            if "eval_loss" in flat and isinstance(flat["eval_loss"], (int, float)):
+            if "val_loss" in flat and isinstance(flat["val_loss"], (int, float)):
                 group_name = str(flat.get("expert_group_name", "unknown_group"))
-                VALIDATOR_EVAL_LOSS.labels(expert_group=group_name).set(flat["eval_loss"])
+                VALIDATOR_EVAL_LOSS.labels(expert_group=group_name).set(flat["val_loss"])
             if "lr" in flat and isinstance(flat["lr"], (int, float)):
                 MINER_LEARNING_RATE.set(flat["lr"])
             if "step_rate" in flat and isinstance(flat["step_rate"], (int, float)):
