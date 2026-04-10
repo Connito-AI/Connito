@@ -1,0 +1,64 @@
+# Keep the build context small and reproducible.
+# Anything not needed to install deps + run the validator should be excluded.
+
+# VCS / editor
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+
+# Local virtualenvs
+.bt-venv
+.hv-venv
+.main-venv
+.test-venv
+.venv
+venv
+
+# Python caches
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Notebooks and one-off scripts (do not need to be in the image)
+notebooks
+*.ipynb
+
+# Local persistent state — must come from a bind mount, not the image
+checkpoints
+expert_groups
+wandb
+metrics
+bittensor_subnetinfo_daily
+
+# Big binary blobs that must not bloat the build context
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.pickle
+mycelia_final.pt
+cuda_snapshot.pickle
+
+# Local infra / observability stack (built separately)
+observability
+infra
+
+# Tests aren't required to run a validator
+connito/test
+tests
+
+# Build outputs
+build
+dist
+*.egg
+
+# Dotfiles that don't belong in an image
+.env
+.env.*
+.claude

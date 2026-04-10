@@ -26,6 +26,11 @@ logger = structlog.get_logger(__name__)
 # ---------------------------
 # Utilities
 # ---------------------------
+def is_running_in_docker() -> bool:
+    """Return True if we are inside a Docker container."""
+    return Path("/.dockerenv").exists()
+
+
 def find_project_root(start: Path | None = None) -> Path:
     """Walk up until we see a repo/config marker."""
     start = (start or Path(".")).expanduser().resolve(strict=True)
@@ -360,6 +365,11 @@ class WorkerConfig(BaseConfig):
         # Fill keys (best-effort)
         self._fill_wallet_data()
 
+        # When running inside Docker, override host paths to container paths.
+        # The compose file mounts: repo root → /data, expert_groups → /app/expert_groups.
+        if is_running_in_docker():
+            self._apply_docker_paths()
+
         # Derive paths
         self._refresh_paths()
 
@@ -368,6 +378,27 @@ class WorkerConfig(BaseConfig):
 
         # Create directories
         self._ensure_runtime_dirs()
+
+    def _apply_docker_paths(self) -> None:
+        """Remap host paths to container paths for Docker runs."""
+        self.run.root_path = Path("/data")
+        # Absolute path so _refresh_paths()'s `root / base_path` keeps it as-is.
+        self.task.base_path = Path("/app/expert_groups")
+        self.task.path = None
+
+        # Reset derived paths to defaults so _refresh_paths() recomputes them
+        # from the new root_path instead of re-joining absolute host paths.
+        self.ckpt.base_checkpoint_path = Path(type(self.ckpt).model_fields["base_checkpoint_path"].default)
+        self.ckpt.checkpoint_path = None
+        self.ckpt.validator_checkpoint_path = Path(type(self.ckpt).model_fields["validator_checkpoint_path"].default)
+        self.log.base_metric_path = Path(type(self.log).model_fields["base_metric_path"].default)
+        self.log.metric_path = None
+        if hasattr(self.ckpt, "miner_submission_path"):
+            self.ckpt.miner_submission_path = Path(type(self.ckpt).model_fields["miner_submission_path"].default)
+        if hasattr(self.ckpt, "miner_submission_archive_path"):
+            self.ckpt.miner_submission_archive_path = Path(type(self.ckpt).model_fields["miner_submission_archive_path"].default)
+
+        logger.info("Docker detected — paths remapped", root_path=str(self.run.root_path))
 
     # -----------------------
     # Derived paths / IO
@@ -680,6 +711,32 @@ class ValidatorConfig(WorkerConfig):
     dht: DhtCfg = Field(default_factory=DhtCfg)
     run: ValidatorRunCfg = Field(default_factory=ValidatorRunCfg)
 
+    def write_docker_env(self, env_path: Path | None = None) -> None:
+        """Generate a Docker compose .env file from the current config."""
+        if env_path is None:
+            env_path = self.run.root_path / "connito" / "validator" / "docker" / ".env"
+
+        wallet_path = Path.home() / ".bittensor" / "wallets"
+        data_dir = self.run.root_path
+
+        lines = [
+            f"IMAGE=ghcr.io/connito-ai/connito-validator:stable",
+            f"WALLET_NAME={self.chain.coldkey_name}",
+            f"HOTKEY_NAME={self.chain.hotkey_name}",
+            f"BITTENSOR_WALLET_PATH={wallet_path}",
+            f"DATA_DIR={data_dir}",
+            f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
+            f"WANDB_API_KEY=",
+            f"WANDB_MODE=online",
+            f"WATCHTOWER_POLL_INTERVAL=300",
+            f"WATCHTOWER_NOTIFICATIONS=",
+            f"WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL=",
+        ]
+
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        logger.info("Wrote Docker compose .env", path=str(env_path))
+
 
 class OwnerConfig(WorkerConfig):
     role: str = "owner"
@@ -691,40 +748,39 @@ class OwnerConfig(WorkerConfig):
 # ---------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Train mycelia with config")
-    parser.add_argument("--path", type=str, help="Path to YAML config file")
-    parser.add_argument("--get_template", choices=["miner", "validator"], help="Get a template config")
-    parser.add_argument("--hotkey_name", type=str, help="Optional wallet hotkey name for template path")
-    parser.add_argument("--coldkey_name", type=str, help="Optional wallet coldkey name for template path")
-    parser.add_argument("--run_name", type=str, help="Optional run name for template path")
-    parser.add_argument("--dht_port", type=int, default=7002, help="Optional DHT port for owner DHT bootstrap service")
-    parser.add_argument("--dht_public_ip", type=str, help="Public IP address for DHT peer discovery")
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="If config exists on disk and differs, overwrite current config with on-disk one.",
-    )
-    parser.add_argument(
-        "--no_bump",
-        action="store_true",
-        help="If config exists on disk and differs, do not bump run_name.",
-    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # --- create_config ---
+    create_cfg = subparsers.add_parser("create_config", help="Generate a template config file")
+    create_cfg.add_argument("--role", choices=["miner", "validator"], required=True, help="Role to generate config for")
+    create_cfg.add_argument("--run_name", type=str, help="Run name")
+
+    # --- create_docker_env ---
+    create_env = subparsers.add_parser("create_docker_env", help="Generate Docker compose .env from an existing config")
+
+    # --- Top-level flags used by connito.validator.run (Docker entrypoint) ---
+    parser.add_argument("--path", type=str, help="Path to validator YAML config file")
     parser.add_argument(
         "--auto_update_config",
         action="store_true",
-        help="Auto-reset locked config fields to defaults without prompting (for systemd / non-interactive).",
+        help="Auto-reset locked config fields to defaults without prompting.",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable verbose debug logging",
-    )
+
+    # --- Legacy flags (kept for backwards compatibility with --get_template) ---
+    parser.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
+    parser.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
+    parser.add_argument("--dht_port", type=int, default=7002, help="DHT port for owner DHT bootstrap service")
+    parser.add_argument("--dht_public_ip", type=str, help="Public IP address for DHT peer discovery")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite current config with on-disk one.")
+    parser.add_argument("--no_bump", action="store_true", help="Do not bump run_name on config diff.")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.get_template:
+    if args.command == "create_config":
         config_dict: dict[str, Any] = {}
         if args.run_name:
             config_dict["run"] = {"run_name": args.run_name}
@@ -733,8 +789,14 @@ if __name__ == "__main__":
         if args.coldkey_name:
             config_dict.setdefault("chain", {})["coldkey_name"] = args.coldkey_name
 
-        if args.get_template == "validator":
-            ValidatorConfig(**config_dict).write()
-        elif args.get_template == "miner":
+        if args.role == "validator":
+            cfg = ValidatorConfig(**config_dict)
+            cfg.write()
+            cfg.write_docker_env()
+        elif args.role == "miner":
             MinerConfig(**config_dict).write()
+
+    elif args.command == "create_docker_env":
+        cfg = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        cfg.write_docker_env()
 

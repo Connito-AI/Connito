@@ -147,3 +147,4 @@ Thumbs.db
 **/**venv/**
 **/init_peer_ids.json
 wandb/
+**/hf/**

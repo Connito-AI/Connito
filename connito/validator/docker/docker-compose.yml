@@ -1,0 +1,180 @@
+# Connito SN102 validator + Watchtower auto-updater.
+#
+# This compose file lives at connito/validator/docker/docker-compose.yml.
+# Run from this directory:
+#
+#   python connito/shared/config.py create_config --role validator ...
+#   cd connito/validator/docker
+#   docker compose up -d
+#
+# - `validator`  runs the containerized validator built from this repo.
+# - `watchtower` polls the registry for new tags of the validator image
+#   and restarts the container in place when one appears.
+#
+# See ../../docs/validator-docker-operators.md for the full host setup
+# checklist (NVIDIA Container Toolkit, wallet bind mount, registry auth,
+# etc). Miners do NOT use this stack — only validators are containerized.
+
+services:
+  validator:
+    # Pulled from GHCR by default. `:stable` only moves when maintainers
+    # cut a release (`git tag vX.Y.Z`) — Watchtower auto-upgrades when it
+    # does. Override with `IMAGE=...` in .env to track `:staging`, pin to
+    # a specific `vX.Y.Z`, or freeze on a `master-<sha>` build artifact.
+    image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:stable}
+    container_name: connito-validator
+    restart: unless-stopped
+    pull_policy: always
+
+    # Local development build. Production deploys pull from the registry
+    # and ignore this section, but `docker compose build` from this dir
+    # will rebuild the image against the live source tree.
+    build:
+      context: ../../..
+      dockerfile: connito/validator/docker/Dockerfile
+
+    # Watchtower watches for this label so it only touches containers we
+    # explicitly opt in. Other containers on the host are left alone.
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+    # Host networking keeps the hivemind DHT, chain serve port, and
+    # Prometheus telemetry endpoint reachable on the host's public IP
+    # without per-port NAT — same pattern as observability/docker-compose.yml.
+    network_mode: "host"
+
+    # NVIDIA GPU access. Requires nvidia-container-toolkit on the host.
+    # Set VALIDATOR_GPU_ID in .env to pin to a specific GPU (e.g. "4").
+    # Defaults to all GPUs if not set.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VALIDATOR_GPU_ID:-0}"]
+              capabilities: [gpu]
+
+    # Shared memory for PyTorch DataLoader workers; default 64MB is too small.
+    shm_size: "16gb"
+    ipc: host
+
+    environment:
+      # Docker passes in only the GPU selected by device_ids above.
+      # Inside the container it always appears as device 0, regardless of
+      # which host GPU it is. Do not change this to match the host GPU ID.
+      CUDA_VISIBLE_DEVICES: "0"
+      # Bittensor wallet selection — must match what `btcli wallet list` shows.
+      WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
+      HOTKEY_NAME: ${HOTKEY_NAME:?set HOTKEY_NAME in .env}
+      # Optional: Weights & Biases logging
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+      WANDB_MODE: ${WANDB_MODE:-online}
+      # Hugging Face: token for gated datasets, cache on the bind-mounted
+      # volume so model downloads survive Watchtower-triggered restarts.
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /data/hf
+      TRANSFORMERS_CACHE: /data/hf
+
+    volumes:
+      # Wallets — read-only is safest; the validator only signs with the hotkey.
+      - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      # Persistent state: checkpoints, expert groups, hf cache, wandb runs.
+      # Defaults to the repo root, which already contains checkpoints/,
+      # expert_groups/, wandb/, etc. Override with DATA_DIR in .env for
+      # production hosts that want a path outside the repo.
+      - ${DATA_DIR:-../../..}:/data
+      # Validator config YAML — bind mount so you can edit on the host
+      # without rebuilding the image.
+      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      # Expert group configs — shipped with the repo, mounted read-only so
+      # the code can load them at /app/expert_groups/<group>/config.yaml.
+      - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
+
+    command: ["--path", "/data/configs/validator.yaml"]
+
+    # Surface a basic liveness signal — telemetry server starts on 8200.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8200/metrics"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+  server:
+    # Model distribution server — serves checkpoints to miners and accepts
+    # submissions. Same image as the validator, different entrypoint.
+    image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:stable}
+    container_name: connito-server
+    restart: unless-stopped
+
+    entrypoint: ["python", "-m", "connito.validator.server"]
+    command: ["--path", "/data/configs/validator.yaml"]
+
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+    network_mode: "host"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${SERVER_GPU_ID:-0}"]
+              capabilities: [gpu]
+
+    shm_size: "16gb"
+    ipc: host
+
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
+      HOTKEY_NAME: ${HOTKEY_NAME:?set HOTKEY_NAME in .env}
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+      WANDB_MODE: ${WANDB_MODE:-online}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /data/hf
+      TRANSFORMERS_CACHE: /data/hf
+
+    volumes:
+      - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      - ${DATA_DIR:-../../..}:/data
+      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
+
+    # Liveness check on the server port (default 8000).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/docs"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: connito-watchtower
+    restart: unless-stopped
+
+    # Mount the docker socket so Watchtower can pull and recreate containers.
+    # If the registry is private, the docker config with creds is also
+    # bind-mounted so Watchtower inherits the same auth.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.docker/config.json:/config.json:ro
+
+    environment:
+      # Match the host Docker daemon API version (docker version → API version).
+      DOCKER_API_VERSION: "1.44"
+      # Only act on containers with the opt-in label above.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Poll every 5 minutes — tweak with WATCHTOWER_POLL_INTERVAL in .env.
+      WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-300}
+      # Remove the previous image so the host doesn't fill up after upgrades.
+      WATCHTOWER_CLEANUP: "true"
+      # Stop containers gracefully so the validator can flush state.
+      WATCHTOWER_TIMEOUT: "120s"
+      # Optional: notifications. Set WATCHTOWER_NOTIFICATIONS=slack and
+      # WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL to get pinged on upgrades.
+      WATCHTOWER_NOTIFICATIONS: ${WATCHTOWER_NOTIFICATIONS:-}
+      WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL: ${WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL:-}
+      WATCHTOWER_NOTIFICATION_SLACK_IDENTIFIER: connito-validator
