@@ -13,6 +13,7 @@ import bittensor
 import torch
 import torch.nn as nn
 from hivemind.averaging import DecentralizedAverager
+from hivemind.averaging.partition import AllreduceException
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
@@ -244,27 +245,31 @@ def sync_grad_across_validators(
     model,
 ):
     for group_id, avg in group_averagers.items():
-        if avg.total_size <= 0:
-            logger.debug("Skipping averager — no peers", group=group_id, mode=avg.mode, total_size=avg.total_size)
-            continue
-
         pack_grads(group_grad_buff_meta[group_id], model)
 
         grad_sum = sum_model_gradients(model)
 
         group_bits = avg.get_group_bits()
-
-        peer_count = max(0, avg.total_size)
+        try:
+            visible_maddrs = [str(addr) for addr in avg.dht.get_visible_maddrs()]
+        except Exception:
+            visible_maddrs = []
+        visible_maddr_count = len(visible_maddrs)
+        buffer_numel = int(group_grad_buff_meta[group_id]["buff"].numel())
 
         logger.info(
             "Starting gradient sync across validators",
             group=group_id,
             mode=avg.mode,
             matchmaking_key=f"{avg.prefix}/{group_bits}",
-            peers_visible=peer_count,
+            visible_maddr_count=visible_maddr_count,
+            visible_maddrs=visible_maddrs[:5],
+            buffer_numel=buffer_numel,
+            target_group_size=getattr(avg, "target_group_size", None),
+            min_group_size=getattr(avg, "min_group_size", None),
         )
-        if peer_count == 0:
-            logger.warning("No visible peers for gradient sync", group=group_id)
+        if visible_maddr_count == 0:
+            logger.warning("No visible DHT addresses for gradient sync", group=group_id, prefix=avg.prefix)
         logger.debug(
             "Averager details",
             group=group_id,
@@ -284,6 +289,20 @@ def sync_grad_across_validators(
                     # scheduled_time=scheduled_time.timestamp()
                 )
                 VALIDATOR_AVG_STEP_STATUS.labels(status="success").inc()
+                break
+            except AllreduceException as e:
+                logger.warning(
+                    "Averager group formation failed",
+                    attempt=attempt,
+                    max_attempts=config.run.averager_step_max_retries,
+                    group=group_id,
+                    prefix=avg.prefix,
+                    visible_maddr_count=visible_maddr_count,
+                    min_group_size=getattr(avg, "min_group_size", None),
+                    target_group_size=getattr(avg, "target_group_size", None),
+                    error=str(e),
+                )
+                VALIDATOR_AVG_STEP_STATUS.labels(status="no-group").inc()
                 break
             except TimeoutError as e:
                 logger.warning(f"Averager - Timeout during avg.step (attempt {attempt}/{config.run.averager_step_max_retries}): {e}")
@@ -434,7 +453,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
     dht = connect_with_peers(config, wallet, subtensor)
 
-    group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
+    logger.info(
+        "Configuring validator averagers",
+        active_group_id=active_group_id,
+        group_keys=[str(gid) for gid in group_grad_buff_meta.keys()],
+        averager_target_group_size=config.run.averager_target_group_size,
+        averager_min_group_size=config.run.averager_min_group_size,
+        dht_port=config.dht.port,
+    )
+
+    group_averagers = build_averagers_from_buff(
+        group_buff_metas=group_grad_buff_meta,
+        dht=dht,
+        target_group_size=config.run.averager_target_group_size,
+        min_group_size=config.run.averager_min_group_size,
+    )
 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
