@@ -657,10 +657,15 @@ class WorkerConfig(BaseConfig):
     def write(self) -> None:
         """
         Persist this config to `<checkpoint_path>/config.yaml`.
-        Excludes task.exp (loaded from task config file).
+        Excludes task.exp (loaded from task config file) and task.base_path /
+        task.path (derived at runtime, remapped in Docker — should not be
+        persisted so the YAML stays portable across host and container).
         """
         assert self.ckpt.checkpoint_path is not None
-        data = self.model_dump(exclude={"task": {"exp"}})
+        data = self.model_dump(exclude={
+            "run": {"root_path"},
+            "task": {"exp", "base_path", "path"},
+        })
         data = convert_to_str(data)
 
         ensure_dirs([self.ckpt.checkpoint_path])
@@ -719,9 +724,10 @@ class ValidatorConfig(WorkerConfig):
         wallet_path = Path.home() / ".bittensor" / "wallets"
         data_dir = self.run.root_path
 
-        # Use hotkey name as project name so multiple validators on the
-        # same host get unique container names automatically.
-        project_name = f"connito-{self.chain.hotkey_name}"
+        # Use hotkey name + run name as project name so multiple validators
+        # on the same host get unique container names automatically.
+        # e.g. connito-hk1-mainnet-server-1
+        project_name = f"connito-{self.chain.hotkey_name}-{self.run.run_name}"
         expert_groups_path = self.run.root_path / "expert_groups"
 
         lines = [
@@ -763,10 +769,13 @@ def parse_args():
     # --- create_config ---
     create_cfg = subparsers.add_parser("create_config", help="Generate a template config file")
     create_cfg.add_argument("--role", choices=["miner", "validator"], required=True, help="Role to generate config for")
+    create_cfg.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
+    create_cfg.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
     create_cfg.add_argument("--run_name", type=str, help="Run name")
 
     # --- create_docker_env ---
     create_env = subparsers.add_parser("create_docker_env", help="Generate Docker compose .env from an existing config")
+    create_env.add_argument("--path", type=str, required=True, help="Path to existing validator YAML config file")
 
     # --- Top-level flags used by connito.validator.run (Docker entrypoint) ---
     parser.add_argument("--path", type=str, help="Path to validator YAML config file")
@@ -776,7 +785,6 @@ def parse_args():
         help="Auto-reset locked config fields to defaults without prompting.",
     )
 
-    # --- Legacy flags (kept for backwards compatibility with --get_template) ---
     parser.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
     parser.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
     parser.add_argument("--dht_port", type=int, default=7002, help="DHT port for owner DHT bootstrap service")
