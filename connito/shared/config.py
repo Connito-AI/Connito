@@ -719,13 +719,23 @@ class ValidatorConfig(WorkerConfig):
         wallet_path = Path.home() / ".bittensor" / "wallets"
         data_dir = self.run.root_path
 
+        # Use hotkey name as project name so multiple validators on the
+        # same host get unique container names automatically.
+        project_name = f"connito-{self.chain.hotkey_name}"
+        expert_groups_path = self.run.root_path / "expert_groups"
+
         lines = [
+            f"COMPOSE_PROJECT_NAME={project_name}",
             f"IMAGE=ghcr.io/connito-ai/connito-validator:stable",
             f"WALLET_NAME={self.chain.coldkey_name}",
             f"HOTKEY_NAME={self.chain.hotkey_name}",
             f"BITTENSOR_WALLET_PATH={wallet_path}",
             f"DATA_DIR={data_dir}",
             f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
+            f"EXPERT_GROUPS_PATH={expert_groups_path}",
+            f"VALIDATOR_GPU_ID=0",
+            f"SERVER_GPU_ID=0",
+            f"HF_TOKEN=",
             f"WANDB_API_KEY=",
             f"WANDB_MODE=online",
             f"WATCHTOWER_POLL_INTERVAL=300",
