@@ -389,6 +389,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     TelemetryManager().start_server(port=telemetry_port)
     
     if rank == 0:
+        logger.info("Loaded config", config=config.model_dump_json(indent=2))
         config.write()
 
     torch.cuda.memory._record_memory_history(enabled=True)

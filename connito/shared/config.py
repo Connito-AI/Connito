@@ -365,10 +365,12 @@ class WorkerConfig(BaseConfig):
         # Fill keys (best-effort)
         self._fill_wallet_data()
 
-        # When running inside Docker, override host paths to container paths.
+        # When running inside Docker, override root to container mount points.
         # The compose file mounts: repo root → /data, expert_groups → /app/expert_groups.
         if is_running_in_docker():
-            self._apply_docker_paths()
+            self.run.root_path = Path("/data")
+            self.task.base_path = Path("/app/expert_groups")
+            logger.info("Docker detected — root_path set to /data")
 
         # Derive paths
         self._refresh_paths()
@@ -378,27 +380,6 @@ class WorkerConfig(BaseConfig):
 
         # Create directories
         self._ensure_runtime_dirs()
-
-    def _apply_docker_paths(self) -> None:
-        """Remap host paths to container paths for Docker runs."""
-        self.run.root_path = Path("/data")
-        # Absolute path so _refresh_paths()'s `root / base_path` keeps it as-is.
-        self.task.base_path = Path("/app/expert_groups")
-        self.task.path = None
-
-        # Reset derived paths to defaults so _refresh_paths() recomputes them
-        # from the new root_path instead of re-joining absolute host paths.
-        self.ckpt.base_checkpoint_path = Path(type(self.ckpt).model_fields["base_checkpoint_path"].default)
-        self.ckpt.checkpoint_path = None
-        self.ckpt.validator_checkpoint_path = Path(type(self.ckpt).model_fields["validator_checkpoint_path"].default)
-        self.log.base_metric_path = Path(type(self.log).model_fields["base_metric_path"].default)
-        self.log.metric_path = None
-        if hasattr(self.ckpt, "miner_submission_path"):
-            self.ckpt.miner_submission_path = Path(type(self.ckpt).model_fields["miner_submission_path"].default)
-        if hasattr(self.ckpt, "miner_submission_archive_path"):
-            self.ckpt.miner_submission_archive_path = Path(type(self.ckpt).model_fields["miner_submission_archive_path"].default)
-
-        logger.info("Docker detected — paths remapped", root_path=str(self.run.root_path))
 
     # -----------------------
     # Derived paths / IO
@@ -552,6 +533,7 @@ class WorkerConfig(BaseConfig):
 
         if changed and config_path is not None:
             data = self.model_dump(exclude={"task": {"exp"}})
+            data = self._strip_root(data, self.run.root_path)
             data = convert_to_str(data)
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(data, f, sort_keys=False)
@@ -600,6 +582,7 @@ class WorkerConfig(BaseConfig):
 
         if changed and config_path is not None:
             data = self.model_dump(exclude={"task": {"exp"}})
+            data = self._strip_root(data, self.run.root_path)
             data = convert_to_str(data)
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(data, f, sort_keys=False)
@@ -654,18 +637,42 @@ class WorkerConfig(BaseConfig):
     # -----------------------
     # Persistence
     # -----------------------
+    @staticmethod
+    def _strip_root(data: dict, root: Path) -> dict:
+        """Recursively strip *root* prefix from Path-like string values so the
+        YAML stays portable across host and Docker environments."""
+        root_str = root.as_posix().rstrip("/") + "/"
+
+        def _walk(obj):
+            if isinstance(obj, dict):
+                return {k: _walk(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_walk(i) for i in obj]
+            if isinstance(obj, Path):
+                try:
+                    return obj.relative_to(root)
+                except ValueError:
+                    return obj
+            if isinstance(obj, str) and obj.startswith(root_str):
+                return obj[len(root_str):]
+            return obj
+
+        return _walk(data)
+
     def write(self) -> None:
         """
         Persist this config to `<checkpoint_path>/config.yaml`.
         Excludes task.exp (loaded from task config file) and task.base_path /
         task.path (derived at runtime, remapped in Docker — should not be
         persisted so the YAML stays portable across host and container).
+        All remaining paths are written relative to root_path.
         """
         assert self.ckpt.checkpoint_path is not None
         data = self.model_dump(exclude={
             "run": {"root_path"},
             "task": {"exp", "base_path", "path"},
         })
+        data = self._strip_root(data, self.run.root_path)
         data = convert_to_str(data)
 
         ensure_dirs([self.ckpt.checkpoint_path])
