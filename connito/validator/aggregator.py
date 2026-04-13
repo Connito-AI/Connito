@@ -66,28 +66,29 @@ from connito.shared.telemetry import VALIDATOR_MINER_SCORE
 
 @dataclass
 class MinerState:
-    uid: str
+    uid: int
     hotkey: str
     series: MinerSeries = field(default_factory=MinerSeries)
 
 
 class MinerScoreAggregator:
     """
-    Aggregates miners' scores over time keyed by uid, and tracks each miner's current hotkey.
+    Aggregates miners' scores over time keyed by uid (int), and tracks each miner's current hotkey.
     REQUIREMENT: if a uid's hotkey changes, that uid's score history resets.
     """
 
     def __init__(self):
-        self._miners: dict[str, MinerState] = {}  # uid -> MinerState
+        self._miners: dict[int, MinerState] = {}  # uid -> MinerState
         self._lock = threading.RLock()
 
     # ---------- Recording ----------
-    def add_score(self, uid: str, hotkey: str, score: float, ts: datetime | None = None) -> None:
+    def add_score(self, uid: int, hotkey: str, score: float, ts: datetime | None = None) -> None:
         """
         Add a score point for a uid at timestamp ts (UTC if omitted).
         If the provided hotkey differs from the stored hotkey for this uid,
         the uid's score history is RESET before recording this new point.
         """
+        uid = int(uid)
         if ts is None:
             ts = _utc_now()
         if ts.tzinfo is None:
@@ -110,10 +111,11 @@ class MinerScoreAggregator:
             except Exception:
                 pass
 
-    def set_hotkey(self, uid: str, new_hotkey: str) -> None:
+    def set_hotkey(self, uid: int, new_hotkey: str) -> None:
         """
         Explicitly change a uid's hotkey and reset its scores.
         """
+        uid = int(uid)
         with self._lock:
             state = self._miners.get(uid)
             if state is None:
@@ -126,8 +128,9 @@ class MinerScoreAggregator:
 
     # ---------- Retrieval ----------
     def get_history(
-        self, uid: str, start: datetime | None = None, end: datetime | None = None
+        self, uid: int, start: datetime | None = None, end: datetime | None = None
     ) -> list[tuple[datetime, float]]:
+        uid = int(uid)
         with self._lock:
             s = self._miners.get(uid)
             if not s:
@@ -135,29 +138,34 @@ class MinerScoreAggregator:
             return s.series.slice(start, end)
 
     # ---------- Aggregates ----------
-    def sum_over(self, uid: str, start: datetime | None = None, end: datetime | None = None) -> float:
+    def sum_over(self, uid: int, start: datetime | None = None, end: datetime | None = None) -> float:
+        uid = int(uid)
         with self._lock:
             s = self._miners.get(uid)
             return s.series.sum(start, end) if s else 0.0
 
-    def avg_over(self, uid: str, start: datetime | None = None, end: datetime | None = None) -> float:
+    def avg_over(self, uid: int, start: datetime | None = None, end: datetime | None = None) -> float:
+        uid = int(uid)
         with self._lock:
             s = self._miners.get(uid)
             return s.series.avg(start, end) if s else 0.0
 
-    def rolling_sum(self, uid: str, window: timedelta, now: datetime | None = None) -> float:
+    def rolling_sum(self, uid: int, window: timedelta, now: datetime | None = None) -> float:
         if now is None:
             now = _utc_now()
         start = now - window
         return self.sum_over(uid, start, now)
 
-    def rolling_avg(self, uid: str, window: timedelta, now: datetime | None = None) -> float:
+    def rolling_avg(self, uid: int, window: timedelta, now: datetime | None = None) -> float:
         if now is None:
             now = _utc_now()
         start = now - window
         return self.avg_over(uid, start, now)
 
-    def ema(self, uid: str, alpha: float = 0.2, start: datetime | None = None, end: datetime | None = None) -> float:
+    def ema(
+        self, uid: int, alpha: float = 0.2,
+        start: datetime | None = None, end: datetime | None = None,
+    ) -> float:
         if not (0 < alpha <= 1):
             raise ValueError("alpha must be in (0, 1].")
         pts = self.get_history(uid, start, end)
@@ -174,7 +182,7 @@ class MinerScoreAggregator:
         how: Literal["latest", "sum", "avg", "ema"] = "latest",
         start: datetime | None = None,
         end: datetime | None = None,
-    ) -> dict[str, float]:
+    ) -> dict[int, float]:
         """
         Return {uid: score} for ALL miners.
         - how="latest" (default): most recent score per uid (0.0 if no points)
@@ -183,7 +191,7 @@ class MinerScoreAggregator:
         - how="ema": exponential moving average of scores in [start, end]
         """
         with self._lock:
-            out: dict[str, float] = {}
+            out: dict[int, float] = {}
             for uid, state in self._miners.items():
                 if how == "latest":
                     out[uid] = state.series.latest()
@@ -199,7 +207,7 @@ class MinerScoreAggregator:
 
     def is_in_top(
         self,
-        uid: str,
+        uid: int,
         cutoff: int = 3,
         how: Literal["latest", "sum", "avg", "ema"] = "latest",
         start: datetime | None = None,
@@ -213,6 +221,7 @@ class MinerScoreAggregator:
         - how="avg": average score over [start, end]
         - how="ema": exponential moving average over [start, end]
         """
+        uid = int(uid)
         scores = self.uid_score_pairs(how=how, start=start, end=end)
         if uid not in scores:
             return False
@@ -239,10 +248,12 @@ class MinerScoreAggregator:
 
     # ---------- Persistence ----------
     def to_json(self) -> str:
-        """Serialize miners to JSON (timestamps as ISO 8601 strings)."""
+        """Serialize miners to JSON (timestamps as ISO 8601 strings).
+        JSON keys are always strings, so uid is serialized as str and
+        converted back to int in from_json."""
         with self._lock:
             payload = {
-                uid: {
+                str(uid): {
                     "hotkey": state.hotkey,
                     "points": [(ts.isoformat(), v) for ts, v in state.series.points],
                 }
@@ -255,7 +266,8 @@ class MinerScoreAggregator:
         raw = json.loads(data)
         agg = cls()
         with agg._lock:
-            for uid, body in raw.items():
+            for uid_str, body in raw.items():
+                uid = int(uid_str)
                 hotkey = body.get("hotkey", "")
                 pts = body.get("points", [])
                 state = MinerState(uid=uid, hotkey=hotkey)
