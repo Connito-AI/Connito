@@ -218,9 +218,16 @@ async def aggregate_miner_gradient_change(
     score_aggregator: MinerScoreAggregator,
 ) -> list[str]:
     global_model.to(device)
+    this_round_uids = {job.uid for job in miner_jobs}
+
     miner_models: dict[str, nn.Module] = {}
     for miner_job in miner_jobs:
-        if score_aggregator.is_in_top(uid=str(miner_job.uid), cutoff=config.run.top_k_miners_to_merge, how="avg"):
+        if score_aggregator.is_in_top(
+            uid=miner_job.uid,
+            cutoff=config.run.top_k_miners_to_merge,
+            how="avg",
+            among=this_round_uids,
+        ):
             miner_models[str(miner_job.uid)] = await asyncio.to_thread(
                 load_model_from_path, miner_job.model_path, global_model, device
             )
@@ -563,12 +570,26 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                         logger.info("Penalizing missing submission", uid=uid, hotkey=expected_hotkey[:6], score=0.0)
                 except ValueError:
                     continue
-
-            uid_scores = score_aggregator.uid_score_pairs()
+ 
+            # Only show scores for miners evaluated or penalized this round
+            this_round_uids = {job.uid for job in miner_jobs} | {
+                metagraph.hotkeys.index(hk) for hk in miner_assignment
+                if hk in metagraph.hotkeys and metagraph.hotkeys.index(hk) not in submitted_uids
+            }
+            all_latest = score_aggregator.uid_score_pairs(how="latest")
+            round_scores = {uid: round(s, 4) for uid, s in all_latest.items() if uid in this_round_uids}
             logger.info(
-                "Evaluation results",
-                miners_evaluated=len(uid_scores),
-                scores={uid: round(s, 4) for uid, s in uid_scores.items()},
+                "Evaluation results (latest this round)",
+                miners_evaluated=len(submitted_uids),
+                miners_penalized=len(this_round_uids) - len(submitted_uids),
+                scores=round_scores,
+            )
+
+            avg_scores = score_aggregator.uid_score_pairs(how="avg")
+            logger.info(
+                "Evaluation results (avg scores)",
+                total_miners=len(avg_scores),
+                scores={uid: round(s, 4) for uid, s in avg_scores.items()},
             )
 
             # Persist aggregator state locally for restarts
