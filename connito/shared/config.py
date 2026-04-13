@@ -310,6 +310,7 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes: int = 8 * 1024**3
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
+    archive_submissions: bool = False
 
 
 class DhtCfg(BaseConfig):
