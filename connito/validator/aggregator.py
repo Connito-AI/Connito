@@ -210,26 +210,33 @@ class MinerScoreAggregator:
         uid: int,
         cutoff: int = 3,
         how: Literal["latest", "sum", "avg", "ema"] = "latest",
+        among: list[int] | set[int] | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> bool:
         """
         Return True if the given uid's score is in the top 'cutoff' miners.
-        The ranking is determined using the specified 'how' metric:
-        - how="latest": most recent score
-        - how="sum": total score over [start, end]
-        - how="avg": average score over [start, end]
-        - how="ema": exponential moving average over [start, end]
+
+        among: if provided, rank only against these uids instead of all
+               tracked miners. Pass the set of uids from the current
+               evaluation round to scope the ranking to this round only.
+
+        how: the metric used for ranking ("latest", "sum", "avg", "ema").
         """
         uid = int(uid)
         scores = self.uid_score_pairs(how=how, start=start, end=end)
         if uid not in scores:
             return False
 
+        if among is not None:
+            scores = {u: s for u, s in scores.items() if u in among}
+            if uid not in scores:
+                return False
+
         # Sort all scores descending
         sorted_scores = sorted(scores.values(), reverse=True)
 
-        # If there are fewer than 20 miners, all are "in top 20"
+        # If there are fewer miners than the cutoff, all are "in top"
         if len(sorted_scores) <= cutoff:
             return True
 

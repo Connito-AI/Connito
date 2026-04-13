@@ -218,9 +218,16 @@ async def aggregate_miner_gradient_change(
     score_aggregator: MinerScoreAggregator,
 ) -> list[str]:
     global_model.to(device)
+    this_round_uids = {job.uid for job in miner_jobs}
+
     miner_models: dict[str, nn.Module] = {}
     for miner_job in miner_jobs:
-        if score_aggregator.is_in_top(uid=miner_job.uid, cutoff=config.run.top_k_miners_to_merge, how="avg"):
+        if score_aggregator.is_in_top(
+            uid=miner_job.uid,
+            cutoff=config.run.top_k_miners_to_merge,
+            how="avg",
+            among=this_round_uids,
+        ):
             miner_models[str(miner_job.uid)] = await asyncio.to_thread(
                 load_model_from_path, miner_job.model_path, global_model, device
             )
