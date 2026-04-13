@@ -385,28 +385,43 @@ class WorkerConfig(BaseConfig):
     # Derived paths / IO
     # -----------------------
     def _refresh_paths(self) -> None:
-        root = self.run.root_path
+        """Derive all runtime paths from root_path + class defaults.
 
-        # ckpt paths
-        self.ckpt.base_checkpoint_path = root / self.ckpt.base_checkpoint_path
+        Always computes from the original default values so this method
+        is idempotent — safe to call multiple times without stacking prefixes.
+        """
+        root = self.run.root_path
+        ckpt_cls = type(self.ckpt)
+        log_cls = type(self.log)
+
+        # ckpt paths — always start from the class default (relative)
+        base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
+        self.ckpt.base_checkpoint_path = base_ckpt
         self.ckpt.checkpoint_path = (
-            self.ckpt.base_checkpoint_path / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
+            base_ckpt / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
         )
-        self.ckpt.validator_checkpoint_path = self.ckpt.base_checkpoint_path / self.ckpt.validator_checkpoint_path
+        self.ckpt.validator_checkpoint_path = (
+            base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+        )
 
         # logging paths
-        self.log.base_metric_path = root / self.log.base_metric_path
-        self.log.metric_path = self.log.base_metric_path / f"{self.run.run_name}.csv"
+        base_metric = root / Path(log_cls.model_fields["base_metric_path"].default)
+        self.log.base_metric_path = base_metric
+        self.log.metric_path = base_metric / f"{self.run.run_name}.csv"
 
         # task paths
         self.task.base_path = root / self.task.base_path
         self.task.path = self.task.base_path / self.task.expert_group_name
 
-        # optional
+        # optional ckpt sub-paths — always from class default + base_ckpt
         if hasattr(self.ckpt, "miner_submission_path"):
-            self.ckpt.miner_submission_path = self.ckpt.base_checkpoint_path / self.ckpt.miner_submission_path
+            self.ckpt.miner_submission_path = (
+                base_ckpt / Path(ckpt_cls.model_fields["miner_submission_path"].default)
+            )
         if hasattr(self.ckpt, "miner_submission_archive_path"):
-            self.ckpt.miner_submission_archive_path = self.ckpt.base_checkpoint_path / self.ckpt.miner_submission_archive_path
+            self.ckpt.miner_submission_archive_path = (
+                base_ckpt / Path(ckpt_cls.model_fields["miner_submission_archive_path"].default)
+            )
 
     def _ensure_runtime_dirs(self) -> None:
         assert self.ckpt.checkpoint_path is not None
