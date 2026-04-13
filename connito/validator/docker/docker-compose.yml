@@ -86,7 +86,7 @@ services:
       - ${DATA_DIR:-../../..}:/data
       # Validator config YAML — bind mount so you can edit on the host
       # without rebuilding the image.
-      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${CONFIG_PATH:?set CONFIG_PATH in .env}:/data/configs/validator.yaml:ro
       # Expert group configs — shipped with the repo, mounted read-only so
       # the code can load them at /app/expert_groups/<group>/config.yaml.
       - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
@@ -140,7 +140,7 @@ services:
     volumes:
       - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
       - ${DATA_DIR:-../../..}:/data
-      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${CONFIG_PATH:?set CONFIG_PATH in .env}:/data/configs/validator.yaml:ro
       - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
 
     # Liveness check on the server port (default 8000).
