@@ -738,7 +738,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
             # === archive top-k submissions, delete the rest ===
             if config.ckpt.archive_submissions:
-                logger.info("(11) Archiving top miner submissions")
+                logger.info("(10) Archiving top miner submissions")
                 archive_top_miner_submissions(
                     submission_dir=config.ckpt.miner_submission_path,
                     archive_dir=config.ckpt.miner_submission_archive_path,
@@ -746,11 +746,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     top_k=config.run.top_k_miners_to_reward,
                 )
             else:
-                logger.info("(11) Submission archiving disabled, skipping")
+                logger.info("(10) Submission archiving disabled, skipping")
 
             # === validation and log metric ===
             # Local evaluation step disabled to reduce per-cycle RAM/compute load.
-            logger.info("(10) Local evaluation disabled, skipping")
+            logger.info("(11) Local evaluation disabled, skipping")
 
             metrics = get_status(
                 config=config,
