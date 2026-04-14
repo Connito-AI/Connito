@@ -310,6 +310,7 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes: int = 8 * 1024**3
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
+    archive_submissions: bool = False
 
 
 class DhtCfg(BaseConfig):
@@ -365,10 +366,12 @@ class WorkerConfig(BaseConfig):
         # Fill keys (best-effort)
         self._fill_wallet_data()
 
-        # When running inside Docker, override host paths to container paths.
+        # When running inside Docker, override root to container mount points.
         # The compose file mounts: repo root → /data, expert_groups → /app/expert_groups.
         if is_running_in_docker():
-            self._apply_docker_paths()
+            self.run.root_path = Path("/data")
+            self.task.base_path = Path("/app/expert_groups")
+            logger.info("Docker detected — root_path set to /data")
 
         # Derive paths
         self._refresh_paths()
@@ -379,53 +382,47 @@ class WorkerConfig(BaseConfig):
         # Create directories
         self._ensure_runtime_dirs()
 
-    def _apply_docker_paths(self) -> None:
-        """Remap host paths to container paths for Docker runs."""
-        self.run.root_path = Path("/data")
-        # Absolute path so _refresh_paths()'s `root / base_path` keeps it as-is.
-        self.task.base_path = Path("/app/expert_groups")
-        self.task.path = None
-
-        # Reset derived paths to defaults so _refresh_paths() recomputes them
-        # from the new root_path instead of re-joining absolute host paths.
-        self.ckpt.base_checkpoint_path = Path(type(self.ckpt).model_fields["base_checkpoint_path"].default)
-        self.ckpt.checkpoint_path = None
-        self.ckpt.validator_checkpoint_path = Path(type(self.ckpt).model_fields["validator_checkpoint_path"].default)
-        self.log.base_metric_path = Path(type(self.log).model_fields["base_metric_path"].default)
-        self.log.metric_path = None
-        if hasattr(self.ckpt, "miner_submission_path"):
-            self.ckpt.miner_submission_path = Path(type(self.ckpt).model_fields["miner_submission_path"].default)
-        if hasattr(self.ckpt, "miner_submission_archive_path"):
-            self.ckpt.miner_submission_archive_path = Path(type(self.ckpt).model_fields["miner_submission_archive_path"].default)
-
-        logger.info("Docker detected — paths remapped", root_path=str(self.run.root_path))
-
     # -----------------------
     # Derived paths / IO
     # -----------------------
     def _refresh_paths(self) -> None:
-        root = self.run.root_path
+        """Derive all runtime paths from root_path + class defaults.
 
-        # ckpt paths
-        self.ckpt.base_checkpoint_path = root / self.ckpt.base_checkpoint_path
+        Always computes from the original default values so this method
+        is idempotent — safe to call multiple times without stacking prefixes.
+        """
+        root = self.run.root_path
+        ckpt_cls = type(self.ckpt)
+        log_cls = type(self.log)
+
+        # ckpt paths — always start from the class default (relative)
+        base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
+        self.ckpt.base_checkpoint_path = base_ckpt
         self.ckpt.checkpoint_path = (
-            self.ckpt.base_checkpoint_path / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
+            base_ckpt / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
         )
-        self.ckpt.validator_checkpoint_path = self.ckpt.base_checkpoint_path / self.ckpt.validator_checkpoint_path
+        self.ckpt.validator_checkpoint_path = (
+            base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+        )
 
         # logging paths
-        self.log.base_metric_path = root / self.log.base_metric_path
-        self.log.metric_path = self.log.base_metric_path / f"{self.run.run_name}.csv"
+        base_metric = root / Path(log_cls.model_fields["base_metric_path"].default)
+        self.log.base_metric_path = base_metric
+        self.log.metric_path = base_metric / f"{self.run.run_name}.csv"
 
         # task paths
         self.task.base_path = root / self.task.base_path
         self.task.path = self.task.base_path / self.task.expert_group_name
 
-        # optional
+        # optional ckpt sub-paths — always from class default + base_ckpt
         if hasattr(self.ckpt, "miner_submission_path"):
-            self.ckpt.miner_submission_path = self.ckpt.base_checkpoint_path / self.ckpt.miner_submission_path
+            self.ckpt.miner_submission_path = (
+                base_ckpt / Path(ckpt_cls.model_fields["miner_submission_path"].default)
+            )
         if hasattr(self.ckpt, "miner_submission_archive_path"):
-            self.ckpt.miner_submission_archive_path = self.ckpt.base_checkpoint_path / self.ckpt.miner_submission_archive_path
+            self.ckpt.miner_submission_archive_path = (
+                base_ckpt / Path(ckpt_cls.model_fields["miner_submission_archive_path"].default)
+            )
 
     def _ensure_runtime_dirs(self) -> None:
         assert self.ckpt.checkpoint_path is not None
@@ -552,6 +549,7 @@ class WorkerConfig(BaseConfig):
 
         if changed and config_path is not None:
             data = self.model_dump(exclude={"task": {"exp"}})
+            data = self._strip_root(data, self.run.root_path)
             data = convert_to_str(data)
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(data, f, sort_keys=False)
@@ -600,6 +598,7 @@ class WorkerConfig(BaseConfig):
 
         if changed and config_path is not None:
             data = self.model_dump(exclude={"task": {"exp"}})
+            data = self._strip_root(data, self.run.root_path)
             data = convert_to_str(data)
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(data, f, sort_keys=False)
@@ -654,13 +653,42 @@ class WorkerConfig(BaseConfig):
     # -----------------------
     # Persistence
     # -----------------------
+    @staticmethod
+    def _strip_root(data: dict, root: Path) -> dict:
+        """Recursively strip *root* prefix from Path-like string values so the
+        YAML stays portable across host and Docker environments."""
+        root_str = root.as_posix().rstrip("/") + "/"
+
+        def _walk(obj):
+            if isinstance(obj, dict):
+                return {k: _walk(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_walk(i) for i in obj]
+            if isinstance(obj, Path):
+                try:
+                    return obj.relative_to(root)
+                except ValueError:
+                    return obj
+            if isinstance(obj, str) and obj.startswith(root_str):
+                return obj[len(root_str):]
+            return obj
+
+        return _walk(data)
+
     def write(self) -> None:
         """
         Persist this config to `<checkpoint_path>/config.yaml`.
-        Excludes task.exp (loaded from task config file).
+        Excludes task.exp (loaded from task config file) and task.base_path /
+        task.path (derived at runtime, remapped in Docker — should not be
+        persisted so the YAML stays portable across host and container).
+        All remaining paths are written relative to root_path.
         """
         assert self.ckpt.checkpoint_path is not None
-        data = self.model_dump(exclude={"task": {"exp"}})
+        data = self.model_dump(exclude={
+            "run": {"root_path"},
+            "task": {"exp", "base_path", "path"},
+        })
+        data = self._strip_root(data, self.run.root_path)
         data = convert_to_str(data)
 
         ensure_dirs([self.ckpt.checkpoint_path])
@@ -703,6 +731,7 @@ class ValidatorRunCfg(RunCfg):
     top_k_miners_to_reward: int = 1   # top-N miners who receive chain weights
     averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
     averager_step_max_retries: int = 2  # max retry attempts for averager step
+    record_cuda_mem_history: bool = False  # enable torch.cuda.memory._record_memory_history (leaks RAM; profiling only)
 
 
 class ValidatorConfig(WorkerConfig):
@@ -719,13 +748,24 @@ class ValidatorConfig(WorkerConfig):
         wallet_path = Path.home() / ".bittensor" / "wallets"
         data_dir = self.run.root_path
 
+        # Use hotkey name + run name as project name so multiple validators
+        # on the same host get unique container names automatically.
+        # e.g. connito-hk1-mainnet-server-1
+        project_name = f"connito-{self.chain.hotkey_name}-{self.run.run_name}"
+        expert_groups_path = self.run.root_path / "expert_groups"
+
         lines = [
+            f"COMPOSE_PROJECT_NAME={project_name}",
             f"IMAGE=ghcr.io/connito-ai/connito-validator:stable",
             f"WALLET_NAME={self.chain.coldkey_name}",
             f"HOTKEY_NAME={self.chain.hotkey_name}",
             f"BITTENSOR_WALLET_PATH={wallet_path}",
             f"DATA_DIR={data_dir}",
             f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
+            f"EXPERT_GROUPS_PATH={expert_groups_path}",
+            f"VALIDATOR_GPU_ID=0",
+            f"SERVER_GPU_ID=0",
+            f"HF_TOKEN=",
             f"WANDB_API_KEY=",
             f"WANDB_MODE=online",
             f"WATCHTOWER_POLL_INTERVAL=300",
@@ -753,10 +793,13 @@ def parse_args():
     # --- create_config ---
     create_cfg = subparsers.add_parser("create_config", help="Generate a template config file")
     create_cfg.add_argument("--role", choices=["miner", "validator"], required=True, help="Role to generate config for")
+    create_cfg.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
+    create_cfg.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
     create_cfg.add_argument("--run_name", type=str, help="Run name")
 
     # --- create_docker_env ---
     create_env = subparsers.add_parser("create_docker_env", help="Generate Docker compose .env from an existing config")
+    create_env.add_argument("--path", type=str, required=True, help="Path to existing validator YAML config file")
 
     # --- Top-level flags used by connito.validator.run (Docker entrypoint) ---
     parser.add_argument("--path", type=str, help="Path to validator YAML config file")
@@ -766,7 +809,6 @@ def parse_args():
         help="Auto-reset locked config fields to defaults without prompting.",
     )
 
-    # --- Legacy flags (kept for backwards compatibility with --get_template) ---
     parser.add_argument("--hotkey_name", type=str, help="Wallet hotkey name")
     parser.add_argument("--coldkey_name", type=str, help="Wallet coldkey name")
     parser.add_argument("--dht_port", type=int, default=7002, help="DHT port for owner DHT bootstrap service")

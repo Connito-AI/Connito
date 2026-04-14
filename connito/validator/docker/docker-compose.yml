@@ -22,7 +22,8 @@ services:
     # does. Override with `IMAGE=...` in .env to track `:staging`, pin to
     # a specific `vX.Y.Z`, or freeze on a `master-<sha>` build artifact.
     image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:stable}
-    container_name: connito-validator
+    # container_name removed — derived from COMPOSE_PROJECT_NAME so
+    # multiple instances can run on the same host.
     restart: unless-stopped
     pull_policy: always
 
@@ -85,7 +86,7 @@ services:
       - ${DATA_DIR:-../../..}:/data
       # Validator config YAML — bind mount so you can edit on the host
       # without rebuilding the image.
-      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${CONFIG_PATH:?set CONFIG_PATH in .env}:/data/configs/validator.yaml:ro
       # Expert group configs — shipped with the repo, mounted read-only so
       # the code can load them at /app/expert_groups/<group>/config.yaml.
       - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
@@ -104,7 +105,7 @@ services:
     # Model distribution server — serves checkpoints to miners and accepts
     # submissions. Same image as the validator, different entrypoint.
     image: ${IMAGE:-ghcr.io/connito-ai/connito-validator:stable}
-    container_name: connito-server
+    # container_name: derived from COMPOSE_PROJECT_NAME
     restart: unless-stopped
 
     entrypoint: ["python", "-m", "connito.validator.server"]
@@ -139,7 +140,7 @@ services:
     volumes:
       - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
       - ${DATA_DIR:-../../..}:/data
-      - ${CONFIG_PATH:-../../../configs/validator.yaml}:/data/configs/validator.yaml:ro
+      - ${CONFIG_PATH:?set CONFIG_PATH in .env}:/data/configs/validator.yaml:ro
       - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
 
     # Liveness check on the server port (default 8000).
@@ -152,7 +153,7 @@ services:
 
   watchtower:
     image: containrrr/watchtower:1.7.1
-    container_name: connito-watchtower
+    # container_name: derived from COMPOSE_PROJECT_NAME
     restart: unless-stopped
 
     # Mount the docker socket so Watchtower can pull and recreate containers.
