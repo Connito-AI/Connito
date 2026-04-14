@@ -1,5 +1,5 @@
 import asyncio
-import copy
+import ctypes
 import gc
 import os
 from dotenv import load_dotenv
@@ -40,7 +40,6 @@ from connito.shared.checkpoints import (
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.cycle import check_phase_expired, gather_validation_job, get_combined_validator_seed, wait_till
 from connito.shared.dataloader import get_dataloader
-from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import (
     ExpertManager,
     get_weight_sum,
@@ -104,20 +103,37 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
     )
 
 
-def cleanup(global_model, base_model) -> None:
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+    _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+    _LIBC.malloc_trim.restype = ctypes.c_int
+except OSError:
+    _LIBC = None
+
+
+def _release_cpu_ram() -> None:
+    """Ask glibc to return freed arenas to the OS."""
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
+def cleanup(global_model) -> None:
     """
-    Cleans up the distributed training environment.
+    Reclaim cached allocator memory. global_model stays resident on GPU.
     """
     _cuda_mem_report("VRAM before GPU cleanup")
 
-    # Move models off GPU
-    torch.cuda.synchronize()
-    global_model.to("cpu")
-    base_model.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    _release_cpu_ram()
 
     _cuda_mem_report("VRAM after GPU cleanup")
 
@@ -131,7 +147,6 @@ def setup_training(
     wallet: bittensor.Wallet,
     current_model_meta: ModelCheckpoint | None,
 ) -> tuple[
-    torch.nn.Module,  # model
     torch.nn.Module,  # global_model
     torch.optim.Optimizer,  # outer_optimizer
     torch.amp.GradScaler,  # outer_scaler
@@ -150,10 +165,11 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # base_model: full model (all experts) — used for evaluation
-    base_model, model_meta = load_model(rank, config, expert_manager, subtensor, wallet, current_model_meta, partial=False, checkpoint_device=torch.device("cpu"))
-    # global_model: partial model (only assigned experts) — used for optimization
-    global_model, _ = load_model(rank, config, expert_manager, subtensor, wallet, current_model_meta, partial=True, checkpoint_device=torch.device("cpu"))
+    # global_model: partial model (only assigned experts) — used for optimization and evaluation
+    global_model, model_meta = load_model(
+        rank, config, expert_manager, subtensor, wallet, current_model_meta,
+        partial=True, checkpoint_device=device,
+    )
 
     # === optimizers ===
     logger.debug("setup training - load optimizer")
@@ -198,7 +214,6 @@ def setup_training(
         device=str(device),
     )
     return (
-        base_model,
         global_model,
         outer_optimizer,
         outer_scaler,
@@ -217,34 +232,44 @@ async def aggregate_miner_gradient_change(
     miner_jobs: list[MinerEvalJob],
     score_aggregator: MinerScoreAggregator,
 ) -> list[str]:
-    global_model.to(device)
+    # global_model is expected to already live on `device` (GPU).
     this_round_uids = {job.uid for job in miner_jobs}
 
-    miner_models: dict[str, nn.Module] = {}
-    for miner_job in miner_jobs:
+    top_jobs = [
+        job for job in miner_jobs
         if score_aggregator.is_in_top(
-            uid=miner_job.uid,
+            uid=job.uid,
             cutoff=config.run.top_k_miners_to_merge,
             how="avg",
             among=this_round_uids,
-        ):
-            miner_models[str(miner_job.uid)] = await asyncio.to_thread(
-                load_model_from_path, miner_job.model_path, global_model, device
-            )
-
-    merged_uids = list(miner_models.keys())
-
-    # each validator is only expected to validate 1 expert group at a time
-    for _, miner_model in miner_models.items():
-        pre_grad_sum = sum_model_gradients(global_model)
-        populate_global_grads_from_local(global_model, miner_model, weight=1 / max(1, len(miner_models)))
-        post_grad_sum = sum_model_gradients(global_model)
-        logger.info(
-            "Miner gradient aggregated",
-            pre_grad_sum=round(pre_grad_sum, 6),
-            post_grad_sum=round(post_grad_sum, 6),
-            grad_delta=round(post_grad_sum - pre_grad_sum, 6),
         )
+    ]
+    weight = 1 / max(1, len(top_jobs))
+    merged_uids: list[str] = []
+
+    # Stream one miner at a time: load → aggregate into global_model → release.
+    # Keeping all top-k miner models resident on CPU simultaneously was the
+    # single largest transient RAM spike in the cycle.
+    for job in top_jobs:
+        miner_model = await asyncio.to_thread(
+            load_model_from_path, job.model_path, global_model, device
+        )
+        try:
+            pre_grad_sum = sum_model_gradients(global_model)
+            populate_global_grads_from_local(global_model, miner_model, weight=weight)
+            post_grad_sum = sum_model_gradients(global_model)
+            logger.info(
+                "Miner gradient aggregated",
+                uid=job.uid,
+                pre_grad_sum=round(pre_grad_sum, 6),
+                post_grad_sum=round(post_grad_sum, 6),
+                grad_delta=round(post_grad_sum - pre_grad_sum, 6),
+            )
+            merged_uids.append(str(job.uid))
+        finally:
+            del miner_model
+            gc.collect()
+            _release_cpu_ram()
 
     return merged_uids
 
@@ -319,7 +344,6 @@ def sync_grad_across_validators(
 
 
 def run_global_optimization(
-    model: nn.Module,
     global_model: nn.Module,
     device: torch.device,
     rank: int,
@@ -327,15 +351,7 @@ def run_global_optimization(
     miner_jobs: list[MinerEvalJob],
     score_aggregator: MinerScoreAggregator,
 ):
-    # --- sync + outer step ---
-    # keep global model on device for syncing/stepping, then move back to CPU
-    for state in outer_optimizer.state.values():
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                state[k] = v.to(device, non_blocking=True)
-
-    global_model.to(device)
-
+    # global_model and outer_optimizer state are expected to already live on `device` (GPU).
     old_shared_name, old_shared_sum = get_weight_sum(global_model, shared=True)
     old_expert_name, old_expert_sum = get_weight_sum(global_model, shared=False)
 
@@ -343,11 +359,6 @@ def run_global_optimization(
 
     outer_optimizer.step()
     outer_optimizer.zero_grad()
-
-    # copy updated global (partial) weights back into the base (full) model
-    # strict=False because global_model has fewer experts than base_model
-    with torch.no_grad():
-        model.load_state_dict(global_model.state_dict(), strict=False)
 
     new_shared_name, new_shared_sum = get_weight_sum(global_model, shared=True)
     new_expert_name, new_expert_sum = get_weight_sum(global_model, shared=False)
@@ -363,12 +374,8 @@ def run_global_optimization(
         expert_delta=expert_delta,
     )
 
-    for state in outer_optimizer.state.values():
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                state[k] = v.cpu()
-
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
@@ -392,7 +399,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
         logger.info("Loaded config", config=config.model_dump_json(indent=2))
         config.write()
 
-    torch.cuda.memory._record_memory_history(enabled=True)
+    # CUDA allocation history recording leaks RAM on long-running loops —
+    # enable only when profiling via run.record_cuda_mem_history in config.
+    if config.run.record_cuda_mem_history:
+        torch.cuda.memory._record_memory_history(enabled=True)
 
     # === create checkpoint directory ===
     os.makedirs(config.ckpt.base_checkpoint_path, exist_ok=True)
@@ -410,16 +420,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = get_base_tokenizer(config)
 
-    eval_dataloader = get_dataloader(
-        config,
-        rank=0,
-        world_size=config.dataloader.world_size,
-        tokenizer=tokenizer,
-    )
+    # eval_dataloader is built lazily inside the eval step so its worker
+    # processes / prefetched batches don't stay resident across the whole cycle.
 
     # === set up training ===
     (
-        base_model,
         global_model,
         outer_optimizer,
         outer_scaler,
@@ -504,7 +509,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             global_opt_step = phase_response.phase_start_block
             logger.info("(0) Commit new seed for next validation")
 
-            # Submit fallback weights if last_update is stale (past max_weight_age)
+            # Submit fallback weights if last_update is stale (past max_weight_age).
+            # Fetch the metagraph once per cycle — it holds per-neuron tensors and
+            # is reused later for penalizing missing submissions.
             max_weight_age = int(config.cycle.cycle_length)
             metagraph = subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
@@ -541,7 +548,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
             # === Get miner model and evaluate the miners ===
             logger.info("(2) Evaluating miners")
-            cleanup(global_model, base_model)
+            cleanup(global_model)
             asyncio.run(
                 run_evaluation(
                     config=config,
@@ -549,20 +556,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     device=device,  # operate at cuda
                     miners=miner_jobs,
                     score_aggregator=score_aggregator,
-                    base_model=global_model.to("cpu"),
+                    base_model=global_model,
                     tokenizer=tokenizer,
                     combinded_seed=get_combined_validator_seed(config, subtensor),
                 )
             )
 
-            cleanup(global_model, base_model)
+            cleanup(global_model)
             
             # Penalize assigned miners that missed their submission
             from connito.shared.cycle import get_validator_miner_assignment
             validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
             miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
             submitted_uids = {job.uid for job in miner_jobs}
-            metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+            # Reuse the metagraph fetched above for this cycle
             for expected_hotkey in miner_assignment:
                 try:
                     uid = metagraph.hotkeys.index(expected_hotkey)
@@ -606,22 +613,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             merged_uids = asyncio.run(
                 aggregate_miner_gradient_change(
                     config=config,
-                    global_model=global_model.to("cpu"),
-                    device=torch.device("cpu"),  # all gradient aggregation done on cpu
+                    global_model=global_model,
+                    device=device,  # gradient aggregation runs on GPU
                     rank=rank,
                     outer_optimizer=outer_optimizer,
                     miner_jobs=miner_jobs,
                     score_aggregator=score_aggregator,
                 )
             )
-            
+
             logger.info(
-                "Aggregated miner gradients locally", 
+                "Aggregated miner gradients locally",
                 merged_uids=merged_uids, 
                 model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6]
             )
 
-            cleanup(global_model, base_model)
+            cleanup(global_model)
 
             check_phase_expired(subtensor, phase_response)
 
@@ -636,8 +643,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
             run_global_optimization(
-                model=base_model,
-                global_model=global_model.to("cpu"),
+                global_model=global_model,
                 device=device,
                 rank=rank,
                 outer_optimizer=outer_optimizer,
@@ -649,10 +655,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 "Optimization step complete",
                 org_model_hash=org_model_hash,
                 new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                new_base_model_hash=get_model_hash(base_model.state_dict(), hex=True)[:6],
             )
 
-            cleanup(global_model, base_model)
+            cleanup(global_model)
 
             # === save checkpoint ===
             logger.info("(6) Saving checkpoint")
@@ -733,7 +738,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
             # === archive top-k submissions, delete the rest ===
             if config.ckpt.archive_submissions:
-                logger.info("(11) Archiving top miner submissions")
+                logger.info("(10) Archiving top miner submissions")
                 archive_top_miner_submissions(
                     submission_dir=config.ckpt.miner_submission_path,
                     archive_dir=config.ckpt.miner_submission_archive_path,
@@ -741,40 +746,31 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     top_k=config.run.top_k_miners_to_reward,
                 )
             else:
-                logger.info("(11) Submission archiving disabled, skipping")
+                logger.info("(10) Submission archiving disabled, skipping")
 
             # === validation and log metric ===
-            logger.info("(10) Running local evaluation")
-            val_metric = evaluate_model(
-                rank=rank,
-                step=global_opt_step,
-                model=global_model.to("cpu"),
-                eval_dataloader=eval_dataloader,
-                device=device,
-            )
+            # Local evaluation step disabled to reduce per-cycle RAM/compute load.
+            logger.info("(11) Local evaluation disabled, skipping")
 
-            metrics = (
-                get_status(
-                    config=config,
-                    model=base_model,
-                    step=global_opt_step,
-                    training_time=training_time,
-                    total_training_time=total_training_time,
-                    inner_opt_step=None,
-                    global_opt_step=global_opt_step,
-                    loss_batch=loss_batch,
-                    aux_loss_batch=aux_loss_batch,
-                )
-                | val_metric
+            metrics = get_status(
+                config=config,
+                model=global_model,
+                step=global_opt_step,
+                training_time=training_time,
+                total_training_time=total_training_time,
+                inner_opt_step=None,
+                global_opt_step=global_opt_step,
+                loss_batch=loss_batch,
+                aux_loss_batch=aux_loss_batch,
             )
 
             metric_logger.log(metrics)
-            cleanup(global_model, base_model)
+            cleanup(global_model)
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
         poller.stop()
-        cleanup(global_model, base_model)
+        cleanup(global_model)
         metric_logger.close()
         for _, a in group_averagers.items():
             a.shutdown()
@@ -782,7 +778,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     except Exception:
         logger.error("Quit training", exc_info=True)
         poller.stop()
-        cleanup(global_model, base_model)
+        cleanup(global_model)
         metric_logger.close()
         for _, a in group_averagers.items():
             a.shutdown()

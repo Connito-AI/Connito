@@ -731,6 +731,7 @@ class ValidatorRunCfg(RunCfg):
     top_k_miners_to_reward: int = 1   # top-N miners who receive chain weights
     averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
     averager_step_max_retries: int = 2  # max retry attempts for averager step
+    record_cuda_mem_history: bool = False  # enable torch.cuda.memory._record_memory_history (leaks RAM; profiling only)
 
 
 class ValidatorConfig(WorkerConfig):

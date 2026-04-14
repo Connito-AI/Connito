@@ -27,6 +27,18 @@ on:
       - "connito/validator/docker/Dockerfile"
       - ".dockerignore"
       - ".github/workflows/docker-publish.yml"
+  pull_request:
+    branches: [staging]
+    paths:
+      - "connito/validator/**"
+      - "connito/shared/**"
+      - "connito/sn_owner/**"
+      - "connito/__init__.py"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "connito/validator/docker/Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker-publish.yml"
   workflow_dispatch:
 
 env:
@@ -78,6 +90,7 @@ jobs:
             type=sha,prefix=master-,enable={{is_default_branch}}
             type=raw,value=staging,enable=${{ github.ref == 'refs/heads/staging' }}
             type=sha,prefix=staging-,enable=${{ github.ref == 'refs/heads/staging' }}
+            type=ref,event=pr
             type=ref,event=tag
             type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
