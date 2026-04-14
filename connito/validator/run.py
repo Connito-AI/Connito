@@ -122,17 +122,17 @@ def _release_cpu_ram() -> None:
 
 def cleanup(global_model) -> None:
     """
-    Cleans up the distributed training environment.
+    Reclaim cached allocator memory. global_model stays resident on GPU.
     """
     _cuda_mem_report("VRAM before GPU cleanup")
 
-    # Move models off GPU
-    torch.cuda.synchronize()
-    global_model.to("cpu")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     _release_cpu_ram()
 
     _cuda_mem_report("VRAM after GPU cleanup")
@@ -166,7 +166,10 @@ def setup_training(
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
     # global_model: partial model (only assigned experts) — used for optimization and evaluation
-    global_model, model_meta = load_model(rank, config, expert_manager, subtensor, wallet, current_model_meta, partial=True, checkpoint_device=torch.device("cpu"))
+    global_model, model_meta = load_model(
+        rank, config, expert_manager, subtensor, wallet, current_model_meta,
+        partial=True, checkpoint_device=device,
+    )
 
     # === optimizers ===
     logger.debug("setup training - load optimizer")
@@ -229,7 +232,7 @@ async def aggregate_miner_gradient_change(
     miner_jobs: list[MinerEvalJob],
     score_aggregator: MinerScoreAggregator,
 ) -> list[str]:
-    global_model.to(device)
+    # global_model is expected to already live on `device` (GPU).
     this_round_uids = {job.uid for job in miner_jobs}
 
     top_jobs = [
@@ -348,15 +351,7 @@ def run_global_optimization(
     miner_jobs: list[MinerEvalJob],
     score_aggregator: MinerScoreAggregator,
 ):
-    # --- sync + outer step ---
-    # keep global model on device for syncing/stepping, then move back to CPU
-    for state in outer_optimizer.state.values():
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                state[k] = v.to(device, non_blocking=True)
-
-    global_model.to(device)
-
+    # global_model and outer_optimizer state are expected to already live on `device` (GPU).
     old_shared_name, old_shared_sum = get_weight_sum(global_model, shared=True)
     old_expert_name, old_expert_sum = get_weight_sum(global_model, shared=False)
 
@@ -379,12 +374,8 @@ def run_global_optimization(
         expert_delta=expert_delta,
     )
 
-    for state in outer_optimizer.state.values():
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                state[k] = v.cpu()
-
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
@@ -565,7 +556,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     device=device,  # operate at cuda
                     miners=miner_jobs,
                     score_aggregator=score_aggregator,
-                    base_model=global_model.to("cpu"),
+                    base_model=global_model,
                     tokenizer=tokenizer,
                     combinded_seed=get_combined_validator_seed(config, subtensor),
                 )
@@ -622,17 +613,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             merged_uids = asyncio.run(
                 aggregate_miner_gradient_change(
                     config=config,
-                    global_model=global_model.to("cpu"),
-                    device=torch.device("cpu"),  # all gradient aggregation done on cpu
+                    global_model=global_model,
+                    device=device,  # gradient aggregation runs on GPU
                     rank=rank,
                     outer_optimizer=outer_optimizer,
                     miner_jobs=miner_jobs,
                     score_aggregator=score_aggregator,
                 )
             )
-            
+
             logger.info(
-                "Aggregated miner gradients locally", 
+                "Aggregated miner gradients locally",
                 merged_uids=merged_uids, 
                 model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6]
             )
@@ -652,7 +643,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
             run_global_optimization(
-                global_model=global_model.to("cpu"),
+                global_model=global_model,
                 device=device,
                 rank=rank,
                 outer_optimizer=outer_optimizer,
