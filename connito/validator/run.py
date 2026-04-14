@@ -40,7 +40,6 @@ from connito.shared.checkpoints import (
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.cycle import check_phase_expired, gather_validation_job, get_combined_validator_seed, wait_till
 from connito.shared.dataloader import get_dataloader
-from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import (
     ExpertManager,
     get_weight_sum,
@@ -409,10 +408,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
         logger.info("Loaded config", config=config.model_dump_json(indent=2))
         config.write()
 
-    # CUDA allocation history recording is off by default — it accumulates
-    # stack traces for every alloc/free and leaks RAM on long-running loops.
-    # Enable explicitly via env var only when profiling.
-    if os.environ.get("CONNITO_RECORD_CUDA_MEM_HISTORY") == "1":
+    # CUDA allocation history recording leaks RAM on long-running loops —
+    # enable only when profiling via run.record_cuda_mem_history in config.
+    if config.run.record_cuda_mem_history:
         torch.cuda.memory._record_memory_history(enabled=True)
 
     # === create checkpoint directory ===
@@ -760,39 +758,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 logger.info("(11) Submission archiving disabled, skipping")
 
             # === validation and log metric ===
-            logger.info("(10) Running local evaluation")
-            eval_dataloader = get_dataloader(
-                config,
-                rank=0,
-                world_size=config.dataloader.world_size,
-                tokenizer=tokenizer,
-            )
-            try:
-                val_metric = evaluate_model(
-                    rank=rank,
-                    step=global_opt_step,
-                    model=global_model.to("cpu"),
-                    eval_dataloader=eval_dataloader,
-                    device=device,
-                )
-            finally:
-                del eval_dataloader
-                gc.collect()
-                _release_cpu_ram()
+            # Local evaluation step disabled to reduce per-cycle RAM/compute load.
+            logger.info("(10) Local evaluation disabled, skipping")
 
-            metrics = (
-                get_status(
-                    config=config,
-                    model=global_model,
-                    step=global_opt_step,
-                    training_time=training_time,
-                    total_training_time=total_training_time,
-                    inner_opt_step=None,
-                    global_opt_step=global_opt_step,
-                    loss_batch=loss_batch,
-                    aux_loss_batch=aux_loss_batch,
-                )
-                | val_metric
+            metrics = get_status(
+                config=config,
+                model=global_model,
+                step=global_opt_step,
+                training_time=training_time,
+                total_training_time=total_training_time,
+                inner_opt_step=None,
+                global_opt_step=global_opt_step,
+                loss_batch=loss_batch,
+                aux_loss_batch=aux_loss_batch,
             )
 
             metric_logger.log(metrics)
