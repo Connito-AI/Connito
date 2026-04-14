@@ -104,7 +104,7 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
     )
 
 
-def cleanup(global_model, base_model) -> None:
+def cleanup(global_model) -> None:
     """
     Cleans up the distributed training environment.
     """
@@ -113,7 +113,6 @@ def cleanup(global_model, base_model) -> None:
     # Move models off GPU
     torch.cuda.synchronize()
     global_model.to("cpu")
-    base_model.to("cpu")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -131,7 +130,6 @@ def setup_training(
     wallet: bittensor.Wallet,
     current_model_meta: ModelCheckpoint | None,
 ) -> tuple[
-    torch.nn.Module,  # model
     torch.nn.Module,  # global_model
     torch.optim.Optimizer,  # outer_optimizer
     torch.amp.GradScaler,  # outer_scaler
@@ -150,10 +148,8 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # base_model: full model (all experts) — used for evaluation
-    base_model, model_meta = load_model(rank, config, expert_manager, subtensor, wallet, current_model_meta, partial=False, checkpoint_device=torch.device("cpu"))
-    # global_model: partial model (only assigned experts) — used for optimization
-    global_model, _ = load_model(rank, config, expert_manager, subtensor, wallet, current_model_meta, partial=True, checkpoint_device=torch.device("cpu"))
+    # global_model: partial model (only assigned experts) — used for optimization and evaluation
+    global_model, model_meta = load_model(rank, config, expert_manager, subtensor, wallet, current_model_meta, partial=True, checkpoint_device=torch.device("cpu"))
 
     # === optimizers ===
     logger.debug("setup training - load optimizer")
@@ -198,7 +194,6 @@ def setup_training(
         device=str(device),
     )
     return (
-        base_model,
         global_model,
         outer_optimizer,
         outer_scaler,
@@ -319,7 +314,6 @@ def sync_grad_across_validators(
 
 
 def run_global_optimization(
-    model: nn.Module,
     global_model: nn.Module,
     device: torch.device,
     rank: int,
@@ -343,11 +337,6 @@ def run_global_optimization(
 
     outer_optimizer.step()
     outer_optimizer.zero_grad()
-
-    # copy updated global (partial) weights back into the base (full) model
-    # strict=False because global_model has fewer experts than base_model
-    with torch.no_grad():
-        model.load_state_dict(global_model.state_dict(), strict=False)
 
     new_shared_name, new_shared_sum = get_weight_sum(global_model, shared=True)
     new_expert_name, new_expert_sum = get_weight_sum(global_model, shared=False)
@@ -419,7 +408,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
     # === set up training ===
     (
-        base_model,
         global_model,
         outer_optimizer,
         outer_scaler,
@@ -541,7 +529,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
             # === Get miner model and evaluate the miners ===
             logger.info("(2) Evaluating miners")
-            cleanup(global_model, base_model)
+            cleanup(global_model)
             asyncio.run(
                 run_evaluation(
                     config=config,
@@ -555,7 +543,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 )
             )
 
-            cleanup(global_model, base_model)
+            cleanup(global_model)
             
             # Penalize assigned miners that missed their submission
             from connito.shared.cycle import get_validator_miner_assignment
@@ -621,7 +609,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6]
             )
 
-            cleanup(global_model, base_model)
+            cleanup(global_model)
 
             check_phase_expired(subtensor, phase_response)
 
@@ -636,7 +624,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
             run_global_optimization(
-                model=base_model,
                 global_model=global_model.to("cpu"),
                 device=device,
                 rank=rank,
@@ -649,10 +636,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 "Optimization step complete",
                 org_model_hash=org_model_hash,
                 new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                new_base_model_hash=get_model_hash(base_model.state_dict(), hex=True)[:6],
             )
 
-            cleanup(global_model, base_model)
+            cleanup(global_model)
 
             # === save checkpoint ===
             logger.info("(6) Saving checkpoint")
@@ -756,7 +742,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             metrics = (
                 get_status(
                     config=config,
-                    model=base_model,
+                    model=global_model,
                     step=global_opt_step,
                     training_time=training_time,
                     total_training_time=total_training_time,
@@ -769,12 +755,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             )
 
             metric_logger.log(metrics)
-            cleanup(global_model, base_model)
+            cleanup(global_model)
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
         poller.stop()
-        cleanup(global_model, base_model)
+        cleanup(global_model)
         metric_logger.close()
         for _, a in group_averagers.items():
             a.shutdown()
@@ -782,7 +768,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     except Exception:
         logger.error("Quit training", exc_info=True)
         poller.stop()
-        cleanup(global_model, base_model)
+        cleanup(global_model)
         metric_logger.close()
         for _, a in group_averagers.items():
             a.shutdown()
