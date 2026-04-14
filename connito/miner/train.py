@@ -46,6 +46,22 @@ logger = structlog.get_logger(__name__)
 torch.autograd.set_detect_anomaly(True)
 
 
+def _is_streaming_timeout_error(error: Exception) -> bool:
+    error_msg = str(error).lower()
+    timeout_markers = (
+        "readtimeout",
+        "httpcore.readtimeout",
+        "the read operation timed out",
+        "caught readtimeout in dataloader worker process",
+        "dataloader worker process",
+        "hfhubhttperror",
+        "server error",
+        "503",
+        "connectionerror",
+    )
+    return any(marker in error_msg for marker in timeout_markers)
+
+
 # this is for local DP only
 def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, backend: str = "nccl") -> None:
     """
@@ -529,7 +545,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     error_msg = str(e).lower()
                     
                     # Make sure a RuntimeError is actually an HTTP/Network error before sleeping
-                    is_network_error = not isinstance(e, RuntimeError) or "hfhubhttperror" in error_msg or "50" in error_msg
+                    is_network_error = (
+                        _is_streaming_timeout_error(e)
+                        or not isinstance(e, RuntimeError)
+                        or "50" in error_msg
+                    )
                     
                     if is_network_error:
                         logger.error(f"Dataloader network streaming error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
@@ -690,7 +710,18 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         free_cuda_models([model, eval_rref])
         torch.cuda.empty_cache()
         raise
-    except Exception:
+    except Exception as e:
+        if _is_streaming_timeout_error(e):
+            logger.error(
+                "Dataloader network streaming error during batch fetch. "
+                "Waiting for distribute phase and restarting miner loop.",
+                error=str(e),
+                exc_info=True,
+            )
+            wait_till(config, phase_name=PhaseNames.distribute)
+            time.sleep(15)
+            return train_worker(rank, world_size, config)
+
         logger.error("Quit training", exc_info=True)
         poller.stop()
         # dist.destroy_process_group()
