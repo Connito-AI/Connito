@@ -1,5 +1,5 @@
 import asyncio
-import copy
+import ctypes
 import gc
 import os
 from dotenv import load_dotenv
@@ -104,6 +104,23 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
     )
 
 
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+    _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+    _LIBC.malloc_trim.restype = ctypes.c_int
+except OSError:
+    _LIBC = None
+
+
+def _release_cpu_ram() -> None:
+    """Ask glibc to return freed arenas to the OS."""
+    if _LIBC is not None:
+        try:
+            _LIBC.malloc_trim(0)
+        except Exception:
+            pass
+
+
 def cleanup(global_model) -> None:
     """
     Cleans up the distributed training environment.
@@ -117,6 +134,7 @@ def cleanup(global_model) -> None:
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+    _release_cpu_ram()
 
     _cuda_mem_report("VRAM after GPU cleanup")
 
@@ -215,31 +233,41 @@ async def aggregate_miner_gradient_change(
     global_model.to(device)
     this_round_uids = {job.uid for job in miner_jobs}
 
-    miner_models: dict[str, nn.Module] = {}
-    for miner_job in miner_jobs:
+    top_jobs = [
+        job for job in miner_jobs
         if score_aggregator.is_in_top(
-            uid=miner_job.uid,
+            uid=job.uid,
             cutoff=config.run.top_k_miners_to_merge,
             how="avg",
             among=this_round_uids,
-        ):
-            miner_models[str(miner_job.uid)] = await asyncio.to_thread(
-                load_model_from_path, miner_job.model_path, global_model, device
-            )
-
-    merged_uids = list(miner_models.keys())
-
-    # each validator is only expected to validate 1 expert group at a time
-    for _, miner_model in miner_models.items():
-        pre_grad_sum = sum_model_gradients(global_model)
-        populate_global_grads_from_local(global_model, miner_model, weight=1 / max(1, len(miner_models)))
-        post_grad_sum = sum_model_gradients(global_model)
-        logger.info(
-            "Miner gradient aggregated",
-            pre_grad_sum=round(pre_grad_sum, 6),
-            post_grad_sum=round(post_grad_sum, 6),
-            grad_delta=round(post_grad_sum - pre_grad_sum, 6),
         )
+    ]
+    weight = 1 / max(1, len(top_jobs))
+    merged_uids: list[str] = []
+
+    # Stream one miner at a time: load → aggregate into global_model → release.
+    # Keeping all top-k miner models resident on CPU simultaneously was the
+    # single largest transient RAM spike in the cycle.
+    for job in top_jobs:
+        miner_model = await asyncio.to_thread(
+            load_model_from_path, job.model_path, global_model, device
+        )
+        try:
+            pre_grad_sum = sum_model_gradients(global_model)
+            populate_global_grads_from_local(global_model, miner_model, weight=weight)
+            post_grad_sum = sum_model_gradients(global_model)
+            logger.info(
+                "Miner gradient aggregated",
+                uid=job.uid,
+                pre_grad_sum=round(pre_grad_sum, 6),
+                post_grad_sum=round(post_grad_sum, 6),
+                grad_delta=round(post_grad_sum - pre_grad_sum, 6),
+            )
+            merged_uids.append(str(job.uid))
+        finally:
+            del miner_model
+            gc.collect()
+            _release_cpu_ram()
 
     return merged_uids
 
@@ -381,7 +409,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
         logger.info("Loaded config", config=config.model_dump_json(indent=2))
         config.write()
 
-    torch.cuda.memory._record_memory_history(enabled=True)
+    # CUDA allocation history recording is off by default — it accumulates
+    # stack traces for every alloc/free and leaks RAM on long-running loops.
+    # Enable explicitly via env var only when profiling.
+    if os.environ.get("CONNITO_RECORD_CUDA_MEM_HISTORY") == "1":
+        torch.cuda.memory._record_memory_history(enabled=True)
 
     # === create checkpoint directory ===
     os.makedirs(config.ckpt.base_checkpoint_path, exist_ok=True)
@@ -399,12 +431,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = get_base_tokenizer(config)
 
-    eval_dataloader = get_dataloader(
-        config,
-        rank=0,
-        world_size=config.dataloader.world_size,
-        tokenizer=tokenizer,
-    )
+    # eval_dataloader is built lazily inside the eval step so its worker
+    # processes / prefetched batches don't stay resident across the whole cycle.
 
     # === set up training ===
     (
@@ -492,7 +520,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             global_opt_step = phase_response.phase_start_block
             logger.info("(0) Commit new seed for next validation")
 
-            # Submit fallback weights if last_update is stale (past max_weight_age)
+            # Submit fallback weights if last_update is stale (past max_weight_age).
+            # Fetch the metagraph once per cycle — it holds per-neuron tensors and
+            # is reused later for penalizing missing submissions.
             max_weight_age = int(config.cycle.cycle_length)
             metagraph = subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
@@ -550,7 +580,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
             miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
             submitted_uids = {job.uid for job in miner_jobs}
-            metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+            # Reuse the metagraph fetched above for this cycle
             for expected_hotkey in miner_assignment:
                 try:
                     uid = metagraph.hotkeys.index(expected_hotkey)
@@ -731,13 +761,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
             # === validation and log metric ===
             logger.info("(10) Running local evaluation")
-            val_metric = evaluate_model(
-                rank=rank,
-                step=global_opt_step,
-                model=global_model.to("cpu"),
-                eval_dataloader=eval_dataloader,
-                device=device,
+            eval_dataloader = get_dataloader(
+                config,
+                rank=0,
+                world_size=config.dataloader.world_size,
+                tokenizer=tokenizer,
             )
+            try:
+                val_metric = evaluate_model(
+                    rank=rank,
+                    step=global_opt_step,
+                    model=global_model.to("cpu"),
+                    eval_dataloader=eval_dataloader,
+                    device=device,
+                )
+            finally:
+                del eval_dataloader
+                gc.collect()
+                _release_cpu_ram()
 
             metrics = (
                 get_status(
