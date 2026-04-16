@@ -732,6 +732,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 threshold=max_consecutive_non_finite_batches,
                 exc_info=True,
             )
+            poller.stop()
+            metric_logger.close()
+            free_cuda_models([model, eval_rref])
+            torch.cuda.empty_cache()
+            gc.collect()
             wait_till(config, phase_name=PhaseNames.distribute)
             time.sleep(15)
             return train_worker(rank, world_size, config)
@@ -743,6 +748,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 error=str(e),
                 exc_info=True,
             )
+            poller.stop()
+            metric_logger.close()
+            free_cuda_models([model, eval_rref])
+            torch.cuda.empty_cache()
+            gc.collect()
             wait_till(config, phase_name=PhaseNames.distribute)
             time.sleep(15)
             return train_worker(rank, world_size, config)
