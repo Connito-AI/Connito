@@ -55,9 +55,17 @@ services:
               device_ids: ["${VALIDATOR_GPU_ID:-0}"]
               capabilities: [gpu]
 
-    # Shared memory for PyTorch DataLoader workers; default 64MB is too small.
+    # Shared memory for PyTorch DataLoader workers and hivemind averager buffers.
+    # ipc: host removed — with host IPC, crashed containers leak torch shm files
+    # onto the host /dev/shm permanently (owned by root, never cleaned up).
+    # Private IPC (the default) gives each container its own tmpfs that Docker
+    # wipes on exit, even on crash. 16 GB is sufficient (~4-5 GB in-use).
     shm_size: "16gb"
-    ipc: host
+
+    # Clean up any leftover torch shm files from a previous run (migration
+    # safety net for hosts that previously used ipc: host), then hand off
+    # to the normal entrypoint.
+    entrypoint: ["/bin/sh", "-c", "rm -f /dev/shm/torch_* && exec python -m connito.validator.run \"$@\"", "--"]
 
     environment:
       # Docker passes in only the GPU selected by device_ids above.
@@ -124,8 +132,8 @@ services:
               device_ids: ["${SERVER_GPU_ID:-0}"]
               capabilities: [gpu]
 
+    # Same reasoning as the validator service — private IPC, no accumulation.
     shm_size: "16gb"
-    ipc: host
 
     environment:
       CUDA_VISIBLE_DEVICES: "0"
