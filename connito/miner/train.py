@@ -306,6 +306,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     training_time = 0
     total_training_time = 0
     training_start_time = None
+    consecutive_non_finite_batches = 0
+    max_consecutive_non_finite_batches = int(
+        get_nested_attr(config, "train.max_consecutive_non_finite_batches", 50)
+    )
 
     inner_optimizer.zero_grad()
     try:
@@ -358,6 +362,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     aux_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
                 if not torch.isfinite(loss):
+                    consecutive_non_finite_batches += 1
                     logits = outputs.logits
                     logits_finite = torch.isfinite(logits)
                     logits_finite_ratio = float(logits_finite.float().mean().item())
@@ -379,10 +384,18 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         num_valid_labels=num_valid if labels is not None else None,
                         precision=precision,
                         step=step,
+                        consecutive_non_finite_batches=consecutive_non_finite_batches,
+                        max_consecutive_non_finite_batches=max_consecutive_non_finite_batches,
                     )
+                    if consecutive_non_finite_batches >= max_consecutive_non_finite_batches:
+                        raise FloatingPointError(
+                            "Non-finite loss persisted for "
+                            f"{consecutive_non_finite_batches} consecutive batches"
+                        )
                     del loss, aux_loss, batch_device, outputs
                     gc.collect()
                     continue
+                consecutive_non_finite_batches = 0
                 logger.info("batch loss", loss=outputs.loss.item(), inner_opt_step=inner_opt_step)
 
                 loss_batch += loss.item()
@@ -711,6 +724,18 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         torch.cuda.empty_cache()
         raise
     except Exception as e:
+        if isinstance(e, FloatingPointError) and "non-finite loss persisted" in str(e).lower():
+            logger.error(
+                "Consecutive non-finite losses exceeded threshold. "
+                "Waiting for distribute phase and restarting miner loop.",
+                error=str(e),
+                threshold=max_consecutive_non_finite_batches,
+                exc_info=True,
+            )
+            wait_till(config, phase_name=PhaseNames.distribute)
+            time.sleep(15)
+            return train_worker(rank, world_size, config)
+
         if _is_streaming_timeout_error(e):
             logger.error(
                 "Dataloader network streaming error during batch fetch. "
