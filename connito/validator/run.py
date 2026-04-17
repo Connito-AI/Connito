@@ -333,11 +333,28 @@ def sync_grad_across_validators(
         for attempt in range(1, config.run.averager_step_max_retries + 1):
             try:
                 avg_step = avg.step(
-                    gather={"grad_sum": grad_sum},
+                    gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
                     timeout=config.run.averager_step_timeout_sec,
                     allow_retries=False,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
+                )
+                gathered = {}
+                if hasattr(avg_step, "items"):
+                    gathered = {
+                        str(peer): {
+                            "hotkey": vals.get("hotkey") if isinstance(vals, dict) else None,
+                            "grad_sum": vals.get("grad_sum") if isinstance(vals, dict) else vals,
+                        }
+                        for peer, vals in avg_step.items()
+                    }
+                logger.info(
+                    "Averager step succeeded",
+                    group=group_id,
+                    our_hotkey=config.chain.hotkey_ss58[-6:],
+                    our_grad_sum=round(grad_sum, 6),
+                    peers=gathered,
+                    group_size=len(gathered),
                 )
                 VALIDATOR_AVG_STEP_STATUS.labels(status="success").inc()
                 break
