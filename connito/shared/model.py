@@ -349,3 +349,65 @@ def fetch_model_from_chain_validator(
             logger.error(f"❌ All download attempts failed after {retries} retries.")
 
             return None
+
+
+def reload_model_inplace(
+    config: ValidatorConfig,
+    global_model: nn.Module,
+    expert_manager: ExpertManager,
+    device: torch.device,
+    subtensor: bittensor.Subtensor,
+    wallet: bittensor.Wallet,
+) -> bool:
+    """
+    Pull the latest committed validator checkpoint from a peer and load it
+    into *global_model* in-place.  Called at the start of the next cycle
+    when this validator was excluded from the allreduce (no miner assigned,
+    or inf/nan gradients).  By then the participating validators have
+    finished merge + optimizer + save + committed new hashes via
+    validator_commit_1/2, so build_chain_checkpoints_from_previous_phase
+    finds the fresh model.
+    Returns True on success, False on any failure (caller keeps stale model).
+    """
+    logger.info("Pulling model from peer validator to re-sync excluded validator")
+    try:
+        fetch_model_from_chain_validator(
+            current_model_meta=None,  # None = always try; no version gate
+            config=config,
+            subtensor=subtensor,
+            wallet=wallet,
+            expert_group_ids=[config.task.exp.group_id, "shared"],
+            expert_group_assignment=expert_manager.expert_group_assignment,
+        )
+    except Exception as e:
+        logger.warning("Peer sync: fetch_model_from_chain_validator failed", error=str(e))
+        return False
+
+    latest = select_best_checkpoint(
+        primary_dir=config.ckpt.validator_checkpoint_path,
+        secondary_dir=config.ckpt.checkpoint_path,
+    )
+    if latest is None or latest.path is None:
+        logger.warning("Peer sync: no checkpoint found after download")
+        return False
+
+    try:
+        sd = compile_full_state_dict_from_path(
+            latest.path,
+            expert_groups=[config.task.exp.group_id, "shared"],
+        )
+        if not sd:
+            logger.warning("Peer sync: downloaded checkpoint has empty state dict")
+            return False
+        global_model.load_state_dict(sd, strict=False)
+        global_model.to(device)
+        logger.info(
+            "Peer sync: loaded checkpoint into global_model",
+            path=str(latest.path),
+            global_ver=latest.global_ver,
+            model_hash=get_model_hash(sd, hex=True)[:6],
+        )
+        return True
+    except Exception as e:
+        logger.warning("Peer sync: failed to load state dict into global_model", error=str(e))
+        return False

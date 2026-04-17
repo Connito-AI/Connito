@@ -19,7 +19,7 @@ def sum_model_gradients(model):
         total = 0.0
         for param in model.parameters():
             if param.grad is not None:
-                total += param.grad.abs().sum().item()
+                total += param.grad.detach().abs().to(torch.float64).sum().item()
         return total
     
     
