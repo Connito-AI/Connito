@@ -256,8 +256,16 @@ def _submit_fallback_weights(
         metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
     }
 
+    fallback_miner_uids = (
+        {int(uid) for uid in fallback_miners} if fallback_miners is not None else None
+    )
+
     if prev_weights:
-        miner_prev_weights = {uid: w for uid, w in prev_weights.items() if int(uid) not in validator_uids}
+        miner_prev_weights = {
+            uid: w for uid, w in prev_weights.items()
+            if int(uid) not in validator_uids
+            and (fallback_miner_uids is None or int(uid) in fallback_miner_uids)
+        }
         dropped = len(prev_weights) - len(miner_prev_weights)
         logger.info(
             "Falling back to previous weights from chain (miners only)",
