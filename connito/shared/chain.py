@@ -237,31 +237,59 @@ def _submit_fallback_weights(
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = False,
 ) -> bool:
-    """Try previous weights from chain, otherwise submit uniform weights."""
+    """Try previous weights from chain, otherwise submit uniform weights.
+
+    Validator UIDs are excluded — weights are only set on miners.
+    """
+    from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
+
     metagraph = subtensor.metagraph(netuid=config.chain.netuid)
     my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
     full_neuron = subtensor.neuron_for_uid(uid=my_uid, netuid=config.chain.netuid)
     prev_weights = {uid: float(w) for uid, w in full_neuron.weights} if full_neuron else {}
 
-    if prev_weights:
-        logger.info("Falling back to previous weights from chain", count=len(prev_weights))
-        return submit_weights(config, wallet, subtensor, prev_weights, normalize=True,
-                              wait_for_inclusion=wait_for_inclusion,
-                              wait_for_finalization=wait_for_finalization)
+    validator_hotkeys = get_validator_whitelist_from_api(config)
+    validator_uids = {
+        metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
+    }
 
-    logger.warning("No previous weights found on chain, submitting uniform weights")
+    if prev_weights:
+        miner_prev_weights = {uid: w for uid, w in prev_weights.items() if int(uid) not in validator_uids}
+        dropped = len(prev_weights) - len(miner_prev_weights)
+        logger.info(
+            "Falling back to previous weights from chain (miners only)",
+            count=len(miner_prev_weights),
+            dropped_validator_uids=dropped,
+        )
+        if miner_prev_weights:
+            return submit_weights(config, wallet, subtensor, miner_prev_weights, normalize=True,
+                                  wait_for_inclusion=wait_for_inclusion,
+                                  wait_for_finalization=wait_for_finalization)
+        logger.warning("No miner weights remain after excluding validators, falling through to uniform")
+
     n = metagraph.n.item()
+    miner_uids = [uid for uid in range(n) if uid not in validator_uids]
+    if not miner_uids:
+        logger.warning("No miner UIDs available (all excluded as validators), skipping uniform weight set")
+        return False
+
+    logger.warning(
+        "No previous weights found on chain, submitting uniform weights to miners",
+        miner_count=len(miner_uids),
+        excluded_validator_count=len(validator_uids),
+    )
+    weight = 1.0 / len(miner_uids)
     result = subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
-        uids=list(range(n)),
-        weights=[1.0 / n] * n,
+        uids=miner_uids,
+        weights=[weight] * len(miner_uids),
         wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )
     success = result[0] if isinstance(result, tuple) else bool(result)
     if success:
-        logger.info("Uniform weights set successfully", count=n)
+        logger.info("Uniform weights set successfully", count=len(miner_uids))
     else:
         logger.warning("Failed to set uniform weights")
     return success
