@@ -59,8 +59,9 @@ services:
     # ipc: host removed — with host IPC, crashed containers leak torch shm files
     # onto the host /dev/shm permanently (owned by root, never cleaned up).
     # Private IPC (the default) gives each container its own tmpfs that Docker
-    # wipes on exit, even on crash. 16 GB is sufficient (~4-5 GB in-use).
-    shm_size: "16gb"
+    # wipes on exit, even on crash.
+    # Override SHM_SIZE in .env if your host has less RAM (minimum ~8gb).
+    shm_size: ${SHM_SIZE:-64gb}
 
     # Clean up any leftover torch shm files from a previous run (migration
     # safety net for hosts that previously used ipc: host), then hand off
@@ -133,7 +134,8 @@ services:
               capabilities: [gpu]
 
     # Same reasoning as the validator service — private IPC, no accumulation.
-    shm_size: "16gb"
+    # Override SHM_SIZE in .env to match the validator service setting.
+    shm_size: ${SHM_SIZE:-64gb}
 
     environment:
       CUDA_VISIBLE_DEVICES: "0"

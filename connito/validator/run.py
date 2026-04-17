@@ -28,7 +28,6 @@ from connito.shared.chain import (
     submit_weights,
 )
 from connito.shared.checkpoint_helper import (
-    compile_full_state_dict_from_path,
     load_checkpoint,
     save_checkpoint,
 )
@@ -49,7 +48,7 @@ from connito.shared.expert_manager import (
 )
 from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
 from connito.shared.metrics import MetricLogger
-from connito.shared.model import fetch_model_from_chain_validator, load_model
+from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
@@ -260,9 +259,17 @@ async def aggregate_miner_gradient_change(
             pre_grad_sum = sum_model_gradients(global_model)
             populate_global_grads_from_local(global_model, miner_model, weight=weight)
             post_grad_sum = sum_model_gradients(global_model)
-            if not math.isfinite(post_grad_sum):
+            # Check element-wise for inf/nan rather than testing the sum,
+            # because abs().sum() in bf16 can overflow to inf even when
+            # individual gradient elements are merely large but finite.
+            grad_has_nonfinite = any(
+                torch.any(torch.isinf(p.grad) | torch.isnan(p.grad)).item()
+                for p in global_model.parameters()
+                if p.grad is not None
+            )
+            if grad_has_nonfinite:
                 logger.warning(
-                    "Non-finite gradient after merging miner — zeroing all gradients and skipping miner",
+                    "Non-finite gradient elements after merging miner — zeroing all gradients and skipping miner",
                     uid=job.uid,
                     pre_grad_sum=pre_grad_sum,
                     post_grad_sum=post_grad_sum,
@@ -287,67 +294,6 @@ async def aggregate_miner_gradient_change(
             _release_cpu_ram()
 
     return merged_uids
-
-def pull_model_from_peer_validator(
-    config: ValidatorConfig,
-    global_model: nn.Module,
-    expert_manager: "ExpertManager",
-    device: torch.device,
-    subtensor: bittensor.Subtensor,
-    wallet: bittensor.Wallet,
-) -> bool:
-    """
-    Pull the latest committed validator checkpoint from a peer and load it
-    into global_model in-place.  Called at the START of the next cycle when
-    this validator was excluded from the allreduce (no miner assigned, or
-    inf/nan gradients).  By then the participating validators have finished
-    merge + optimizer + save + committed new hashes via validator_commit_1/2,
-    so build_chain_checkpoints_from_previous_phase finds the fresh model.
-    Returns True on success, False on any failure (caller keeps stale model).
-    """
-    logger.info("Pulling model from peer validator to re-sync excluded validator")
-    try:
-        fetch_model_from_chain_validator(
-            current_model_meta=None,  # None = always try; no version gate
-            config=config,
-            subtensor=subtensor,
-            wallet=wallet,
-            expert_group_ids=[config.task.exp.group_id, "shared"],
-            expert_group_assignment=expert_manager.expert_group_assignment,
-        )
-    except Exception as e:
-        logger.warning("Peer sync: fetch_model_from_chain_validator failed", error=str(e))
-        return False
-
-    latest = select_best_checkpoint(
-        primary_dir=config.ckpt.validator_checkpoint_path,
-        secondary_dir=config.ckpt.checkpoint_path,
-    )
-    if latest is None or latest.path is None:
-        logger.warning("Peer sync: no checkpoint found after download")
-        return False
-
-    try:
-        sd = compile_full_state_dict_from_path(
-            latest.path,
-            expert_groups=[config.task.exp.group_id, "shared"],
-        )
-        if not sd:
-            logger.warning("Peer sync: downloaded checkpoint has empty state dict")
-            return False
-        global_model.load_state_dict(sd, strict=False)
-        global_model.to(device)
-        logger.info(
-            "Peer sync: loaded checkpoint into global_model",
-            path=str(latest.path),
-            global_ver=latest.global_ver,
-            model_hash=get_model_hash(sd, hex=True)[:6],
-        )
-        return True
-    except Exception as e:
-        logger.warning("Peer sync: failed to load state dict into global_model", error=str(e))
-        return False
-
 
 def sync_grad_across_validators(
     config: ValidatorConfig,
@@ -587,7 +533,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 logger.info(
                     "(0) Re-syncing model from peer validator (was excluded from allreduce last cycle)"
                 )
-                success = pull_model_from_peer_validator(
+                success = reload_model_inplace(
                     config=config,
                     global_model=global_model,
                     expert_manager=expert_manager,
@@ -723,7 +669,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             )
 
             grad_sum_after_aggregation = sum_model_gradients(global_model)
-            grad_is_valid = bool(merged_uids) and math.isfinite(grad_sum_after_aggregation)
+            # Use element-wise check: the sum can overflow bf16 to inf even
+            # when no individual element is actually non-finite.
+            grad_has_nonfinite_elements = any(
+                torch.any(torch.isinf(p.grad) | torch.isnan(p.grad)).item()
+                for p in global_model.parameters()
+                if p.grad is not None
+            )
+            grad_is_valid = bool(merged_uids) and not grad_has_nonfinite_elements
 
             logger.info(
                 "Aggregated miner gradients locally",
