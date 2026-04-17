@@ -1,6 +1,7 @@
 import asyncio
 import ctypes
 import gc
+import math
 import os
 from dotenv import load_dotenv
 
@@ -47,7 +48,7 @@ from connito.shared.expert_manager import (
 )
 from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
 from connito.shared.metrics import MetricLogger
-from connito.shared.model import load_model
+from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
@@ -258,14 +259,35 @@ async def aggregate_miner_gradient_change(
             pre_grad_sum = sum_model_gradients(global_model)
             populate_global_grads_from_local(global_model, miner_model, weight=weight)
             post_grad_sum = sum_model_gradients(global_model)
-            logger.info(
-                "Miner gradient aggregated",
-                uid=job.uid,
-                pre_grad_sum=round(pre_grad_sum, 6),
-                post_grad_sum=round(post_grad_sum, 6),
-                grad_delta=round(post_grad_sum - pre_grad_sum, 6),
+            # Check element-wise for inf/nan rather than testing the sum,
+            # because abs().sum() in bf16 can overflow to inf even when
+            # individual gradient elements are merely large but finite.
+            grad_has_nonfinite = any(
+                torch.any(torch.isinf(p.grad) | torch.isnan(p.grad)).item()
+                for p in global_model.parameters()
+                if p.grad is not None
             )
-            merged_uids.append(str(job.uid))
+            if grad_has_nonfinite:
+                logger.warning(
+                    "Non-finite gradient elements after merging miner — zeroing all gradients and skipping miner",
+                    uid=job.uid,
+                    pre_grad_sum=pre_grad_sum,
+                    post_grad_sum=post_grad_sum,
+                )
+                # Zero out all accumulated .grad tensors so the poisoned
+                # gradient does not propagate to the allreduce or optimizer.
+                for p in global_model.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
+            else:
+                logger.info(
+                    "Miner gradient aggregated",
+                    uid=job.uid,
+                    pre_grad_sum=round(pre_grad_sum, 6),
+                    post_grad_sum=round(post_grad_sum, 6),
+                    grad_delta=round(post_grad_sum - pre_grad_sum, 6),
+                )
+                merged_uids.append(str(job.uid))
         finally:
             del miner_model
             gc.collect()
@@ -280,8 +302,10 @@ def sync_grad_across_validators(
     model,
 ):
     for group_id, avg in group_averagers.items():
+        # avg.total_size is the number of tensor *elements* in the grad buffer,
+        # not the peer count. Skip only if the buffer is empty (should never happen).
         if avg.total_size <= 0:
-            logger.debug("Skipping averager — no peers", group=group_id, mode=avg.mode, total_size=avg.total_size)
+            logger.debug("Skipping averager — grad buffer is empty", group=group_id, mode=avg.mode)
             continue
 
         pack_grads(group_grad_buff_meta[group_id], model)
@@ -290,17 +314,13 @@ def sync_grad_across_validators(
 
         group_bits = avg.get_group_bits()
 
-        peer_count = max(0, avg.total_size)
-
         logger.info(
             "Starting gradient sync across validators",
             group=group_id,
             mode=avg.mode,
             matchmaking_key=f"{avg.prefix}/{group_bits}",
-            peers_visible=peer_count,
+            grad_buffer_elements=avg.total_size,
         )
-        if peer_count == 0:
-            logger.warning("No visible peers for gradient sync", group=group_id)
         logger.debug(
             "Averager details",
             group=group_id,
@@ -434,6 +454,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
     global_opt_step = start_step
+    # Tracks whether this validator participated in the last allreduce.
+    # If False at the start of the next cycle, pull the updated model from a
+    # peer validator before continuing.
+    _participated_in_merge = True
 
     # === set up score aggregator ===
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
@@ -503,6 +527,28 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
             # for each step, we run 1 backward
             # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
+
+            # === (0) Re-sync from peer if we were excluded last cycle ===
+            if not _participated_in_merge:
+                logger.info(
+                    "(0) Re-syncing model from peer validator (was excluded from allreduce last cycle)"
+                )
+                success = reload_model_inplace(
+                    config=config,
+                    global_model=global_model,
+                    expert_manager=expert_manager,
+                    device=device,
+                    subtensor=subtensor,
+                    wallet=wallet,
+                )
+                if success:
+                    logger.info("(0) Peer sync successful — model updated")
+                else:
+                    logger.warning(
+                        "(0) Peer sync failed — continuing with current model; "
+                        "weight quality may be reduced this cycle"
+                    )
+                _participated_in_merge = True  # reset regardless; try allreduce next cycle
 
             # === Wait till commit phase to submit random seed ===
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
@@ -622,40 +668,76 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 )
             )
 
+            grad_sum_after_aggregation = sum_model_gradients(global_model)
+            # Use element-wise check: the sum can overflow bf16 to inf even
+            # when no individual element is actually non-finite.
+            grad_has_nonfinite_elements = any(
+                torch.any(torch.isinf(p.grad) | torch.isnan(p.grad)).item()
+                for p in global_model.parameters()
+                if p.grad is not None
+            )
+            grad_is_valid = bool(merged_uids) and not grad_has_nonfinite_elements
+
             logger.info(
                 "Aggregated miner gradients locally",
-                merged_uids=merged_uids, 
-                model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6]
+                merged_uids=merged_uids,
+                grad_sum=round(grad_sum_after_aggregation, 6) if math.isfinite(grad_sum_after_aggregation) else str(grad_sum_after_aggregation),
+                grad_is_valid=grad_is_valid,
+                model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
             )
+
+            if not grad_is_valid:
+                logger.warning(
+                    "Invalid gradient state after local aggregation — "
+                    "skipping allreduce and optimizer this cycle; "
+                    "will pull updated model from peer at start of next cycle",
+                    merged_uids=merged_uids,
+                    grad_sum=grad_sum_after_aggregation,
+                )
+                outer_optimizer.zero_grad()  # ensure clean state
 
             cleanup(global_model)
 
             check_phase_expired(subtensor, phase_response)
 
-            # === wait till merging phase and aggragate miner gradient change ===
+            # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
-            logger.info("(4) Syncing gradient across validators")
-            sync_grad_across_validators(config=config, group_averagers=group_averagers, group_grad_buff_meta=group_grad_buff_meta, model=global_model)
 
-            # === global optimizer ===
-            logger.info("(5) Running global model optimization step")
+            if grad_is_valid:
+                logger.info("(4) Syncing gradient across validators")
+                sync_grad_across_validators(
+                    config=config,
+                    group_averagers=group_averagers,
+                    group_grad_buff_meta=group_grad_buff_meta,
+                    model=global_model,
+                )
 
-            org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
+                # === global optimizer ===
+                logger.info("(5) Running global model optimization step")
 
-            run_global_optimization(
-                global_model=global_model,
-                device=device,
-                rank=rank,
-                outer_optimizer=outer_optimizer,
-                miner_jobs=miner_jobs,
-                score_aggregator=score_aggregator,
-            )
+                org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
-            logger.info(
-                "Optimization step complete",
-                org_model_hash=org_model_hash,
-                new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-            )
+                run_global_optimization(
+                    global_model=global_model,
+                    device=device,
+                    rank=rank,
+                    outer_optimizer=outer_optimizer,
+                    miner_jobs=miner_jobs,
+                    score_aggregator=score_aggregator,
+                )
+
+                logger.info(
+                    "Optimization step complete",
+                    org_model_hash=org_model_hash,
+                    new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
+                )
+                _participated_in_merge = True
+            else:
+                logger.info(
+                    "(4/5) Skipping gradient sync and optimizer — "
+                    "no valid gradient contribution this cycle"
+                )
+                _participated_in_merge = False
 
             cleanup(global_model)
 
