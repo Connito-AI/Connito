@@ -807,7 +807,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     subtensor,
                     ValidatorChainCommit(
                         model_hash=model_ckpt.model_hash,
-                        global_ver=model_ckpt.global_ver,
+                        global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                         expert_group=config.task.exp.group_id,
                         miner_seed=0,
                         block=subtensor.block,
