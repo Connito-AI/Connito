@@ -236,10 +236,13 @@ def _submit_fallback_weights(
     subtensor: bittensor.Subtensor,
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = False,
+    fallback_miners: list[int] | None = None,
 ) -> bool:
     """Try previous weights from chain, otherwise submit uniform weights.
 
-    Validator UIDs are excluded — weights are only set on miners.
+    Validator UIDs are excluded — weights are only set on miners. When
+    ``fallback_miners`` is provided, it is used directly as the miner group
+    for the uniform-weights path (bypasses metagraph-wide miner derivation).
     """
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
 
@@ -267,8 +270,11 @@ def _submit_fallback_weights(
                                   wait_for_finalization=wait_for_finalization)
         logger.warning("No miner weights remain after excluding validators, falling through to uniform")
 
-    n = metagraph.n.item()
-    miner_uids = [uid for uid in range(n) if uid not in validator_uids]
+    if fallback_miners is not None:
+        miner_uids = [int(uid) for uid in fallback_miners]
+    else:
+        n = metagraph.n.item()
+        miner_uids = [uid for uid in range(n) if uid not in validator_uids]
     if not miner_uids:
         logger.warning("No miner UIDs available (all excluded as validators), skipping uniform weight set")
         return False
@@ -307,6 +313,7 @@ def submit_weights(
     top_k: int | None = None,
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = False,
+    fallback_miners: list[int] | None = None,
 ) -> bool:
     """
     Submit weights to the chain for this subnet.
@@ -317,6 +324,8 @@ def submit_weights(
     - If `top_k` is set, only the top-k weights are kept (by value) before normalization.
     - If `normalize=True`, weights are normalized to sum to 1.
     - Zero/negative or non-finite weights are dropped.
+    - `fallback_miners` is forwarded to `_submit_fallback_weights` and used as
+      the miner group for the uniform-weights fallback path.
     """
     # Filter invalid weights
     filtered: list[tuple[int, float]] = []
@@ -329,7 +338,8 @@ def submit_weights(
         logger.warning("No valid weights to submit, falling back to default weights", uids=len(uid_weights))
         return _submit_fallback_weights(config, wallet, subtensor,
                                         wait_for_inclusion=wait_for_inclusion,
-                                        wait_for_finalization=wait_for_finalization)
+                                        wait_for_finalization=wait_for_finalization,
+                                        fallback_miners=fallback_miners)
 
     if top_k is not None:
         if top_k <= 0:
