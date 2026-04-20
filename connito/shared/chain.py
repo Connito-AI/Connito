@@ -267,16 +267,26 @@ def _submit_fallback_weights(
             and (fallback_miner_uids is None or int(uid) in fallback_miner_uids)
         }
         dropped = len(prev_weights) - len(miner_prev_weights)
-        logger.info(
-            "Falling back to previous weights from chain (miners only)",
-            count=len(miner_prev_weights),
-            dropped_validator_uids=dropped,
-        )
-        if miner_prev_weights:
+
+        values = list(miner_prev_weights.values())
+        is_even = len(values) >= 2 and (max(values) - min(values)) < 1e-9
+
+        if miner_prev_weights and not is_even:
+            logger.info(
+                "Falling back to previous weights from chain (miners only)",
+                count=len(miner_prev_weights),
+                dropped_validator_uids=dropped,
+            )
             return submit_weights(config, wallet, subtensor, miner_prev_weights, normalize=True,
                                   wait_for_inclusion=wait_for_inclusion,
                                   wait_for_finalization=wait_for_finalization)
-        logger.warning("No miner weights remain after excluding validators, falling through to uniform")
+        if is_even:
+            logger.info(
+                "Previous on-chain weights are uniform; treating as no prev_weights and recomputing",
+                count=len(miner_prev_weights),
+            )
+        else:
+            logger.warning("No miner weights remain after excluding validators, falling through to uniform")
 
     if fallback_miners is not None:
         miner_uids = [int(uid) for uid in fallback_miners]
