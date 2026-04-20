@@ -112,6 +112,41 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
     return model.to(device)
 
 
+async def _evaluate_on_fresh_loader(
+    *,
+    config,
+    tokenizer,
+    combinded_seed: str,
+    step: int,
+    model: nn.Module,
+    device: torch.device,
+    max_eval_batches: int,
+    rank: int | None = None,
+) -> dict:
+    """Build a fresh eval dataloader and run evaluate_model on the given model.
+
+    Every caller shares the same `combinded_seed`, so the baseline and all
+    miner evals see the same batches — the deltas are comparable.
+    """
+    dataloader = await asyncio.to_thread(
+        get_dataloader,
+        config=config,
+        tokenizer=tokenizer,
+        seed=combinded_seed,
+        rank=0,
+        world_size=config.dataloader.world_size,
+    )
+
+    @track_eval_latency()
+    def _run():
+        return evaluate_model(step, model, dataloader, device, max_eval_batches, rank)
+
+    try:
+        return await asyncio.to_thread(_run)
+    finally:
+        del dataloader
+
+
 async def evaluator_worker(
     name: str,
     config,
@@ -121,6 +156,7 @@ async def evaluator_worker(
     base_model: nn.Module,
     tokenizer,
     combinded_seed: str,
+    baseline_loss: float,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
 ):
@@ -157,35 +193,36 @@ async def evaluator_worker(
                 merged_hash=get_model_hash(model.state_dict(), hex=True)[:6],
             )
 
-            eval_dataloader = await asyncio.to_thread(
-                get_dataloader,
+            metrics = await _evaluate_on_fresh_loader(
                 config=config,
                 tokenizer=tokenizer,
-                seed=combinded_seed,
-                rank=0,
-                world_size=config.dataloader.world_size,
+                combinded_seed=combinded_seed,
+                step=job.step,
+                model=model,
+                device=device,
+                max_eval_batches=max_eval_batches,
+                rank=rank,
             )
 
-            @track_eval_latency()
-            def run_eval_with_telemetry():
-                return evaluate_model(job.step, model, eval_dataloader, device, max_eval_batches, rank)
-
-            metrics = await asyncio.to_thread(run_eval_with_telemetry)
-
-            # We use 1.0 / loss as the score because MinerScoreAggregator and submit_weights assume higher is better.
+            # Score = (baseline_loss - miner_loss) ** 1.5. Direct loss-space delta
+            # isolates the miner's contribution over the un-merged baseline. Clamped
+            # at 0 because (-x) ** 1.5 returns a complex number in Python.
             val_loss = float(metrics.get("val_loss", 100))
-            score = 1.0 / max(val_loss, 1e-6)
+            delta = max(0.0, baseline_loss - val_loss)
+            score = delta ** 1.2
             aggregator.add_score(job.uid, job.hotkey, score)
             logger.info(
                 f"{name}: evaluation complete",
                 uid=job.uid,
                 hotkey=job.hotkey[:6],
                 val_loss=round(val_loss, 4),
-                score=round(score, 4),
+                baseline_loss=round(baseline_loss, 4),
+                delta=round(delta, 4),
+                score=round(score, 6),
             )
 
             # Explicit cleanup
-            del eval_dataloader, model, metrics
+            del model, metrics
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -203,7 +240,29 @@ async def evaluator_worker(
 async def run_evaluation(
     config, step, device, miners, score_aggregator, base_model: nn.Module, tokenizer, combinded_seed
 ):
-    # Device & dataloader (MOCK). Replace eval_dataloader with a real one.
+    import gc
+
+    # --- Baseline: evaluate the un-merged base model on the same eval stream so
+    # each miner's score can be expressed as an improvement delta over it. ---
+    baseline_metrics = await _evaluate_on_fresh_loader(
+        config=config,
+        tokenizer=tokenizer,
+        combinded_seed=combinded_seed,
+        step=step,
+        model=base_model,
+        device=device,
+        max_eval_batches=EVAL_MAX_BATCHES,
+    )
+    baseline_loss = float(baseline_metrics.get("val_loss", 100))
+    logger.info(
+        "Baseline evaluation complete (no miner merged)",
+        val_loss=round(baseline_loss, 4),
+    )
+
+    del baseline_metrics
+    gc.collect()
+    torch.cuda.empty_cache()
+
     miners_q: asyncio.Queue[MinerEvalJob] = asyncio.Queue()
 
     # Enqueue miners
@@ -214,7 +273,8 @@ async def run_evaluation(
     eval_workers = [
         asyncio.create_task(
             evaluator_worker(
-                f"evaluator-{i+1}", config, miners_q, score_aggregator, device, base_model, tokenizer, combinded_seed
+                f"evaluator-{i+1}", config, miners_q, score_aggregator, device,
+                base_model, tokenizer, combinded_seed, baseline_loss=baseline_loss,
             )
         )
         for i in range(EVAL_WORKERS)

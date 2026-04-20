@@ -643,7 +643,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 except ValueError:
                     continue
  
-            # Only show scores for miners evaluated or penalized this round
+            # Logging - Only show scores for miners evaluated or penalized this round
             this_round_uids = {job.uid for job in miner_jobs} | {
                 metagraph.hotkeys.index(hk) for hk in miner_assignment
                 if hk in metagraph.hotkeys and metagraph.hotkeys.index(hk) not in submitted_uids
