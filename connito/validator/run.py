@@ -3,12 +3,57 @@ import ctypes
 import gc
 import math
 import os
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
 load_dotenv()
 
 import secrets
 from typing import Any
+
+
+def _get_build_version() -> tuple[str, str]:
+    """Return (version, git_sha).
+
+    Precedence for `version`:
+      1. CONNITO_GIT_VERSION env (baked into the Docker image by CI; matches
+         the docker tag — e.g. "1.2.3", "master", "staging").
+      2. `git describe --tags --always` in a source checkout (e.g. "v1.2.3-5-gabc1234").
+      3. pyproject.toml version via installed metadata (e.g. "0.1.0").
+
+    Precedence for `git_sha`:
+      1. CONNITO_GIT_SHA env (baked into the Docker image).
+      2. `git rev-parse HEAD` in a source checkout.
+      3. "unknown".
+    """
+    import subprocess
+    from pathlib import Path
+
+    def _git(*args) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", *args],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return ""
+
+    version = os.environ.get("CONNITO_GIT_VERSION", "")
+    if not version or version == "unknown":
+        version = _git("describe", "--tags", "--always", "--dirty")
+    if not version:
+        try:
+            version = _pkg_version("subnet-moe")
+        except PackageNotFoundError:
+            version = "unknown"
+
+    sha = os.environ.get("CONNITO_GIT_SHA", "")
+    if not sha or sha == "unknown":
+        sha = _git("rev-parse", "HEAD") or "unknown"
+
+    return version, sha
 
 import bittensor
 import torch
@@ -240,7 +285,7 @@ async def aggregate_miner_gradient_change(
         job for job in miner_jobs
         if score_aggregator.is_in_top(
             uid=job.uid,
-            cutoff=config.run.top_k_miners_to_merge,
+            cutoff=config.evaluation.top_k_miners_to_merge,
             how="avg",
             among=this_round_uids,
         )
@@ -335,7 +380,7 @@ def sync_grad_across_validators(
                 avg_step = avg.step(
                     gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
                     timeout=config.run.averager_step_timeout_sec,
-                    allow_retries=False,
+                    allow_retries=True,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
                 )
@@ -415,7 +460,7 @@ def run_global_optimization(
         torch.cuda.empty_cache()
 
 
-def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
+def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = "") -> None:
     """
     The worker function for training in a distributed setting.
 
@@ -477,17 +522,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     _participated_in_merge = True
 
     # === set up score aggregator ===
+    score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if score_path.exists():
+    if pkg_version == "v0.0.5":
+        logger.info("Skipping historic score_aggregator load for v0.0.5", pkg_version=pkg_version)
+        score_aggregator = MinerScoreAggregator(max_points=score_window)
+    elif score_path.exists():
         try:
             with open(score_path, "r") as f:
-                score_aggregator = MinerScoreAggregator.from_json(f.read())
+                score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
             logger.info("Loaded previous MinerScoreAggregator state from disk")
         except Exception as e:
             logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
-            score_aggregator = MinerScoreAggregator()
+            score_aggregator = MinerScoreAggregator(max_points=score_window)
     else:
-        score_aggregator = MinerScoreAggregator()
+        score_aggregator = MinerScoreAggregator(max_points=score_window)
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
@@ -642,7 +691,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 except ValueError:
                     continue
  
-            # Only show scores for miners evaluated or penalized this round
+            # Logging - Only show scores for miners evaluated or penalized this round
             this_round_uids = {job.uid for job in miner_jobs} | {
                 metagraph.hotkeys.index(hk) for hk in miner_assignment
                 if hk in metagraph.hotkeys and metagraph.hotkeys.index(hk) not in submitted_uids
@@ -841,7 +890,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 subtensor=subtensor,
                 uid_weights=uid_weights,
                 normalize=True,
-                top_k=config.run.top_k_miners_to_reward,
+                top_k=config.evaluation.top_k_miners_to_reward,
                 fallback_miners=fallback_miners,
             )
 
@@ -852,7 +901,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     submission_dir=config.ckpt.miner_submission_path,
                     archive_dir=config.ckpt.miner_submission_archive_path,
                     score_aggregator=score_aggregator,
-                    top_k=config.run.top_k_miners_to_reward,
+                    top_k=config.evaluation.top_k_miners_to_reward,
                 )
             else:
                 logger.info("(10) Submission archiving disabled, skipping")
@@ -898,6 +947,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
+
+    pkg_version, git_sha = _get_build_version()
+    print(f"Connito validator — version={pkg_version}  git_sha={git_sha[:12]}", flush=True)
+    logger.info("Validator starting", version=pkg_version, git_sha=git_sha[:12])
 
     if args.path:
         config = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)

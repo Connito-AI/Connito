@@ -17,6 +17,7 @@ class MinerSeries:
     """Holds a single miner's (timestamp, score) points, kept sorted by time."""
 
     points: list[tuple[datetime, float]] = field(default_factory=list)
+    max_points: int = 16
 
     def add(self, ts: datetime, score: float) -> None:
         if ts.tzinfo is None:
@@ -26,10 +27,10 @@ class MinerSeries:
             self.points[i] = (ts, score)  # overwrite same-ts
         else:
             self.points.insert(i, (ts, score))
-            
-        # Keep only the last 4 phases (points) per miner to compute rolling average
-        if len(self.points) > 4:
-            self.points = self.points[-4:]
+
+        # Keep only the last max_points phases per miner to compute rolling average
+        if len(self.points) > self.max_points:
+            self.points = self.points[-self.max_points:]
 
     def slice(self, start: datetime | None, end: datetime | None) -> list[tuple[datetime, float]]:
         if start and start.tzinfo is None:
@@ -77,9 +78,10 @@ class MinerScoreAggregator:
     REQUIREMENT: if a uid's hotkey changes, that uid's score history resets.
     """
 
-    def __init__(self):
+    def __init__(self, max_points: int = 16):
         self._miners: dict[int, MinerState] = {}  # uid -> MinerState
         self._lock = threading.RLock()
+        self._max_points = max_points
 
     # ---------- Recording ----------
     def add_score(self, uid: int, hotkey: str, score: float, ts: datetime | None = None) -> None:
@@ -97,7 +99,7 @@ class MinerScoreAggregator:
         with self._lock:
             state = self._miners.get(uid)
             if state is None:
-                state = MinerState(uid=uid, hotkey=hotkey)
+                state = MinerState(uid=uid, hotkey=hotkey, series=MinerSeries(max_points=self._max_points))
                 self._miners[uid] = state
             elif state.hotkey != hotkey:
                 # Hotkey changed -> reset scores for this uid
@@ -120,7 +122,7 @@ class MinerScoreAggregator:
             state = self._miners.get(uid)
             if state is None:
                 # create empty series for new uid
-                self._miners[uid] = MinerState(uid=uid, hotkey=new_hotkey)
+                self._miners[uid] = MinerState(uid=uid, hotkey=new_hotkey, series=MinerSeries(max_points=self._max_points))
             else:
                 if state.hotkey != new_hotkey:
                     state.hotkey = new_hotkey
@@ -269,15 +271,15 @@ class MinerScoreAggregator:
         return json.dumps(payload)
 
     @classmethod
-    def from_json(cls, data: str) -> MinerScoreAggregator:
+    def from_json(cls, data: str, max_points: int = 16) -> MinerScoreAggregator:
         raw = json.loads(data)
-        agg = cls()
+        agg = cls(max_points=max_points)
         with agg._lock:
             for uid_str, body in raw.items():
                 uid = int(uid_str)
                 hotkey = body.get("hotkey", "")
                 pts = body.get("points", [])
-                state = MinerState(uid=uid, hotkey=hotkey)
+                state = MinerState(uid=uid, hotkey=hotkey, series=MinerSeries(max_points=max_points))
                 for ts_str, v in pts:
                     ts = datetime.fromisoformat(ts_str)
                     state.series.add(ts, float(v))
