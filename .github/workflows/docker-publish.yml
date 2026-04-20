@@ -112,6 +112,9 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_VERSION=${{ steps.meta.outputs.version }}
           # Use the GitHub Actions cache backend so subsequent builds reuse
           # the heavy pip-install layer (torch + transformers + hivemind).
           cache-from: type=gha

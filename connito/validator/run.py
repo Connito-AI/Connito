@@ -3,12 +3,57 @@ import ctypes
 import gc
 import math
 import os
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
 load_dotenv()
 
 import secrets
 from typing import Any
+
+
+def _get_build_version() -> tuple[str, str]:
+    """Return (version, git_sha).
+
+    Precedence for `version`:
+      1. CONNITO_GIT_VERSION env (baked into the Docker image by CI; matches
+         the docker tag — e.g. "1.2.3", "master", "staging").
+      2. `git describe --tags --always` in a source checkout (e.g. "v1.2.3-5-gabc1234").
+      3. pyproject.toml version via installed metadata (e.g. "0.1.0").
+
+    Precedence for `git_sha`:
+      1. CONNITO_GIT_SHA env (baked into the Docker image).
+      2. `git rev-parse HEAD` in a source checkout.
+      3. "unknown".
+    """
+    import subprocess
+    from pathlib import Path
+
+    def _git(*args) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", *args],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except Exception:
+            return ""
+
+    version = os.environ.get("CONNITO_GIT_VERSION", "")
+    if not version or version == "unknown":
+        version = _git("describe", "--tags", "--always", "--dirty")
+    if not version:
+        try:
+            version = _pkg_version("subnet-moe")
+        except PackageNotFoundError:
+            version = "unknown"
+
+    sha = os.environ.get("CONNITO_GIT_SHA", "")
+    if not sha or sha == "unknown":
+        sha = _git("rev-parse", "HEAD") or "unknown"
+
+    return version, sha
 
 import bittensor
 import torch
@@ -899,6 +944,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
+
+    pkg_version, git_sha = _get_build_version()
+    logger.info("Validator starting", version=pkg_version, git_sha=git_sha[:12])
 
     if args.path:
         config = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)

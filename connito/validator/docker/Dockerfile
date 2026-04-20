@@ -15,6 +15,17 @@
 ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_IMAGE} AS base
 
+# Build-time provenance, baked into the image so `run.py` can report which
+# commit/tag this image was built from. Set by CI (docker-publish.yml) or via
+#   docker build \
+#     --build-arg GIT_SHA=$(git rev-parse HEAD) \
+#     --build-arg GIT_VERSION=$(git describe --tags --always) \
+#     ...
+# GIT_SHA = immutable commit id; GIT_VERSION = human-readable (e.g. v1.2.3,
+# master-abc1234) — operators see the latter in startup logs.
+ARG GIT_SHA=unknown
+ARG GIT_VERSION=unknown
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -24,7 +35,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
     # Default Hivemind/DHT + telemetry ports — overridable at runtime
     CONNITO_DHT_PORT=6000 \
-    CONNITO_TELEMETRY_PORT=8200
+    CONNITO_TELEMETRY_PORT=8200 \
+    CONNITO_GIT_SHA=${GIT_SHA} \
+    CONNITO_GIT_VERSION=${GIT_VERSION}
 
 # System packages: python 3.10, build essentials (some wheels still need them),
 # git for the VCS-installed deps in requirements.txt (hivemind, unsloth),
