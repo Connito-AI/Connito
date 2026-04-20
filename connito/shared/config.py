@@ -551,9 +551,16 @@ class WorkerConfig(BaseConfig):
             data = self.model_dump(exclude={"task": {"exp"}})
             data = self._strip_root(data, self.run.root_path)
             data = convert_to_str(data)
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(data, f, sort_keys=False)
-            logger.info("Wrote updated config (new fields added)", path=str(config_path))
+            try:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, sort_keys=False)
+                logger.info("Wrote updated config (new fields added)", path=str(config_path))
+            except OSError as e:
+                logger.warning(
+                    "Could not persist new fields — config path is read-only; defaults applied in memory only",
+                    path=str(config_path),
+                    error=str(e),
+                )
 
     def check_and_prompt_locked(self, config_path: Path | None = None, auto_update: bool = False) -> None:
         """
@@ -600,9 +607,16 @@ class WorkerConfig(BaseConfig):
             data = self.model_dump(exclude={"task": {"exp"}})
             data = self._strip_root(data, self.run.root_path)
             data = convert_to_str(data)
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(data, f, sort_keys=False)
-            logger.info("Wrote updated config (locked fields reset)", path=str(config_path))
+            try:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, sort_keys=False)
+                logger.info("Wrote updated config (locked fields reset)", path=str(config_path))
+            except OSError as e:
+                logger.warning(
+                    "Could not persist locked-field reset — config path is read-only; reset applied in memory only",
+                    path=str(config_path),
+                    error=str(e),
+                )
 
     # -----------------------
     # Config equivalence / versioning
