@@ -460,7 +460,7 @@ def run_global_optimization(
         torch.cuda.empty_cache()
 
 
-def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
+def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = "") -> None:
     """
     The worker function for training in a distributed setting.
 
@@ -524,7 +524,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if score_path.exists():
+    if pkg_version == "v0.0.5":
+        logger.info("Skipping historic score_aggregator load for v0.0.5", pkg_version=pkg_version)
+        score_aggregator = MinerScoreAggregator(max_points=score_window)
+    elif score_path.exists():
         try:
             with open(score_path, "r") as f:
                 score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
