@@ -946,6 +946,7 @@ if __name__ == "__main__":
     args = parse_args()
 
     pkg_version, git_sha = _get_build_version()
+    print(f"Connito validator — version={pkg_version}  git_sha={git_sha[:12]}", flush=True)
     logger.info("Validator starting", version=pkg_version, git_sha=git_sha[:12])
 
     if args.path:
