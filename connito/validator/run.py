@@ -477,17 +477,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     _participated_in_merge = True
 
     # === set up score aggregator ===
+    score_window = config.run.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
     if score_path.exists():
         try:
             with open(score_path, "r") as f:
-                score_aggregator = MinerScoreAggregator.from_json(f.read())
+                score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
             logger.info("Loaded previous MinerScoreAggregator state from disk")
         except Exception as e:
             logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
-            score_aggregator = MinerScoreAggregator()
+            score_aggregator = MinerScoreAggregator(max_points=score_window)
     else:
-        score_aggregator = MinerScoreAggregator()
+        score_aggregator = MinerScoreAggregator(max_points=score_window)
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(

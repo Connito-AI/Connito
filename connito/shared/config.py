@@ -732,6 +732,7 @@ class ValidatorRunCfg(RunCfg):
     averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
     averager_step_max_retries: int = 2  # max retry attempts for averager step
     record_cuda_mem_history: bool = False  # enable torch.cuda.memory._record_memory_history (leaks RAM; profiling only)
+    score_window: int = 16  # max number of phases (points) retained per miner in MinerScoreAggregator
 
 
 class ValidatorConfig(WorkerConfig):
@@ -805,7 +806,8 @@ def parse_args():
     parser.add_argument("--path", type=str, help="Path to validator YAML config file")
     parser.add_argument(
         "--auto_update_config",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Auto-reset locked config fields to defaults without prompting.",
     )
 
