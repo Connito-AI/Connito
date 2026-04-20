@@ -240,7 +240,7 @@ async def aggregate_miner_gradient_change(
         job for job in miner_jobs
         if score_aggregator.is_in_top(
             uid=job.uid,
-            cutoff=config.run.top_k_miners_to_merge,
+            cutoff=config.evaluation.top_k_miners_to_merge,
             how="avg",
             among=this_round_uids,
         )
@@ -477,7 +477,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
     _participated_in_merge = True
 
     # === set up score aggregator ===
-    score_window = config.run.score_window
+    score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
     if score_path.exists():
         try:
@@ -842,7 +842,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                 subtensor=subtensor,
                 uid_weights=uid_weights,
                 normalize=True,
-                top_k=config.run.top_k_miners_to_reward,
+                top_k=config.evaluation.top_k_miners_to_reward,
                 fallback_miners=fallback_miners,
             )
 
@@ -853,7 +853,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig) -> None:
                     submission_dir=config.ckpt.miner_submission_path,
                     archive_dir=config.ckpt.miner_submission_archive_path,
                     score_aggregator=score_aggregator,
-                    top_k=config.run.top_k_miners_to_reward,
+                    top_k=config.evaluation.top_k_miners_to_reward,
                 )
             else:
                 logger.info("(10) Submission archiving disabled, skipping")

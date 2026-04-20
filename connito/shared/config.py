@@ -481,7 +481,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation")
 
     @classmethod
     def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
@@ -727,12 +727,18 @@ class MinerConfig(WorkerConfig):
 
 
 class ValidatorRunCfg(RunCfg):
-    top_k_miners_to_merge: int = 3    # top-N miners whose gradients are merged into global model
-    top_k_miners_to_reward: int = 1   # top-N miners who receive chain weights
     averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
     averager_step_max_retries: int = 2  # max retry attempts for averager step
     record_cuda_mem_history: bool = False  # enable torch.cuda.memory._record_memory_history (leaks RAM; profiling only)
-    score_window: int = 16  # max number of phases (points) retained per miner in MinerScoreAggregator
+
+
+class EvalCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window",
+    })
+    top_k_miners_to_merge: int = 3    # top-N miners whose gradients are merged into global model
+    top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
+    score_window: int = 16            # max number of phases (points) retained per miner in MinerScoreAggregator
 
 
 class ValidatorConfig(WorkerConfig):
@@ -740,6 +746,7 @@ class ValidatorConfig(WorkerConfig):
     ckpt: ValidatorCheckpointCfg = Field(default_factory=ValidatorCheckpointCfg)
     dht: DhtCfg = Field(default_factory=DhtCfg)
     run: ValidatorRunCfg = Field(default_factory=ValidatorRunCfg)
+    evaluation: EvalCfg = Field(default_factory=EvalCfg)
 
     def write_docker_env(self, env_path: Path | None = None) -> None:
         """Generate a Docker compose .env file from the current config."""
