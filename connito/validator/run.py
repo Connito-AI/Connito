@@ -380,7 +380,7 @@ def sync_grad_across_validators(
                 avg_step = avg.step(
                     gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
                     timeout=config.run.averager_step_timeout_sec,
-                    allow_retries=False,
+                    allow_retries=True,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
                 )
