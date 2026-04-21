@@ -684,7 +684,10 @@ async def submit_checkpoint(
 
     logger.info("Submission verified", path=str(dest_path))
 
-    delete_old_checkpoints_by_hotkey(config.ckpt.miner_submission_path)
+    delete_old_checkpoints_by_hotkey(
+        config.ckpt.miner_submission_path,
+        keep_per_hotkey=config.ckpt.miner_submission_keep_per_hotkey,
+    )
 
     return {
         "status": "ok",

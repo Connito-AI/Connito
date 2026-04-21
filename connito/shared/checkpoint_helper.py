@@ -31,6 +31,27 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:.2f}{units[unit_idx]}"
 
 
+def cleanup_temporary_checkpoint_dirs(checkpoint_root: str | Path) -> list[str]:
+    checkpoint_root = Path(checkpoint_root)
+    if not checkpoint_root.exists():
+        return []
+
+    removed: list[str] = []
+    for path in checkpoint_root.iterdir():
+        if not path.name.startswith(".tmp_"):
+            continue
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+        removed.append(str(path))
+
+    if removed:
+        logger.warning("Removed stale temporary checkpoints", count=len(removed), paths=removed)
+
+    return removed
+
+
 # @total_ordering
 # @dataclass
 # class ModelCheckpoint:
@@ -409,96 +430,102 @@ def save_checkpoint(
     checkpoint_path = Path(checkpoint_path)
     tmp_checkpoint_path = checkpoint_path.with_name(f".tmp_{checkpoint_path.name}")
 
+    cleanup_temporary_checkpoint_dirs(checkpoint_path.parent)
+
     if tmp_checkpoint_path.exists():
         shutil.rmtree(tmp_checkpoint_path)
     tmp_checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     write_path = tmp_checkpoint_path
 
-    # === save model, optimizer ===
-    model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
-
-    if save_model_by_expert_group and expert_manager is not None:
-        state_dict = model.state_dict()
-        save_state_dict_by_expert_group(
-            state_dict,
-            expert_manager.expert_group_assignment,
-            write_path,
-            strict_sharding=strict_sharding,
-            active_expert_group_id=active_expert_group_id,
-            save_dtype=model_dtype,
-        )
-        del state_dict
-        gc.collect()
-
-    else:
-        checkpoint = {
-            "model_state_dict": {k: v.detach().to(dtype=model_dtype, device="cpu", non_blocking=True) for k, v in model.state_dict().items()},
-            "loss": loss,
-        }
-        target = write_path / "model.pt"
-        if not target.exists():
-            with fsspec.open(str(target), "wb") as f:
-                torch.save(checkpoint, f)
-
-    # === save optimizer ===
-    if inner_optimizer is not None:
-        opt_checkpoint = {
-            "optimizer_state_dict": inner_optimizer.state_dict(),
-        }
-
-        target = write_path / "inner_optimizer.pt"
-        if not target.exists():
-            with fsspec.open(str(target), "wb") as f:
-                torch.save(opt_checkpoint, f)
-
-    if outer_optimizer is not None:
-        opt_checkpoint = {
-            "optimizer_state_dict": outer_optimizer.state_dict(),
-        }
-        target = write_path / "outer_optimizer.pt"
-        if not target.exists():
-            with fsspec.open(str(target), "wb") as f:
-                torch.save(opt_checkpoint, f)
-
-    # === save dataloader ===
-    if data_loader is not None:
-        rank_state_dict = {}
-        rank_state_dict["data_loader"] = data_loader.state_dict()
-
-        target = write_path / f"dataloader_rank{rank}.pt"
-        if not target.exists():
-            with fsspec.open(str(target), "wb") as f:
-                torch.save(rank_state_dict, f)
-
-        del rank_state_dict
-
-    if save_global_state:
-        # === save global state ===
-        global_state_dict = {
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "loss": loss if loss is not None else 0,
-        }
-
-        if inner_scaler is not None:
-            global_state_dict["inner_scaler_state_dict"] = inner_scaler.state_dict()
-
-        if outer_scaler is not None:
-            global_state_dict["outer_scaler_state_dict"] = outer_scaler.state_dict()
-
-        target = write_path / "global_state.pt"
-        if not target.exists():
-            with fsspec.open(str(target), "wb") as f:
-                torch.save(global_state_dict, f)
-
     try:
-        os.replace(write_path, checkpoint_path)
-    except OSError as e:
-        if checkpoint_path.exists() and e.errno in (errno.EEXIST, errno.ENOTEMPTY):
-            shutil.rmtree(checkpoint_path)
-            os.replace(write_path, checkpoint_path)
+        # === save model, optimizer ===
+        model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
+
+        if save_model_by_expert_group and expert_manager is not None:
+            state_dict = model.state_dict()
+            save_state_dict_by_expert_group(
+                state_dict,
+                expert_manager.expert_group_assignment,
+                write_path,
+                strict_sharding=strict_sharding,
+                active_expert_group_id=active_expert_group_id,
+                save_dtype=model_dtype,
+            )
+            del state_dict
+            gc.collect()
+
         else:
-            raise
+            checkpoint = {
+                "model_state_dict": {k: v.detach().to(dtype=model_dtype, device="cpu", non_blocking=True) for k, v in model.state_dict().items()},
+                "loss": loss,
+            }
+            target = write_path / "model.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(checkpoint, f)
+
+        # === save optimizer ===
+        if inner_optimizer is not None:
+            opt_checkpoint = {
+                "optimizer_state_dict": inner_optimizer.state_dict(),
+            }
+
+            target = write_path / "inner_optimizer.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(opt_checkpoint, f)
+
+        if outer_optimizer is not None:
+            opt_checkpoint = {
+                "optimizer_state_dict": outer_optimizer.state_dict(),
+            }
+            target = write_path / "outer_optimizer.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(opt_checkpoint, f)
+
+        # === save dataloader ===
+        if data_loader is not None:
+            rank_state_dict = {}
+            rank_state_dict["data_loader"] = data_loader.state_dict()
+
+            target = write_path / f"dataloader_rank{rank}.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(rank_state_dict, f)
+
+            del rank_state_dict
+
+        if save_global_state:
+            # === save global state ===
+            global_state_dict = {
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "loss": loss if loss is not None else 0,
+            }
+
+            if inner_scaler is not None:
+                global_state_dict["inner_scaler_state_dict"] = inner_scaler.state_dict()
+
+            if outer_scaler is not None:
+                global_state_dict["outer_scaler_state_dict"] = outer_scaler.state_dict()
+
+            target = write_path / "global_state.pt"
+            if not target.exists():
+                with fsspec.open(str(target), "wb") as f:
+                    torch.save(global_state_dict, f)
+
+        try:
+            os.replace(write_path, checkpoint_path)
+        except OSError as e:
+            if checkpoint_path.exists() and e.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                shutil.rmtree(checkpoint_path)
+                os.replace(write_path, checkpoint_path)
+            else:
+                raise
+    except Exception:
+        shutil.rmtree(write_path, ignore_errors=True)
+        raise
 
     logger.info(f"Checkpoint saved to {checkpoint_path}")
 

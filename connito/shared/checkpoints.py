@@ -784,19 +784,25 @@ def delete_old_checkpoints(checkpoint_path: str | Path, topk: int) -> list[str]:
     return ckpt_deleted
 
 
-def delete_old_checkpoints_by_hotkey(folder_path: Path) -> list[str]:
+def prune_miner_submission_files(
+    folder_path: Path,
+    keep_per_hotkey: int = 1,
+    max_total_files: int | None = None,
+) -> list[str]:
     """
-    Deletes all non-latest submission files coming from the same hotkey.
-    Keeps only the file with the highest block number per hotkey.
+    Prune miner submission files aggressively.
+    First keep only the latest `keep_per_hotkey` files for each hotkey, then
+    optionally enforce `max_total_files` across the remaining set.
     """
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
 
+    keep_per_hotkey = max(0, keep_per_hotkey)
     submissions_by_hotkey: dict[str, list[tuple[int, Path]]] = {}
     for file_path in folder_path.glob("*.pt"):
         meta = parse_dynamic_filename(file_path.name)
         if "hotkey" not in meta or "block" not in meta:
-            print(f"Skipping malformed filename: {file_path.name}")
+            logger.warning("Skipping malformed submission filename", file=file_path.name)
             continue
 
         hotkey = meta["hotkey"]
@@ -806,16 +812,28 @@ def delete_old_checkpoints_by_hotkey(folder_path: Path) -> list[str]:
             submissions_by_hotkey[hotkey] = []
         submissions_by_hotkey[hotkey].append((block, file_path))
 
-    deleted_files = []
-    for _, entries in submissions_by_hotkey.items():
+    deleted_files: list[str] = []
+    retained_entries: list[tuple[int, Path]] = []
+    for hotkey, entries in submissions_by_hotkey.items():
         entries.sort(key=lambda x: x[0], reverse=True)
+        retained_entries.extend(entries[:keep_per_hotkey])
 
-        for _, file_path in entries[2:]:
+        for _, file_path in entries[keep_per_hotkey:]:
             try:
                 os.remove(file_path)
                 deleted_files.append(file_path.name)
             except Exception as exc:
-                print(f"Failed to delete {file_path.name}: {exc}")
+                logger.warning("Failed to delete submission file", file=file_path.name, error=str(exc), hotkey=hotkey)
+
+    if max_total_files is not None:
+        max_total_files = max(0, max_total_files)
+        retained_entries.sort(key=lambda item: item[0], reverse=True)
+        for _, file_path in retained_entries[max_total_files:]:
+            try:
+                os.remove(file_path)
+                deleted_files.append(file_path.name)
+            except Exception as exc:
+                logger.warning("Failed to enforce submission file cap", file=file_path.name, error=str(exc))
 
     if deleted_files:
         logger.info("Deleted outdated submissions", count=len(deleted_files), files=deleted_files)
@@ -823,6 +841,13 @@ def delete_old_checkpoints_by_hotkey(folder_path: Path) -> list[str]:
         logger.debug("No outdated submissions to delete")
 
     return deleted_files
+
+
+def delete_old_checkpoints_by_hotkey(folder_path: Path, keep_per_hotkey: int = 1) -> list[str]:
+    """
+    Backward-compatible wrapper for per-hotkey miner submission pruning.
+    """
+    return prune_miner_submission_files(folder_path, keep_per_hotkey=keep_per_hotkey)
 
 
 def archive_top_miner_submissions(
