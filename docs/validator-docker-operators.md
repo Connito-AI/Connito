@@ -173,6 +173,26 @@ sudo ufw allow 6000/udp     # hivemind DHT (QUIC)
 # 8200/tcp telemetry — leave closed unless you scrape it remotely
 ```
 
+### 8. Apply host TCP tuning
+
+The checkpoint server streams 3+ GiB files over long-haul TCP. Default
+Linux socket buffers (~208 KB) cap a single connection at roughly
+`buffer / RTT` — about 1 MB/s at 200 ms RTT, which is why miners see
+~3 MiB/s downloads from untuned validators. The compose stack uses
+`network_mode: host`, so the tuning has to live on the host.
+
+```bash
+sudo cp infra/sysctl/99-connito-tcp.conf /etc/sysctl.d/
+sudo sysctl --system
+```
+
+Verify:
+
+```bash
+sysctl net.core.wmem_max net.ipv4.tcp_congestion_control net.core.default_qdisc
+# expect: 16777216, bbr, fq
+```
+
 ## Running
 
 From `connito/validator/docker/`:
@@ -264,6 +284,7 @@ reachable.
 | `permission denied while trying to connect to the Docker daemon socket` | You forgot `usermod -aG docker $USER` + `newgrp docker` from step 1. |
 | Validator logs spam `wallet not found` | `BITTENSOR_WALLET_PATH` in `.env` doesn't point at the right host path, or `WALLET_NAME` / `HOTKEY_NAME` don't match what's actually under that dir. |
 | Validator can't reach hivemind peers | Firewall step 7 not done, or `dht.port` in `validator.yaml` doesn't match what you opened. Both **TCP and UDP** must be open. |
+| Miners report ~3 MiB/s downloads from `/get-checkpoint` | Host TCP tuning (step 8) not applied. Confirm with `sysctl net.core.wmem_max net.ipv4.tcp_congestion_control` — should report `16777216` and `bbr`. |
 | Watchtower never upgrades | Either the registry is private and Watchtower has no creds (mount `~/.docker/config.json`), or you pinned `IMAGE` to a sha or `vX.Y.Z` tag (Watchtower only follows moving tags like `:stable` or `:staging`), or no new tagged release has been cut since you started. |
 | Image pull fails with `denied` | GHCR package is private and you haven't run `docker login ghcr.io` on the host. |
 | `CUDA error: no kernel image is available for execution on the device` | Your GPU is too old for the CUDA runtime in the image, or your host driver is < 550. |
