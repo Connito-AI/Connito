@@ -320,7 +320,11 @@ async def stream_gather_and_evaluate(
     """
     # Deferred import — gather_validation_job depends on config schemas that
     # would otherwise create a circular import at module load.
-    from connito.shared.cycle import gather_validation_job
+    from connito.shared.cycle import gather_validation_job, get_validator_miner_assignment
+
+    # Compute once and reuse across every poll tick — the assignment is
+    # stable for the duration of this Submission window.
+    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
 
     # --- Baseline: unmerged base model scored once, reused for all deltas ---
     baseline_metrics = await _evaluate_on_fresh_loader(
@@ -364,7 +368,12 @@ async def stream_gather_and_evaluate(
     try:
         while subtensor.block <= end_block:
             try:
-                jobs = gather_validation_job(config, subtensor, step=step)
+                jobs = gather_validation_job(
+                    config,
+                    subtensor,
+                    step=step,
+                    validator_miner_assignment=validator_miner_assignment,
+                )
             except Exception as e:
                 logger.warning("stream_evaluate: gather_validation_job failed", error=str(e))
                 jobs = []

@@ -86,7 +86,6 @@ from connito.shared.checkpoints import (
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.cycle import (
     check_phase_expired,
-    get_blocks_until_next_phase_from_api,
     get_combined_validator_seed,
     wait_till,
 )
@@ -653,26 +652,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(subtensor, phase_response)
 
-            # === Wait till Submission phase; stream-evaluate through Submission + Validate ===
+            # === Wait till Submission phase; stream-evaluate during Submission only ===
             # Start eval as soon as miners can submit so slow uploads get picked
-            # up and scored the moment they land, rather than all-at-once at the
-            # Validate phase boundary. Evaluation runs one miner at a time until
-            # the Validate phase ends.
+            # up and scored the moment they land. Evaluation runs one miner at a
+            # time and stops at the Submission phase boundary.
             phase_response = wait_till(config, PhaseNames.submission)
-
-            # Resolve the absolute end block for the combined window.
-            blocks_until = get_blocks_until_next_phase_from_api(config)
-            if blocks_until and PhaseNames.validate in blocks_until:
-                _validate_start, validate_end_block, _ = blocks_until[PhaseNames.validate]
-            else:
-                # Fallback: validate follows submission immediately per cycle config.
-                validate_end_block = phase_response.phase_end_block + config.cycle.validate_period
 
             logger.info(
                 "(1) Starting streaming miner evaluation",
                 submission_start=phase_response.phase_start_block,
                 submission_end=phase_response.phase_end_block,
-                validate_end=validate_end_block,
                 current_block=subtensor.block,
             )
 
@@ -687,10 +676,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     base_model=global_model,
                     tokenizer=tokenizer,
                     combined_seed=get_combined_validator_seed(config, subtensor),
-                    end_block=validate_end_block,
+                    end_block=phase_response.phase_end_block,
                 )
             )
-            logger.info("(2) Streaming evaluation complete", evaluated=len(miner_jobs))
+
+            phase_response = wait_till(config, PhaseNames.validate)
+
+            logger.info("(2) Streaming evaluation complete, aggregating score", evaluated=len(miner_jobs))
             if len(miner_jobs) == 0:
                 logger.warning("No miner jobs evaluated", step=global_opt_step)
 
