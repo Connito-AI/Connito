@@ -28,7 +28,10 @@ on:
       - ".dockerignore"
       - ".github/workflows/docker-publish.yml"
   pull_request:
-    branches: [staging]
+    # Build (and push to GHCR as :pr-<N>) on any PR targeting master or
+    # staging so reviewers can confirm the image actually builds before
+    # merging, and pull the PR image for test deploys if needed.
+    branches: [master, staging]
     paths:
       - "connito/validator/**"
       - "connito/shared/**"

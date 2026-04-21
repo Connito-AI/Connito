@@ -528,9 +528,12 @@ def load_submission_files(folder: str = "miner_submission"):
     return files_dict
 
 
-def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtensor, step: int) -> list[MinerEvalJob]:
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
-
+def gather_validation_job(
+    config: ValidatorConfig,
+    subtensor: bittensor.Subtensor,
+    step: int,
+    validator_miner_assignment: dict[str, list[str]],
+) -> list[MinerEvalJob]:
     miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
 
     if not miner_assignment:
@@ -593,7 +596,7 @@ def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtenso
 
 
     if missing_hotkeys:
-        logger.warning(
+        logger.debug(
             "Missing miner submissions",
             missing_hotkeys=missing_hotkeys,
             assigned_count=len(miner_assignment),
@@ -601,7 +604,7 @@ def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtenso
         )
     
     if unexpected_submissions:
-        logger.warning(
+        logger.debug(
             "Rejected submission: In phase but unassigned miner",
             unexpected_count=len(unexpected_submissions),
             unexpected_submissions=unexpected_submissions,

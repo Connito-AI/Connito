@@ -17,6 +17,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.app_logging import configure_logging, structlog
@@ -48,6 +49,13 @@ app = FastAPI(title="Checkpoint Sender", version="1.0.0")
 
 # ---- Settings via environment variables ----
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for auth
+
+# Concurrency cap for /get-checkpoint serves. Initialized from
+# config.ckpt.download_concurrency in __main__ once the config is loaded.
+_download_semaphore: asyncio.Semaphore | None = None
+# Concurrency cap for /submit-checkpoint streams. Initialized from
+# config.ckpt.submission_concurrency in __main__ once the config is loaded.
+_submission_semaphore: asyncio.Semaphore | None = None
 
 
 
@@ -366,13 +374,6 @@ async def get_checkpoint(
     if not latest_checkpoint or not latest_checkpoint.path:
         raise HTTPException(status_code=503, detail="No checkpoint available on disk yet — validator has not completed a training cycle")
 
-    logger.info(
-        "Serving checkpoint download",
-        from_hk=origin_hotkey_ss58[:6] if origin_hotkey_ss58 else None,
-        block=origin_block,
-        expert_group_id=expert_group_id,
-    )
-
     if expert_group_id is not None:
         if expert_group_id == "shared":
             ckpt_path = latest_checkpoint.path / "model_shared.pt"
@@ -388,10 +389,29 @@ async def get_checkpoint(
             detail=f"Checkpoint not found: {ckpt_path.name}",
         )
 
-    logger.debug("Preparing file response", path=str(ckpt_path))
-    result = file_response_for(Path(ckpt_path), f"step{latest_checkpoint.global_ver}")
+    # Queue behind the uplink-concurrency cap. Acquired here, released via
+    # BackgroundTask after Starlette finishes streaming the FileResponse.
+    assert _download_semaphore is not None, "Download semaphore not initialized"
+    queued_at = asyncio.get_event_loop().time()
+    await _download_semaphore.acquire()
+    wait_s = asyncio.get_event_loop().time() - queued_at
 
-    return result
+    try:
+        logger.info(
+            "Serving checkpoint download",
+            from_hk=origin_hotkey_ss58[:6] if origin_hotkey_ss58 else None,
+            block=origin_block,
+            expert_group_id=expert_group_id,
+            queue_wait_s=round(wait_s, 3),
+        )
+
+        logger.debug("Preparing file response", path=str(ckpt_path))
+        result = file_response_for(Path(ckpt_path), f"step{latest_checkpoint.global_ver}")
+        result.background = BackgroundTask(_download_semaphore.release)
+        return result
+    except BaseException:
+        _download_semaphore.release()
+        raise
 
 def validate_get_checkpoint_request(
     config: ValidatorConfig,
@@ -620,6 +640,20 @@ async def submit_checkpoint(
                 await out.write(chunk)
                 bytes_written += len(chunk)
 
+    # Queue behind the downlink-concurrency cap. Held across the whole
+    # stream-to-disk phase; released in finally so TimeoutError / disconnect
+    # paths free the slot too.
+    assert _submission_semaphore is not None, "Submission semaphore not initialized"
+    queued_at = asyncio.get_event_loop().time()
+    await _submission_semaphore.acquire()
+    wait_s = asyncio.get_event_loop().time() - queued_at
+    if wait_s > 0.1:
+        logger.info(
+            "Submission queued behind concurrency cap",
+            from_hk=origin_hotkey_ss58[:6] if origin_hotkey_ss58 else None,
+            queue_wait_s=round(wait_s, 3),
+        )
+
     try:
         await asyncio.wait_for(_stream_to_disk(), timeout=SUBMISSION_TIMEOUT_SEC)
 
@@ -646,6 +680,7 @@ async def submit_checkpoint(
         raise HTTPException(status_code=500, detail="Failed to store file") from e
     finally:
         await file.close()
+        _submission_semaphore.release()
 
     computed = hasher.hexdigest()
 
@@ -708,6 +743,14 @@ if __name__ == "__main__":
         config = ValidatorConfig()
 
     config.write()
+
+    _download_semaphore = asyncio.Semaphore(config.ckpt.download_concurrency)
+    _submission_semaphore = asyncio.Semaphore(config.ckpt.submission_concurrency)
+    logger.info(
+        "Concurrency caps set",
+        download_limit=config.ckpt.download_concurrency,
+        submission_limit=config.ckpt.submission_concurrency,
+    )
 
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     subtensor = bittensor.Subtensor(network=config.chain.network)

@@ -170,8 +170,8 @@ class CycleCfg(BaseConfig):
     distribute_period: int = 20 # 4 mins
     train_period: int = 300 # 1 hr (will adjust to 500 mins when mature to align with Diloco)
     commit_period: int = 8 # 1.6 mins
-    submission_period: int = 20 # 4 mins
-    validate_period: int = 50 # 10 mins
+    submission_period: int = 60 # 4 mins
+    validate_period: int = 10 # 10 mins
     merge_period: int = 50 # 10 mins
 
     owner_url: str = "https://cycle-api.connito.ai:443"
@@ -311,6 +311,15 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
+    # Max concurrent /get-checkpoint serves. During Distribute bursts 20+ peers
+    # hit the server in seconds; uncapped they each get link_capacity/N
+    # (≈3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
+    # active transfer at full line rate.
+    download_concurrency: int = 4
+    # Max concurrent /submit-checkpoint streams. Protects the server downlink
+    # and disk write throughput from N parallel 3.35 GiB uploads dragging each
+    # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
+    submission_concurrency: int = 2
 
 
 class DhtCfg(BaseConfig):
