@@ -887,15 +887,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 "Submitting weights derived from avg scores",
                 top_weights={str(k): round(v, 4) for k, v in sorted(uid_weights.items(), key=lambda item: item[1], reverse=True)[:5]}
             )
-            # Fallback miner group: all miners assigned across validators this cycle.
-            assigned_miner_hotkeys = {
-                hk for hotkeys in validator_miner_assignment.values() for hk in hotkeys
-            }
-            fallback_miners = [
-                metagraph.hotkeys.index(hk)
-                for hk in assigned_miner_hotkeys
-                if hk in metagraph.hotkeys
-            ]
             submit_weights(
                 config=config,
                 wallet=wallet,
@@ -903,7 +894,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 uid_weights=uid_weights,
                 normalize=True,
                 top_k=config.evaluation.top_k_miners_to_reward,
-                fallback_miners=fallback_miners,
             )
 
             # === archive top-k submissions, delete the rest ===
