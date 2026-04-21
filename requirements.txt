@@ -51,7 +51,6 @@ fsspec==2024.6.1
 # -----------------------------
 bittensor==10.1.0
 bittensor-cli==9.18.0
-substrate-interface==1.8.1
 
 # -----------------------------
 # Observability
