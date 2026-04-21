@@ -16,7 +16,7 @@ from requests.exceptions import (
     RequestException,
     Timeout,
 )
-from substrateinterface import Keypair
+from bittensor import Keypair
 
 from connito.shared.app_logging import structlog
 from connito.shared.schema import (
