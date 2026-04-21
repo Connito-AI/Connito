@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import bittensor as bt
-from substrateinterface import Keypair
+from bittensor import Keypair
 
 from connito.shared.checkpoint_helper import compile_full_state_dict_from_path
 from connito.shared.helper import get_model_hash
