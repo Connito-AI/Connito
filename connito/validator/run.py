@@ -84,7 +84,12 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
-from connito.shared.cycle import check_phase_expired, gather_validation_job, get_combined_validator_seed, wait_till
+from connito.shared.cycle import (
+    check_phase_expired,
+    get_blocks_until_next_phase_from_api,
+    get_combined_validator_seed,
+    wait_till,
+)
 from connito.shared.dataloader import get_dataloader
 from connito.shared.expert_manager import (
     ExpertManager,
@@ -100,7 +105,7 @@ from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator.evaluator import (
     MinerEvalJob,
     load_model_from_path,
-    run_evaluation,
+    stream_gather_and_evaluate,
 )
 from connito.validator.inter_validator_connection import (
     build_averagers_from_buff,
@@ -648,31 +653,46 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(subtensor, phase_response)
 
-            # === Wait till validation phase to start the validation procedure ===
-            phase_response = wait_till(config, PhaseNames.validate)
-            
-            # === Get miner ===
-            logger.info("(1) Gathering miner jobs")
-            miner_jobs = gather_validation_job(config, subtensor, step=global_opt_step)
-            logger.debug("Miner jobs collected", step=global_opt_step, count=len(miner_jobs))
-            if len(miner_jobs) == 0:
-                logger.warning("No miner jobs to evaluate", step=global_opt_step)
+            # === Wait till Submission phase; stream-evaluate through Submission + Validate ===
+            # Start eval as soon as miners can submit so slow uploads get picked
+            # up and scored the moment they land, rather than all-at-once at the
+            # Validate phase boundary. Evaluation runs one miner at a time until
+            # the Validate phase ends.
+            phase_response = wait_till(config, PhaseNames.submission)
 
-            # === Get miner model and evaluate the miners ===
-            logger.info("(2) Evaluating miners")
+            # Resolve the absolute end block for the combined window.
+            blocks_until = get_blocks_until_next_phase_from_api(config)
+            if blocks_until and PhaseNames.validate in blocks_until:
+                _validate_start, validate_end_block, _ = blocks_until[PhaseNames.validate]
+            else:
+                # Fallback: validate follows submission immediately per cycle config.
+                validate_end_block = phase_response.phase_end_block + config.cycle.validate_period
+
+            logger.info(
+                "(1) Starting streaming miner evaluation",
+                submission_start=phase_response.phase_start_block,
+                submission_end=phase_response.phase_end_block,
+                validate_end=validate_end_block,
+                current_block=subtensor.block,
+            )
+
             cleanup(global_model)
-            asyncio.run(
-                run_evaluation(
+            miner_jobs = asyncio.run(
+                stream_gather_and_evaluate(
                     config=config,
+                    subtensor=subtensor,
                     step=global_opt_step,
-                    device=device,  # operate at cuda
-                    miners=miner_jobs,
+                    device=device,
                     score_aggregator=score_aggregator,
                     base_model=global_model,
                     tokenizer=tokenizer,
-                    combinded_seed=get_combined_validator_seed(config, subtensor),
+                    combined_seed=get_combined_validator_seed(config, subtensor),
+                    end_block=validate_end_block,
                 )
             )
+            logger.info("(2) Streaming evaluation complete", evaluated=len(miner_jobs))
+            if len(miner_jobs) == 0:
+                logger.warning("No miner jobs evaluated", step=global_opt_step)
 
             cleanup(global_model)
             
