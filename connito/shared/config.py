@@ -311,6 +311,11 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
+    # Max concurrent /get-checkpoint serves. During Distribute bursts 20+ peers
+    # hit the server in seconds; uncapped they each get link_capacity/N
+    # (≈3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
+    # active transfer at full line rate.
+    download_concurrency: int = 4
 
 
 class DhtCfg(BaseConfig):
