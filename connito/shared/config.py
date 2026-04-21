@@ -316,6 +316,10 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     # (≈3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
     # active transfer at full line rate.
     download_concurrency: int = 4
+    # Max concurrent /submit-checkpoint streams. Protects the server downlink
+    # and disk write throughput from N parallel 3.35 GiB uploads dragging each
+    # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
+    submission_concurrency: int = 2
 
 
 class DhtCfg(BaseConfig):

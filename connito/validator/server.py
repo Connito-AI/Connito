@@ -53,6 +53,9 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for auth
 # Concurrency cap for /get-checkpoint serves. Initialized from
 # config.ckpt.download_concurrency in __main__ once the config is loaded.
 _download_semaphore: asyncio.Semaphore | None = None
+# Concurrency cap for /submit-checkpoint streams. Initialized from
+# config.ckpt.submission_concurrency in __main__ once the config is loaded.
+_submission_semaphore: asyncio.Semaphore | None = None
 
 
 
@@ -637,6 +640,20 @@ async def submit_checkpoint(
                 await out.write(chunk)
                 bytes_written += len(chunk)
 
+    # Queue behind the downlink-concurrency cap. Held across the whole
+    # stream-to-disk phase; released in finally so TimeoutError / disconnect
+    # paths free the slot too.
+    assert _submission_semaphore is not None, "Submission semaphore not initialized"
+    queued_at = asyncio.get_event_loop().time()
+    await _submission_semaphore.acquire()
+    wait_s = asyncio.get_event_loop().time() - queued_at
+    if wait_s > 0.1:
+        logger.info(
+            "Submission queued behind concurrency cap",
+            from_hk=origin_hotkey_ss58[:6] if origin_hotkey_ss58 else None,
+            queue_wait_s=round(wait_s, 3),
+        )
+
     try:
         await asyncio.wait_for(_stream_to_disk(), timeout=SUBMISSION_TIMEOUT_SEC)
 
@@ -663,6 +680,7 @@ async def submit_checkpoint(
         raise HTTPException(status_code=500, detail="Failed to store file") from e
     finally:
         await file.close()
+        _submission_semaphore.release()
 
     computed = hasher.hexdigest()
 
@@ -727,7 +745,12 @@ if __name__ == "__main__":
     config.write()
 
     _download_semaphore = asyncio.Semaphore(config.ckpt.download_concurrency)
-    logger.info("Download concurrency cap set", limit=config.ckpt.download_concurrency)
+    _submission_semaphore = asyncio.Semaphore(config.ckpt.submission_concurrency)
+    logger.info(
+        "Concurrency caps set",
+        download_limit=config.ckpt.download_concurrency,
+        submission_limit=config.ckpt.submission_concurrency,
+    )
 
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     subtensor = bittensor.Subtensor(network=config.chain.network)
