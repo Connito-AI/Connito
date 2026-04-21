@@ -51,6 +51,10 @@ fsspec==2024.6.1
 # -----------------------------
 bittensor==10.1.0
 bittensor-cli==9.18.0
+# Pinned to pre-cyscale release. Newer async-substrate-interface versions
+# migrated scalecodec → cyscale and added an import-time check that fails
+# when bittensor-cli's transitive substrate-interface also pulls scalecodec.
+async-substrate-interface==1.6.4
 
 # -----------------------------
 # Observability
