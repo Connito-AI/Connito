@@ -285,8 +285,15 @@ async def aggregate_miner_gradient_change(
     # global_model is expected to already live on `device` (GPU).
     this_round_uids = {job.uid for job in miner_jobs}
 
+    # Drop zero-score miners before ranking so they can never be merged, even
+    # when fewer than top_k miners have a positive score this round.
+    scored_jobs = [job for job in miner_jobs if score_aggregator.avg_over(job.uid) > 0]
+    skipped_zero_uids = [job.uid for job in miner_jobs if job not in scored_jobs]
+    if skipped_zero_uids:
+        logger.info("Excluding zero-score miners from merge", uids=skipped_zero_uids)
+
     top_jobs = [
-        job for job in miner_jobs
+        job for job in scored_jobs
         if score_aggregator.is_in_top(
             uid=job.uid,
             cutoff=config.evaluation.top_k_miners_to_merge,
