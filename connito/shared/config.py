@@ -170,7 +170,7 @@ class CycleCfg(BaseConfig):
     cycle_length: int = 448 # 1.5 hr
     distribute_period: int = 20 # 4 mins
     train_period: int = 300 # 1 hr (will adjust to 500 mins when mature to align with Diloco)
-    commit_period: int = 8 # 1.6 mins
+    commit_period: int = 10 # 2 mins
     submission_period: int = 60 # 4 mins
     validate_period: int = 10 # 10 mins
     merge_period: int = 50 # 10 mins
