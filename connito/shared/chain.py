@@ -130,6 +130,13 @@ def get_chain_commits(
     parsed = []
 
     for hotkey, commit in all_commitments.items():
+        if hotkey not in metagraph.hotkeys:
+            logger.debug(
+                "Skipping commit from hotkey not in metagraph (likely deregistered)",
+                hotkey=hotkey,
+                block=current_block,
+            )
+            continue
         uid = metagraph.hotkeys.index(hotkey)
         neuron = metagraph.neurons[uid]
         age = current_block - int(getattr(neuron, "last_update", 0))
@@ -201,20 +208,41 @@ def get_chain_commits(
 
 
 # --- setup chain worker ---
-def setup_chain_worker(config, subtensor=None, serve=True):
+def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
+    """Create the chain connections this worker needs.
+
+    Returns ``(wallet, subtensor, lite_subtensor)``:
+
+    - ``subtensor`` uses ``config.chain.network`` and must be an archive node
+      because ``get_chain_commits`` issues historical ``block=N`` queries.
+    - ``lite_subtensor`` uses ``config.chain.lite_network`` (defaults to
+      ``finney``) for operations that only need the current head (axon
+      serving, set_weights, head-level metagraph reads). When
+      ``lite_network == network`` the same connection is reused.
+    """
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     if subtensor is None:
-        logger.debug("setup_chain_worker: creating new Subtensor connection", network=config.chain.network)
+        logger.debug("setup_chain_worker: creating archive Subtensor connection", network=config.chain.network)
         subtensor = bittensor.Subtensor(network=config.chain.network)
     else:
-        logger.debug("setup_chain_worker: reusing existing Subtensor connection", network=config.chain.network)
+        logger.debug("setup_chain_worker: reusing existing archive Subtensor connection", network=config.chain.network)
+
+    if lite_subtensor is None:
+        lite_network = config.chain.lite_network
+        if lite_network and lite_network != config.chain.network:
+            logger.debug("setup_chain_worker: creating lite Subtensor connection", lite_network=lite_network)
+            lite_subtensor = bittensor.Subtensor(network=lite_network)
+        else:
+            # lite_network explicitly matches archive — single connection.
+            lite_subtensor = subtensor
+
     if serve:
         serve_axon(
             config=config,
             wallet=wallet,
-            subtensor=subtensor,
+            subtensor=lite_subtensor,
         )
-    return wallet, subtensor
+    return wallet, subtensor, lite_subtensor
 
 
 def serve_axon(config: WorkerConfig, wallet: bittensor.Wallet, subtensor: bittensor.Subtensor):
@@ -428,7 +456,9 @@ def submit_weights(
                 )
                 try:
                     # Recreate subtensor to refresh the WS connection.
-                    subtensor = bittensor.Subtensor(network=config.chain.network)
+                    # set_weights only needs the current head, so reconnect to
+                    # the lite endpoint rather than the heavier archive node.
+                    subtensor = bittensor.Subtensor(network=config.chain.lite_network)
                 except Exception as refresh_exc:
                     logger.warning("Failed to refresh subtensor", error=str(refresh_exc))
                 time.sleep(backoff_s * (attempt + 1))
