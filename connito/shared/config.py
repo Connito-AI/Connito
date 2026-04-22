@@ -311,11 +311,8 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
-    checkpoint_presave_keep: int | None = Field(default=None, ge=0)
     cleanup_stale_temporary_checkpoints: bool = True
-    miner_submission_keep_per_hotkey: int = Field(default=1, ge=0)
-    miner_submission_max_files: PositiveInt | None = None
-    miner_submission_cycle_cleanup: Literal["delete_all", "keep_latest_per_hotkey", "keep_all"] = "delete_all"
+    miner_submission_max_age_cycles: PositiveFloat = 1.5
     miner_submission_archive_max_files: PositiveInt = 500
 
 

@@ -686,7 +686,9 @@ async def submit_checkpoint(
 
     delete_old_checkpoints_by_hotkey(
         config.ckpt.miner_submission_path,
-        keep_per_hotkey=config.ckpt.miner_submission_keep_per_hotkey,
+        current_block=subtensor.block,
+        cycle_length=config.cycle.cycle_length,
+        max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
     )
 
     return {

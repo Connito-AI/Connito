@@ -33,14 +33,14 @@ def test_prune_miner_submission_files_keeps_latest_per_hotkey(tmp_path: Path):
     for name in files:
         (tmp_path / name).write_bytes(b"x")
 
-    deleted = prune_miner_submission_files(tmp_path, keep_per_hotkey=1)
+    deleted = prune_miner_submission_files(tmp_path, current_block=45, cycle_length=20, max_age_cycles=1.5)
 
     assert sorted(deleted) == ["hotkey_alpha_block_10.pt", "hotkey_beta_block_15.pt"]
     assert (tmp_path / "hotkey_alpha_block_20.pt").exists()
     assert (tmp_path / "hotkey_beta_block_30.pt").exists()
 
 
-def test_prune_miner_submission_files_enforces_total_file_cap(tmp_path: Path):
+def test_prune_miner_submission_files_keeps_recent_history_within_cycle_window(tmp_path: Path):
     files = [
         "hotkey_alpha_block_10.pt",
         "hotkey_beta_block_20.pt",
@@ -49,7 +49,8 @@ def test_prune_miner_submission_files_enforces_total_file_cap(tmp_path: Path):
     for name in files:
         (tmp_path / name).write_bytes(b"x")
 
-    deleted = prune_miner_submission_files(tmp_path, keep_per_hotkey=1, max_total_files=1)
+    deleted = prune_miner_submission_files(tmp_path, current_block=40, cycle_length=20, max_age_cycles=1.5)
 
-    assert sorted(deleted) == ["hotkey_alpha_block_10.pt", "hotkey_beta_block_20.pt"]
+    assert sorted(deleted) == ["hotkey_alpha_block_10.pt"]
+    assert (tmp_path / "hotkey_beta_block_20.pt").exists()
     assert (tmp_path / "hotkey_gamma_block_30.pt").exists()

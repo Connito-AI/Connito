@@ -816,8 +816,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             logger.info("(6) Saving checkpoint")
             ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
 
-            presave_keep = config.ckpt.checkpoint_presave_keep
-            if presave_keep is None and config.ckpt.checkpoint_topk is not None:
+            presave_keep = None
+            if config.ckpt.checkpoint_topk is not None:
                 presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
             if presave_keep is not None:
                 presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
@@ -921,29 +921,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     top_k=config.evaluation.top_k_miners_to_reward,
                     max_archive=config.ckpt.miner_submission_archive_max_files,
                 )
-            else:
-                cleanup_mode = config.ckpt.miner_submission_cycle_cleanup
-                if cleanup_mode == "delete_all":
-                    deleted = prune_miner_submission_files(
-                        config.ckpt.miner_submission_path,
-                        keep_per_hotkey=0,
-                        max_total_files=0,
-                    )
-                    logger.info("(10) Deleted miner submissions after cycle", deleted=len(deleted))
-                elif cleanup_mode == "keep_latest_per_hotkey":
-                    deleted = prune_miner_submission_files(
-                        config.ckpt.miner_submission_path,
-                        keep_per_hotkey=config.ckpt.miner_submission_keep_per_hotkey,
-                        max_total_files=config.ckpt.miner_submission_max_files,
-                    )
-                    logger.info(
-                        "(10) Pruned miner submissions after cycle",
-                        deleted=len(deleted),
-                        keep_per_hotkey=config.ckpt.miner_submission_keep_per_hotkey,
-                        max_total_files=config.ckpt.miner_submission_max_files,
-                    )
-                else:
-                    logger.info("(10) Submission cleanup disabled; retaining miner submissions on disk")
+
+            deleted = prune_miner_submission_files(
+                config.ckpt.miner_submission_path,
+                current_block=subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+            )
+            logger.info(
+                "(10) Pruned aged miner submissions after cycle",
+                deleted=len(deleted),
+                current_block=subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+            )
 
             # === validation and log metric ===
             # Local evaluation step disabled to reduce per-cycle RAM/compute load.
