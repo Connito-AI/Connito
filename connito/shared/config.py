@@ -292,6 +292,20 @@ class CheckpointCfg(BaseConfig):
     validator_checkpoint_path: Path = Path("validator_checkpoint")
 
 
+class HfCfg(BaseConfig):
+    # HuggingFace Hub is the checkpoint transport: validators upload the
+    # checkpoint directory, commit the revision SHA to the Bittensor chain,
+    # and miners download from the returned repo@revision.
+    #
+    # checkpoint_repo: the HF repo the validator pushes to. Must exist and
+    # be writable by the HF_TOKEN. Miners discover which repo to pull from
+    # via the chain commit, so only the validator needs this set.
+    checkpoint_repo: str | None = None
+    # Read from HF_TOKEN env at runtime — not stored in config YAML.
+    # Validators need write access; miners need read access (or public repo).
+    token_env_var: str = "HF_TOKEN"
+
+
 class LoggingCfg(BaseConfig):
     log_wandb: bool = False
     wandb_project_name: str = "test-moe"
@@ -311,11 +325,6 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
-    # Max concurrent /get-checkpoint serves. During Distribute bursts 20+ peers
-    # hit the server in seconds; uncapped they each get link_capacity/N
-    # (≈3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
-    # active transfer at full line rate.
-    download_concurrency: int = 4
     # Max concurrent /submit-checkpoint streams. Protects the server downlink
     # and disk write throughput from N parallel 3.35 GiB uploads dragging each
     # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
@@ -361,6 +370,7 @@ class WorkerConfig(BaseConfig):
     model: ModelCfg = Field(default_factory=ModelCfg)
     moe: MoECfg = Field(default_factory=MoECfg)
     ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
+    hf: HfCfg = Field(default_factory=HfCfg)
     sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
     log: LoggingCfg = Field(default_factory=LoggingCfg)
     opt: OptimizerCfg = Field(default_factory=OptimizerCfg)

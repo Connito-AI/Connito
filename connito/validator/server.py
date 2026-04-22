@@ -17,11 +17,9 @@ import uvicorn
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
-
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.app_logging import configure_logging, structlog
-from connito.shared.checkpoints import delete_old_checkpoints_by_hotkey, select_best_checkpoint, build_chain_checkpoints_from_previous_phase
+from connito.shared.checkpoints import delete_old_checkpoints_by_hotkey, build_chain_checkpoints_from_previous_phase
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.cycle import (
     PhaseNames,
@@ -34,8 +32,6 @@ from connito.shared.cycle import (
 )
 from connito.shared.helper import parse_dynamic_filename, hex_to_byte
 from connito.shared.schema import (
-    construct_block_message,
-    construct_model_message,
     verify_message,
 )
 from fastapi import FastAPI, Request
@@ -50,9 +46,6 @@ app = FastAPI(title="Checkpoint Sender", version="1.0.0")
 # ---- Settings via environment variables ----
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")  # optional bearer token for auth
 
-# Concurrency cap for /get-checkpoint serves. Initialized from
-# config.ckpt.download_concurrency in __main__ once the config is loaded.
-_download_semaphore: asyncio.Semaphore | None = None
 # Concurrency cap for /submit-checkpoint streams. Initialized from
 # config.ckpt.submission_concurrency in __main__ once the config is loaded.
 _submission_semaphore: asyncio.Semaphore | None = None
@@ -333,98 +326,10 @@ async def status():
 
 
 
-# miners / client get model from validator
-@app.get("/get-checkpoint")
-async def get_checkpoint(
-    authorization: str | None = Header(default=None),
-    target_hotkey_ss58: str = Form(None, description="Receiver's hotkey"),
-    origin_hotkey_ss58: str = Form(None, description="Sender's hotkey"),
-    origin_block: int = Form(None, description="The block that the message was sent."),  # insecure, do not use this field for validation, TODO: change it to block hash?
-    signature: str = Form(None, description="Signed message"),
-    expert_group_id: int | str | None = Form(None, description="List of expert groups to fetch"),
-):
-    """GET to download the configured checkpoint immediately."""
-    require_auth(authorization)
-
-    logger.debug(
-        "Download request — verifying signature",
-        from_hk=origin_hotkey_ss58[:6] if origin_hotkey_ss58 else None,
-        origin_block=origin_block,
-    )
-    verify_message(
-        origin_hotkey_ss58=origin_hotkey_ss58,
-        message=construct_block_message(
-            target_hotkey_ss58=target_hotkey_ss58,  # TODO: assert hotkey is valid within the metagraph
-            block=origin_block,  # TODO: change to block hash and assert it is not too far from current
-        ),
-        signature_hex=signature,
-    )
-
-    validate_get_checkpoint_request(
-        config=config,
-        subtensor=subtensor,
-        origin_block=origin_block,
-        target_hotkey_ss58=target_hotkey_ss58,
-        origin_hotkey_ss58=origin_hotkey_ss58,
-        authorization=authorization,
-    )
-    
-    latest_checkpoint = select_best_checkpoint(primary_dir=config.ckpt.checkpoint_path)
-
-    if not latest_checkpoint or not latest_checkpoint.path:
-        raise HTTPException(status_code=503, detail="No checkpoint available on disk yet — validator has not completed a training cycle")
-
-    if expert_group_id is not None:
-        if expert_group_id == "shared":
-            ckpt_path = latest_checkpoint.path / "model_shared.pt"
-        else:
-            ckpt_path = latest_checkpoint.path / f"model_expgroup_{expert_group_id}.pt"
-
-    else:
-        ckpt_path = latest_checkpoint.path / "model.pt"
-
-    if not ckpt_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Checkpoint not found: {ckpt_path.name}",
-        )
-
-    # Queue behind the uplink-concurrency cap. Acquired here, released via
-    # BackgroundTask after Starlette finishes streaming the FileResponse.
-    assert _download_semaphore is not None, "Download semaphore not initialized"
-    queued_at = asyncio.get_event_loop().time()
-    await _download_semaphore.acquire()
-    wait_s = asyncio.get_event_loop().time() - queued_at
-
-    try:
-        logger.info(
-            "Serving checkpoint download",
-            from_hk=origin_hotkey_ss58[:6] if origin_hotkey_ss58 else None,
-            block=origin_block,
-            expert_group_id=expert_group_id,
-            queue_wait_s=round(wait_s, 3),
-        )
-
-        logger.debug("Preparing file response", path=str(ckpt_path))
-        result = file_response_for(Path(ckpt_path), f"step{latest_checkpoint.global_ver}")
-        result.background = BackgroundTask(_download_semaphore.release)
-        return result
-    except BaseException:
-        _download_semaphore.release()
-        raise
-
-def validate_get_checkpoint_request(
-    config: ValidatorConfig,
-    subtensor: bittensor.Subtensor,
-    origin_block: int,
-    target_hotkey_ss58: str | None,
-    origin_hotkey_ss58: str | None,
-    authorization: str | None = Header(default=None),
-) -> None:
-    
-    # check if the submission is to this validator
-    if target_hotkey_ss58 != config.chain.hotkey_ss58:
-        raise HTTPException(status_code=403, detail="Submission target hotkey does not match this validator")
+# Miners pull checkpoints from HuggingFace now — see connito/shared/hf_distribute.py.
+# The validator uploads to HF and commits the repo@revision to the Bittensor
+# chain in validator_commit_2; miners read the chain commit and hf_hub_download
+# directly. The old /get-checkpoint endpoint has been removed.
 
 # miners submit checkpoint
 # @app.post("/submit-checkpoint-permit")
@@ -744,11 +649,9 @@ if __name__ == "__main__":
 
     config.write()
 
-    _download_semaphore = asyncio.Semaphore(config.ckpt.download_concurrency)
     _submission_semaphore = asyncio.Semaphore(config.ckpt.submission_concurrency)
     logger.info(
         "Concurrency caps set",
-        download_limit=config.ckpt.download_concurrency,
         submission_limit=config.ckpt.submission_concurrency,
     )
 

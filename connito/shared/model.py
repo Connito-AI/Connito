@@ -23,8 +23,8 @@ from connito.shared.checkpoints import (
     delete_old_checkpoints,
     select_best_checkpoint,
 )
-from connito.shared.client import download_model
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.shared.cycle import PhaseNames, get_blocks_from_previous_phase_from_api
 from connito.shared.expert_manager import (
     ExpertManager,
@@ -266,77 +266,82 @@ def fetch_model_from_chain_validator(
             for chain_checkpoint in chain_checkpoints.checkpoints:
                 logger.info(f"Downloading from chain: uid = {chain_checkpoint.uid}", chain_checkpoint=chain_checkpoint)
 
-                # Resolve URL if not provided; fall back to ip/port + default route
-                # Best-effort defaults; customize if your API differs
-                protocol = getattr(getattr(config, "miner", object()), "protocol", "http")
-                if chain_checkpoint.ip and chain_checkpoint.port:
-                    url = f"{protocol}://{chain_checkpoint.ip}:{chain_checkpoint.port}/get-checkpoint"
-                else:
-                    logger.warning("Skipping meta without URL or ip:port: %s", chain_checkpoint)
+                if not chain_checkpoint.hf_repo_id or not chain_checkpoint.hf_revision:
+                    logger.warning(
+                        "Chain commit missing HF repo/revision, skipping",
+                        uid=chain_checkpoint.uid,
+                        hotkey=chain_checkpoint.hotkey,
+                        hf_repo_id=chain_checkpoint.hf_repo_id,
+                        hf_revision=chain_checkpoint.hf_revision,
+                    )
                     continue
 
                 out_folder = Path(config.ckpt.validator_checkpoint_path) / (
                     f"uid_{chain_checkpoint.uid}_hotkey_{chain_checkpoint.hotkey}_globalver_{chain_checkpoint.global_ver}"
                 )
-
                 out_folder.mkdir(parents=True, exist_ok=True)
 
+                # Resolve the per-expert-group file names the local miner needs.
+                filenames: list[str] = []
                 for expert_group_id in expert_group_ids:
                     if isinstance(expert_group_id, int):
-                        out_file = f"model_expgroup_{expert_group_id}.pt"
+                        filenames.append(f"model_expgroup_{expert_group_id}.pt")
                     elif expert_group_id == "shared":
-                        out_file = "model_shared.pt"
+                        filenames.append("model_shared.pt")
                     else:
                         logger.warning("Invalid expert_group_id, skipping:", expert_group_id=expert_group_id)
+
+                if not filenames:
+                    continue
+
+                try:
+                    download_checkpoint_from_hf(
+                        repo_id=chain_checkpoint.hf_repo_id,
+                        revision=chain_checkpoint.hf_revision,
+                        filenames=filenames,
+                        dest_dir=out_folder,
+                        token_env_var=config.hf.token_env_var,
+                    )
+
+                    chain_checkpoint.path = out_folder
+                    validated = chain_checkpoint.validate(expert_group_assignment=expert_group_assignment)
+
+                    if not validated:
+                        logger.warning(
+                            "❌ Downloaded checkpoint failed validation",
+                            out_folder=out_folder,
+                            current_model_version=current_model_meta.global_ver if current_model_meta else None,
+                            current_model_hash=current_model_meta.model_hash if current_model_meta else None,
+                        )
                         continue
 
-                    out_path = out_folder / out_file
-                    try:
-                        download_model(
-                            url=url,
-                            my_hotkey=wallet.hotkey,  # type: ignore
-                            target_hotkey_ss58=chain_checkpoint.hotkey,
-                            block=subtensor.block,
-                            expert_group_id=expert_group_id,
-                            token=getattr(config.cycle, "token", ""),
-                            out_dir=out_path,
-                        )
+                    download_success = validated
+                    current_model_version = chain_checkpoint.global_ver
+                    current_model_hash = chain_checkpoint.model_hash
 
-                        chain_checkpoint.path = out_folder
-                        validated = chain_checkpoint.validate(expert_group_assignment = expert_group_assignment)
+                    logger.info(
+                        "✅ Downloaded checkpoint from HF (verified)",
+                        out_folder=out_folder,
+                        hf_repo_id=chain_checkpoint.hf_repo_id,
+                        hf_revision=chain_checkpoint.hf_revision,
+                        current_model_version=current_model_version,
+                        current_model_hash=current_model_hash,
+                    )
 
-                        if not validated:
-                            logger.warning(
-                                "❌ Downloaded checkpoint failed validation",
-                                out_path=out_path,
-                                current_model_version=current_model_meta.global_ver
-                                if current_model_meta
-                                else None,
-                                current_model_hash=current_model_meta.model_hash if current_model_meta else None,
-                            )
-                            continue
-                        # If download + verification succeed, consider it a success
-                        download_success = validated
+                    delete_old_checkpoints(
+                        checkpoint_path=Path(config.ckpt.validator_checkpoint_path),
+                        topk=config.ckpt.checkpoint_topk,
+                    )
 
-                        current_model_version = chain_checkpoint.global_ver
-                        current_model_hash = chain_checkpoint.model_hash
-                        
-                        logger.info(
-                            "✅ Downloaded checkpoint (verified)",
-                            out_path=out_path,
-                            current_model_version=current_model_version,
-                            current_model_hash=current_model_hash,
-                            validation_success=validated,
-                        )
-
-                        delete_old_checkpoints(
-                            checkpoint_path=Path(config.ckpt.validator_checkpoint_path),
-                            topk=config.ckpt.checkpoint_topk,
-                        )
-
-                        return chain_checkpoint
-                    except Exception as e:
-                        logger.warning("Download failed", url=url, error=str(e), exc_info=True)
+                    return chain_checkpoint
+                except Exception as e:
+                    logger.warning(
+                        "HF download failed",
+                        hf_repo_id=chain_checkpoint.hf_repo_id,
+                        hf_revision=chain_checkpoint.hf_revision,
+                        error=str(e),
+                        exc_info=True,
+                    )
 
             if not download_success:
                 retries += 1

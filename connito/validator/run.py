@@ -84,6 +84,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
+from connito.shared.hf_distribute import upload_checkpoint_to_hf
 from connito.shared.cycle import (
     check_phase_expired,
     get_combined_validator_seed,
@@ -860,6 +861,36 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 check_phase_expired(subtensor, phase_response)
 
+                # Upload checkpoint to HuggingFace so miners can pull it during
+                # the Distribute phase. The returned revision SHA pins the exact
+                # bytes miners will download, even if :main advances afterward.
+                hf_repo_id = config.hf.checkpoint_repo
+                hf_revision: str | None = None
+                if hf_repo_id and model_ckpt.path is not None:
+                    try:
+                        hf_revision = upload_checkpoint_to_hf(
+                            ckpt_dir=model_ckpt.path,
+                            repo_id=hf_repo_id,
+                            token_env_var=config.hf.token_env_var,
+                            commit_message=(
+                                f"global_ver={model_ckpt.global_ver} "
+                                f"expert_group={config.task.exp.group_id}"
+                            ),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "HF checkpoint upload failed; skipping validator_commit_2",
+                            repo_id=hf_repo_id,
+                            error=str(e),
+                            exc_info=True,
+                        )
+                else:
+                    logger.warning(
+                        "HF checkpoint repo not configured; skipping upload",
+                        checkpoint_repo=hf_repo_id,
+                        has_ckpt_path=model_ckpt.path is not None,
+                    )
+
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
                 logger.info("(8) Commit model_hash for next validation")
                 commit_status(
@@ -872,6 +903,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         expert_group=config.task.exp.group_id,
                         miner_seed=0,
                         block=subtensor.block,
+                        hf_repo_id=hf_repo_id if hf_revision else None,
+                        hf_revision=hf_revision,
                     ),
                 )
 

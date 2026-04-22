@@ -44,6 +44,12 @@ class ValidatorChainCommit(WorkerChainCommit):
     expert_group: int | None = Field(default=None, alias="e")
     miner_seed: int | None = Field(default=None, alias="s")
     block: int | None = Field(default=None, alias="b")
+    # HuggingFace is the checkpoint transport: the validator uploads the
+    # checkpoint directory to `hf_repo_id`, and `hf_revision` pins the exact
+    # commit SHA so miners pull the same bytes even if the repo advances.
+    # model_hash/signed_model_hash still verify integrity post-download.
+    hf_repo_id: str | None = Field(default=None, alias="r")
+    hf_revision: str | None = Field(default=None, alias="rv")
 
 
 class MinerChainCommit(WorkerChainCommit):

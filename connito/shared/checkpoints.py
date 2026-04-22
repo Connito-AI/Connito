@@ -308,6 +308,8 @@ class ChainCheckpoint(ModelCheckpoint):
     port: int | None = None
     hotkey: str | None = None
     stake: float = 0.0
+    hf_repo_id: str | None = None
+    hf_revision: str | None = None
 
     def __init__(self, **data: Any):
         data.setdefault("place", "onchain")
@@ -645,6 +647,8 @@ def build_chain_checkpoints(
                     port=getattr(neuron.axon_info, "port", None),
                     hotkey=hotkey,
                     stake=float(getattr(neuron, "stake", 0.0)),
+                    hf_repo_id=getattr(commit, "hf_repo_id", None),
+                    hf_revision=getattr(commit, "hf_revision", None),
                     signature_required=True,
                     hash_required=True,
                     expert_group_check_required=True,
