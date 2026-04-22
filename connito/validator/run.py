@@ -670,6 +670,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             )
 
             cleanup(global_model)
+            # Compute once at submission start and reuse for both streaming
+            # evaluation and the post-evaluation penalty pass. Recomputing
+            # later would query a different block/phase and could yield a
+            # different assignment.
+            from connito.shared.cycle import get_validator_miner_assignment
+            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
             miner_jobs = asyncio.run(
                 stream_gather_and_evaluate(
                     config=config,
@@ -681,6 +687,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     tokenizer=tokenizer,
                     combined_seed=get_combined_validator_seed(config, subtensor),
                     end_block=phase_response.phase_end_block,
+                    validator_miner_assignment=validator_miner_assignment,
                 )
             )
 
@@ -691,10 +698,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 logger.warning("No miner jobs evaluated", step=global_opt_step)
 
             cleanup(global_model)
-            
-            # Penalize assigned miners that missed their submission
-            from connito.shared.cycle import get_validator_miner_assignment
-            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+
+            # Penalize assigned miners that missed their submission. Reuse the
+            # assignment computed at submission start — recomputing here would
+            # query a later block/phase and could penalize a different set.
             miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
             submitted_uids = {job.uid for job in miner_jobs}
             # Reuse the metagraph fetched above for this cycle
