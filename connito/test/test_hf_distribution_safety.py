@@ -1,0 +1,206 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+from fastapi.testclient import TestClient
+
+from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
+from connito.shared.hf_distribute import get_hf_upload_readiness, upload_checkpoint_to_hf
+from connito.shared.model import fetch_model_from_chain_validator
+from connito.validator import server
+
+
+def _make_config(tmp_path: Path):
+    return SimpleNamespace(
+        chain=SimpleNamespace(netuid=102, hotkey_ss58="validator-hotkey"),
+        ckpt=SimpleNamespace(
+            validator_checkpoint_path=tmp_path / "validator_checkpoint",
+            checkpoint_topk=2,
+            checkpoint_path=tmp_path / "checkpoints",
+        ),
+        hf=SimpleNamespace(token_env_var="HF_TOKEN"),
+        cycle=SimpleNamespace(token=""),
+        miner=SimpleNamespace(protocol="http"),
+    )
+
+
+def _make_chain_checkpoint(**overrides):
+    base = dict(
+        uid=7,
+        hotkey="validator-hotkey",
+        global_ver=42,
+        model_hash="abcd",
+        signed_model_hash="signed",
+        expert_group=0,
+        ip="127.0.0.1",
+        port=8000,
+        hf_repo_id="owner/repo",
+        hf_revision="rev-1",
+    )
+    base.update(overrides)
+    return ChainCheckpoint(**base)
+
+
+def test_hf_upload_readiness_reports_missing_repo_and_token(monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+
+    ready, reason = get_hf_upload_readiness(repo_id=None, token_env_var="HF_TOKEN")
+    assert not ready
+    assert "repo not configured" in reason
+
+    ready, reason = get_hf_upload_readiness(repo_id="owner/repo", token_env_var="HF_TOKEN")
+    assert not ready
+    assert "HF token missing" in reason
+
+
+def test_upload_checkpoint_to_hf_requires_token(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    ckpt_dir = tmp_path / "checkpoint"
+    ckpt_dir.mkdir()
+
+    try:
+        upload_checkpoint_to_hf(ckpt_dir=ckpt_dir, repo_id="owner/repo", token_env_var="HF_TOKEN")
+    except RuntimeError as exc:
+        assert "HF token missing" in str(exc)
+    else:
+        raise AssertionError("expected missing token RuntimeError")
+
+
+def test_fetch_model_falls_back_to_http_when_hf_download_fails(tmp_path, monkeypatch):
+    config = _make_config(tmp_path)
+    config.ckpt.validator_checkpoint_path.mkdir(parents=True)
+    wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey"))
+    subtensor = SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner-hotkey")
+    chain_checkpoint = _make_chain_checkpoint()
+
+    monkeypatch.setattr(
+        "connito.shared.model.build_chain_checkpoints_from_previous_phase",
+        lambda **kwargs: ChainCheckpoints(checkpoints=[chain_checkpoint]),
+    )
+    monkeypatch.setattr("connito.shared.model.download_checkpoint_from_hf", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("hf down")))
+    monkeypatch.setattr("connito.shared.model.delete_old_checkpoints", lambda **kwargs: None)
+    monkeypatch.setattr(ChainCheckpoint, "validate", lambda self, expert_group_assignment: True)
+
+    seen = []
+
+    def fake_download_model(**kwargs):
+        out_path = Path(kwargs["out_dir"])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"ok")
+        seen.append((kwargs["url"], out_path.name, kwargs["expert_group_id"]))
+
+    monkeypatch.setattr("connito.shared.model.download_model", fake_download_model)
+
+    result = fetch_model_from_chain_validator(
+        current_model_meta=None,
+        config=config,
+        subtensor=subtensor,
+        wallet=wallet,
+        expert_group_ids=[0, "shared"],
+        expert_group_assignment={},
+    )
+
+    assert result is chain_checkpoint
+    assert seen == [
+        ("http://127.0.0.1:8000/get-checkpoint", "model_expgroup_0.pt", 0),
+        ("http://127.0.0.1:8000/get-checkpoint", "model_shared.pt", "shared"),
+    ]
+
+
+def test_fetch_model_uses_http_when_hf_metadata_missing(tmp_path, monkeypatch):
+    config = _make_config(tmp_path)
+    config.ckpt.validator_checkpoint_path.mkdir(parents=True)
+    wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey"))
+    subtensor = SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner-hotkey")
+    chain_checkpoint = _make_chain_checkpoint(hf_repo_id=None, hf_revision=None)
+
+    monkeypatch.setattr(
+        "connito.shared.model.build_chain_checkpoints_from_previous_phase",
+        lambda **kwargs: ChainCheckpoints(checkpoints=[chain_checkpoint]),
+    )
+    monkeypatch.setattr("connito.shared.model.download_checkpoint_from_hf", lambda **kwargs: (_ for _ in ()).throw(AssertionError("HF should not be used")))
+    monkeypatch.setattr("connito.shared.model.delete_old_checkpoints", lambda **kwargs: None)
+    monkeypatch.setattr(ChainCheckpoint, "validate", lambda self, expert_group_assignment: True)
+
+    seen = []
+
+    def fake_download_model(**kwargs):
+        out_path = Path(kwargs["out_dir"])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"ok")
+        seen.append(out_path.name)
+
+    monkeypatch.setattr("connito.shared.model.download_model", fake_download_model)
+
+    result = fetch_model_from_chain_validator(
+        current_model_meta=None,
+        config=config,
+        subtensor=subtensor,
+        wallet=wallet,
+        expert_group_ids=[0],
+        expert_group_assignment={},
+    )
+
+    assert result is chain_checkpoint
+    assert seen == ["model_expgroup_0.pt"]
+
+
+def test_get_checkpoint_endpoint_serves_local_checkpoint(tmp_path, monkeypatch):
+    checkpoint_dir = tmp_path / "ckpt"
+    checkpoint_dir.mkdir()
+    shard = checkpoint_dir / "model_expgroup_0.pt"
+    shard.write_bytes(b"checkpoint-bytes")
+
+    server.config = SimpleNamespace(
+        chain=SimpleNamespace(hotkey_ss58="validator-hotkey"),
+        ckpt=SimpleNamespace(checkpoint_path=tmp_path / "checkpoints"),
+    )
+    server.subtensor = SimpleNamespace(block=999)
+    monkeypatch.setattr(server, "verify_message", lambda **kwargs: True)
+    monkeypatch.setattr(server, "construct_block_message", lambda **kwargs: b"msg")
+    monkeypatch.setattr(server, "select_best_checkpoint", lambda primary_dir: SimpleNamespace(path=checkpoint_dir, global_ver=42))
+
+    client = TestClient(server.app)
+    response = client.request(
+        "GET",
+        "/get-checkpoint",
+        data={
+            "target_hotkey_ss58": "validator-hotkey",
+            "origin_hotkey_ss58": "miner-hotkey",
+            "origin_block": "123",
+            "signature": "sig",
+            "expert_group_id": "0",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"checkpoint-bytes"
+
+
+def test_get_checkpoint_endpoint_rejects_wrong_target(tmp_path, monkeypatch):
+    checkpoint_dir = tmp_path / "ckpt"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "model_expgroup_0.pt").write_bytes(b"checkpoint-bytes")
+
+    server.config = SimpleNamespace(
+        chain=SimpleNamespace(hotkey_ss58="validator-hotkey"),
+        ckpt=SimpleNamespace(checkpoint_path=tmp_path / "checkpoints"),
+    )
+    server.subtensor = SimpleNamespace(block=999)
+    monkeypatch.setattr(server, "verify_message", lambda **kwargs: True)
+    monkeypatch.setattr(server, "construct_block_message", lambda **kwargs: b"msg")
+    monkeypatch.setattr(server, "select_best_checkpoint", lambda primary_dir: SimpleNamespace(path=checkpoint_dir, global_ver=42))
+
+    client = TestClient(server.app)
+    response = client.request(
+        "GET",
+        "/get-checkpoint",
+        data={
+            "target_hotkey_ss58": "different-validator",
+            "origin_hotkey_ss58": "miner-hotkey",
+            "origin_block": "123",
+            "signature": "sig",
+            "expert_group_id": "0",
+        },
+    )
+
+    assert response.status_code == 403

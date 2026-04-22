@@ -84,7 +84,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
-from connito.shared.hf_distribute import upload_checkpoint_to_hf
+from connito.shared.hf_distribute import get_hf_upload_readiness, upload_checkpoint_to_hf
 from connito.shared.cycle import (
     check_phase_expired,
     get_combined_validator_seed,
@@ -866,7 +866,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # bytes miners will download, even if :main advances afterward.
                 hf_repo_id = config.hf.checkpoint_repo
                 hf_revision: str | None = None
-                if hf_repo_id and model_ckpt.path is not None:
+                hf_ready, hf_reason = get_hf_upload_readiness(
+                    repo_id=hf_repo_id,
+                    token_env_var=config.hf.token_env_var,
+                )
+                if model_ckpt.path is None:
+                    logger.warning("No checkpoint path available for HF upload", checkpoint_repo=hf_repo_id)
+                elif hf_ready:
                     try:
                         hf_revision = upload_checkpoint_to_hf(
                             ckpt_dir=model_ckpt.path,
@@ -879,15 +885,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         )
                     except Exception as e:
                         logger.error(
-                            "HF checkpoint upload failed; skipping validator_commit_2",
+                            "HF checkpoint upload failed; miners will use validator HTTP fallback",
                             repo_id=hf_repo_id,
                             error=str(e),
                             exc_info=True,
                         )
                 else:
                     logger.warning(
-                        "HF checkpoint repo not configured; skipping upload",
+                        "HF checkpoint upload unavailable; miners will use validator HTTP fallback",
                         checkpoint_repo=hf_repo_id,
+                        reason=hf_reason,
                         has_ckpt_path=model_ckpt.path is not None,
                     )
 

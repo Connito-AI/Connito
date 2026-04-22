@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.app_logging import configure_logging, structlog
-from connito.shared.checkpoints import delete_old_checkpoints_by_hotkey, build_chain_checkpoints_from_previous_phase
+from connito.shared.checkpoints import delete_old_checkpoints_by_hotkey, select_best_checkpoint, build_chain_checkpoints_from_previous_phase
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.cycle import (
     PhaseNames,
@@ -32,6 +32,7 @@ from connito.shared.cycle import (
 )
 from connito.shared.helper import parse_dynamic_filename, hex_to_byte
 from connito.shared.schema import (
+    construct_block_message,
     verify_message,
 )
 from fastapi import FastAPI, Request
@@ -300,6 +301,7 @@ async def index(request: Request):
             "version": "0.0.0",
             "endpoints": {
                 "GET /ping": "Health check",
+                "GET /get-checkpoint": "Compatibility checkpoint download endpoint used as HF fallback",
                 "GET /checkpoint": "Download the configured checkpoint",
                 "POST /send-checkpoint": {
                     "body": {"path": "optional string", "download_name": "optional string"},
@@ -326,10 +328,70 @@ async def status():
 
 
 
+@app.get("/get-checkpoint")
+async def get_checkpoint(
+    authorization: str | None = Header(default=None),
+    target_hotkey_ss58: str = Form(None, description="Receiver's hotkey"),
+    origin_hotkey_ss58: str = Form(None, description="Sender's hotkey"),
+    origin_block: int = Form(None, description="The block that the message was sent."),
+    signature: str = Form(None, description="Signed message"),
+    expert_group_id: int | str | None = Form(None, description="Expert group to fetch"),
+):
+    require_auth(authorization)
+
+    message = construct_block_message(target_hotkey_ss58=target_hotkey_ss58, block=origin_block)
+    if not verify_message(
+        origin_hotkey_ss58=origin_hotkey_ss58,
+        message=message,
+        signature_hex=signature,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid checkpoint download signature")
+
+    validate_get_checkpoint_request(
+        config=config,
+        subtensor=subtensor,
+        origin_block=origin_block,
+        target_hotkey_ss58=target_hotkey_ss58,
+        origin_hotkey_ss58=origin_hotkey_ss58,
+        authorization=authorization,
+    )
+
+    latest_checkpoint = select_best_checkpoint(primary_dir=config.ckpt.checkpoint_path)
+    if not latest_checkpoint or not latest_checkpoint.path:
+        raise HTTPException(status_code=503, detail="No checkpoint available on disk yet")
+
+    if expert_group_id is not None:
+        if expert_group_id == "shared":
+            ckpt_path = latest_checkpoint.path / "model_shared.pt"
+        else:
+            ckpt_path = latest_checkpoint.path / f"model_expgroup_{expert_group_id}.pt"
+    else:
+        ckpt_path = latest_checkpoint.path / "model.pt"
+
+    if not ckpt_path.exists():
+        raise HTTPException(status_code=404, detail=f"Checkpoint not found: {ckpt_path.name}")
+
+    return file_response_for(Path(ckpt_path), f"step{latest_checkpoint.global_ver}")
+
+
+def validate_get_checkpoint_request(
+    config: ValidatorConfig,
+    subtensor: bittensor.Subtensor,
+    origin_block: int,
+    target_hotkey_ss58: str | None,
+    origin_hotkey_ss58: str | None,
+    authorization: str | None = Header(default=None),
+) -> None:
+    if target_hotkey_ss58 != config.chain.hotkey_ss58:
+        raise HTTPException(status_code=403, detail="Submission target hotkey does not match this validator")
+
+
+
 # Miners pull checkpoints from HuggingFace now — see connito/shared/hf_distribute.py.
 # The validator uploads to HF and commits the repo@revision to the Bittensor
 # chain in validator_commit_2; miners read the chain commit and hf_hub_download
-# directly. The old /get-checkpoint endpoint has been removed.
+# directly. /get-checkpoint stays available as a compatibility and outage
+# fallback path.
 
 # miners submit checkpoint
 # @app.post("/submit-checkpoint-permit")

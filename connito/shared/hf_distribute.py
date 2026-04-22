@@ -17,6 +17,22 @@ def _resolve_token(token: str | None, env_var: str) -> str | None:
     return os.environ.get(env_var) or None
 
 
+def resolve_hf_token(token: str | None = None, token_env_var: str = "HF_TOKEN") -> str | None:
+    return _resolve_token(token, token_env_var)
+
+
+def get_hf_upload_readiness(
+    repo_id: str | None,
+    token: str | None = None,
+    token_env_var: str = "HF_TOKEN",
+) -> tuple[bool, str]:
+    if not repo_id:
+        return False, "HF checkpoint repo not configured"
+    if _resolve_token(token, token_env_var) is None:
+        return False, f"HF token missing — set {token_env_var} or pass token= explicitly"
+    return True, "ready"
+
+
 def upload_checkpoint_to_hf(
     ckpt_dir: Path,
     repo_id: str,
@@ -31,11 +47,10 @@ def upload_checkpoint_to_hf(
     updated to point at the new commit as a side effect, but miners should
     pin to the SHA from the chain, not the branch name.
     """
+    ready, reason = get_hf_upload_readiness(repo_id=repo_id, token=token, token_env_var=token_env_var)
+    if not ready:
+        raise RuntimeError(reason)
     resolved_token = _resolve_token(token, token_env_var)
-    if resolved_token is None:
-        raise RuntimeError(
-            f"HF token missing — set {token_env_var} or pass token= explicitly"
-        )
     if not ckpt_dir.exists() or not ckpt_dir.is_dir():
         raise FileNotFoundError(f"checkpoint dir not found: {ckpt_dir}")
 

@@ -150,6 +150,7 @@ $EDITOR connito/validator/docker/.env
 Available `.env` overrides:
 
 - `WANDB_API_KEY` if you want metrics in Weights & Biases.
+- `HF_TOKEN` if your validator should upload checkpoints to Hugging Face.
 - `WATCHTOWER_NOTIFICATIONS=slack` and `WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL`
   if you want a Slack ping every time Watchtower upgrades the container.
 - `IMAGE` — leave on `:stable` for auto-upgrades on tagged releases.
@@ -199,6 +200,17 @@ reachable.
    You should see Watchtower detect the new digest, stop the old
    container, pull the new image, and start the new one.
 3. The validator resumes from the latest checkpoint in `/data/checkpoints`.
+
+## Hugging Face distribution
+
+If you enable HF-backed checkpoint distribution, set `hf.checkpoint_repo` in
+your validator YAML and provide a writable `HF_TOKEN` in the compose `.env`.
+The validator will upload the merged checkpoint to that repo and commit the
+exact HF revision to chain.
+
+If HF is misconfigured or temporarily unavailable, miners can still fall back
+to the validator's `/get-checkpoint` endpoint. HF is the preferred transport;
+the validator HTTP path remains as compatibility and outage backup.
 
 ## Operational notes
 
