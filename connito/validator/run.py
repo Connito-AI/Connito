@@ -286,8 +286,11 @@ async def aggregate_miner_gradient_change(
     this_round_uids = {job.uid for job in miner_jobs}
 
     # Drop zero-score miners before ranking so they can never be merged, even
-    # when fewer than top_k miners have a positive score this round.
-    scored_jobs = [job for job in miner_jobs if score_aggregator.avg_over(job.uid) > 0]
+    # when fewer than top_k miners have a positive score this round. Use the
+    # latest (this-round) score, not the rolling avg, so a single bad round
+    # is enough to exclude a miner regardless of their history.
+    latest_scores = score_aggregator.uid_score_pairs(how="latest")
+    scored_jobs = [job for job in miner_jobs if latest_scores.get(job.uid, 0.0) > 0]
     skipped_zero_uids = [job.uid for job in miner_jobs if job not in scored_jobs]
     if skipped_zero_uids:
         logger.info("Excluding zero-score miners from merge", uids=skipped_zero_uids)
