@@ -311,6 +311,15 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
+    # Max concurrent /get-checkpoint serves. During Distribute bursts 20+ peers
+    # hit the server in seconds; uncapped they each get link_capacity/N
+    # (approximately 3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
+    # active transfer at full line rate.
+    download_concurrency: int = 4
+    # Max concurrent /submit-checkpoint streams. Protects the server downlink
+    # and disk write throughput from N parallel 3.35 GiB uploads dragging each
+    # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
+    submission_concurrency: int = 2
     cleanup_stale_temporary_checkpoints: bool = True
     miner_submission_max_age_cycles: PositiveFloat = 1.5
     miner_submission_archive_max_files: PositiveInt = 500
