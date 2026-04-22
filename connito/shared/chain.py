@@ -132,11 +132,22 @@ def get_chain_commits(
 
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
     whitelisted_validators = get_validator_whitelist_from_api(config)
+    hotkey_to_uid = {metagraph_hotkey: uid for uid, metagraph_hotkey in enumerate(metagraph.hotkeys)}
 
     parsed = []
 
     for hotkey, commit in all_commitments.items():
-        uid = metagraph.hotkeys.index(hotkey)
+        uid = hotkey_to_uid.get(hotkey)
+        if uid is None:
+            logger.warning(
+                "Skipping chain commit for hotkey missing from metagraph",
+                hotkey=hotkey,
+                requested_block=block,
+                current_block=current_block,
+                network=config.chain.network,
+                netuid=config.chain.netuid,
+            )
+            continue
         neuron = metagraph.neurons[uid]
         age = current_block - int(getattr(neuron, "last_update", 0))
 
