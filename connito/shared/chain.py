@@ -130,6 +130,13 @@ def get_chain_commits(
     parsed = []
 
     for hotkey, commit in all_commitments.items():
+        if hotkey not in metagraph.hotkeys:
+            logger.debug(
+                "Skipping commit from hotkey not in metagraph (likely deregistered)",
+                hotkey=hotkey,
+                block=current_block,
+            )
+            continue
         uid = metagraph.hotkeys.index(hotkey)
         neuron = metagraph.neurons[uid]
         age = current_block - int(getattr(neuron, "last_update", 0))
