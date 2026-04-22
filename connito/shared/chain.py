@@ -291,8 +291,15 @@ def _submit_fallback_weights(
         }
         dropped = len(prev_weights) - len(miner_prev_weights)
 
+        # Detect the fallback shape on chain: all miner weights equal. Covers
+        # both the current top-3-even pattern and the legacy many-miner
+        # uniform pattern; if we see it we recompute rather than reuse.
         values = list(miner_prev_weights.values())
-        is_even = len(values) >= 2 and (max(values) - min(values)) < 1e-9
+        is_even = (
+            len(values) >= 1
+            and max(values) > 0
+            and (max(values) - min(values)) < 1e-9
+        )
 
         if miner_prev_weights and not is_even:
             logger.info(
@@ -305,37 +312,49 @@ def _submit_fallback_weights(
                                   wait_for_finalization=wait_for_finalization)
         if is_even:
             logger.info(
-                "Previous on-chain weights are uniform; treating as no prev_weights and recomputing",
+                "Previous on-chain weights are even (fallback pattern); recomputing",
                 count=len(miner_prev_weights),
             )
         else:
-            logger.warning("No miner weights remain after excluding validators, falling through to uniform")
+            logger.warning("No miner weights remain after excluding validators, falling through to fallback")
 
-    # Uniform path: target miners receiving non-zero weight from any other
-    # validator (excluding self). Avoids weighting UIDs the rest of the
-    # subnet has already abandoned.
-    miner_uids_set: set[int] = set()
+    # Fallback path: submit even weight to the top-3 miners ranked by
+    # stake-weighted votes from other validators (excluding self). Each
+    # miner's score = sum over (other validators) of
+    # (validator_stake * weight_from_validator_to_miner).
+    miner_score: dict[int, float] = {}
     for vuid in validator_uids - {my_uid}:
         vneuron = subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
         if vneuron is None:
             continue
+        v_stake = float(getattr(vneuron, "stake", 0.0))
+        if v_stake <= 0:
+            continue
         for uid, w in vneuron.weights:
-            if float(w) > 0 and int(uid) not in validator_uids:
-                miner_uids_set.add(int(uid))
-    miner_uids = sorted(miner_uids_set)
+            uid_i = int(uid)
+            if uid_i in validator_uids or uid_i == my_uid:
+                continue
+            fw = float(w)
+            if fw <= 0:
+                continue
+            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
+
+    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    miner_uids = [uid for uid, _ in top_peers]
     if not miner_uids:
         logger.warning(
-            "No miner UIDs found with non-zero weight from other validators, skipping uniform weight set",
+            "No miner UIDs with stake-weighted votes from other validators, skipping fallback",
             other_validator_count=len(validator_uids - {my_uid}),
         )
         return False
 
+    weight = 1.0 / len(miner_uids)
     logger.warning(
-        "No previous weights found on chain, submitting uniform weights to miners",
-        miner_count=len(miner_uids),
+        "No previous weights found on chain, submitting even fallback weights to top stake-weighted miners",
+        top_uids=miner_uids,
+        top_scores=[round(s, 6) for _, s in top_peers],
         excluded_validator_count=len(validator_uids),
     )
-    weight = 1.0 / len(miner_uids)
     result = subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
@@ -346,9 +365,9 @@ def _submit_fallback_weights(
     )
     success = result[0] if isinstance(result, tuple) else bool(result)
     if success:
-        logger.info("Uniform weights set successfully", count=len(miner_uids))
+        logger.info("Fallback weights set successfully", count=len(miner_uids))
     else:
-        logger.warning("Failed to set uniform weights")
+        logger.warning("Failed to set fallback weights")
     return success
 
 
