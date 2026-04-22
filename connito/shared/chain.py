@@ -130,6 +130,13 @@ def get_chain_commits(
     parsed = []
 
     for hotkey, commit in all_commitments.items():
+        if hotkey not in metagraph.hotkeys:
+            logger.debug(
+                "Skipping commit from hotkey not in metagraph (likely deregistered)",
+                hotkey=hotkey,
+                block=current_block,
+            )
+            continue
         uid = metagraph.hotkeys.index(hotkey)
         neuron = metagraph.neurons[uid]
         age = current_block - int(getattr(neuron, "last_update", 0))
@@ -201,20 +208,41 @@ def get_chain_commits(
 
 
 # --- setup chain worker ---
-def setup_chain_worker(config, subtensor=None, serve=True):
+def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
+    """Create the chain connections this worker needs.
+
+    Returns ``(wallet, subtensor, lite_subtensor)``:
+
+    - ``subtensor`` uses ``config.chain.network`` and must be an archive node
+      because ``get_chain_commits`` issues historical ``block=N`` queries.
+    - ``lite_subtensor`` uses ``config.chain.lite_network`` (defaults to
+      ``finney``) for operations that only need the current head (axon
+      serving, set_weights, head-level metagraph reads). When
+      ``lite_network == network`` the same connection is reused.
+    """
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     if subtensor is None:
-        logger.debug("setup_chain_worker: creating new Subtensor connection", network=config.chain.network)
+        logger.debug("setup_chain_worker: creating archive Subtensor connection", network=config.chain.network)
         subtensor = bittensor.Subtensor(network=config.chain.network)
     else:
-        logger.debug("setup_chain_worker: reusing existing Subtensor connection", network=config.chain.network)
+        logger.debug("setup_chain_worker: reusing existing archive Subtensor connection", network=config.chain.network)
+
+    if lite_subtensor is None:
+        lite_network = config.chain.lite_network
+        if lite_network and lite_network != config.chain.network:
+            logger.debug("setup_chain_worker: creating lite Subtensor connection", lite_network=lite_network)
+            lite_subtensor = bittensor.Subtensor(network=lite_network)
+        else:
+            # lite_network explicitly matches archive — single connection.
+            lite_subtensor = subtensor
+
     if serve:
         serve_axon(
             config=config,
             wallet=wallet,
-            subtensor=subtensor,
+            subtensor=lite_subtensor,
         )
-    return wallet, subtensor
+    return wallet, subtensor, lite_subtensor
 
 
 def serve_axon(config: WorkerConfig, wallet: bittensor.Wallet, subtensor: bittensor.Subtensor):
@@ -236,13 +264,13 @@ def _submit_fallback_weights(
     subtensor: bittensor.Subtensor,
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = False,
-    fallback_miners: list[int] | None = None,
 ) -> bool:
     """Try previous weights from chain, otherwise submit uniform weights.
 
-    Validator UIDs are excluded — weights are only set on miners. When
-    ``fallback_miners`` is provided, it is used directly as the miner group
-    for the uniform-weights path (bypasses metagraph-wide miner derivation).
+    Validator UIDs are excluded — weights are only set on miners. The uniform
+    fallback targets the union of miners currently receiving non-zero weight
+    from any other validator on-chain (self is excluded); this mirrors the
+    rest of the subnet's active miner set without needing an explicit list.
     """
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
 
@@ -256,15 +284,10 @@ def _submit_fallback_weights(
         metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
     }
 
-    fallback_miner_uids = (
-        {int(uid) for uid in fallback_miners} if fallback_miners is not None else None
-    )
-
     if prev_weights:
         miner_prev_weights = {
             uid: w for uid, w in prev_weights.items()
             if int(uid) not in validator_uids
-            and (fallback_miner_uids is None or int(uid) in fallback_miner_uids)
         }
         dropped = len(prev_weights) - len(miner_prev_weights)
 
@@ -288,13 +311,23 @@ def _submit_fallback_weights(
         else:
             logger.warning("No miner weights remain after excluding validators, falling through to uniform")
 
-    if fallback_miners is not None:
-        miner_uids = [int(uid) for uid in fallback_miners]
-    else:
-        n = metagraph.n.item()
-        miner_uids = [uid for uid in range(n) if uid not in validator_uids]
+    # Uniform path: target miners receiving non-zero weight from any other
+    # validator (excluding self). Avoids weighting UIDs the rest of the
+    # subnet has already abandoned.
+    miner_uids_set: set[int] = set()
+    for vuid in validator_uids - {my_uid}:
+        vneuron = subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
+        if vneuron is None:
+            continue
+        for uid, w in vneuron.weights:
+            if float(w) > 0 and int(uid) not in validator_uids:
+                miner_uids_set.add(int(uid))
+    miner_uids = sorted(miner_uids_set)
     if not miner_uids:
-        logger.warning("No miner UIDs available (all excluded as validators), skipping uniform weight set")
+        logger.warning(
+            "No miner UIDs found with non-zero weight from other validators, skipping uniform weight set",
+            other_validator_count=len(validator_uids - {my_uid}),
+        )
         return False
 
     logger.warning(
@@ -331,7 +364,6 @@ def submit_weights(
     top_k: int | None = None,
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = False,
-    fallback_miners: list[int] | None = None,
 ) -> bool:
     """
     Submit weights to the chain for this subnet.
@@ -342,8 +374,6 @@ def submit_weights(
     - If `top_k` is set, only the top-k weights are kept (by value) before normalization.
     - If `normalize=True`, weights are normalized to sum to 1.
     - Zero/negative or non-finite weights are dropped.
-    - `fallback_miners` is forwarded to `_submit_fallback_weights` and used as
-      the miner group for the uniform-weights fallback path.
     """
     # Filter invalid weights
     filtered: list[tuple[int, float]] = []
@@ -356,8 +386,7 @@ def submit_weights(
         logger.warning("No valid weights to submit, falling back to default weights", uids=len(uid_weights))
         return _submit_fallback_weights(config, wallet, subtensor,
                                         wait_for_inclusion=wait_for_inclusion,
-                                        wait_for_finalization=wait_for_finalization,
-                                        fallback_miners=fallback_miners)
+                                        wait_for_finalization=wait_for_finalization)
 
     if top_k is not None:
         if top_k <= 0:
@@ -427,7 +456,9 @@ def submit_weights(
                 )
                 try:
                     # Recreate subtensor to refresh the WS connection.
-                    subtensor = bittensor.Subtensor(network=config.chain.network)
+                    # set_weights only needs the current head, so reconnect to
+                    # the lite endpoint rather than the heavier archive node.
+                    subtensor = bittensor.Subtensor(network=config.chain.lite_network)
                 except Exception as refresh_exc:
                     logger.warning("Failed to refresh subtensor", error=str(refresh_exc))
                 time.sleep(backoff_s * (attempt + 1))

@@ -268,7 +268,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     metric_logger = MetricLogger(config, rank)
 
     # === set up chain worker ===
-    wallet, subtensor = setup_chain_worker(config)
+    # subtensor is the archive connection (needed for historical chain-commit
+    # queries during load_model). lite_subtensor is unused here for now — miner
+    # call sites can migrate onto it in a follow-up without breaking this one.
+    wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(

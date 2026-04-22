@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import gc
 from dataclasses import dataclass
 
+import bittensor
 import torch
 import torch.nn as nn
 
@@ -288,3 +290,126 @@ async def run_evaluation(
         await miners_q.put(None)
 
     await asyncio.gather(*eval_workers)
+
+
+async def stream_gather_and_evaluate(
+    config,
+    subtensor: bittensor.Subtensor,
+    step: int,
+    device: torch.device,
+    score_aggregator,
+    base_model: nn.Module,
+    tokenizer,
+    combined_seed: str,
+    end_block: int,
+    poll_interval_sec: float = 6.0,
+) -> list[MinerEvalJob]:
+    """
+    Stream-evaluate miner submissions as they land during the combined
+    Submission + Validate window.
+
+    Runs the baseline once, spins up a single evaluator worker, and polls
+    `config.ckpt.miner_submission_path` via gather_validation_job every
+    `poll_interval_sec` seconds. New qualifying submissions are enqueued
+    as they appear (deduped by hotkey). Polling stops once
+    `subtensor.block > end_block`; the queue is then drained and the
+    worker shut down.
+
+    Returns the list of MinerEvalJobs that were evaluated so downstream
+    aggregation can operate on the same set.
+    """
+    # Deferred import — gather_validation_job depends on config schemas that
+    # would otherwise create a circular import at module load.
+    from connito.shared.cycle import gather_validation_job, get_validator_miner_assignment
+
+    # Compute once and reuse across every poll tick — the assignment is
+    # stable for the duration of this Submission window.
+    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+
+    # --- Baseline: unmerged base model scored once, reused for all deltas ---
+    baseline_metrics = await _evaluate_on_fresh_loader(
+        config=config,
+        tokenizer=tokenizer,
+        combinded_seed=combined_seed,
+        step=step,
+        model=base_model,
+        device=device,
+        max_eval_batches=EVAL_MAX_BATCHES,
+    )
+    baseline_loss = float(baseline_metrics.get("val_loss", 100))
+    del baseline_metrics
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(
+        "Streaming evaluation baseline complete",
+        val_loss=round(baseline_loss, 4),
+        end_block=end_block,
+        current_block=subtensor.block,
+    )
+
+    jobs_q: asyncio.Queue[MinerEvalJob] = asyncio.Queue()
+    enqueued_hotkeys: set[str] = set()
+    all_jobs: list[MinerEvalJob] = []
+
+    worker = asyncio.create_task(
+        evaluator_worker(
+            "evaluator-streaming",
+            config,
+            jobs_q,
+            score_aggregator,
+            device,
+            base_model,
+            tokenizer,
+            combined_seed,
+            baseline_loss=baseline_loss,
+        )
+    )
+
+    try:
+        while subtensor.block <= end_block:
+            try:
+                jobs = gather_validation_job(
+                    config,
+                    subtensor,
+                    step=step,
+                    validator_miner_assignment=validator_miner_assignment,
+                )
+            except Exception as e:
+                logger.warning("stream_evaluate: gather_validation_job failed", error=str(e))
+                jobs = []
+
+            new_count = 0
+            for job in jobs:
+                if job.hotkey in enqueued_hotkeys:
+                    continue
+                enqueued_hotkeys.add(job.hotkey)
+                all_jobs.append(job)
+                await jobs_q.put(job)
+                new_count += 1
+
+            if new_count:
+                logger.info(
+                    "Streaming eval: enqueued new submissions",
+                    enqueued=new_count,
+                    total_enqueued=len(all_jobs),
+                    queued_waiting=jobs_q.qsize(),
+                    current_block=subtensor.block,
+                    end_block=end_block,
+                )
+
+            if subtensor.block > end_block:
+                break
+            await asyncio.sleep(poll_interval_sec)
+    finally:
+        # Drain whatever is still in the queue before stopping the worker.
+        await jobs_q.join()
+        await jobs_q.put(None)  # type: ignore[arg-type]
+        await worker
+
+    logger.info(
+        "Streaming evaluation finished",
+        evaluated=len(all_jobs),
+        final_block=subtensor.block,
+        end_block=end_block,
+    )
+    return all_jobs

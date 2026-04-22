@@ -86,7 +86,11 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
-from connito.shared.cycle import check_phase_expired, gather_validation_job, get_combined_validator_seed, wait_till
+from connito.shared.cycle import (
+    check_phase_expired,
+    get_combined_validator_seed,
+    wait_till,
+)
 from connito.shared.dataloader import get_dataloader
 from connito.shared.expert_manager import (
     ExpertManager,
@@ -102,7 +106,7 @@ from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator.evaluator import (
     MinerEvalJob,
     load_model_from_path,
-    run_evaluation,
+    stream_gather_and_evaluate,
 )
 from connito.validator.inter_validator_connection import (
     build_averagers_from_buff,
@@ -495,7 +499,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     os.makedirs(config.ckpt.miner_submission_path, exist_ok=True)
 
     # === set up chain worker ===
-    wallet, subtensor = setup_chain_worker(config, serve=False)
+    # subtensor: archive connection (used by setup_training → load_model →
+    # get_chain_commits with historical block=). lite_subtensor: used for
+    # head-only ops like commit_status and submit_weights. They collapse to a
+    # single connection when no lite endpoint is configured.
+    wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
 
     # === set logging ===
     metric_logger = MetricLogger(config, rank)
@@ -569,13 +577,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     commit_status(
         config,
         wallet,
-        subtensor,
+        lite_subtensor,
         ValidatorChainCommit(
             model_hash=None,
             global_ver=global_opt_step,
             expert_group=config.task.exp.group_id,
             miner_seed=0,  # this should reveal later
-            block=subtensor.block,
+            block=lite_subtensor.block,
         ),
     )
 
@@ -630,54 +638,62 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Fetch the metagraph once per cycle — it holds per-neuron tensors and
             # is reused later for penalizing missing submissions.
             max_weight_age = int(config.cycle.cycle_length)
-            metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
-            weight_age = subtensor.block - last_update
+            weight_age = lite_subtensor.block - last_update
             if weight_age > max_weight_age:
                 logger.info("Weights stale, submitting fallback", weight_age=weight_age, max_weight_age=max_weight_age)
-                _submit_fallback_weights(config, wallet, subtensor, wait_for_inclusion=True, wait_for_finalization=True)
+                _submit_fallback_weights(config, wallet, lite_subtensor, wait_for_inclusion=True, wait_for_finalization=True)
 
             commit_status(
                 config,
                 wallet,
-                subtensor,
+                lite_subtensor,
                 ValidatorChainCommit(
                     model_hash=current_model_hash,
                     global_ver=global_opt_step,
                     expert_group=config.task.exp.group_id,
                     miner_seed=secrets.randbits(16),
-                    block=subtensor.block,
+                    block=lite_subtensor.block,
                 ),
             )
 
             check_phase_expired(subtensor, phase_response)
 
-            # === Wait till validation phase to start the validation procedure ===
-            phase_response = wait_till(config, PhaseNames.validate)
-            
-            # === Get miner ===
-            logger.info("(1) Gathering miner jobs")
-            miner_jobs = gather_validation_job(config, subtensor, step=global_opt_step)
-            logger.debug("Miner jobs collected", step=global_opt_step, count=len(miner_jobs))
-            if len(miner_jobs) == 0:
-                logger.warning("No miner jobs to evaluate", step=global_opt_step)
+            # === Wait till Submission phase; stream-evaluate during Submission only ===
+            # Start eval as soon as miners can submit so slow uploads get picked
+            # up and scored the moment they land. Evaluation runs one miner at a
+            # time and stops at the Submission phase boundary.
+            phase_response = wait_till(config, PhaseNames.submission)
 
-            # === Get miner model and evaluate the miners ===
-            logger.info("(2) Evaluating miners")
+            logger.info(
+                "(1) Starting streaming miner evaluation",
+                submission_start=phase_response.phase_start_block,
+                submission_end=phase_response.phase_end_block,
+                current_block=subtensor.block,
+            )
+
             cleanup(global_model)
-            asyncio.run(
-                run_evaluation(
+            miner_jobs = asyncio.run(
+                stream_gather_and_evaluate(
                     config=config,
+                    subtensor=subtensor,
                     step=global_opt_step,
-                    device=device,  # operate at cuda
-                    miners=miner_jobs,
+                    device=device,
                     score_aggregator=score_aggregator,
                     base_model=global_model,
                     tokenizer=tokenizer,
-                    combinded_seed=get_combined_validator_seed(config, subtensor),
+                    combined_seed=get_combined_validator_seed(config, subtensor),
+                    end_block=phase_response.phase_end_block,
                 )
             )
+
+            phase_response = wait_till(config, PhaseNames.validate)
+
+            logger.info("(2) Streaming evaluation complete, aggregating score", evaluated=len(miner_jobs))
+            if len(miner_jobs) == 0:
+                logger.warning("No miner jobs evaluated", step=global_opt_step)
 
             cleanup(global_model)
             
@@ -857,7 +873,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 commit_status(
                     config,
                     wallet,
-                    subtensor,
+                    lite_subtensor,
                     SignedModelHashChainCommit(
                         signed_model_hash=model_ckpt.signed_model_hash,
                     ),
@@ -870,13 +886,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 commit_status(
                     config,
                     wallet,
-                    subtensor,
+                    lite_subtensor,
                     ValidatorChainCommit(
                         model_hash=model_ckpt.model_hash,
                         global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                         expert_group=config.task.exp.group_id,
                         miner_seed=0,
-                        block=subtensor.block,
+                        block=lite_subtensor.block,
                     ),
                 )
 
@@ -892,23 +908,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 "Submitting weights derived from avg scores",
                 top_weights={str(k): round(v, 4) for k, v in sorted(uid_weights.items(), key=lambda item: item[1], reverse=True)[:5]}
             )
-            # Fallback miner group: all miners assigned across validators this cycle.
-            assigned_miner_hotkeys = {
-                hk for hotkeys in validator_miner_assignment.values() for hk in hotkeys
-            }
-            fallback_miners = [
-                metagraph.hotkeys.index(hk)
-                for hk in assigned_miner_hotkeys
-                if hk in metagraph.hotkeys
-            ]
             submit_weights(
                 config=config,
                 wallet=wallet,
-                subtensor=subtensor,
+                subtensor=lite_subtensor,
                 uid_weights=uid_weights,
                 normalize=True,
                 top_k=config.evaluation.top_k_miners_to_reward,
-                fallback_miners=fallback_miners,
             )
 
             # === archive top-k submissions, delete the rest ===

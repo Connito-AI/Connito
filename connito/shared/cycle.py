@@ -528,9 +528,12 @@ def load_submission_files(folder: str = "miner_submission"):
     return files_dict
 
 
-def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtensor, step: int) -> list[MinerEvalJob]:
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
-
+def gather_validation_job(
+    config: ValidatorConfig,
+    subtensor: bittensor.Subtensor,
+    step: int,
+    validator_miner_assignment: dict[str, list[str]],
+) -> list[MinerEvalJob]:
     miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
 
     if not miner_assignment:
@@ -551,6 +554,17 @@ def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtenso
     outdated_submissions = []
     unexpected_submissions = []
     for file_name, submission_meta in miner_submission_files.items():
+        # Guard against filenames that don't match the uid_*_hotkey_*_block_*.pt
+        # template (partial uploads, stale files from older miner versions,
+        # manually placed debug checkpoints). Without this, a single bad file
+        # raises KeyError and aborts the whole scan, losing valid submissions.
+        if "hotkey" not in submission_meta or "block" not in submission_meta:
+            logger.warning(
+                "Skipping submission file: missing required filename fields",
+                file_name=file_name,
+                parsed_keys=sorted(submission_meta.keys()),
+            )
+            continue
         is_assigned = submission_meta["hotkey"] in miner_assignment
         in_previous_phase = previous_phase_range is not None and (previous_phase_range[0] <= submission_meta["block"] <= previous_phase_range[1])
         if is_assigned and in_previous_phase:
@@ -593,7 +607,7 @@ def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtenso
 
 
     if missing_hotkeys:
-        logger.warning(
+        logger.debug(
             "Missing miner submissions",
             missing_hotkeys=missing_hotkeys,
             assigned_count=len(miner_assignment),
@@ -601,7 +615,7 @@ def gather_validation_job(config: ValidatorConfig, subtensor: bittensor.Subtenso
         )
     
     if unexpected_submissions:
-        logger.warning(
+        logger.debug(
             "Rejected submission: In phase but unassigned miner",
             unexpected_count=len(unexpected_submissions),
             unexpected_submissions=unexpected_submissions,
