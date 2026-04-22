@@ -719,7 +719,12 @@ async def submit_checkpoint(
 
     logger.info("Submission verified", path=str(dest_path))
 
-    delete_old_checkpoints_by_hotkey(config.ckpt.miner_submission_path)
+    delete_old_checkpoints_by_hotkey(
+        config.ckpt.miner_submission_path,
+        current_block=subtensor.block,
+        cycle_length=config.cycle.cycle_length,
+        max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+    )
 
     return {
         "status": "ok",
