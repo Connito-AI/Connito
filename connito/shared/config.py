@@ -158,6 +158,7 @@ class ChainCfg(BaseConfig):
     coldkey_name: str = "template_coldkey_name"
     hotkey_name: str = "template_hotkey_name"
     network: str = "archive"
+    lite_network: str = "finney"
 
 
 class CycleCfg(BaseConfig):
