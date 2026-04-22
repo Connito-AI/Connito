@@ -554,6 +554,17 @@ def gather_validation_job(
     outdated_submissions = []
     unexpected_submissions = []
     for file_name, submission_meta in miner_submission_files.items():
+        # Guard against filenames that don't match the uid_*_hotkey_*_block_*.pt
+        # template (partial uploads, stale files from older miner versions,
+        # manually placed debug checkpoints). Without this, a single bad file
+        # raises KeyError and aborts the whole scan, losing valid submissions.
+        if "hotkey" not in submission_meta or "block" not in submission_meta:
+            logger.warning(
+                "Skipping submission file: missing required filename fields",
+                file_name=file_name,
+                parsed_keys=sorted(submission_meta.keys()),
+            )
+            continue
         is_assigned = submission_meta["hotkey"] in miner_assignment
         in_previous_phase = previous_phase_range is not None and (previous_phase_range[0] <= submission_meta["block"] <= previous_phase_range[1])
         if is_assigned and in_previous_phase:
