@@ -73,6 +73,7 @@ from connito.shared.chain import (
     submit_weights,
 )
 from connito.shared.checkpoint_helper import (
+    cleanup_temporary_checkpoint_dirs,
     load_checkpoint,
     save_checkpoint,
 )
@@ -81,6 +82,7 @@ from connito.shared.checkpoints import (
     archive_top_miner_submissions,
     build_local_checkpoint,
     delete_old_checkpoints,
+    prune_miner_submission_files,
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
@@ -627,6 +629,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     current_model_hash = None
 
+    if config.ckpt.cleanup_stale_temporary_checkpoints:
+        cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
+
     try:
         while True:
 
@@ -864,6 +869,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             logger.info("(6) Saving checkpoint")
             ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
 
+            presave_keep = None
+            if config.ckpt.checkpoint_topk is not None:
+                presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
+            if presave_keep is not None:
+                presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
+                if presave_deleted:
+                    logger.info(
+                        "Pruned older checkpoints before save",
+                        keep=presave_keep,
+                        deleted=presave_deleted,
+                    )
+
             save_checkpoint(
                 checkpoint_path=ckpt_path,
                 model=global_model,
@@ -995,9 +1012,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     archive_dir=config.ckpt.miner_submission_archive_path,
                     score_aggregator=score_aggregator,
                     top_k=config.evaluation.top_k_miners_to_reward,
+                    max_archive=config.ckpt.miner_submission_archive_max_files,
                 )
-            else:
-                logger.info("(10) Submission archiving disabled, skipping")
+
+            deleted = prune_miner_submission_files(
+                config.ckpt.miner_submission_path,
+                current_block=subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+            )
+            logger.info(
+                "(10) Pruned aged miner submissions after cycle",
+                deleted=len(deleted),
+                current_block=subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+            )
 
             # === validation and log metric ===
             # Local evaluation step disabled to reduce per-cycle RAM/compute load.

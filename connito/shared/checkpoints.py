@@ -785,45 +785,88 @@ def delete_old_checkpoints(checkpoint_path: str | Path, topk: int) -> list[str]:
     return ckpt_deleted
 
 
-def delete_old_checkpoints_by_hotkey(folder_path: Path) -> list[str]:
+def prune_miner_submission_files(
+    folder_path: Path,
+    current_block: int,
+    cycle_length: int,
+    max_age_cycles: float = 1.5,
+) -> list[str]:
     """
-    Deletes all non-latest submission files coming from the same hotkey.
-    Keeps only the file with the highest block number per hotkey.
+    Delete miner submission files older than the allowed history window.
+
+    Files are identified by the embedded `block` in their filename. Any file
+    older than `max_age_cycles * cycle_length` relative to `current_block` is
+    removed.
     """
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
 
-    submissions_by_hotkey: dict[str, list[tuple[int, Path]]] = {}
+    max_age_blocks = max(0, int(cycle_length * max_age_cycles))
+    min_allowed_block = current_block - max_age_blocks
+
     for file_path in folder_path.glob("*.pt"):
         meta = parse_dynamic_filename(file_path.name)
         if "hotkey" not in meta or "block" not in meta:
-            print(f"Skipping malformed filename: {file_path.name}")
+            logger.warning("Skipping malformed submission filename", file=file_path.name)
+            continue
+
+    deleted_files: list[str] = []
+    for file_path in folder_path.glob("*.pt"):
+        meta = parse_dynamic_filename(file_path.name)
+        if "hotkey" not in meta or "block" not in meta:
             continue
 
         hotkey = meta["hotkey"]
         block = meta["block"]
+        if not isinstance(block, int):
+            logger.warning("Skipping submission with non-integer block", file=file_path.name, block=block)
+            continue
+        if block > min_allowed_block:
+            continue
 
-        if hotkey not in submissions_by_hotkey:
-            submissions_by_hotkey[hotkey] = []
-        submissions_by_hotkey[hotkey].append((block, file_path))
-
-    deleted_files = []
-    for _, entries in submissions_by_hotkey.items():
-        entries.sort(key=lambda x: x[0], reverse=True)
-
-        for _, file_path in entries[2:]:
-            try:
-                os.remove(file_path)
-                deleted_files.append(file_path.name)
-            except Exception as exc:
-                print(f"Failed to delete {file_path.name}: {exc}")
+        try:
+            os.remove(file_path)
+            deleted_files.append(file_path.name)
+        except Exception as exc:
+            logger.warning("Failed to delete aged submission file", file=file_path.name, error=str(exc), hotkey=hotkey)
 
     if deleted_files:
-        logger.info("Deleted outdated submissions", count=len(deleted_files), files=deleted_files)
+        logger.info(
+            "Deleted aged submissions",
+            count=len(deleted_files),
+            files=deleted_files,
+            current_block=current_block,
+            cycle_length=cycle_length,
+            max_age_cycles=max_age_cycles,
+            min_allowed_block=min_allowed_block,
+        )
     else:
-        logger.debug("No outdated submissions to delete")
+        logger.debug(
+            "No aged submissions to delete",
+            current_block=current_block,
+            cycle_length=cycle_length,
+            max_age_cycles=max_age_cycles,
+            min_allowed_block=min_allowed_block,
+        )
 
     return deleted_files
+
+
+def delete_old_checkpoints_by_hotkey(
+    folder_path: Path,
+    current_block: int,
+    cycle_length: int,
+    max_age_cycles: float = 1.5,
+) -> list[str]:
+    """
+    Backward-compatible wrapper for miner submission pruning.
+    """
+    return prune_miner_submission_files(
+        folder_path,
+        current_block=current_block,
+        cycle_length=cycle_length,
+        max_age_cycles=max_age_cycles,
+    )
 
 
 def archive_top_miner_submissions(

@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Iterable, Literal
 
 import bittensor
 import fsspec
@@ -331,6 +331,9 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     # and disk write throughput from N parallel 3.35 GiB uploads dragging each
     # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
     submission_concurrency: int = 2
+    cleanup_stale_temporary_checkpoints: bool = True
+    miner_submission_max_age_cycles: PositiveFloat = 1.5
+    miner_submission_archive_max_files: PositiveInt = 500
 
 
 class DhtCfg(BaseConfig):
