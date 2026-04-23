@@ -61,7 +61,7 @@ def submit_model(
     block: int,
     timeout_s: int = 300,
     retries: int = 3,
-    backoff: float = 1.8,
+    backoff_s: float = 60.0,
     expert_groups: list[int | str] | None = None,
     extra_form: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -190,9 +190,8 @@ def submit_model(
         # If we got here, we plan to retry
         attempt += 1
         if attempt <= retries:
-            sleep_s = backoff**attempt
-            logger.info("Retrying after backoff", sleep_seconds=sleep_s, attempt=attempt + 1)
-            time.sleep(sleep_s)
+            logger.info("Retrying after backoff", sleep_seconds=backoff_s, attempt=attempt + 1)
+            time.sleep(backoff_s)
 
     # Exhausted retries
     logger.error("Submission failed after all retries exhausted", total_attempts=retries + 1, last_error=str(last_exc))
