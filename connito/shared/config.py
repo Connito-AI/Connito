@@ -180,7 +180,7 @@ class CycleCfg(BaseConfig):
     version_range_cycles: int = 3  # how many cycles back to accept checkpoints
     # Owner-node API retry policy
     api_timeout_sec: int = 10
-    api_retries: int = 3
+    api_retries: int = 5
     api_backoff_sec: int = 2
 
 
