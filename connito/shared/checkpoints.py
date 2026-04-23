@@ -387,7 +387,7 @@ class ChainCheckpoints(BaseModel):
                 missing.append("hotkey")
 
             if missing:
-                logger.debug(
+                logger.info(
                     "filter_checkpoints: excluded (incomplete)",
                     hotkey=ckpt.hotkey,
                     uid=ckpt.uid,
@@ -428,7 +428,7 @@ class ChainCheckpoints(BaseModel):
                         max_allowed_version=max_allowed_version,
                     )
                 elif ver is not None and min_allowed_version is not None and ver < min_allowed_version:
-                    logger.warning(
+                    logger.info(
                         "filter_checkpoints: excluded (version too old)",
                         hotkey=ckpt.hotkey,
                         uid=ckpt.uid,

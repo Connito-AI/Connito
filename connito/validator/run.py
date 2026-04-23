@@ -603,8 +603,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.0":
-        logger.info("Skipping historic score_aggregator load for v0.1.0", pkg_version=pkg_version)
+    if pkg_version == "v0.1.1":
+        logger.info("Skipping historic score_aggregator load for v0.1.1", pkg_version=pkg_version)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
         try:
