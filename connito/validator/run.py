@@ -194,6 +194,7 @@ def setup_training(
     device: torch.device,
     tokenizer: PreTrainedTokenizerBase,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     wallet: bittensor.Wallet,
     current_model_meta: ModelCheckpoint | None,
 ) -> tuple[
@@ -217,7 +218,7 @@ def setup_training(
     expert_manager = ExpertManager(config)
     # global_model: partial model (only assigned experts) — used for optimization and evaluation
     global_model, model_meta = load_model(
-        rank, config, expert_manager, subtensor, wallet, current_model_meta,
+        rank, config, expert_manager, subtensor, phase_manager, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
     )
 
@@ -512,6 +513,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # head-only ops like commit_status and submit_weights. They collapse to a
     # single connection when no lite endpoint is configured.
     wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
+    phase_manager = PhaseManager.from_api(config, subtensor)
 
     # === set logging ===
     metric_logger = MetricLogger(config, rank)
@@ -531,7 +533,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         start_step,
         expert_manager,
         train_dataloader,
-    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+    ) = setup_training(config, rank, device, tokenizer, subtensor, phase_manager, wallet, current_model_meta=None)
 
     global_opt_step = start_step
     # Tracks whether this validator participated in the last allreduce.
@@ -573,8 +575,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
-        subtensor=subtensor, 
-        phase_manager=PhaseManager(config.cycle, subtensor),
+        subtensor=subtensor,
+        phase_manager=phase_manager,
         group_averagers=group_averagers,
         interval_sec=12.0
     )
@@ -623,6 +625,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     expert_manager=expert_manager,
                     device=device,
                     subtensor=subtensor,
+                    phase_manager=phase_manager,
                     wallet=wallet,
                 )
                 if success:
@@ -634,8 +637,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
                 _participated_in_merge = True  # reset regardless; try allreduce next cycle
 
+            # Refresh phase schedule from owner once per cycle so in-flight
+            # schedule changes take effect without restarting the validator.
+            phase_manager.refresh_from_api(config)
+
             # === Wait till commit phase to submit random seed ===
-            phase_response = wait_till(config, PhaseNames.miner_commit_1)
+            phase_response = wait_till(phase_manager, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
             logger.info("(0) Commit new seed for next validation")
 
@@ -670,7 +677,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Start eval as soon as miners can submit so slow uploads get picked
             # up and scored the moment they land. Evaluation runs one miner at a
             # time and stops at the Submission phase boundary.
-            phase_response = wait_till(config, PhaseNames.submission)
+            phase_response = wait_till(phase_manager, PhaseNames.submission)
 
             logger.info(
                 "(1) Starting streaming miner evaluation",
@@ -685,11 +692,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # later would query a different block/phase and could yield a
             # different assignment.
             from connito.shared.cycle import get_validator_miner_assignment
-            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+            validator_miner_assignment = get_validator_miner_assignment(config, subtensor, phase_manager)
             miner_jobs = asyncio.run(
                 stream_gather_and_evaluate(
                     config=config,
                     subtensor=subtensor,
+                    phase_manager=phase_manager,
                     step=global_opt_step,
                     device=device,
                     score_aggregator=score_aggregator,
@@ -701,7 +709,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
             )
 
-            phase_response = wait_till(config, PhaseNames.validate)
+            phase_response = wait_till(phase_manager, PhaseNames.validate)
 
             logger.info("(2) Streaming evaluation complete, aggregating score", evaluated=len(miner_jobs))
             if len(miner_jobs) == 0:
@@ -800,7 +808,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             check_phase_expired(subtensor, phase_response)
 
             # === wait till merging phase and aggregate miner gradient change ===
-            phase_response = wait_till(config, PhaseNames.merge)
+            phase_response = wait_till(phase_manager, PhaseNames.merge)
 
             if grad_is_valid:
                 logger.info("(4) Syncing gradient across validators")
@@ -868,7 +876,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 model_ckpt.expert_group = config.task.exp.group_id
                 model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
-                phase_response = wait_till(config, PhaseNames.validator_commit_1)
+                phase_response = wait_till(phase_manager, PhaseNames.validator_commit_1)
                 logger.info("(7) Commit new signed_model_hash for next validation")
                 commit_status(
                     config,
@@ -881,7 +889,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 check_phase_expired(subtensor, phase_response)
 
-                phase_response = wait_till(config, PhaseNames.validator_commit_2)
+                phase_response = wait_till(phase_manager, PhaseNames.validator_commit_2)
                 logger.info("(8) Commit model_hash for next validation")
                 commit_status(
                     config,

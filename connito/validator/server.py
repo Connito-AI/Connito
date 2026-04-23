@@ -24,14 +24,14 @@ from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.checkpoints import delete_old_checkpoints_by_hotkey, select_best_checkpoint, build_chain_checkpoints_from_previous_phase
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.cycle import (
+    BITTENSOR_BLOCK_TIME_SECONDS,
     PhaseNames,
     PhaseResponseLite,
-    get_blocks_from_previous_phase_from_api,
-    get_blocks_until_next_phase_from_api,
-    get_phase_from_api,
     get_validator_miner_assignment,
-    PhaseResponse
+    PhaseResponse,
+    wait_till,
 )
+from connito.sn_owner.cycle import PhaseManager
 from connito.shared.helper import parse_dynamic_filename, hex_to_byte
 from connito.shared.schema import (
     construct_block_message,
@@ -127,9 +127,11 @@ class ValidatorStateCache:
         self,
         config: ValidatorConfig,
         subtensor: bittensor.Subtensor,
+        phase_manager: PhaseManager,
     ) -> None:
         self._config = config
         self._subtensor = subtensor
+        self._phase_manager = phase_manager
         self._blocks_until_cache = None
         self._blocks_until_cache_phase_end = None
         self._previous_phase_cache = None
@@ -179,7 +181,11 @@ class ValidatorStateCache:
             
             if current_phase is None:
                 # refresh
-                self._phase_cache: PhaseResponse | None = get_phase_from_api(self._config)
+                try:
+                    self._phase_cache: PhaseResponse | None = self._phase_manager.get_phase()
+                except Exception as e:
+                    logger.warning("ValidatorStateCache.get_phase: failed to resolve phase locally", error=str(e))
+                    self._phase_cache = None
                 self._phase_cache_block = block
 
             else:
@@ -198,7 +204,11 @@ class ValidatorStateCache:
 
         if should_refresh:
             self._blocks_until_cache_phase_end = None
-            self._blocks_until_cache: dict[str, tuple[int, int, int]] | None = get_blocks_until_next_phase_from_api(self._config)
+            try:
+                self._blocks_until_cache: dict[str, tuple[int, int, int]] | None = self._phase_manager.blocks_until_next_phase()
+            except Exception as e:
+                logger.warning("ValidatorStateCache.get_blocks_until_next_phase: failed to resolve locally", error=str(e))
+                self._blocks_until_cache = None
             # Record the end block of the current phase so we refresh on phase change
             if self._blocks_until_cache:
                 for _, (start, end, _) in self._blocks_until_cache.items():
@@ -251,7 +261,7 @@ class ValidatorStateCache:
             or (prev_miner_commit_2_end is not None and prev_miner_commit_2_end != self._assignment_cache_block)
         )
         if should_refresh:
-            self._assignment_cache = get_validator_miner_assignment(self._config, self._subtensor)
+            self._assignment_cache = get_validator_miner_assignment(self._config, self._subtensor, self._phase_manager)
             self._assignment_cache_block = prev_miner_commit_2_end
 
         return self._assignment_cache
@@ -267,6 +277,7 @@ class ValidatorStateCache:
             self._chain_checkpoints_cache = build_chain_checkpoints_from_previous_phase(
                 config=self._config,
                 subtensor=self._subtensor,
+                phase_manager=self._phase_manager,
                 for_role="miner",
             )
             self._chain_checkpoints_cache_block = prev_miner_commit_2_end
@@ -281,10 +292,35 @@ class SendBody(BaseModel):
     download_name: str | None = None
 
 
+async def _phase_manager_refresh_loop(config: ValidatorConfig, phase_manager: PhaseManager) -> None:
+    """Refresh `phase_manager` at the beginning of each Train phase.
+
+    The FastAPI server has no cycle loop of its own, so without this task a
+    cycle-config change on the owner would never propagate here and
+    ValidatorStateCache would keep reporting phases against the stale schedule.
+    """
+    while True:
+        try:
+            # wait_till is blocking (time.sleep); run it off the event loop.
+            await asyncio.to_thread(wait_till, phase_manager, PhaseNames.train)
+            phase_manager.refresh_from_api(config)
+            # Step past Train so the next wait_till doesn't return immediately
+            # (it would, because we're still inside Train right now).
+            blocks_to_sleep = phase_manager.get_phase().blocks_remaining_in_phase + 1
+            await asyncio.sleep(blocks_to_sleep * BITTENSOR_BLOCK_TIME_SECONDS)
+        except Exception as e:
+            logger.warning("phase_manager refresh loop error", error=str(e))
+            await asyncio.sleep(BITTENSOR_BLOCK_TIME_SECONDS * 5)
+
+
 @app.on_event("startup")
 async def _startup():
     configure_logging()  # <— configure ONCE
     structlog.get_logger(__name__).info("Validator server started")
+    # Kick off the background refresh so the cached schedule stays in sync
+    # with the owner. `config` / `phase_manager` are populated in __main__
+    # before uvicorn.run starts serving requests.
+    asyncio.create_task(_phase_manager_refresh_loop(config, phase_manager))
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -736,6 +772,7 @@ if __name__ == "__main__":
     global subtensor
     global validator_state_cache
     global expert_manager
+    global phase_manager
 
     if args.path:
         config = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
@@ -760,7 +797,8 @@ if __name__ == "__main__":
     serve_axon(config=config, wallet=wallet, subtensor=subtensor)
     logger.info("Axon served on chain", hotkey=wallet.hotkey.ss58_address, ip=config.chain.ip, port=config.chain.port)
 
-    validator_state_cache = ValidatorStateCache(config=config, subtensor=subtensor)
+    phase_manager = PhaseManager.from_api(config, subtensor)
+    validator_state_cache = ValidatorStateCache(config=config, subtensor=subtensor, phase_manager=phase_manager)
 
     expert_manager = ExpertManager(config)
 

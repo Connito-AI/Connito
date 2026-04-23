@@ -19,7 +19,7 @@ from connito.shared.chain import (
     get_chain_commits,
     serve_axon,
 )
-from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+from connito.shared.config import CycleCfg, MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.helper import h256_int, parse_dynamic_filename
 from connito.validator.evaluator import MinerEvalJob
 
@@ -114,12 +114,16 @@ class PhaseNames:
     validator_commit_2: str = "ValidatorCommit2"  # validator commit model_hash
 
 
-def wait_till(config: MinerConfig | ValidatorConfig, phase_name: str, poll_fallback_block: int = 3) -> PhaseResponse:
+def wait_till(
+    phase_manager: "PhaseManager",
+    phase_name: str,
+    poll_fallback_block: int = 3,
+) -> PhaseResponse:
     ready = False
     phase_response: PhaseResponse | None = None
     first_print = True
     while not ready:
-        ready, blocks_till, phase_response = should_act(config, phase_name, retry_blocks=poll_fallback_block)
+        ready, blocks_till, phase_response = should_act(phase_manager, phase_name, retry_blocks=poll_fallback_block)
         if ready is False and blocks_till > 0:
             sleep_sec = min(blocks_till, max(poll_fallback_block, blocks_till * 0.9)) * BITTENSOR_BLOCK_TIME_SECONDS
 
@@ -163,29 +167,36 @@ def check_phase_expired(subtensor: bittensor.Subtensor, phase_response: PhaseRes
     return False
 
 
-def should_act(config: MinerConfig | ValidatorConfig, phase_name: str, retry_blocks: int) -> tuple[bool, int, PhaseResponse | None]:
-    phase_response: PhaseResponse | None = get_phase_from_api(config)
+def should_act(
+    phase_manager: "PhaseManager",
+    phase_name: str,
+    retry_blocks: int,
+) -> tuple[bool, int, PhaseResponse | None]:
+    try:
+        phase_response: PhaseResponse | None = phase_manager.get_phase()
+    except Exception as e:
+        logger.warning("should_act: failed to compute current phase", error=str(e))
+        phase_response = None
 
-    if phase_response is None:
-        ready = False
-    else:
-        ready = phase_response.phase_name == phase_name
+    ready = phase_response is not None and phase_response.phase_name == phase_name
 
-    blocks_till_next_phase = get_blocks_until_next_phase_from_api(config)
-
-    if blocks_till_next_phase is None:
+    try:
+        blocks_till = phase_manager.blocks_until_next_phase()[phase_name][2]
+    except Exception as e:
+        logger.warning("should_act: failed to compute blocks until next phase", error=str(e))
         blocks_till = retry_blocks
-    else:
-        blocks_till = blocks_till_next_phase[phase_name][2]
 
     return ready, blocks_till, phase_response
 
 
 def search_model_submission_destination(
-    wallet: bittensor.Wallet, config: MinerConfig, subtensor: bittensor.Subtensor
+    wallet: bittensor.Wallet,
+    config: MinerConfig,
+    subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
 ) -> bittensor.Axon:
-    
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+
+    validator_miner_assignment = get_validator_miner_assignment(config, subtensor, phase_manager)
 
     assigned_validator_hotkey = None
     for validator, miners in validator_miner_assignment.items():
@@ -283,7 +294,11 @@ def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subte
     return hashlib.sha256(combined_seed_str.encode()).hexdigest()
 
 
-def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Subtensor):
+def get_validator_miner_assignment(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
+):
     from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
 
     commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
@@ -292,7 +307,7 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
 
     # Filter miners to only those with a chain checkpoint from the previous commit phase
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
-        config=config, subtensor=subtensor, for_role="miner",
+        config=config, subtensor=subtensor, phase_manager=phase_manager, for_role="miner",
     )
     miners_with_checkpoint = {ckpt.hotkey for ckpt in chain_checkpoints.checkpoints}
     excluded_miners = [m for m in miners if m not in miners_with_checkpoint]
@@ -354,71 +369,26 @@ def get_miners_from_commit(config, commits):
     return miners
 
 
-def get_phase_from_api(config: WorkerConfig) -> PhaseResponse | None:
-    """
-    Determine current phase based on block schedule.
-
-    Returns:
-        str: one of ["training", "submission", "waiting"]
-    """
+def fetch_cycle_cfg_from_api(config: WorkerConfig) -> CycleCfg | None:
+    """Fetch the owner's CycleCfg via /get_cycle_config. Returns None on failure."""
     base_url = config.cycle.owner_url
-    url = f"{base_url}/get_phase"
+    url = f"{base_url}/get_cycle_config"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    resp = _get_with_retry(
+        url,
+        timeout=config.cycle.api_timeout_sec,
+        retries=config.cycle.api_retries,
+        backoff=config.cycle.api_backoff_sec,
+    )
     if resp is None:
         return None
 
     try:
-        return PhaseResponse(**resp.json())
+        return CycleCfg(**resp.json())
     except (ValueError, TypeError) as e:
-        # ValueError: JSON decode problems
-        # TypeError: PhaseResponse(**...) got unexpected/missing fields
-        logger.exception("Bad response payload from %s: %s", url, e)
+        logger.exception("Bad /get_cycle_config payload from %s: %s", url, e)
         return None
 
-
-def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tuple[int, int, int]] | None:
-    """
-    Determine current phase based on block schedule.
-
-    Returns:
-        str: one of ["training", "submission", "waiting"]
-    """
-    base_url = config.cycle.owner_url
-    url = f"{base_url}/blocks_until_next_phase"
-
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as e:
-        # JSON decoding failed
-        logger.exception("Invalid JSON from %s: %s", url, e)
-        return None
-
-
-def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None:
-    """
-    Determine current phase based on block schedule.
-
-    Returns:
-        str: one of ["training", "submission", "waiting"]
-    """
-    base_url = config.cycle.owner_url
-    url = f"{base_url}/previous_phase_blocks"
-
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as e:
-        # JSON decoding failed
-        logger.exception("Invalid JSON from %s: %s", url, e)
-        return None
 
 def get_validator_whitelist_from_api(config) -> set[str]:
     """Fetch the validator whitelist from the owner phase service."""
@@ -442,18 +412,26 @@ def get_validator_whitelist_from_api(config) -> set[str]:
     except (ValueError, TypeError) as e:
         logger.exception("Invalid JSON from %s: %s", url, e)
         return set()
-def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | None]:
+def get_allowed_version_range(
+    config: WorkerConfig,
+    phase_manager: "PhaseManager",
+) -> tuple[int | None, int | None]:
     """
     Return (min_allowed_version, max_allowed_version) for global_ver filtering.
 
     max_allowed_version: start block of the most recent MinerCommit1 phase.
-    min_allowed_version: max_allowed_version - 1.5 * cycle_length.
+    min_allowed_version: max_allowed_version - version_range_cycles * cycle_length.
 
-    Both are derived from the owner phase service API.
-    Returns (None, None) if the API is unavailable.
+    Both are derived from the local PhaseManager.
+    Returns (None, None) if the phase cannot be resolved.
     """
-    current_phase = get_phase_from_api(config)
-    if current_phase is not None and current_phase.phase_name == PhaseNames.miner_commit_1:
+    try:
+        current_phase = phase_manager.get_phase()
+    except Exception as e:
+        logger.warning("get_allowed_version_range: failed to compute current phase", error=str(e))
+        return None, None
+
+    if current_phase.phase_name == PhaseNames.miner_commit_1:
         max_version = current_phase.phase_start_block
         cycle_length = current_phase.cycle_length
         min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
@@ -463,9 +441,10 @@ def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | N
         )
         return min_version, max_version
 
-    previous_ranges = get_blocks_from_previous_phase_from_api(config)
-    if previous_ranges is None:
-        logger.warning("get_allowed_version_range: could not fetch previous phase ranges")
+    try:
+        previous_ranges = phase_manager.previous_phase_block_ranges()
+    except Exception as e:
+        logger.warning("get_allowed_version_range: failed to compute previous phase ranges", error=str(e))
         return None, None
 
     miner_commit_1_range = previous_ranges.get(PhaseNames.miner_commit_1)
@@ -531,6 +510,7 @@ def load_submission_files(folder: str = "miner_submission"):
 def gather_validation_job(
     config: ValidatorConfig,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     step: int,
     validator_miner_assignment: dict[str, list[str]],
 ) -> list[MinerEvalJob]:
@@ -542,11 +522,12 @@ def gather_validation_job(
         logger.debug("assigned_miners", miner_assignment=miner_assignment)
 
     miner_submission_files = load_submission_files(str(config.ckpt.miner_submission_path))
-    _prev_phase_api = get_blocks_from_previous_phase_from_api(config)
-    if _prev_phase_api is None:
-        logger.warning("gather_validation_job: could not fetch previous phase info from API — skipping evaluation this cycle")
+    try:
+        previous_phase_ranges = phase_manager.previous_phase_block_ranges()
+    except Exception as e:
+        logger.warning("gather_validation_job: failed to compute previous phase ranges — skipping evaluation this cycle", error=str(e))
         return []
-    previous_phase_range = _prev_phase_api.get(PhaseNames.submission)
+    previous_phase_range = previous_phase_ranges.get(PhaseNames.submission)
 
     hotkeys = subtensor.metagraph(netuid=config.chain.netuid).hotkeys
     miner_jobs = []

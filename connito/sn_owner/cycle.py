@@ -1,8 +1,10 @@
 import bittensor
 
-from connito.shared.config import CycleCfg
-from connito.shared.cycle import PhaseNames, PhaseResponse
+from connito.shared.app_logging import structlog
+from connito.shared.config import CycleCfg, WorkerConfig
+from connito.shared.cycle import PhaseNames, PhaseResponse, fetch_cycle_cfg_from_api
 
+logger = structlog.get_logger(__name__)
 
 
 class PhaseManager:
@@ -16,6 +18,34 @@ class PhaseManager:
     def from_dict(cls, cycle_dict: dict, subtensor: bittensor.Subtensor) -> "PhaseManager":
         """Build from a dict matching CycleCfg (e.g. parsed from the owner's /get_cycle_config JSON)."""
         return cls(CycleCfg(**cycle_dict), subtensor)
+
+    @classmethod
+    def from_api(cls, config: WorkerConfig, subtensor: bittensor.Subtensor) -> "PhaseManager":
+        """Construct by fetching CycleCfg from the owner's /get_cycle_config.
+
+        Falls back to the local `config.cycle` if the API is unreachable so
+        clients can still make progress with their on-disk settings.
+        """
+        cfg = fetch_cycle_cfg_from_api(config)
+        if cfg is None:
+            logger.warning("PhaseManager.from_api: /get_cycle_config unavailable — using local config.cycle")
+            cfg = config.cycle
+        return cls(cfg, subtensor)
+
+    def refresh_from_api(self, config: WorkerConfig) -> bool:
+        """Re-fetch CycleCfg from owner and rebuild phases in place.
+
+        Returns True on a successful refresh. Existing references to this
+        instance (e.g. from the telemetry poller) stay valid.
+        """
+        cfg = fetch_cycle_cfg_from_api(config)
+        if cfg is None:
+            logger.warning("PhaseManager.refresh_from_api: /get_cycle_config unavailable — keeping previous phases")
+            return False
+        self.cycle_cfg = cfg
+        self.phases = self.init_phases(cfg, PhaseNames())
+        self.cycle_length = sum(p["length"] for p in self.phases)
+        return True
 
     def init_phases(self, cycle_cfg: CycleCfg, names):
         # ordered phase

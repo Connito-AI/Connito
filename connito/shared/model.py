@@ -25,7 +25,7 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.client import download_model
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
-from connito.shared.cycle import PhaseNames, get_blocks_from_previous_phase_from_api
+from connito.shared.cycle import PhaseNames
 from connito.shared.expert_manager import (
     ExpertManager,
     get_layer_expert_id,
@@ -188,6 +188,7 @@ def load_model(
     config: MinerConfig | ValidatorConfig,
     expert_manager: ExpertManager,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     wallet: bittensor.Wallet,
     current_checkpoint: ModelCheckpoint | None = None,
     partial: bool = False,
@@ -211,6 +212,7 @@ def load_model(
         current_model_meta=current_checkpoint,
         config=config,
         subtensor=subtensor,
+        phase_manager=phase_manager,
         wallet=wallet,
         expert_group_ids=[config.task.exp.group_id],
         expert_group_assignment=expert_manager.expert_group_assignment
@@ -223,6 +225,7 @@ def fetch_model_from_chain_validator(
     current_model_meta: ModelCheckpoint | None,
     config: WorkerConfig,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     wallet: bittensor.Wallet,
     expert_group_ids: list[int | str],
     expert_group_assignment: ExpertAssignments
@@ -237,7 +240,11 @@ def fetch_model_from_chain_validator(
         owner_hotkey = None
 
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
-        config=config, subtensor=subtensor, for_role="validator", owner_hotkey=owner_hotkey
+        config=config,
+        subtensor=subtensor,
+        phase_manager=phase_manager,
+        for_role="validator",
+        owner_hotkey=owner_hotkey,
     )
 
     # --- Filter to only newer than current model ---
@@ -357,6 +364,7 @@ def reload_model_inplace(
     expert_manager: ExpertManager,
     device: torch.device,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     wallet: bittensor.Wallet,
 ) -> bool:
     """
@@ -375,6 +383,7 @@ def reload_model_inplace(
             current_model_meta=None,  # None = always try; no version gate
             config=config,
             subtensor=subtensor,
+            phase_manager=phase_manager,
             wallet=wallet,
             expert_group_ids=[config.task.exp.group_id, "shared"],
             expert_group_assignment=expert_manager.expert_group_assignment,

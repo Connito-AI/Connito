@@ -104,6 +104,7 @@ def setup_training(
     device: torch.device,
     tokenizer: PreTrainedTokenizerBase,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     wallet: bittensor.Wallet,
     current_model_meta: ModelCheckpoint,
 ) -> tuple[
@@ -146,7 +147,7 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("init - model and expert manager")
     expert_manager = ExpertManager(config)
-    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet, partial=True)
+    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, phase_manager, wallet, partial=True)
     model = model.to(device)
     model = freeze_parameters(
         model=model,
@@ -272,11 +273,12 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     # queries during load_model). lite_subtensor is unused here for now — miner
     # call sites can migrate onto it in a follow-up without breaking this one.
     wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
+    phase_manager = PhaseManager.from_api(config, subtensor)
 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
-        subtensor=subtensor, 
-        phase_manager=PhaseManager(config.cycle, subtensor),
+        subtensor=subtensor,
+        phase_manager=phase_manager,
         interval_sec=12.0
     )
     poller.start()
@@ -294,7 +296,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         expert_manager,
         train_dataloader,
         current_model_meta,
-    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+    ) = setup_training(config, rank, device, tokenizer, subtensor, phase_manager, wallet, current_model_meta=None)
 
     # === training ===
     precision = get_nested_attr(config, "model.precision", "fp16-mixed")
@@ -570,7 +572,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     if is_network_error:
                         logger.error(f"Dataloader network streaming error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
                         logger.info("Sleeping until PhaseNames.distribute starts...")
-                        wait_till(config, phase_name=PhaseNames.distribute)
+                        wait_till(phase_manager, phase_name=PhaseNames.distribute)
                     
                         time.sleep(15)
                     
@@ -587,7 +589,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     if "server error" in str(e).lower() or "503" in str(e).lower():
                         logger.error(f"Dataloader HF server streaming error: {e}. Skipping remaining steps until next distribution phase.", exc_info=True)
                         logger.info("Sleeping until PhaseNames.distribute starts...")
-                        wait_till(config, phase_name=PhaseNames.distribute)
+                        wait_till(phase_manager, phase_name=PhaseNames.distribute)
                     
                         time.sleep(15)
                     
@@ -697,7 +699,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         expert_manager,
                         train_dataloader,
                         current_model_meta,
-                    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
+                    ) = setup_training(config, rank, device, tokenizer, subtensor, phase_manager, wallet, current_model_meta)
                 else:
                     logger.info(
                         "No need to reload model",
@@ -740,7 +742,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             free_cuda_models([model, eval_rref])
             torch.cuda.empty_cache()
             gc.collect()
-            wait_till(config, phase_name=PhaseNames.distribute)
+            wait_till(phase_manager, phase_name=PhaseNames.distribute)
             time.sleep(15)
             return train_worker(rank, world_size, config)
 
@@ -756,7 +758,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             free_cuda_models([model, eval_rref])
             torch.cuda.empty_cache()
             gc.collect()
-            wait_till(config, phase_name=PhaseNames.distribute)
+            wait_till(phase_manager, phase_name=PhaseNames.distribute)
             time.sleep(15)
             return train_worker(rank, world_size, config)
 
