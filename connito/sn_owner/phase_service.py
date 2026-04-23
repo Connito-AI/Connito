@@ -1,3 +1,4 @@
+import asyncio
 import bittensor
 from connito.validator.inter_validator_connection import structlog, AllowedHotkeyService
 import uvicorn
@@ -21,7 +22,7 @@ async def read_phase():
     Returns which phase we're in for the given block height.
     """
     try:
-        return phase_manager.get_phase()
+        return await asyncio.to_thread(phase_manager.get_phase)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -32,7 +33,7 @@ async def prev_phase():
     Returns which phase we're in for the given block height.
     """
     try:
-        return phase_manager.previous_phase_block_ranges()
+        return await asyncio.to_thread(phase_manager.previous_phase_block_ranges)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -43,7 +44,7 @@ async def next_phase():
     Returns which phase we're in for the given block height.
     """
     try:
-        return phase_manager.blocks_until_next_phase()
+        return await asyncio.to_thread(phase_manager.blocks_until_next_phase)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -104,4 +105,12 @@ if __name__ == "__main__":
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
 
     phase_manager = PhaseManager(config, subtensor)
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8080,
+        limit_concurrency=265,
+        timeout_keep_alive=30,
+        backlog=4096,
+        access_log=True,
+    )
