@@ -19,7 +19,7 @@ from connito.shared.hf_distribute import (
 )
 from connito.shared.model import fetch_model_from_chain_validator
 from connito.shared.cycle import get_validator_seed_from_commit
-from connito.validator.run import get_hf_upload_repo_id, validate_hf_distribution_config
+from connito.validator.run import resolve_hf_repo_ids, validate_hf_distribution_config
 from connito.validator import server
 
 
@@ -95,14 +95,19 @@ def test_resolve_default_checkpoint_repo_uses_authenticated_namespace(monkeypatc
     assert repo_id == "alice/co"
 
 
-def test_get_hf_upload_repo_id_defaults_when_config_omits_repo(monkeypatch):
+def test_hf_cfg_resolves_default_upload_repo_when_config_omits_repo(monkeypatch):
     monkeypatch.setattr(
         "connito.validator.run.resolve_default_checkpoint_repo",
         lambda token_env_var, default_repo_name: f"resolved/{default_repo_name}",
     )
-    config = SimpleNamespace(hf=SimpleNamespace(checkpoint_repo=None, token_env_var="HF_TOKEN", default_repo_name="co"))
+    config = SimpleNamespace(
+        hf=HfCfg(checkpoint_repo=None, token_env_var="HF_TOKEN", default_repo_name="co")
+    )
 
-    assert get_hf_upload_repo_id(config) == "resolved/co"
+    upload_repo, chain_repo = resolve_hf_repo_ids(config)
+
+    assert upload_repo == "resolved/co"
+    assert chain_repo == "resolved/cycle"
 
 
 def test_hf_cfg_rejects_invalid_default_repo_name():
@@ -112,6 +117,12 @@ def test_hf_cfg_rejects_invalid_default_repo_name():
         assert "default_repo_name" in str(exc)
     else:
         raise AssertionError("expected invalid default_repo_name validation error")
+
+
+def test_hf_cfg_derives_advertised_repo_from_upload_repo():
+    hf_cfg = HfCfg(checkpoint_repo="owner/repo", default_repo_name="co")
+
+    assert hf_cfg.advertised_repo_id("owner/repo") == "owner/cycle"
 
 
 def test_checkpoint_cfg_restores_download_concurrency_for_compatibility():
@@ -321,7 +332,7 @@ def test_validator_chain_commit_payload_stays_compact_with_hf_fields():
 def test_validator_commit_rejects_repo_id_that_exceeds_budget():
     owner = "x" * VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS
     config = SimpleNamespace(
-        hf=SimpleNamespace(checkpoint_repo=f"{owner}/repo", token_env_var="HF_TOKEN", default_repo_name="co"),
+        hf=HfCfg(checkpoint_repo=f"{owner}/repo", token_env_var="HF_TOKEN", default_repo_name="co"),
         task=SimpleNamespace(exp=SimpleNamespace(group_id=0)),
     )
 

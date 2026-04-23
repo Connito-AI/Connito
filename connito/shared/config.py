@@ -313,20 +313,38 @@ class HfCfg(BaseConfig):
     # Validators need write access; miners need read access (or public repo).
     token_env_var: str = "HF_TOKEN"
 
-    @model_validator(mode="after")
-    def _validate_hf_repo_settings(self):
-        checkpoint_repo = (self.checkpoint_repo or "").strip()
+    @staticmethod
+    def _normalize_checkpoint_repo_value(value: str | None) -> str | None:
+        checkpoint_repo = (value or "").strip()
         if checkpoint_repo and "/" not in checkpoint_repo:
             raise ValueError("hf.checkpoint_repo must be '<namespace>/<repo>'")
+        return checkpoint_repo or None
 
-        default_repo_name = self.default_repo_name.strip()
+    @staticmethod
+    def _normalize_default_repo_name(value: str) -> str:
+        default_repo_name = value.strip()
         if not default_repo_name:
             raise ValueError("hf.default_repo_name cannot be empty")
         if "/" in default_repo_name:
             raise ValueError("hf.default_repo_name must be a repo name, not '<namespace>/<repo>'")
+        return default_repo_name
 
-        self.checkpoint_repo = checkpoint_repo or None
-        self.default_repo_name = default_repo_name
+    def resolve_upload_repo(self, derived_repo: str | None = None) -> str | None:
+        return self.checkpoint_repo or self._normalize_checkpoint_repo_value(derived_repo)
+
+    def advertised_repo_id(self, upload_repo: str | None) -> str | None:
+        if not upload_repo:
+            return None
+        owner, _repo_name = upload_repo.split("/", 1)
+        return f"{owner}/cycle"
+
+    def uses_explicit_checkpoint_repo(self) -> bool:
+        return self.checkpoint_repo is not None
+
+    @model_validator(mode="after")
+    def _validate_hf_repo_settings(self):
+        self.checkpoint_repo = self._normalize_checkpoint_repo_value(self.checkpoint_repo)
+        self.default_repo_name = self._normalize_default_repo_name(self.default_repo_name)
         return self
 
 
