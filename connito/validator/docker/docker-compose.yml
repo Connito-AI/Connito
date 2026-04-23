@@ -167,11 +167,9 @@ services:
     restart: unless-stopped
 
     # Mount the docker socket so Watchtower can pull and recreate containers.
-    # If the registry is private, the docker config with creds is also
-    # bind-mounted so Watchtower inherits the same auth.
+    # The GHCR image is public, so no registry auth is needed.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOME}/.docker/config.json:/config.json:ro
 
     environment:
       # Match the host Docker daemon API version (docker version → API version).

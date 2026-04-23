@@ -286,8 +286,18 @@ async def aggregate_miner_gradient_change(
     # global_model is expected to already live on `device` (GPU).
     this_round_uids = {job.uid for job in miner_jobs}
 
+    # Drop zero-score miners before ranking so they can never be merged, even
+    # when fewer than top_k miners have a positive score this round. Use the
+    # latest (this-round) score, not the rolling avg, so a single bad round
+    # is enough to exclude a miner regardless of their history.
+    latest_scores = score_aggregator.uid_score_pairs(how="latest")
+    scored_jobs = [job for job in miner_jobs if latest_scores.get(job.uid, 0.0) > 0]
+    skipped_zero_uids = [job.uid for job in miner_jobs if job not in scored_jobs]
+    if skipped_zero_uids:
+        logger.info("Excluding zero-score miners from merge", uids=skipped_zero_uids)
+
     top_jobs = [
-        job for job in miner_jobs
+        job for job in scored_jobs
         if score_aggregator.is_in_top(
             uid=job.uid,
             cutoff=config.evaluation.top_k_miners_to_merge,
@@ -498,7 +508,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     os.makedirs(config.ckpt.miner_submission_path, exist_ok=True)
 
     # === set up chain worker ===
-    wallet, subtensor = setup_chain_worker(config, serve=False)
+    # subtensor: archive connection (used by setup_training → load_model →
+    # get_chain_commits with historical block=). lite_subtensor: used for
+    # head-only ops like commit_status and submit_weights. They collapse to a
+    # single connection when no lite endpoint is configured.
+    wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
 
     # === set logging ===
     metric_logger = MetricLogger(config, rank)
@@ -572,13 +586,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     commit_status(
         config,
         wallet,
-        subtensor,
+        lite_subtensor,
         ValidatorChainCommit(
             model_hash=None,
             global_ver=global_opt_step,
             expert_group=config.task.exp.group_id,
             miner_seed=0,  # this should reveal later
-            block=subtensor.block,
+            block=lite_subtensor.block,
         ),
     )
 
@@ -630,24 +644,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Fetch the metagraph once per cycle — it holds per-neuron tensors and
             # is reused later for penalizing missing submissions.
             max_weight_age = int(config.cycle.cycle_length)
-            metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
-            weight_age = subtensor.block - last_update
+            weight_age = lite_subtensor.block - last_update
             if weight_age > max_weight_age:
                 logger.info("Weights stale, submitting fallback", weight_age=weight_age, max_weight_age=max_weight_age)
-                _submit_fallback_weights(config, wallet, subtensor, wait_for_inclusion=True, wait_for_finalization=True)
+                _submit_fallback_weights(config, wallet, lite_subtensor, wait_for_inclusion=True, wait_for_finalization=True)
 
             commit_status(
                 config,
                 wallet,
-                subtensor,
+                lite_subtensor,
                 ValidatorChainCommit(
                     model_hash=current_model_hash,
                     global_ver=global_opt_step,
                     expert_group=config.task.exp.group_id,
                     miner_seed=secrets.randbits(16),
-                    block=subtensor.block,
+                    block=lite_subtensor.block,
                 ),
             )
 
@@ -667,6 +681,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             )
 
             cleanup(global_model)
+            # Compute once at submission start and reuse for both streaming
+            # evaluation and the post-evaluation penalty pass. Recomputing
+            # later would query a different block/phase and could yield a
+            # different assignment.
+            from connito.shared.cycle import get_validator_miner_assignment
+            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
             miner_jobs = asyncio.run(
                 stream_gather_and_evaluate(
                     config=config,
@@ -678,6 +698,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     tokenizer=tokenizer,
                     combined_seed=get_combined_validator_seed(config, subtensor),
                     end_block=phase_response.phase_end_block,
+                    validator_miner_assignment=validator_miner_assignment,
                 )
             )
 
@@ -688,10 +709,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 logger.warning("No miner jobs evaluated", step=global_opt_step)
 
             cleanup(global_model)
-            
-            # Penalize assigned miners that missed their submission
-            from connito.shared.cycle import get_validator_miner_assignment
-            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+
+            # Penalize assigned miners that missed their submission. Reuse the
+            # assignment computed at submission start — recomputing here would
+            # query a later block/phase and could penalize a different set.
             miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
             submitted_uids = {job.uid for job in miner_jobs}
             # Reuse the metagraph fetched above for this cycle
@@ -853,7 +874,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 commit_status(
                     config,
                     wallet,
-                    subtensor,
+                    lite_subtensor,
                     SignedModelHashChainCommit(
                         signed_model_hash=model_ckpt.signed_model_hash,
                     ),
@@ -903,13 +924,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 commit_status(
                     config,
                     wallet,
-                    subtensor,
+                    lite_subtensor,
                     ValidatorChainCommit(
                         model_hash=model_ckpt.model_hash,
                         global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                         expert_group=config.task.exp.group_id,
                         miner_seed=0,
-                        block=subtensor.block,
+                        block=lite_subtensor.block,
                         hf_repo_id=hf_repo_id if hf_revision else None,
                         hf_revision=hf_revision,
                     ),
@@ -930,7 +951,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             submit_weights(
                 config=config,
                 wallet=wallet,
-                subtensor=subtensor,
+                subtensor=lite_subtensor,
                 uid_weights=uid_weights,
                 normalize=True,
                 top_k=config.evaluation.top_k_miners_to_reward,

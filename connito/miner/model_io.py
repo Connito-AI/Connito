@@ -402,7 +402,7 @@ if __name__ == "__main__":
 
     config.write()
 
-    wallet, subtensor = setup_chain_worker(config)
+    wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
 
     expert_manager = ExpertManager(config)
 

@@ -302,6 +302,7 @@ async def stream_gather_and_evaluate(
     tokenizer,
     combined_seed: str,
     end_block: int,
+    validator_miner_assignment: dict[str, list[str]],
     poll_interval_sec: float = 6.0,
 ) -> list[MinerEvalJob]:
     """
@@ -315,16 +316,16 @@ async def stream_gather_and_evaluate(
     `subtensor.block > end_block`; the queue is then drained and the
     worker shut down.
 
+    `validator_miner_assignment` is provided by the caller (computed once
+    at submission start) so the penalty pass after evaluation can reuse
+    the exact same set of miners, avoiding drift from a later recompute.
+
     Returns the list of MinerEvalJobs that were evaluated so downstream
     aggregation can operate on the same set.
     """
     # Deferred import — gather_validation_job depends on config schemas that
     # would otherwise create a circular import at module load.
-    from connito.shared.cycle import gather_validation_job, get_validator_miner_assignment
-
-    # Compute once and reuse across every poll tick — the assignment is
-    # stable for the duration of this Submission window.
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+    from connito.shared.cycle import gather_validation_job
 
     # --- Baseline: unmerged base model scored once, reused for all deltas ---
     baseline_metrics = await _evaluate_on_fresh_loader(
