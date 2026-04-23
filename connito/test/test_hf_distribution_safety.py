@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from connito.shared.chain import ValidatorChainCommit, commit_status
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
 from connito.shared.hf_distribute import get_hf_upload_readiness, upload_checkpoint_to_hf
 from connito.shared.model import fetch_model_from_chain_validator
@@ -204,3 +206,62 @@ def test_get_checkpoint_endpoint_rejects_wrong_target(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 403
+
+
+def test_validator_chain_commit_payload_stays_compact_with_hf_fields():
+    class DummySubtensor:
+        def __init__(self):
+            self.block = 9_999_999
+            self.calls = []
+
+        def set_commitment(self, wallet, netuid, data, raise_error=False):
+            self.calls.append(
+                {
+                    "wallet": wallet,
+                    "netuid": netuid,
+                    "data": data,
+                    "raise_error": raise_error,
+                }
+            )
+            return True
+
+    config = SimpleNamespace(chain=SimpleNamespace(netuid=102))
+    wallet = SimpleNamespace(name="dummy-wallet")
+    subtensor = DummySubtensor()
+
+    status_with_hf = ValidatorChainCommit(
+        model_hash="a" * 64,
+        global_ver=123456,
+        expert_group=7,
+        hf_repo_id="owner/cycle",
+        hf_revision="53ddbcd",
+    )
+    status_without_hf = ValidatorChainCommit(
+        model_hash="a" * 64,
+        global_ver=123456,
+        expert_group=7,
+    )
+
+    commit_status(config=config, wallet=wallet, subtensor=subtensor, status=status_with_hf)
+
+    assert len(subtensor.calls) == 1
+    committed = subtensor.calls[0]
+    payload = committed["data"]
+    payload_dict = json.loads(payload)
+    payload_without_hf = json.dumps(status_without_hf.model_dump(by_alias=True, exclude_none=True), separators=(",", ":"))
+
+    assert committed["netuid"] == 102
+    assert committed["raise_error"] is False
+    assert payload_dict["r"] == "owner/cycle"
+    assert payload_dict["rv"] == "53ddbcd"
+    assert "m" not in payload_dict
+    assert "s" not in payload_dict
+    assert "b" not in payload_dict
+    assert "hf_repo_id" not in payload
+    assert "hf_revision" not in payload
+
+    payload_bytes = len(payload.encode())
+    delta_bytes = payload_bytes - len(payload_without_hf.encode())
+
+    assert payload_bytes <= 128
+    assert delta_bytes <= 40

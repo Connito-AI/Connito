@@ -40,12 +40,12 @@ def upload_checkpoint_to_hf(
     token_env_var: str = "HF_TOKEN",
     commit_message: str | None = None,
 ) -> str:
-    """Upload a checkpoint directory to HF and return the commit revision SHA.
+    """Upload a checkpoint directory to HF and return a short commit revision.
 
-    The revision SHA is what validators write to the Bittensor chain so miners
-    can pull exactly this snapshot even if the repo advances later. `main` is
-    updated to point at the new commit as a side effect, but miners should
-    pin to the SHA from the chain, not the branch name.
+    The returned value is the first 12 chars of the commit SHA so callers can
+    use a shorter immutable revision token downstream. `main` is updated to
+    point at the new commit as a side effect, but miners should pin to the
+    revision from the chain, not the branch name.
     """
     ready, reason = get_hf_upload_readiness(repo_id=repo_id, token=token, token_env_var=token_env_var)
     if not ready:
@@ -67,7 +67,7 @@ def upload_checkpoint_to_hf(
         repo_id=repo_id,
         commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
     )
-    revision = commit_info.oid
+    revision = commit_info.oid[:12]
     logger.info(
         "Uploaded checkpoint to HF",
         repo_id=repo_id,

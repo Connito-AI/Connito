@@ -299,8 +299,9 @@ class HfCfg(BaseConfig):
     # and miners download from the returned repo@revision.
     #
     # checkpoint_repo: the HF repo the validator pushes to. Must exist and
-    # be writable by the HF_TOKEN. Miners discover which repo to pull from
-    # via the chain commit, so only the validator needs this set.
+    # be writable by the HF_TOKEN. The on-chain advertised repo can diverge
+    # from this upload target; validator code currently derives the advertised
+    # repo as {owner}/cycle from this configured upload repo.
     checkpoint_repo: str | None = None
     # Read from HF_TOKEN env at runtime — not stored in config YAML.
     # Validators need write access; miners need read access (or public repo).

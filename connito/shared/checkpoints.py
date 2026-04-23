@@ -377,8 +377,6 @@ class ChainCheckpoints(BaseModel):
                 missing.append("global_ver")
             if ckpt.expert_group is None:
                 missing.append("expert_group")
-            if ckpt.miner_seed is None and for_role == "validator":
-                missing.append("miner_seed")
             if ckpt.uid is None:
                 missing.append("uid")
             if ckpt.ip is None:
@@ -640,7 +638,6 @@ def build_chain_checkpoints(
                     model_hash=getattr(commit, "model_hash", None),
                     global_ver=getattr(commit, "global_ver", None),
                     expert_group=getattr(commit, "expert_group", None),
-                    miner_seed=getattr(commit, "miner_seed", None),
                     inner_opt=getattr(commit, "inner_opt", None),
                     uid=getattr(neuron, "uid", None),
                     ip=getattr(neuron.axon_info, "ip", None),

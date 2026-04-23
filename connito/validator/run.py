@@ -107,6 +107,29 @@ from connito.validator.evaluator import (
     load_model_from_path,
     stream_gather_and_evaluate,
 )
+HF_CHAIN_REVISION_LENGTH = 7
+
+
+def get_hf_upload_repo_id(config: ValidatorConfig) -> str | None:
+    configured_repo = (config.hf.checkpoint_repo or "").strip()
+    if not configured_repo:
+        return None
+
+    return configured_repo
+
+
+def get_hf_chain_repo_id(config: ValidatorConfig) -> str | None:
+    configured_repo = get_hf_upload_repo_id(config)
+    if not configured_repo:
+        return None
+
+    if "/" not in configured_repo:
+        return None
+
+    owner, _repo_name = configured_repo.split("/", 1)
+    return f"{owner}/cycle"
+
+
 from connito.validator.inter_validator_connection import (
     build_averagers_from_buff,
     build_grad_buff_from_model,
@@ -591,8 +614,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             model_hash=None,
             global_ver=global_opt_step,
             expert_group=config.task.exp.group_id,
-            miner_seed=0,  # this should reveal later
-            block=lite_subtensor.block,
         ),
     )
 
@@ -660,8 +681,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     model_hash=current_model_hash,
                     global_ver=global_opt_step,
                     expert_group=config.task.exp.group_id,
-                    miner_seed=secrets.randbits(16),
-                    block=lite_subtensor.block,
                 ),
             )
 
@@ -885,19 +904,30 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Upload checkpoint to HuggingFace so miners can pull it during
                 # the Distribute phase. The returned revision SHA pins the exact
                 # bytes miners will download, even if :main advances afterward.
-                hf_repo_id = config.hf.checkpoint_repo
+                hf_upload_repo_id = get_hf_upload_repo_id(config)
+                hf_chain_repo_id = get_hf_chain_repo_id(config)
                 hf_revision: str | None = None
+                if hf_upload_repo_id and hf_chain_repo_id and hf_upload_repo_id != hf_chain_repo_id:
+                    logger.info(
+                        "HF upload repo differs from chain-advertised repo",
+                        upload_checkpoint_repo=hf_upload_repo_id,
+                        advertised_checkpoint_repo=hf_chain_repo_id,
+                    )
                 hf_ready, hf_reason = get_hf_upload_readiness(
-                    repo_id=hf_repo_id,
+                    repo_id=hf_upload_repo_id,
                     token_env_var=config.hf.token_env_var,
                 )
                 if model_ckpt.path is None:
-                    logger.warning("No checkpoint path available for HF upload", checkpoint_repo=hf_repo_id)
+                    logger.warning(
+                        "No checkpoint path available for HF upload",
+                        upload_checkpoint_repo=hf_upload_repo_id,
+                        advertised_checkpoint_repo=hf_chain_repo_id,
+                    )
                 elif hf_ready:
                     try:
                         hf_revision = upload_checkpoint_to_hf(
                             ckpt_dir=model_ckpt.path,
-                            repo_id=hf_repo_id,
+                            repo_id=hf_upload_repo_id,
                             token_env_var=config.hf.token_env_var,
                             commit_message=(
                                 f"global_ver={model_ckpt.global_ver} "
@@ -907,14 +937,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     except Exception as e:
                         logger.error(
                             "HF checkpoint upload failed; miners will use validator HTTP fallback",
-                            repo_id=hf_repo_id,
+                            upload_checkpoint_repo=hf_upload_repo_id,
+                            advertised_checkpoint_repo=hf_chain_repo_id,
                             error=str(e),
                             exc_info=True,
                         )
                 else:
                     logger.warning(
                         "HF checkpoint upload unavailable; miners will use validator HTTP fallback",
-                        checkpoint_repo=hf_repo_id,
+                        upload_checkpoint_repo=hf_upload_repo_id,
+                        advertised_checkpoint_repo=hf_chain_repo_id,
                         reason=hf_reason,
                         has_ckpt_path=model_ckpt.path is not None,
                     )
@@ -929,10 +961,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         model_hash=model_ckpt.model_hash,
                         global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                         expert_group=config.task.exp.group_id,
-                        miner_seed=0,
-                        block=lite_subtensor.block,
-                        hf_repo_id=hf_repo_id if hf_revision else None,
-                        hf_revision=hf_revision,
+                        hf_repo_id=hf_chain_repo_id if hf_revision else None,
+                        hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
                     ),
                 )
 

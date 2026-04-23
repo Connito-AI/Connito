@@ -38,16 +38,13 @@ class SignedModelHashChainCommit(BaseModel):
 
 class ValidatorChainCommit(WorkerChainCommit):
     model_config = ConfigDict(populate_by_name=True)
-    signed_model_hash: str | None = Field(default=None, alias="m")
     model_hash: str | None = Field(default=None, alias="h")
     global_ver: int | None = Field(default=None, alias="v")
     expert_group: int | None = Field(default=None, alias="e")
-    miner_seed: int | None = Field(default=None, alias="s")
-    block: int | None = Field(default=None, alias="b")
     # HuggingFace is the checkpoint transport: the validator uploads the
-    # checkpoint directory to `hf_repo_id`, and `hf_revision` pins the exact
-    # commit SHA so miners pull the same bytes even if the repo advances.
-    # model_hash/signed_model_hash still verify integrity post-download.
+    # checkpoint directory to `hf_repo_id`, and `hf_revision` carries a short
+    # commit SHA prefix so miners pull a pinned snapshot even if the repo
+    # advances. model_hash still verifies integrity post-download.
     hf_repo_id: str | None = Field(default=None, alias="r")
     hf_revision: str | None = Field(default=None, alias="rv")
 
@@ -86,9 +83,9 @@ def commit_status(
           you want the data to be revealed (fallback to 200 if missing).
     """
     # Serialize status first; same input for both plain + encrypted paths
-    data_dict = status.model_dump(by_alias=True)
+    data_dict = status.model_dump(by_alias=True, exclude_none=True)
 
-    data = json.dumps(data_dict)
+    data = json.dumps(data_dict, separators=(",", ":"))
 
     success = subtensor.set_commitment(wallet=wallet, netuid=config.chain.netuid, data=data, raise_error=False)
 
