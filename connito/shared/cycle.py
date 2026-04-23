@@ -336,22 +336,12 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
 
 def get_validator_seed_from_commit(config, commits):
     def _derive_validator_assignment_seed(commit: ValidatorChainCommit, hotkey: str) -> int:
-        # Read-path compatibility only: newer validator commits no longer carry
-        # miner_seed, so derive a deterministic assignment seed from fields that
-        # remain on-chain. Legacy commits still use the explicit seed if present.
+        # Keep `miner_seed` in the schema contract, but treat omitted values as
+        # the default assignment seed to preserve the compact chain payload.
         legacy_seed = getattr(commit, "miner_seed", None)
         if legacy_seed is not None:
             return int(legacy_seed)
-
-        seed_material = ":".join(
-            [
-                hotkey,
-                str(getattr(commit, "expert_group", "")),
-                str(getattr(commit, "global_ver", "")),
-                str(getattr(commit, "model_hash", "")),
-            ]
-        )
-        return int(hashlib.sha256(seed_material.encode()).hexdigest(), 16)
+        return 0
 
     validator_seeds: dict[str, int] = {
         neuron.hotkey: _derive_validator_assignment_seed(commit, neuron.hotkey)

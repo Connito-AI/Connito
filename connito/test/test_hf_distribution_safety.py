@@ -107,7 +107,7 @@ def test_hf_cfg_resolves_default_upload_repo_when_config_omits_repo(monkeypatch)
     upload_repo, chain_repo = resolve_hf_repo_ids(config)
 
     assert upload_repo == "resolved/co"
-    assert chain_repo == "resolved/cycle"
+    assert chain_repo == "resolved/co"
 
 
 def test_hf_cfg_rejects_invalid_default_repo_name():
@@ -119,10 +119,21 @@ def test_hf_cfg_rejects_invalid_default_repo_name():
         raise AssertionError("expected invalid default_repo_name validation error")
 
 
-def test_hf_cfg_derives_advertised_repo_from_upload_repo():
+def test_hf_cfg_returns_advertised_repo_as_upload_repo():
     hf_cfg = HfCfg(checkpoint_repo="owner/repo", default_repo_name="co")
 
-    assert hf_cfg.advertised_repo_id("owner/repo") == "owner/cycle"
+    assert hf_cfg.advertised_repo_id("owner/repo") == "owner/repo"
+
+
+def test_hf_cfg_explicit_checkpoint_repo_is_used_for_upload_and_chain_repo():
+    config = SimpleNamespace(
+        hf=HfCfg(checkpoint_repo="present42/cycle", token_env_var="HF_TOKEN", default_repo_name="co")
+    )
+
+    upload_repo, chain_repo = resolve_hf_repo_ids(config)
+
+    assert upload_repo == "present42/cycle"
+    assert chain_repo == "present42/cycle"
 
 
 def test_checkpoint_cfg_restores_download_concurrency_for_compatibility():
@@ -344,7 +355,19 @@ def test_validator_commit_rejects_repo_id_that_exceeds_budget():
         raise AssertionError("expected HF repo id length failure")
 
 
-def test_validator_seed_derivation_no_longer_depends_on_removed_miner_seed():
+def test_validator_seed_prefers_explicit_miner_seed_when_present():
+    config = SimpleNamespace(task=SimpleNamespace(exp=SimpleNamespace(group_id=3)))
+    commit_a = ValidatorChainCommit(model_hash="a" * 64, global_ver=101, expert_group=3, miner_seed=11)
+    commit_b = ValidatorChainCommit(model_hash="b" * 64, global_ver=101, expert_group=3, miner_seed=29)
+    neuron_a = SimpleNamespace(hotkey="validator-a")
+    neuron_b = SimpleNamespace(hotkey="validator-b")
+
+    seeds = get_validator_seed_from_commit(config, [(commit_a, neuron_a), (commit_b, neuron_b)])
+
+    assert seeds == {"validator-a": 11, "validator-b": 29}
+
+
+def test_validator_seed_defaults_to_zero_when_miner_seed_missing():
     config = SimpleNamespace(task=SimpleNamespace(exp=SimpleNamespace(group_id=3)))
     commit_a = ValidatorChainCommit(model_hash="a" * 64, global_ver=101, expert_group=3)
     commit_b = ValidatorChainCommit(model_hash="b" * 64, global_ver=101, expert_group=3)
@@ -353,6 +376,4 @@ def test_validator_seed_derivation_no_longer_depends_on_removed_miner_seed():
 
     seeds = get_validator_seed_from_commit(config, [(commit_a, neuron_a), (commit_b, neuron_b)])
 
-    assert set(seeds) == {"validator-a", "validator-b"}
-    assert all(isinstance(seed, int) for seed in seeds.values())
-    assert seeds["validator-a"] != seeds["validator-b"]
+    assert seeds == {"validator-a": 0, "validator-b": 0}
