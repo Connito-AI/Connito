@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     raising `websockets.ConcurrencyError`.
     """
     global phase_manager
-    async_subtensor = bittensor.AsyncSubtensor(network=config.chain.network)
+    async_subtensor = bittensor.AsyncSubtensor(network=config.chain.lite_network)
     await async_subtensor.initialize()
     phase_manager = PhaseManager(config.cycle, async_subtensor)
     try:
