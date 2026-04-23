@@ -1,64 +1,80 @@
-import asyncio
+import json
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import bittensor
-from connito.validator.inter_validator_connection import structlog, AllowedHotkeyService
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
+from connito.shared.app_logging import configure_logging
 from connito.shared.config import CycleCfg, OwnerConfig, parse_args
 from connito.sn_owner.cycle import PhaseManager, PhaseResponse
-from connito.shared.app_logging import configure_logging
-import multiprocessing as mp
-from pathlib import Path
+from connito.sn_owner.init_peer_store import get_init_peer_ids
+from connito.validator.inter_validator_connection import structlog
 
-from connito.sn_owner.init_peer_store import add_init_peer_id, get_init_peer_ids
-from connito.sn_owner.dht_init import init_dht_and_peer_id
-import json
 
-app = FastAPI(title="Phase Service")
+phase_manager: PhaseManager | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize the async subtensor and the PhaseManager bound to it.
+
+    Kept inside lifespan (rather than __main__) because `AsyncSubtensor`
+    needs an event loop for `initialize()`. The sync subtensor that used to
+    back PhaseManager is gone — concurrent `recv()` from the threadpool was
+    raising `websockets.ConcurrencyError`.
+    """
+    global phase_manager
+    async_subtensor = bittensor.AsyncSubtensor(network=config.chain.network)
+    await async_subtensor.initialize()
+    phase_manager = PhaseManager(config.cycle, async_subtensor)
+    try:
+        yield
+    finally:
+        close = getattr(async_subtensor, "close", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception as e:
+                logger.warning("AsyncSubtensor close failed", error=str(e))
+
+
+app = FastAPI(title="Phase Service", lifespan=lifespan)
+
 
 @app.get("/get_phase", response_model=PhaseResponse)
 async def read_phase():
-    """
-    Returns which phase we're in for the given block height.
-    """
     try:
-        return await asyncio.to_thread(phase_manager.get_phase)
+        return await phase_manager.get_current_phase()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/previous_phase_blocks", response_model=dict[str, tuple[int, int]])
 async def prev_phase():
-    """
-    Returns which phase we're in for the given block height.
-    """
     try:
-        return await asyncio.to_thread(phase_manager.previous_phase_block_ranges)
+        return await phase_manager.current_previous_phase_block_ranges()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/blocks_until_next_phase", response_model=dict[str, tuple[int, int, int]])
 async def next_phase():
-    """
-    Returns which phase we're in for the given block height.
-    """
     try:
-        return await asyncio.to_thread(phase_manager.blocks_until_next_phase)
+        return await phase_manager.current_blocks_until_next_phase()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/get_init_peer_id", response_model=list[str])
 async def get_init_peer_id():
-    """
-    Returns which phase we're in for the given block height.
-    """
     try:
         return get_init_peer_ids(init_peer_id_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
+
 @app.get("/get_validator_whitelist", response_model=list[str])
 async def get_validator_whitelist():
     """Returns the list of hotkeys that are force-permitted as validators."""
@@ -83,6 +99,7 @@ async def get_cycle_config():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/")
 async def root():
     return {
@@ -99,7 +116,6 @@ if __name__ == "__main__":
     logger = structlog.get_logger(__name__)
 
     global config
-    global phase_manager
     global init_peer_id_path
     global validator_whitelist_path
     global cycle_config_path
@@ -115,13 +131,11 @@ if __name__ == "__main__":
     validator_whitelist_path = Path(config.run.root_path) / "connito" / "sn_owner" / "validator_whitelist.json"
     cycle_config_path = Path(config.run.root_path) / "cycle_config.json"
 
-    subtensor = bittensor.Subtensor(network=config.chain.network)
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
 
     cycle_config_path.write_text(config.cycle.model_dump_json(indent=2))
     logger.info("wrote cycle config", path=str(cycle_config_path))
 
-    phase_manager = PhaseManager(config.cycle, subtensor)
     uvicorn.run(
         app,
         host="127.0.0.1",

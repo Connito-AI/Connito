@@ -6,14 +6,20 @@ from connito.shared.cycle import PhaseNames, PhaseResponse
 
 
 class PhaseManager:
-    def __init__(self, cycle_cfg: CycleCfg, subtensor: bittensor.Subtensor):
+    def __init__(self, cycle_cfg: CycleCfg, subtensor: bittensor.AsyncSubtensor):
+        """
+        `subtensor` is an async subtensor because the sync one wraps a single
+        websocket that raises `websockets.ConcurrencyError` under concurrent
+        recv() — which the FastAPI threadpool will trigger. The async client
+        is safe for concurrent awaits within one event loop.
+        """
         self.cycle_cfg = cycle_cfg
         self.subtensor = subtensor
         self.phases = self.init_phases(cycle_cfg, PhaseNames())
         self.cycle_length = sum(p["length"] for p in self.phases)
 
     @classmethod
-    def from_dict(cls, cycle_dict: dict, subtensor: bittensor.Subtensor) -> "PhaseManager":
+    def from_dict(cls, cycle_dict: dict, subtensor: bittensor.AsyncSubtensor) -> "PhaseManager":
         """Build from a dict matching CycleCfg (e.g. parsed from the owner's /get_cycle_config JSON)."""
         return cls(CycleCfg(**cycle_dict), subtensor)
 
@@ -41,10 +47,12 @@ class PhaseManager:
         ]
         return phases
 
-    def get_phase(self, block: int = None) -> PhaseResponse:
-        if block is None:
-            block = self.subtensor.block
+    async def get_current_phase(self) -> PhaseResponse:
+        """Awaits the current chain block, then resolves the phase."""
+        block = await self.subtensor.block
+        return self.get_phase(block)
 
+    def get_phase(self, block: int) -> PhaseResponse:
         if block < 0:
             raise RuntimeError(f"Invalida block input block = {block}")
 
@@ -76,7 +84,12 @@ class PhaseManager:
         # Should never happen if PHASES and self.cycle_length are consistent
         raise RuntimeError("Failed to determine phase")
 
-    def blocks_until_next_phase(self) -> dict[str, tuple[int, int, int]]:
+    async def current_blocks_until_next_phase(self) -> dict[str, tuple[int, int, int]]:
+        """Awaits the current chain block, then computes blocks_until_next_phase."""
+        block = await self.subtensor.block
+        return self.blocks_until_next_phase(block)
+
+    def blocks_until_next_phase(self, block: int) -> dict[str, tuple[int, int, int]]:
         """
         Returns a mapping:
             { phase_name: (start_block, end_block, blocks_until) }
@@ -84,7 +97,6 @@ class PhaseManager:
         Each tuple corresponds to the next occurrence of that phase (in this
         cycle if upcoming, otherwise the next cycle).
         """
-        block = self.subtensor.block
         cycle_len = self.cycle_length
         cycle_block_index = block % cycle_len  # 0..cycle_len-1
         cycle_start_block = block - cycle_block_index
@@ -111,7 +123,12 @@ class PhaseManager:
 
         return result
 
-    def previous_phase_block_ranges(self) -> dict[str, tuple[int, int]]:
+    async def current_previous_phase_block_ranges(self) -> dict[str, tuple[int, int]]:
+        """Awaits the current chain block, then computes previous_phase_block_ranges."""
+        block = await self.subtensor.block
+        return self.previous_phase_block_ranges(block)
+
+    def previous_phase_block_ranges(self, block: int) -> dict[str, tuple[int, int]]:
         """
         Returns a mapping:
             { phase_name: (start_block, end_block) }
@@ -119,7 +136,7 @@ class PhaseManager:
         The range corresponds to the most recent completed
         occurrence of that phase.
         """
-        next_phase_ranges = self.blocks_until_next_phase()
+        next_phase_ranges = self.blocks_until_next_phase(block)
         previous_ranges: dict[str, tuple[int, int]] = {}
         for phase_name, (start_block, end_block, _blocks_until) in next_phase_ranges.items():
             previous_ranges[phase_name] = (
