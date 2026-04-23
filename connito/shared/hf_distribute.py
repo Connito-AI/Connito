@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
@@ -19,6 +20,43 @@ def _resolve_token(token: str | None, env_var: str) -> str | None:
 
 def resolve_hf_token(token: str | None = None, token_env_var: str = "HF_TOKEN") -> str | None:
     return _resolve_token(token, token_env_var)
+
+
+@lru_cache(maxsize=8)
+def _resolve_default_checkpoint_repo_from_token(resolved_token: str, default_repo_name: str) -> str | None:
+    api = HfApi(token=resolved_token)
+    whoami = api.whoami()
+    namespace = str(whoami.get("name") or "").strip()
+    if not namespace:
+        logger.warning("HF whoami did not return a namespace for default checkpoint repo derivation")
+        return None
+    return f"{namespace}/{default_repo_name}"
+
+
+def resolve_default_checkpoint_repo(
+    token: str | None = None,
+    token_env_var: str = "HF_TOKEN",
+    default_repo_name: str = "co",
+) -> str | None:
+    repo_name = default_repo_name.strip()
+    if not repo_name:
+        raise ValueError("default_repo_name cannot be empty")
+    if "/" in repo_name:
+        raise ValueError("default_repo_name must be a repo name, not '<namespace>/<repo>'")
+
+    resolved_token = _resolve_token(token, token_env_var)
+    if resolved_token is None:
+        return None
+
+    try:
+        return _resolve_default_checkpoint_repo_from_token(resolved_token, repo_name)
+    except Exception as exc:
+        logger.warning(
+            "Failed to derive default HF checkpoint repo from authenticated user",
+            default_repo_name=repo_name,
+            error=str(exc),
+        )
+        return None
 
 
 def get_hf_upload_readiness(

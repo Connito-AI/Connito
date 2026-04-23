@@ -67,6 +67,8 @@ from connito.shared.app_logging import configure_logging, log_phase, structlog
 from connito.shared.chain import (
     SignedModelHashChainCommit,
     ValidatorChainCommit,
+    VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    validate_validator_chain_commit_payload,
     _submit_fallback_weights,
     commit_status,
     setup_chain_worker,
@@ -86,7 +88,11 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
-from connito.shared.hf_distribute import get_hf_upload_readiness, upload_checkpoint_to_hf
+from connito.shared.hf_distribute import (
+    get_hf_upload_readiness,
+    resolve_default_checkpoint_repo,
+    upload_checkpoint_to_hf,
+)
 from connito.shared.cycle import (
     check_phase_expired,
     get_combined_validator_seed,
@@ -114,10 +120,13 @@ HF_CHAIN_REVISION_LENGTH = 7
 
 def get_hf_upload_repo_id(config: ValidatorConfig) -> str | None:
     configured_repo = (config.hf.checkpoint_repo or "").strip()
-    if not configured_repo:
-        return None
+    if configured_repo:
+        return configured_repo
 
-    return configured_repo
+    return resolve_default_checkpoint_repo(
+        token_env_var=config.hf.token_env_var,
+        default_repo_name=config.hf.default_repo_name,
+    )
 
 
 def get_hf_chain_repo_id(config: ValidatorConfig) -> str | None:
@@ -126,10 +135,50 @@ def get_hf_chain_repo_id(config: ValidatorConfig) -> str | None:
         return None
 
     if "/" not in configured_repo:
-        return None
+        raise ValueError("HF checkpoint repo must be '<namespace>/<repo>'")
 
     owner, _repo_name = configured_repo.split("/", 1)
-    return f"{owner}/cycle"
+    chain_repo_id = f"{owner}/cycle"
+    if len(chain_repo_id) > VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS:
+        raise ValueError(
+            "HF chain repo id is too long for the validator commit payload: "
+            f"{len(chain_repo_id)} > {VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS}"
+        )
+    return chain_repo_id
+
+
+def validate_hf_distribution_config(config: ValidatorConfig) -> tuple[str | None, str | None]:
+    hf_upload_repo_id = get_hf_upload_repo_id(config)
+    hf_chain_repo_id = get_hf_chain_repo_id(config)
+    configured_repo = (config.hf.checkpoint_repo or "").strip()
+
+    if not (hf_upload_repo_id and hf_chain_repo_id):
+        return hf_upload_repo_id, hf_chain_repo_id
+
+    validate_validator_chain_commit_payload(
+        ValidatorChainCommit(
+            model_hash="0" * 64,
+            global_ver=0,
+            expert_group=config.task.exp.group_id,
+            hf_repo_id=hf_chain_repo_id,
+            hf_revision="0" * HF_CHAIN_REVISION_LENGTH,
+        )
+    )
+
+    if configured_repo:
+        logger.info(
+            "Using configured HF checkpoint repo",
+            upload_checkpoint_repo=hf_upload_repo_id,
+            advertised_checkpoint_repo=hf_chain_repo_id,
+        )
+    else:
+        logger.info(
+            "Using default HF checkpoint repo derived from authenticated user",
+            upload_checkpoint_repo=hf_upload_repo_id,
+            advertised_checkpoint_repo=hf_chain_repo_id,
+        )
+
+    return hf_upload_repo_id, hf_chain_repo_id
 
 
 from connito.validator.inter_validator_connection import (
@@ -537,6 +586,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # get_chain_commits with historical block=). lite_subtensor: used for
     # head-only ops like commit_status and submit_weights. They collapse to a
     # single connection when no lite endpoint is configured.
+    validate_hf_distribution_config(config)
     wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
 
     # === set logging ===

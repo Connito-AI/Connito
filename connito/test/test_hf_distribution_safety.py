@@ -3,11 +3,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
-from connito.shared.chain import ValidatorChainCommit, commit_status
+from connito.shared.chain import (
+    VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    ValidatorChainCommit,
+    commit_status,
+)
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
-from connito.shared.hf_distribute import get_hf_upload_readiness, upload_checkpoint_to_hf
+from connito.shared.config import CheckpointCfg, HfCfg
+from connito.shared.hf_distribute import (
+    get_hf_upload_readiness,
+    resolve_default_checkpoint_repo,
+    upload_checkpoint_to_hf,
+)
 from connito.shared.model import fetch_model_from_chain_validator
+from connito.shared.cycle import get_validator_seed_from_commit
+from connito.validator.run import get_hf_upload_repo_id, validate_hf_distribution_config
 from connito.validator import server
 
 
@@ -65,6 +77,45 @@ def test_upload_checkpoint_to_hf_requires_token(tmp_path, monkeypatch):
         assert "HF token missing" in str(exc)
     else:
         raise AssertionError("expected missing token RuntimeError")
+
+
+def test_resolve_default_checkpoint_repo_uses_authenticated_namespace(monkeypatch):
+    class DummyApi:
+        def __init__(self, token):
+            self.token = token
+
+        def whoami(self):
+            return {"name": "alice"}
+
+    monkeypatch.setenv("HF_TOKEN", "secret")
+    monkeypatch.setattr("connito.shared.hf_distribute.HfApi", DummyApi)
+
+    repo_id = resolve_default_checkpoint_repo(token_env_var="HF_TOKEN", default_repo_name="co")
+
+    assert repo_id == "alice/co"
+
+
+def test_get_hf_upload_repo_id_defaults_when_config_omits_repo(monkeypatch):
+    monkeypatch.setattr(
+        "connito.validator.run.resolve_default_checkpoint_repo",
+        lambda token_env_var, default_repo_name: f"resolved/{default_repo_name}",
+    )
+    config = SimpleNamespace(hf=SimpleNamespace(checkpoint_repo=None, token_env_var="HF_TOKEN", default_repo_name="co"))
+
+    assert get_hf_upload_repo_id(config) == "resolved/co"
+
+
+def test_hf_cfg_rejects_invalid_default_repo_name():
+    try:
+        HfCfg(default_repo_name="owner/co")
+    except ValidationError as exc:
+        assert "default_repo_name" in str(exc)
+    else:
+        raise AssertionError("expected invalid default_repo_name validation error")
+
+
+def test_checkpoint_cfg_restores_download_concurrency_for_compatibility():
+    assert CheckpointCfg().download_concurrency == 4
 
 
 def test_fetch_model_falls_back_to_http_when_hf_download_fails(tmp_path, monkeypatch):
@@ -265,3 +316,32 @@ def test_validator_chain_commit_payload_stays_compact_with_hf_fields():
 
     assert payload_bytes <= 128
     assert delta_bytes <= 40
+
+
+def test_validator_commit_rejects_repo_id_that_exceeds_budget():
+    owner = "x" * VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS
+    config = SimpleNamespace(
+        hf=SimpleNamespace(checkpoint_repo=f"{owner}/repo", token_env_var="HF_TOKEN", default_repo_name="co"),
+        task=SimpleNamespace(exp=SimpleNamespace(group_id=0)),
+    )
+
+    try:
+        validate_hf_distribution_config(config)
+    except ValueError as exc:
+        assert "too long" in str(exc)
+    else:
+        raise AssertionError("expected HF repo id length failure")
+
+
+def test_validator_seed_derivation_no_longer_depends_on_removed_miner_seed():
+    config = SimpleNamespace(task=SimpleNamespace(exp=SimpleNamespace(group_id=3)))
+    commit_a = ValidatorChainCommit(model_hash="a" * 64, global_ver=101, expert_group=3)
+    commit_b = ValidatorChainCommit(model_hash="b" * 64, global_ver=101, expert_group=3)
+    neuron_a = SimpleNamespace(hotkey="validator-a")
+    neuron_b = SimpleNamespace(hotkey="validator-b")
+
+    seeds = get_validator_seed_from_commit(config, [(commit_a, neuron_a), (commit_b, neuron_b)])
+
+    assert set(seeds) == {"validator-a", "validator-b"}
+    assert all(isinstance(seed, int) for seed in seeds.values())
+    assert seeds["validator-a"] != seeds["validator-b"]

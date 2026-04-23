@@ -335,8 +335,23 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
 
 
 def get_validator_seed_from_commit(config, commits):
+    def _fallback_validator_seed(commit: ValidatorChainCommit, hotkey: str) -> int:
+        legacy_seed = getattr(commit, "miner_seed", None)
+        if legacy_seed is not None:
+            return int(legacy_seed)
+
+        seed_material = ":".join(
+            [
+                hotkey,
+                str(getattr(commit, "expert_group", "")),
+                str(getattr(commit, "global_ver", "")),
+                str(getattr(commit, "model_hash", "")),
+            ]
+        )
+        return int(hashlib.sha256(seed_material.encode()).hexdigest(), 16)
+
     validator_seeds: dict[str, int] = {
-        neuron.hotkey: commit.miner_seed
+        neuron.hotkey: _fallback_validator_seed(commit, neuron.hotkey)
         for commit, neuron in commits
         if isinstance(commit, ValidatorChainCommit)
         and getattr(commit, "expert_group", None) == config.task.exp.group_id

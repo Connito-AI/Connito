@@ -19,6 +19,9 @@ from connito.shared.telemetry import track_chain_commit_latency, count_rpc_error
 
 logger = structlog.get_logger(__name__)
 
+VALIDATOR_COMMIT_MAX_BYTES = 128
+VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS = 32
+
 # Global lock for subtensor WebSocket access to prevent concurrent recv calls
 _subtensor_lock = threading.Lock()
 
@@ -58,6 +61,36 @@ class MinerChainCommit(WorkerChainCommit):
     global_ver: int | None = Field(default=0, alias="v")
     inner_opt: int | None = Field(default=0, alias="i")
 
+
+def serialize_chain_status(
+    status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
+) -> tuple[dict, str]:
+    data_dict = status.model_dump(by_alias=True, exclude_none=True)
+    data = json.dumps(data_dict, separators=(",", ":"))
+    return data_dict, data
+
+
+def validate_validator_chain_commit_payload(
+    status: ValidatorChainCommit,
+    max_bytes: int = VALIDATOR_COMMIT_MAX_BYTES,
+) -> tuple[dict, str]:
+    data_dict, data = serialize_chain_status(status)
+    hf_repo_id = status.hf_repo_id
+    if hf_repo_id and len(hf_repo_id) > VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS:
+        raise ValueError(
+            "Validator HF repo id is too long for the chain payload budget: "
+            f"{len(hf_repo_id)} > {VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS}"
+        )
+
+    payload_bytes = len(data.encode())
+    if payload_bytes > max_bytes:
+        raise ValueError(
+            "Validator chain commit exceeds payload budget: "
+            f"{payload_bytes} > {max_bytes} bytes"
+        )
+
+    return data_dict, data
+
 @track_chain_commit_latency()
 @count_rpc_errors()
 def commit_status(
@@ -82,10 +115,10 @@ def commit_status(
         - config.chain.timelock_rounds_ahead: how many Drand rounds in the future
           you want the data to be revealed (fallback to 200 if missing).
     """
-    # Serialize status first; same input for both plain + encrypted paths
-    data_dict = status.model_dump(by_alias=True, exclude_none=True)
-
-    data = json.dumps(data_dict, separators=(",", ":"))
+    if isinstance(status, ValidatorChainCommit):
+        data_dict, data = validate_validator_chain_commit_payload(status)
+    else:
+        data_dict, data = serialize_chain_status(status)
 
     success = subtensor.set_commitment(wallet=wallet, netuid=config.chain.netuid, data=data, raise_error=False)
 

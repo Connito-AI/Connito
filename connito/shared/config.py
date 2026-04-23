@@ -291,6 +291,10 @@ class CheckpointCfg(BaseConfig):
     full_validation_interval: PositiveInt | None = None
     checkpoint_topk: PositiveInt = 2
     validator_checkpoint_path: Path = Path("validator_checkpoint")
+    # Legacy compatibility knob. Miner checkpoint downloads currently use an
+    # ordered HF -> validator HTTP fallback path rather than parallel shard
+    # fan-out, but older configs may still include this field.
+    download_concurrency: PositiveInt = 4
 
 
 class HfCfg(BaseConfig):
@@ -299,13 +303,31 @@ class HfCfg(BaseConfig):
     # and miners download from the returned repo@revision.
     #
     # checkpoint_repo: the HF repo the validator pushes to. Must exist and
-    # be writable by the HF_TOKEN. The on-chain advertised repo can diverge
-    # from this upload target; validator code currently derives the advertised
-    # repo as {owner}/cycle from this configured upload repo.
+    # be writable by the HF_TOKEN. If omitted, runtime will derive
+    # {authenticated_hf_user}/{default_repo_name}. The on-chain advertised
+    # repo can diverge from this upload target; validator code currently
+    # derives the advertised repo as {owner}/cycle from the upload repo.
     checkpoint_repo: str | None = None
+    default_repo_name: str = "co"
     # Read from HF_TOKEN env at runtime — not stored in config YAML.
     # Validators need write access; miners need read access (or public repo).
     token_env_var: str = "HF_TOKEN"
+
+    @model_validator(mode="after")
+    def _validate_hf_repo_settings(self):
+        checkpoint_repo = (self.checkpoint_repo or "").strip()
+        if checkpoint_repo and "/" not in checkpoint_repo:
+            raise ValueError("hf.checkpoint_repo must be '<namespace>/<repo>'")
+
+        default_repo_name = self.default_repo_name.strip()
+        if not default_repo_name:
+            raise ValueError("hf.default_repo_name cannot be empty")
+        if "/" in default_repo_name:
+            raise ValueError("hf.default_repo_name must be a repo name, not '<namespace>/<repo>'")
+
+        self.checkpoint_repo = checkpoint_repo or None
+        self.default_repo_name = default_repo_name
+        return self
 
 
 class LoggingCfg(BaseConfig):
