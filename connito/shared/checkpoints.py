@@ -387,7 +387,7 @@ class ChainCheckpoints(BaseModel):
                 missing.append("hotkey")
 
             if missing:
-                logger.info(
+                logger.debug(
                     "filter_checkpoints: excluded (incomplete)",
                     hotkey=ckpt.hotkey,
                     uid=ckpt.uid,
