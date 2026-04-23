@@ -23,6 +23,7 @@ class SignedMessage:
     def from_dict(cls, d: dict):
         return cls(**d)
 
+
 @dataclass
 class SignedDownloadRequestMessage(SignedMessage):
     expert_group_id: int | str | None = None

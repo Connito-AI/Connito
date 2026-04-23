@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import secrets
 from typing import Any
 
 
@@ -67,12 +66,15 @@ from connito.shared.app_logging import configure_logging, log_phase, structlog
 from connito.shared.chain import (
     SignedModelHashChainCommit,
     ValidatorChainCommit,
+    VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    validate_validator_chain_commit_payload,
     _submit_fallback_weights,
     commit_status,
     setup_chain_worker,
     submit_weights,
 )
 from connito.shared.checkpoint_helper import (
+    cleanup_temporary_checkpoint_dirs,
     load_checkpoint,
     save_checkpoint,
 )
@@ -81,9 +83,15 @@ from connito.shared.checkpoints import (
     archive_top_miner_submissions,
     build_local_checkpoint,
     delete_old_checkpoints,
+    prune_miner_submission_files,
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
+from connito.shared.hf_distribute import (
+    get_hf_upload_readiness,
+    resolve_default_checkpoint_repo,
+    upload_checkpoint_to_hf,
+)
 from connito.shared.cycle import (
     check_phase_expired,
     get_combined_validator_seed,
@@ -106,6 +114,58 @@ from connito.validator.evaluator import (
     load_model_from_path,
     stream_gather_and_evaluate,
 )
+HF_CHAIN_REVISION_LENGTH = 7
+
+
+def resolve_hf_repo_ids(config: ValidatorConfig) -> tuple[str | None, str | None]:
+    derived_repo = resolve_default_checkpoint_repo(
+        token_env_var=config.hf.token_env_var,
+        default_repo_name=config.hf.default_repo_name,
+    )
+    hf_upload_repo_id = config.hf.resolve_upload_repo(derived_repo)
+    hf_chain_repo_id = config.hf.advertised_repo_id(hf_upload_repo_id)
+
+    if hf_chain_repo_id and len(hf_chain_repo_id) > VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS:
+        raise ValueError(
+            "HF chain repo id is too long for the validator commit payload: "
+            f"{len(hf_chain_repo_id)} > {VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS}"
+        )
+
+    return hf_upload_repo_id, hf_chain_repo_id
+
+
+def validate_hf_distribution_config(config: ValidatorConfig) -> tuple[str | None, str | None]:
+    hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(config)
+
+    if not (hf_upload_repo_id and hf_chain_repo_id):
+        return hf_upload_repo_id, hf_chain_repo_id
+
+    validate_validator_chain_commit_payload(
+        ValidatorChainCommit(
+            model_hash="0" * 64,
+            global_ver=0,
+            expert_group=config.task.exp.group_id,
+            hf_repo_id=hf_chain_repo_id,
+            hf_revision="0" * HF_CHAIN_REVISION_LENGTH,
+        )
+    )
+
+    if config.hf.uses_explicit_checkpoint_repo():
+        logger.info(
+            "Using configured HF checkpoint repo",
+            upload_checkpoint_repo=hf_upload_repo_id,
+            advertised_checkpoint_repo=hf_chain_repo_id,
+        )
+    else:
+        logger.info(
+            "Using default HF checkpoint repo derived from authenticated user",
+            upload_checkpoint_repo=hf_upload_repo_id,
+            advertised_checkpoint_repo=hf_chain_repo_id,
+        )
+
+    return hf_upload_repo_id, hf_chain_repo_id
+
+
 from connito.validator.inter_validator_connection import (
     build_averagers_from_buff,
     build_grad_buff_from_model,
@@ -511,6 +571,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # get_chain_commits with historical block=). lite_subtensor: used for
     # head-only ops like commit_status and submit_weights. They collapse to a
     # single connection when no lite endpoint is configured.
+    validate_hf_distribution_config(config)
     wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
 
     # === set logging ===
@@ -542,8 +603,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.0.5":
-        logger.info("Skipping historic score_aggregator load for v0.0.5", pkg_version=pkg_version)
+    if pkg_version == "v0.1.0":
+        logger.info("Skipping historic score_aggregator load for v0.1.0", pkg_version=pkg_version)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
         try:
@@ -590,8 +651,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             model_hash=None,
             global_ver=global_opt_step,
             expert_group=config.task.exp.group_id,
-            miner_seed=0,  # this should reveal later
-            block=lite_subtensor.block,
         ),
     )
 
@@ -604,6 +663,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     outer_optimizer.zero_grad()
 
     current_model_hash = None
+
+    if config.ckpt.cleanup_stale_temporary_checkpoints:
+        cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
     try:
         while True:
@@ -659,8 +721,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     model_hash=current_model_hash,
                     global_ver=global_opt_step,
                     expert_group=config.task.exp.group_id,
-                    miner_seed=secrets.randbits(16),
-                    block=lite_subtensor.block,
                 ),
             )
 
@@ -844,6 +904,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             logger.info("(6) Saving checkpoint")
             ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
 
+            presave_keep = None
+            if config.ckpt.checkpoint_topk is not None:
+                presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
+            if presave_keep is not None:
+                presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
+                if presave_deleted:
+                    logger.info(
+                        "Pruned older checkpoints before save",
+                        keep=presave_keep,
+                        deleted=presave_deleted,
+                    )
+
             save_checkpoint(
                 checkpoint_path=ckpt_path,
                 model=global_model,
@@ -881,6 +953,55 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 check_phase_expired(subtensor, phase_response)
 
+                # Upload checkpoint to HuggingFace so miners can pull it during
+                # the Distribute phase. The returned revision SHA pins the exact
+                # bytes miners will download, even if :main advances afterward.
+                hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(config)
+                hf_revision: str | None = None
+                if hf_upload_repo_id and hf_chain_repo_id and hf_upload_repo_id != hf_chain_repo_id:
+                    logger.info(
+                        "HF upload repo differs from chain-advertised repo",
+                        upload_checkpoint_repo=hf_upload_repo_id,
+                        advertised_checkpoint_repo=hf_chain_repo_id,
+                    )
+                hf_ready, hf_reason = get_hf_upload_readiness(
+                    repo_id=hf_upload_repo_id,
+                    token_env_var=config.hf.token_env_var,
+                )
+                if model_ckpt.path is None:
+                    logger.warning(
+                        "No checkpoint path available for HF upload",
+                        upload_checkpoint_repo=hf_upload_repo_id,
+                        advertised_checkpoint_repo=hf_chain_repo_id,
+                    )
+                elif hf_ready:
+                    try:
+                        hf_revision = upload_checkpoint_to_hf(
+                            ckpt_dir=model_ckpt.path,
+                            repo_id=hf_upload_repo_id,
+                            token_env_var=config.hf.token_env_var,
+                            commit_message=(
+                                f"global_ver={model_ckpt.global_ver} "
+                                f"expert_group={config.task.exp.group_id}"
+                            ),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "HF checkpoint upload failed; miners will use validator HTTP fallback",
+                            upload_checkpoint_repo=hf_upload_repo_id,
+                            advertised_checkpoint_repo=hf_chain_repo_id,
+                            error=str(e),
+                            exc_info=True,
+                        )
+                else:
+                    logger.warning(
+                        "HF checkpoint upload unavailable; miners will use validator HTTP fallback",
+                        upload_checkpoint_repo=hf_upload_repo_id,
+                        advertised_checkpoint_repo=hf_chain_repo_id,
+                        reason=hf_reason,
+                        has_ckpt_path=model_ckpt.path is not None,
+                    )
+
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
                 logger.info("(8) Commit model_hash for next validation")
                 commit_status(
@@ -891,8 +1012,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         model_hash=model_ckpt.model_hash,
                         global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                         expert_group=config.task.exp.group_id,
-                        miner_seed=0,
-                        block=lite_subtensor.block,
+                        hf_repo_id=hf_chain_repo_id if hf_revision else None,
+                        hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
                     ),
                 )
 
@@ -925,9 +1046,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     archive_dir=config.ckpt.miner_submission_archive_path,
                     score_aggregator=score_aggregator,
                     top_k=config.evaluation.top_k_miners_to_reward,
+                    max_archive=config.ckpt.miner_submission_archive_max_files,
                 )
-            else:
-                logger.info("(10) Submission archiving disabled, skipping")
+
+            deleted = prune_miner_submission_files(
+                config.ckpt.miner_submission_path,
+                current_block=subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+            )
+            logger.info(
+                "(10) Pruned aged miner submissions after cycle",
+                deleted=len(deleted),
+                current_block=subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+            )
 
             # === validation and log metric ===
             # Local evaluation step disabled to reduce per-cycle RAM/compute load.

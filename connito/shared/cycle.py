@@ -335,8 +335,16 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
 
 
 def get_validator_seed_from_commit(config, commits):
+    def _derive_validator_assignment_seed(commit: ValidatorChainCommit, hotkey: str) -> int:
+        # Keep `miner_seed` in the schema contract, but treat omitted values as
+        # the default assignment seed to preserve the compact chain payload.
+        legacy_seed = getattr(commit, "miner_seed", None)
+        if legacy_seed is not None:
+            return int(legacy_seed)
+        return 0
+
     validator_seeds: dict[str, int] = {
-        neuron.hotkey: commit.miner_seed
+        neuron.hotkey: _derive_validator_assignment_seed(commit, neuron.hotkey)
         for commit, neuron in commits
         if isinstance(commit, ValidatorChainCommit)
         and getattr(commit, "expert_group", None) == config.task.exp.group_id

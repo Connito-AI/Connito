@@ -19,6 +19,9 @@ from connito.shared.telemetry import track_chain_commit_latency, count_rpc_error
 
 logger = structlog.get_logger(__name__)
 
+VALIDATOR_COMMIT_MAX_BYTES = 128
+VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS = 32
+
 # Global lock for subtensor WebSocket access to prevent concurrent recv calls
 _subtensor_lock = threading.Lock()
 
@@ -38,12 +41,16 @@ class SignedModelHashChainCommit(BaseModel):
 
 class ValidatorChainCommit(WorkerChainCommit):
     model_config = ConfigDict(populate_by_name=True)
-    signed_model_hash: str | None = Field(default=None, alias="m")
     model_hash: str | None = Field(default=None, alias="h")
     global_ver: int | None = Field(default=None, alias="v")
     expert_group: int | None = Field(default=None, alias="e")
     miner_seed: int | None = Field(default=None, alias="s")
-    block: int | None = Field(default=None, alias="b")
+    # HuggingFace is the checkpoint transport: the validator uploads the
+    # checkpoint directory to `hf_repo_id`, and `hf_revision` carries a short
+    # commit SHA prefix so miners pull a pinned snapshot even if the repo
+    # advances. model_hash still verifies integrity post-download.
+    hf_repo_id: str | None = Field(default=None, alias="r")
+    hf_revision: str | None = Field(default=None, alias="rv")
 
 
 class MinerChainCommit(WorkerChainCommit):
@@ -54,6 +61,36 @@ class MinerChainCommit(WorkerChainCommit):
     model_hash: str | None = Field(default=None, alias="h")
     global_ver: int | None = Field(default=0, alias="v")
     inner_opt: int | None = Field(default=0, alias="i")
+
+
+def serialize_chain_status(
+    status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
+) -> tuple[dict, str]:
+    data_dict = status.model_dump(by_alias=True, exclude_none=True)
+    data = json.dumps(data_dict, separators=(",", ":"))
+    return data_dict, data
+
+
+def validate_validator_chain_commit_payload(
+    status: ValidatorChainCommit,
+    max_bytes: int = VALIDATOR_COMMIT_MAX_BYTES,
+) -> tuple[dict, str]:
+    data_dict, data = serialize_chain_status(status)
+    hf_repo_id = status.hf_repo_id
+    if hf_repo_id and len(hf_repo_id) > VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS:
+        raise ValueError(
+            "Validator HF repo id is too long for the chain payload budget: "
+            f"{len(hf_repo_id)} > {VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS}"
+        )
+
+    payload_bytes = len(data.encode())
+    if payload_bytes > max_bytes:
+        raise ValueError(
+            "Validator chain commit exceeds payload budget: "
+            f"{payload_bytes} > {max_bytes} bytes"
+        )
+
+    return data_dict, data
 
 @track_chain_commit_latency()
 @count_rpc_errors()
@@ -79,10 +116,10 @@ def commit_status(
         - config.chain.timelock_rounds_ahead: how many Drand rounds in the future
           you want the data to be revealed (fallback to 200 if missing).
     """
-    # Serialize status first; same input for both plain + encrypted paths
-    data_dict = status.model_dump(by_alias=True)
-
-    data = json.dumps(data_dict)
+    if isinstance(status, ValidatorChainCommit):
+        data_dict, data = validate_validator_chain_commit_payload(status)
+    else:
+        data_dict, data = serialize_chain_status(status)
 
     success = subtensor.set_commitment(wallet=wallet, netuid=config.chain.netuid, data=data, raise_error=False)
 
@@ -126,18 +163,19 @@ def get_chain_commits(
 
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
     whitelisted_validators = get_validator_whitelist_from_api(config)
+    hotkey_to_uid = {metagraph_hotkey: uid for uid, metagraph_hotkey in enumerate(metagraph.hotkeys)}
 
     parsed = []
 
     for hotkey, commit in all_commitments.items():
-        if hotkey not in metagraph.hotkeys:
+        uid = hotkey_to_uid.get(hotkey)
+        if uid is None:
             logger.debug(
                 "Skipping commit from hotkey not in metagraph (likely deregistered)",
                 hotkey=hotkey,
                 block=current_block,
             )
             continue
-        uid = metagraph.hotkeys.index(hotkey)
         neuron = metagraph.neurons[uid]
         age = current_block - int(getattr(neuron, "last_update", 0))
 
