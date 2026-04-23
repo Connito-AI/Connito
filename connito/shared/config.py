@@ -335,8 +335,7 @@ class HfCfg(BaseConfig):
     def advertised_repo_id(self, upload_repo: str | None) -> str | None:
         if not upload_repo:
             return None
-        owner, _repo_name = upload_repo.split("/", 1)
-        return f"{owner}/cycle"
+        return upload_repo
 
     def uses_explicit_checkpoint_repo(self) -> bool:
         return self.checkpoint_repo is not None
