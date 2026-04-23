@@ -1,38 +1,43 @@
 import bittensor
 
-from connito.shared.config import WorkerConfig
+from connito.shared.config import CycleCfg
 from connito.shared.cycle import PhaseNames, PhaseResponse
 
 
 
 class PhaseManager:
-    def __init__(self, config: WorkerConfig, subtensor: bittensor.Subtensor):
-        self.config = config
+    def __init__(self, cycle_cfg: CycleCfg, subtensor: bittensor.Subtensor):
+        self.cycle_cfg = cycle_cfg
         self.subtensor = subtensor
-        self.phases = self.init_phases(config, PhaseNames())
+        self.phases = self.init_phases(cycle_cfg, PhaseNames())
         self.cycle_length = sum(p["length"] for p in self.phases)
 
-    def init_phases(self, config, names):
+    @classmethod
+    def from_dict(cls, cycle_dict: dict, subtensor: bittensor.Subtensor) -> "PhaseManager":
+        """Build from a dict matching CycleCfg (e.g. parsed from the owner's /get_cycle_config JSON)."""
+        return cls(CycleCfg(**cycle_dict), subtensor)
+
+    def init_phases(self, cycle_cfg: CycleCfg, names):
         # ordered phase
         phases = [
-            {"name": names.distribute, "length": config.cycle.distribute_period},  # miner download model from validator
-            {"name": names.train, "length": config.cycle.train_period},  # miner train
+            {"name": names.distribute, "length": cycle_cfg.distribute_period},  # miner download model from validator
+            {"name": names.train, "length": cycle_cfg.train_period},  # miner train
             {
                 "name": names.miner_commit_1,
-                "length": config.cycle.commit_period,
+                "length": cycle_cfg.commit_period,
             },  # miner commit model hash and validator commit seed
             {
                 "name": names.miner_commit_2,
-                "length": config.cycle.commit_period,
+                "length": cycle_cfg.commit_period,
             },  # miner commit model hash and validator commit seed
-            {"name": names.submission, "length": config.cycle.submission_period},  # miner submit model to validator
-            {"name": names.validate, "length": config.cycle.validate_period},  # validator validate models from miners
-            {"name": names.merge, "length": config.cycle.merge_period},  # validator merge models
+            {"name": names.submission, "length": cycle_cfg.submission_period},  # miner submit model to validator
+            {"name": names.validate, "length": cycle_cfg.validate_period},  # validator validate models from miners
+            {"name": names.merge, "length": cycle_cfg.merge_period},  # validator merge models
             {
                 "name": names.validator_commit_1,
-                "length": config.cycle.commit_period,
+                "length": cycle_cfg.commit_period,
             },  # validator commit signed_model_hash
-            {"name": names.validator_commit_2, "length": config.cycle.commit_period},  # validator commit model_hash
+            {"name": names.validator_commit_2, "length": cycle_cfg.commit_period},  # validator commit model_hash
         ]
         return phases
 

@@ -4,7 +4,7 @@ from connito.validator.inter_validator_connection import structlog, AllowedHotke
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
-from connito.shared.config import OwnerConfig, parse_args
+from connito.shared.config import CycleCfg, OwnerConfig, parse_args
 from connito.sn_owner.cycle import PhaseManager, PhaseResponse
 from connito.shared.app_logging import configure_logging
 import multiprocessing as mp
@@ -71,6 +71,18 @@ async def get_validator_whitelist():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/get_cycle_config", response_model=CycleCfg)
+async def get_cycle_config():
+    """Returns the owner's CycleCfg. Clients can feed this dict into PhaseManager.from_dict to track phases locally."""
+    try:
+        with open(cycle_config_path) as f:
+            return CycleCfg(**json.load(f))
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="cycle config not yet written")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 async def root():
     return {
@@ -90,6 +102,7 @@ if __name__ == "__main__":
     global phase_manager
     global init_peer_id_path
     global validator_whitelist_path
+    global cycle_config_path
 
     if args.path:
         config = OwnerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
@@ -100,11 +113,15 @@ if __name__ == "__main__":
 
     init_peer_id_path = Path(config.run.root_path) / "init_peer_ids.json"
     validator_whitelist_path = Path(config.run.root_path) / "connito" / "sn_owner" / "validator_whitelist.json"
+    cycle_config_path = Path(config.run.root_path) / "cycle_config.json"
 
     subtensor = bittensor.Subtensor(network=config.chain.network)
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
 
-    phase_manager = PhaseManager(config, subtensor)
+    cycle_config_path.write_text(config.cycle.model_dump_json(indent=2))
+    logger.info("wrote cycle config", path=str(cycle_config_path))
+
+    phase_manager = PhaseManager(config.cycle, subtensor)
     uvicorn.run(
         app,
         host="127.0.0.1",

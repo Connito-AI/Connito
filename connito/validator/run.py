@@ -574,7 +574,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
         subtensor=subtensor, 
-        phase_manager=PhaseManager(config, subtensor),
+        phase_manager=PhaseManager(config.cycle, subtensor),
         group_averagers=group_averagers,
         interval_sec=12.0
     )
