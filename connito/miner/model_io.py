@@ -27,7 +27,7 @@ from connito.shared.chain import setup_chain_worker
 from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till, search_model_submission_destination
 from connito.shared.helper import get_model_hash
 from connito.shared.model import fetch_model_from_chain_validator
-from connito.sn_owner.cycle import PhaseNames
+from connito.sn_owner.cycle import PhaseManager, PhaseNames
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -64,6 +64,7 @@ class FileNotReadyError(RuntimeError):
 # --- Scheduler service ---
 def scheduler_service(
     config,
+    phase_manager: PhaseManager,
     download_queue: Queue,
     commit_queue: Queue,
     submit_queue: Queue,
@@ -74,12 +75,18 @@ def scheduler_service(
     """
     while True:
         # --------- DOWNLOAD SCHEDULING ---------
-        phase_response = wait_till(config, phase_name=PhaseNames.distribute, poll_fallback_block=poll_fallback_block)
+        phase_response = wait_till(phase_manager, phase_name=PhaseNames.distribute, poll_fallback_block=poll_fallback_block)
         download_queue.put(Job(job_type=JobType.DOWNLOAD, phase_response=phase_response))
+
+        # --------- TRAIN PHASE: refresh cycle config at start of phase ---------
+        # Pull the latest CycleCfg as soon as Train begins so any owner-side
+        # schedule change is applied for the rest of this cycle.
+        wait_till(phase_manager, phase_name=PhaseNames.train, poll_fallback_block=poll_fallback_block)
+        phase_manager.refresh_from_api(config)
 
         # --------- COMISSION SCHEDULING ---------
         phase_response = wait_till(
-            config, phase_name=PhaseNames.miner_commit_1, poll_fallback_block=poll_fallback_block
+            phase_manager, phase_name=PhaseNames.miner_commit_1, poll_fallback_block=poll_fallback_block
         )
         commit_queue.put(
             Job(
@@ -89,13 +96,14 @@ def scheduler_service(
         )
 
         # --------- SUBMISSION SCHEDULING ---------
-        phase_response = wait_till(config, phase_name=PhaseNames.submission, poll_fallback_block=poll_fallback_block)
+        phase_response = wait_till(phase_manager, phase_name=PhaseNames.submission, poll_fallback_block=poll_fallback_block)
         submit_queue.put(Job(job_type=JobType.SUBMIT, phase_response=phase_response))
 
 
 # --- Workers ---
 def download_worker(
     config,
+    phase_manager: PhaseManager,
     wallet,
     expert_manager,
     download_queue: Queue,
@@ -130,6 +138,7 @@ def download_worker(
                 current_model_meta,
                 config,
                 subtensor,
+                phase_manager,
                 wallet,
                 expert_group_ids=[config.task.exp.group_id],
                 expert_group_assignment = expert_manager.expert_group_assignment
@@ -170,6 +179,7 @@ def download_worker(
 
 def commit_worker(
     config,
+    phase_manager: PhaseManager,
     commit_queue: Queue,
     wallet,
     shared_state: SharedState,
@@ -217,7 +227,7 @@ def commit_worker(
 
             check_phase_expired(subtensor, job.phase_response)
 
-            phase_response = wait_till(config, PhaseNames.miner_commit_2)
+            phase_response = wait_till(phase_manager, PhaseNames.miner_commit_2)
 
             logger.info(
                 f"<{PhaseNames.miner_commit_2}> committing",
@@ -252,6 +262,7 @@ def commit_worker(
 
 def submit_worker(
     config,
+    phase_manager: PhaseManager,
     submit_queue: Queue,
     wallet,
     shared_state: SharedState,
@@ -279,6 +290,7 @@ def submit_worker(
                 wallet=wallet,
                 config=config,
                 subtensor=subtensor,
+                phase_manager=phase_manager,
             )
 
             if destination_axon is None:
@@ -335,9 +347,19 @@ def submit_worker(
 
 
 # --- Wiring it all together ---
-def run_system(config, wallet, expert_manager, current_model_version: int = 0, current_model_hash: str = "xxx", subtensor=None):
+def run_system(
+    config,
+    wallet,
+    expert_manager,
+    current_model_version: int = 0,
+    current_model_hash: str = "xxx",
+    subtensor=None,
+    phase_manager: PhaseManager | None = None,
+):
     if subtensor is None:
         subtensor = bittensor.Subtensor(config.chain.network)
+    if phase_manager is None:
+        phase_manager = PhaseManager.from_api(config, subtensor)
 
     download_queue = Queue()
     commit_queue = Queue()
@@ -347,17 +369,17 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
     # Non-daemon threads so they can be joined cleanly on shutdown.
     download_thread = Thread(
         target=download_worker,
-        args=(config, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
+        args=(config, phase_manager, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
         daemon=False,
     )
     commit_thread = Thread(
         target=commit_worker,
-        args=(config, commit_queue, wallet, shared_state, subtensor),
+        args=(config, phase_manager, commit_queue, wallet, shared_state, subtensor),
         daemon=False,
     )
     submit_thread = Thread(
         target=submit_worker,
-        args=(config, submit_queue, wallet, shared_state, subtensor),
+        args=(config, phase_manager, submit_queue, wallet, shared_state, subtensor),
         daemon=False,
     )
 
@@ -369,6 +391,7 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
         # Scheduler runs in the foreground; blocks until interrupted or it errors.
         scheduler_service(
             config=config,
+            phase_manager=phase_manager,
             download_queue=download_queue,
             commit_queue=commit_queue,
             submit_queue=submit_queue,

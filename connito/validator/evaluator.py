@@ -295,6 +295,7 @@ async def run_evaluation(
 async def stream_gather_and_evaluate(
     config,
     subtensor: bittensor.Subtensor,
+    phase_manager,
     step: int,
     device: torch.device,
     score_aggregator,
@@ -372,6 +373,7 @@ async def stream_gather_and_evaluate(
                 jobs = gather_validation_job(
                     config,
                     subtensor,
+                    phase_manager,
                     step=step,
                     validator_miner_assignment=validator_miner_assignment,
                 )

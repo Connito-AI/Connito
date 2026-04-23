@@ -24,8 +24,6 @@ from connito.shared.cycle import (
     PhaseNames,
     PhaseResponse,
     get_allowed_version_range,
-    get_blocks_from_previous_phase_from_api,
-    get_phase_from_api,
     wait_till,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
@@ -688,17 +686,18 @@ def build_chain_checkpoints(
 def build_chain_checkpoints_from_previous_phase(
     config: WorkerConfig,
     subtensor: bittensor.Subtensor,
+    phase_manager: "PhaseManager",
     for_role: str = "validator",
     owner_hotkey: str | None = None,
 ) -> ChainCheckpoints:
     logger.debug("Building chain checkpoints from previous phase", for_role=for_role)
-    
+
     # --- Validate type ---
     if for_role == "miner":
         phase_name_1 = PhaseNames.miner_commit_1
         phase_name_2 = PhaseNames.miner_commit_2
         next_phase = PhaseNames.submission
-        
+
     elif for_role == "validator":
         phase_name_1 = PhaseNames.validator_commit_1
         phase_name_2 = PhaseNames.validator_commit_2
@@ -707,14 +706,22 @@ def build_chain_checkpoints_from_previous_phase(
     else:
         raise ValueError(f"Invalid type: {for_role}. Must be 'miner' or 'validator'.")
 
-    # --- Make sure we are not inbetween commit 1 and 2---    
-    current_phase: PhaseResponse | None = get_phase_from_api(config)
+    # --- Make sure we are not inbetween commit 1 and 2---
+    try:
+        current_phase: PhaseResponse | None = phase_manager.get_phase()
+    except Exception as e:
+        logger.warning("build_chain_checkpoints_from_previous_phase: failed to resolve current phase", error=str(e))
+        current_phase = None
     if current_phase is not None and (current_phase.phase_name == phase_name_1 or current_phase.phase_name == phase_name_2):
         logger.info(f"In between hash commit phase, waiting till {next_phase}")
-        wait_till(config, next_phase)
-        
+        wait_till(phase_manager, next_phase)
+
     # --- Get block ranges for previous phases ---
-    previous_phase_range = get_blocks_from_previous_phase_from_api(config)
+    try:
+        previous_phase_range = phase_manager.previous_phase_block_ranges()
+    except Exception as e:
+        logger.warning("build_chain_checkpoints_from_previous_phase: failed to resolve previous phase ranges", error=str(e))
+        previous_phase_range = None
 
     if previous_phase_range is not None:
         commit_1_end_block = previous_phase_range[phase_name_1][1] + 1
@@ -760,7 +767,7 @@ def build_chain_checkpoints_from_previous_phase(
         )
 
     # --- Build chain checkpoints ---
-    min_ver, max_ver = get_allowed_version_range(config)
+    min_ver, max_ver = get_allowed_version_range(config, phase_manager)
     return build_chain_checkpoints(
         signed_hash_chain_commits=signed_hash_chain_commits,
         hash_chain_commits=hash_chain_commits,
