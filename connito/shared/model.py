@@ -310,8 +310,8 @@ def fetch_model_from_chain_validator(
     if should_download and chain_checkpoints:
         download_success = False
         retries = 0
-        max_retries = 3
-        base_delay_s = 5  # backoff base
+        max_retries = 6
+        base_delay_s = 60  # exponential backoff: 1/2/4/8/16 min between the 6 attempts
 
         while (not download_success) and (retries < max_retries):
             for chain_checkpoint in chain_checkpoints.checkpoints:
