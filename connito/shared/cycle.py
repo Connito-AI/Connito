@@ -59,6 +59,8 @@ def _get_with_retry(
                     attempt=attempt + 1,
                 )
             else:
+                if attempt > 0:
+                    logger.info("Request succeeded after retry", url=url, attempt=attempt + 1)
                 return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
             logger.warning(
