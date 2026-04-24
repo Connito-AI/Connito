@@ -540,31 +540,6 @@ def load_submission_files(folder: str = "miner_submission"):
     return files_dict
 
 
-def _submission_hotkeys_in_phase_range(
-    submission_dir: Path,
-    previous_phase_range: tuple[int, int] | None,
-) -> set[str]:
-    existing_hotkeys: set[str] = set()
-    for file_path in submission_dir.glob("*.pt"):
-        if file_path.name.startswith(".tmp"):
-            continue
-        meta = parse_dynamic_filename(file_path.name)
-        if not meta or "hotkey" not in meta or "block" not in meta:
-            continue
-
-        block = meta["block"]
-        if (
-            previous_phase_range is not None
-            and isinstance(block, int)
-            and not (previous_phase_range[0] <= block <= previous_phase_range[1])
-        ):
-            continue
-
-        existing_hotkeys.add(meta["hotkey"])
-
-    return existing_hotkeys
-
-
 def hydrate_miner_submissions_from_hf(
     config: ValidatorConfig,
     subtensor: bittensor.Subtensor,
@@ -594,14 +569,6 @@ def hydrate_miner_submissions_from_hf(
     submission_dir = Path(config.ckpt.miner_submission_path)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
-    _prev_phase_api = get_blocks_from_previous_phase_from_api(config)
-    previous_phase_range = None if _prev_phase_api is None else _prev_phase_api.get(PhaseNames.submission)
-
-    # Only current-window local submissions should suppress HF hydration.
-    # Stale files from older cycles are ignored here so they do not block a
-    # fresh HF pull for the same miner.
-    existing_hotkeys = _submission_hotkeys_in_phase_range(submission_dir, previous_phase_range)
-
     try:
         chain_checkpoints = build_chain_checkpoints_from_previous_phase(
             config=config, subtensor=subtensor, for_role="miner",
@@ -616,8 +583,6 @@ def hydrate_miner_submissions_from_hf(
     hydrated = 0
     for ckpt in chain_checkpoints.checkpoints:
         if ckpt.hotkey is None or ckpt.hotkey not in miner_assignment:
-            continue
-        if ckpt.hotkey in existing_hotkeys:
             continue
         if not (ckpt.hf_repo_id and ckpt.hf_revision):
             continue
@@ -634,9 +599,10 @@ def hydrate_miner_submissions_from_hf(
                 dest_dir=tmp_dir,
                 token_env_var=config.hf.token_env_var,
             )
+            for file_path in submission_dir.glob(f"hotkey_{ckpt.hotkey}_block_*.pt"):
+                file_path.unlink(missing_ok=True)
             # Atomic rename so gather_validation_job never sees a partial file.
             (tmp_dir / filename_in_hf).replace(dest)
-            existing_hotkeys.add(ckpt.hotkey)
             hydrated += 1
             logger.info(
                 "Hydrated miner submission from HF",
