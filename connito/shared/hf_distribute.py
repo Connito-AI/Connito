@@ -132,6 +132,9 @@ def upload_checkpoint_to_hf(
         folder_path=str(ckpt_dir),
         repo_id=repo_id,
         commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
+        # Only upload model shards — validators download model_expgroup_N.pt and
+        # model_shared.pt exclusively; optimizer/dataloader state is never fetched.
+        allow_patterns=["model*.pt"],
     )
     revision = commit_info.oid[:12]
     logger.info(
