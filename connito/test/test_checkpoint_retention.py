@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from connito.shared.checkpoints import build_local_checkpoints, delete_old_checkpoints
+from connito.shared.checkpoints import build_local_checkpoints, clear_miner_submission_files, delete_old_checkpoints
 
 
 def test_build_local_checkpoints_ignores_score_aggregator_sidecar(tmp_path):
@@ -25,3 +25,20 @@ def test_delete_old_checkpoints_preserves_score_aggregator_sidecar(tmp_path):
     assert [Path(path).name for path in removed] == ["globalver_10"]
     assert new_ckpt.exists()
     assert score_path.exists()
+
+
+def test_clear_miner_submission_files_removes_only_submission_artifacts(tmp_path):
+    first = tmp_path / "hotkey_alpha_block_10.pt"
+    second = tmp_path / ".tmp_hotkey_beta_block_11.pt"
+    keep = tmp_path / "score_aggregator.json"
+
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    keep.write_text("{}", encoding="utf-8")
+
+    removed = clear_miner_submission_files(tmp_path)
+
+    assert sorted(removed) == [".tmp_hotkey_beta_block_11.pt", "hotkey_alpha_block_10.pt"]
+    assert not first.exists()
+    assert not second.exists()
+    assert keep.exists()

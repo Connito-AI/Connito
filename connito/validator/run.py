@@ -82,6 +82,7 @@ from connito.shared.checkpoints import (
     ModelCheckpoint,
     archive_top_miner_submissions,
     build_local_checkpoint,
+    clear_miner_submission_files,
     delete_old_checkpoints,
     prune_miner_submission_files,
     select_best_checkpoint,
@@ -1038,18 +1039,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     max_archive=config.ckpt.miner_submission_archive_max_files,
                 )
 
-            deleted = prune_miner_submission_files(
-                config.ckpt.miner_submission_path,
-                current_block=subtensor.block,
-                cycle_length=config.cycle.cycle_length,
-                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
-            )
+            deleted = clear_miner_submission_files(config.ckpt.miner_submission_path)
             logger.info(
-                "(10) Pruned aged miner submissions after cycle",
+                "(10) Cleared miner submissions after cycle",
                 deleted=len(deleted),
-                current_block=subtensor.block,
-                cycle_length=config.cycle.cycle_length,
-                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
             )
 
             # === validation and log metric ===

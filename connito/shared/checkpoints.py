@@ -861,6 +861,29 @@ def prune_miner_submission_files(
     return deleted_files
 
 
+def clear_miner_submission_files(folder_path: Path) -> list[str]:
+    """Delete all miner submission artifacts at cycle end."""
+    if not folder_path.exists():
+        raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
+
+    deleted_files: list[str] = []
+    for file_path in folder_path.iterdir():
+        if not file_path.is_file() or file_path.suffix != ".pt":
+            continue
+        try:
+            os.remove(file_path)
+            deleted_files.append(file_path.name)
+        except Exception as exc:
+            logger.warning("Failed to delete miner submission file", file=file_path.name, error=str(exc))
+
+    if deleted_files:
+        logger.info("Cleared miner submissions", count=len(deleted_files), files=deleted_files)
+    else:
+        logger.debug("No miner submissions to clear")
+
+    return deleted_files
+
+
 def delete_old_checkpoints_by_hotkey(
     folder_path: Path,
     current_block: int,
