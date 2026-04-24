@@ -569,16 +569,6 @@ def hydrate_miner_submissions_from_hf(
     submission_dir = Path(config.ckpt.miner_submission_path)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
-    # A miner with any existing submission file is skipped — don't clobber an
-    # HTTP upload already received, and don't re-download on subsequent polls.
-    existing_hotkeys: set[str] = set()
-    for file_path in submission_dir.glob("*.pt"):
-        if file_path.name.startswith(".tmp"):
-            continue
-        meta = parse_dynamic_filename(file_path.name)
-        if meta and "hotkey" in meta:
-            existing_hotkeys.add(meta["hotkey"])
-
     try:
         chain_checkpoints = build_chain_checkpoints_from_previous_phase(
             config=config, subtensor=subtensor, for_role="miner",
@@ -593,8 +583,6 @@ def hydrate_miner_submissions_from_hf(
     hydrated = 0
     for ckpt in chain_checkpoints.checkpoints:
         if ckpt.hotkey is None or ckpt.hotkey not in miner_assignment:
-            continue
-        if ckpt.hotkey in existing_hotkeys:
             continue
         if not (ckpt.hf_repo_id and ckpt.hf_revision):
             continue
@@ -611,9 +599,10 @@ def hydrate_miner_submissions_from_hf(
                 dest_dir=tmp_dir,
                 token_env_var=config.hf.token_env_var,
             )
+            for file_path in submission_dir.glob(f"hotkey_{ckpt.hotkey}_block_*.pt"):
+                file_path.unlink(missing_ok=True)
             # Atomic rename so gather_validation_job never sees a partial file.
             (tmp_dir / filename_in_hf).replace(dest)
-            existing_hotkeys.add(ckpt.hotkey)
             hydrated += 1
             logger.info(
                 "Hydrated miner submission from HF",
