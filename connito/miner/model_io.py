@@ -160,7 +160,7 @@ def download_worker(
                 or chain_checkpoint.global_ver is None
                 or chain_checkpoint.model_hash is None
             ):
-                raise FileNotReadyError(f"No qualifying download destination: {chain_checkpoint}")
+                raise FileNotReadyError(f"No required download job: {chain_checkpoint}")
 
             logger.info(f"<{PhaseNames.distribute}> downloaded model metadata from chain: {chain_checkpoint}.")
 
@@ -176,7 +176,7 @@ def download_worker(
                 shared_state.current_model_hash = current_model_meta.model_hash
 
         except FileNotReadyError as e:
-            logger.warning(f"<{PhaseNames.distribute}> File not ready error: {e}")
+            logger.info(f"<{PhaseNames.distribute}>: {e}")
 
         except Exception as e:
             logger.error(f"<{PhaseNames.distribute}> Error while handling job", error=str(e), exc_info=True)
@@ -428,7 +428,7 @@ def submit_worker(
             )
 
             if destination_axon is None:
-                logger.warning(
+                logger.info(
                     f"<{PhaseNames.submission}> No validator assigned to this miner — skipping submission",
                     miner_hotkey=wallet.hotkey.ss58_address[:6],
                 )
