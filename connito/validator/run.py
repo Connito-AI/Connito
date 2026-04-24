@@ -1042,14 +1042,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 config.ckpt.miner_submission_path,
                 current_block=subtensor.block,
                 cycle_length=config.cycle.cycle_length,
-                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+                max_age_cycles=0,
             )
             logger.info(
                 "(10) Pruned aged miner submissions after cycle",
                 deleted=len(deleted),
                 current_block=subtensor.block,
                 cycle_length=config.cycle.cycle_length,
-                max_age_cycles=config.ckpt.miner_submission_max_age_cycles,
+                max_age_cycles=0,
             )
 
             # === validation and log metric ===
