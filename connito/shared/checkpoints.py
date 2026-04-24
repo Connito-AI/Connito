@@ -551,11 +551,25 @@ class Checkpoints(BaseModel):
         )
 
 
-def build_local_checkpoint(path: Path, role: str = "miner") -> ModelCheckpoint | None:
+def _local_checkpoint_meta(path: Path) -> dict[str, Any] | None:
     if path.name.startswith(".tmp_") or "yaml" in path.name.lower():
         return None
 
     meta = parse_dynamic_filename(str(path))
+    if meta is None:
+        return None
+
+    # Only treat entries with checkpoint version markers as checkpoint artifacts.
+    # Sidecar files like score_aggregator.json live beside checkpoints but should
+    # never participate in retention ordering or pruning.
+    if "globalver" not in meta and "inneropt" not in meta:
+        return None
+
+    return meta
+
+
+def build_local_checkpoint(path: Path, role: str = "miner") -> ModelCheckpoint | None:
+    meta = _local_checkpoint_meta(path)
     if meta is None:
         return None
 
@@ -574,12 +588,7 @@ def build_local_checkpoints(ckpt_dir: Path, role: str = "miner") -> ModelCheckpo
 
     for entry in fs.ls(root, detail=False):
         path = Path(entry)
-        if path.name.startswith(".tmp_"):
-            continue
-        if "yaml" in path.name.lower():
-            continue
-
-        meta = parse_dynamic_filename(str(path))
+        meta = _local_checkpoint_meta(path)
         if meta is None:
             continue
 
