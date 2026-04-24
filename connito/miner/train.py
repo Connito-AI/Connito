@@ -459,13 +459,13 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     logger.info("Scaler updated", scale_after=scale_after)
 
                 if step_skipped:
-                    logger.debug("GradScaler skipped optimizer step due to non-finite gradients", step=step)
+                    logger.warning("GradScaler skipped optimizer step due to non-finite gradients", step=step)
 
                 if not step_skipped:
                     scheduler.step()
                     logger.info("scheduler step", lr=inner_optimizer.param_groups[0]["lr"])
                 else:
-                    logger.debug("Skipping scheduler step because optimizer step was skipped", step=step)
+                    logger.warning("Skipping scheduler step because optimizer step was skipped", step=step)
 
                 inner_optimizer.zero_grad()
 
