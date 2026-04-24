@@ -89,7 +89,7 @@ from connito.shared.checkpoints import (
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
-    resolve_default_checkpoint_repo,
+    resolve_hf_repo_ids,
     upload_checkpoint_to_hf,
 )
 from connito.shared.cycle import (
@@ -117,25 +117,11 @@ from connito.validator.evaluator import (
 HF_CHAIN_REVISION_LENGTH = 7
 
 
-def resolve_hf_repo_ids(config: ValidatorConfig) -> tuple[str | None, str | None]:
-    derived_repo = resolve_default_checkpoint_repo(
-        token_env_var=config.hf.token_env_var,
-        default_repo_name=config.hf.default_repo_name,
-    )
-    hf_upload_repo_id = config.hf.resolve_upload_repo(derived_repo)
-    hf_chain_repo_id = config.hf.advertised_repo_id(hf_upload_repo_id)
-
-    if hf_chain_repo_id and len(hf_chain_repo_id) > VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS:
-        raise ValueError(
-            "HF chain repo id is too long for the validator commit payload: "
-            f"{len(hf_chain_repo_id)} > {VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS}"
-        )
-
-    return hf_upload_repo_id, hf_chain_repo_id
-
-
 def validate_hf_distribution_config(config: ValidatorConfig) -> tuple[str | None, str | None]:
-    hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(config)
+    hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(
+        config.hf,
+        max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    )
 
     if not (hf_upload_repo_id and hf_chain_repo_id):
         return hf_upload_repo_id, hf_chain_repo_id
@@ -956,7 +942,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Upload checkpoint to HuggingFace so miners can pull it during
                 # the Distribute phase. The returned revision SHA pins the exact
                 # bytes miners will download, even if :main advances afterward.
-                hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(config)
+                hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(
+                    config.hf,
+                    max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+                )
                 hf_revision: str | None = None
                 if hf_upload_repo_id and hf_chain_repo_id and hf_upload_repo_id != hf_chain_repo_id:
                     logger.info(

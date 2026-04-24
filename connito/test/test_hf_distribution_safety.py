@@ -6,20 +6,25 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from connito.shared.chain import (
+    CHAIN_COMMIT_MAX_BYTES,
+    CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
     VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    MinerChainCommit,
     ValidatorChainCommit,
     commit_status,
+    validate_chain_commit_payload,
 )
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
 from connito.shared.config import CheckpointCfg, HfCfg
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_default_checkpoint_repo,
+    resolve_hf_repo_ids,
     upload_checkpoint_to_hf,
 )
 from connito.shared.model import fetch_model_from_chain_validator
-from connito.shared.cycle import get_validator_seed_from_commit
-from connito.validator.run import resolve_hf_repo_ids, validate_hf_distribution_config
+from connito.shared.cycle import get_validator_seed_from_commit, hydrate_miner_submissions_from_hf
+from connito.validator.run import validate_hf_distribution_config
 from connito.validator import server
 
 
@@ -97,14 +102,12 @@ def test_resolve_default_checkpoint_repo_uses_authenticated_namespace(monkeypatc
 
 def test_hf_cfg_resolves_default_upload_repo_when_config_omits_repo(monkeypatch):
     monkeypatch.setattr(
-        "connito.validator.run.resolve_default_checkpoint_repo",
+        "connito.shared.hf_distribute.resolve_default_checkpoint_repo",
         lambda token_env_var, default_repo_name: f"resolved/{default_repo_name}",
     )
-    config = SimpleNamespace(
-        hf=HfCfg(checkpoint_repo=None, token_env_var="HF_TOKEN", default_repo_name="co")
-    )
+    hf_cfg = HfCfg(checkpoint_repo=None, token_env_var="HF_TOKEN", default_repo_name="co")
 
-    upload_repo, chain_repo = resolve_hf_repo_ids(config)
+    upload_repo, chain_repo = resolve_hf_repo_ids(hf_cfg)
 
     assert upload_repo == "resolved/co"
     assert chain_repo == "resolved/co"
@@ -126,11 +129,9 @@ def test_hf_cfg_returns_advertised_repo_as_upload_repo():
 
 
 def test_hf_cfg_explicit_checkpoint_repo_is_used_for_upload_and_chain_repo():
-    config = SimpleNamespace(
-        hf=HfCfg(checkpoint_repo="present42/cycle", token_env_var="HF_TOKEN", default_repo_name="co")
-    )
+    hf_cfg = HfCfg(checkpoint_repo="present42/cycle", token_env_var="HF_TOKEN", default_repo_name="co")
 
-    upload_repo, chain_repo = resolve_hf_repo_ids(config)
+    upload_repo, chain_repo = resolve_hf_repo_ids(hf_cfg)
 
     assert upload_repo == "present42/cycle"
     assert chain_repo == "present42/cycle"
@@ -365,6 +366,181 @@ def test_validator_seed_prefers_explicit_miner_seed_when_present():
     seeds = get_validator_seed_from_commit(config, [(commit_a, neuron_a), (commit_b, neuron_b)])
 
     assert seeds == {"validator-a": 11, "validator-b": 29}
+
+
+def test_miner_chain_commit_payload_includes_hf_fields_and_stays_within_budget():
+    # block and inner_opt omitted deliberately — they're excluded from the
+    # serialized payload when left at their defaults so the HF coords fit
+    # within the shared 128-byte chain budget.
+    commit = MinerChainCommit(
+        expert_group=0,
+        model_hash="a" * 64,
+        global_ver=1234,
+        hf_repo_id="user/co-miner",
+        hf_revision="abcdef0",
+    )
+    data_dict, data = validate_chain_commit_payload(commit)
+    assert data_dict["r"] == "user/co-miner"
+    assert data_dict["rv"] == "abcdef0"
+    assert "b" not in data_dict
+    assert "i" not in data_dict
+    assert len(data.encode()) <= CHAIN_COMMIT_MAX_BYTES
+    # Round-trip through JSON produces equivalent fields.
+    reparsed = MinerChainCommit.model_validate(json.loads(data))
+    assert reparsed.hf_repo_id == commit.hf_repo_id
+    assert reparsed.hf_revision == commit.hf_revision
+
+
+def test_miner_commit_rejects_repo_id_that_exceeds_budget():
+    commit = MinerChainCommit(
+        expert_group=0,
+        model_hash="a" * 64,
+        global_ver=1,
+        hf_repo_id="x" * (CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS + 1),
+        hf_revision="abcdef0",
+    )
+    try:
+        validate_chain_commit_payload(commit)
+    except ValueError as exc:
+        assert "too long" in str(exc)
+    else:
+        raise AssertionError("expected miner HF repo id length failure")
+
+
+def test_miner_and_validator_share_the_same_payload_budget():
+    # Sanity: commit_status routes both schemas through the same validator so
+    # the chain can't see divergent caps.
+    assert CHAIN_COMMIT_MAX_BYTES == 128
+    assert CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS == VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS
+
+
+def test_hydrate_miner_submissions_from_hf_writes_assigned_miners_only(tmp_path, monkeypatch):
+    submission_dir = tmp_path / "miner_submission"
+    submission_dir.mkdir()
+
+    config = SimpleNamespace(
+        chain=SimpleNamespace(netuid=102, hotkey_ss58="validator-hotkey"),
+        ckpt=SimpleNamespace(miner_submission_path=submission_dir),
+        hf=SimpleNamespace(token_env_var="HF_TOKEN"),
+        task=SimpleNamespace(exp=SimpleNamespace(group_id=0)),
+    )
+    subtensor = SimpleNamespace(block=999)
+
+    assigned = ChainCheckpoint(
+        uid=7,
+        hotkey="miner-assigned",
+        global_ver=10,
+        model_hash="abcd",
+        signed_model_hash="signed",
+        expert_group=0,
+        ip="127.0.0.1",
+        port=8000,
+        hf_repo_id="some-user/co-miner",
+        hf_revision="abcdef0",
+    )
+    unassigned = ChainCheckpoint(
+        uid=8,
+        hotkey="miner-unassigned",
+        global_ver=10,
+        model_hash="abce",
+        signed_model_hash="signed2",
+        expert_group=0,
+        ip="127.0.0.2",
+        port=8001,
+        hf_repo_id="some-user/co-miner2",
+        hf_revision="abcdef1",
+    )
+    without_hf = ChainCheckpoint(
+        uid=9,
+        hotkey="miner-http-only",
+        global_ver=10,
+        model_hash="abcf",
+        signed_model_hash="signed3",
+        expert_group=0,
+        ip="127.0.0.3",
+        port=8002,
+    )
+
+    monkeypatch.setattr(
+        "connito.shared.checkpoints.build_chain_checkpoints_from_previous_phase",
+        lambda **kwargs: ChainCheckpoints(checkpoints=[assigned, unassigned, without_hf]),
+    )
+
+    seen = []
+
+    def fake_download(**kwargs):
+        dest_dir = Path(kwargs["dest_dir"])
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for fname in kwargs["filenames"]:
+            (dest_dir / fname).write_bytes(b"hf-shard")
+            seen.append((kwargs["repo_id"], kwargs["revision"], fname))
+
+    monkeypatch.setattr("connito.shared.cycle.download_checkpoint_from_hf", fake_download)
+
+    hydrated = hydrate_miner_submissions_from_hf(
+        config=config,
+        subtensor=subtensor,
+        validator_miner_assignment={"validator-hotkey": ["miner-assigned", "miner-http-only"]},
+    )
+
+    assert hydrated == 1
+    assert seen == [("some-user/co-miner", "abcdef0", "model_expgroup_0.pt")]
+    # Assigned HF miner got a submission file with the expected naming convention.
+    assert (submission_dir / "hotkey_miner-assigned_block_999.pt").exists()
+    # Unassigned miner is skipped even though it has HF coords.
+    assert not list(submission_dir.glob("*miner-unassigned*"))
+    # HTTP-only miner with no HF coords is skipped (HTTP /submit-checkpoint handles it).
+    assert not list(submission_dir.glob("*miner-http-only*"))
+    # No leftover tmp dirs from atomic-rename path.
+    assert not list(submission_dir.glob(".tmp_*"))
+
+
+def test_hydrate_miner_submissions_skips_when_local_file_already_present(tmp_path, monkeypatch):
+    submission_dir = tmp_path / "miner_submission"
+    submission_dir.mkdir()
+    # Simulate an HTTP /submit-checkpoint upload that already landed.
+    (submission_dir / "hotkey_miner-assigned_block_500.pt").write_bytes(b"http-upload")
+
+    config = SimpleNamespace(
+        chain=SimpleNamespace(netuid=102, hotkey_ss58="validator-hotkey"),
+        ckpt=SimpleNamespace(miner_submission_path=submission_dir),
+        hf=SimpleNamespace(token_env_var="HF_TOKEN"),
+        task=SimpleNamespace(exp=SimpleNamespace(group_id=0)),
+    )
+    subtensor = SimpleNamespace(block=999)
+
+    ckpt = ChainCheckpoint(
+        uid=7,
+        hotkey="miner-assigned",
+        global_ver=10,
+        model_hash="abcd",
+        signed_model_hash="signed",
+        expert_group=0,
+        ip="127.0.0.1",
+        port=8000,
+        hf_repo_id="some-user/co-miner",
+        hf_revision="abcdef0",
+    )
+    monkeypatch.setattr(
+        "connito.shared.checkpoints.build_chain_checkpoints_from_previous_phase",
+        lambda **kwargs: ChainCheckpoints(checkpoints=[ckpt]),
+    )
+
+    called = []
+
+    def fake_download(**kwargs):
+        called.append(kwargs)
+
+    monkeypatch.setattr("connito.shared.cycle.download_checkpoint_from_hf", fake_download)
+
+    hydrated = hydrate_miner_submissions_from_hf(
+        config=config,
+        subtensor=subtensor,
+        validator_miner_assignment={"validator-hotkey": ["miner-assigned"]},
+    )
+
+    assert hydrated == 0
+    assert called == []
 
 
 def test_validator_seed_defaults_to_zero_when_miner_seed_missing():

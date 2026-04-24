@@ -13,11 +13,17 @@ load_dotenv()
 import bittensor
 
 from connito.shared.app_logging import configure_logging, structlog
-from connito.shared.chain import MinerChainCommit, SignedModelHashChainCommit, commit_status
+from connito.shared.chain import (
+    CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
+    MinerChainCommit,
+    SignedModelHashChainCommit,
+    commit_status,
+)
 from connito.shared.checkpoint_helper import (
     compile_full_state_dict_from_path,
 )
 from connito.shared.checkpoints import (
+    ModelCheckpoint,
     select_best_checkpoint,
 )
 from connito.shared.expert_manager import ExpertManager
@@ -26,8 +32,17 @@ from connito.shared.config import MinerConfig, parse_args
 from connito.shared.chain import setup_chain_worker
 from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till, search_model_submission_destination
 from connito.shared.helper import get_model_hash
+from connito.shared.hf_distribute import (
+    get_hf_upload_readiness,
+    resolve_hf_repo_ids,
+    upload_checkpoint_to_hf,
+)
 from connito.shared.model import fetch_model_from_chain_validator
 from connito.sn_owner.cycle import PhaseNames
+
+# Short SHA prefix written to the chain. Matches the validator convention so
+# HF short-SHA resolution behaves the same on both sides.
+HF_CHAIN_REVISION_LENGTH = 7
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -54,6 +69,11 @@ class SharedState:
     current_model_version: int | None = None
     current_model_hash: str | None = None
     latest_checkpoint_path: str | None = None
+    # True iff the *current* latest_checkpoint_path has been successfully
+    # published to HuggingFace this cycle. Reset to False every time
+    # latest_checkpoint_path is rotated so the submit_worker never skips HTTP
+    # submission based on a previous cycle's upload.
+    latest_checkpoint_hf_uploaded: bool = False
     lock: Lock = field(default_factory=Lock, repr=False)
 
 
@@ -168,6 +188,147 @@ def download_worker(
             logger.info(f"<{PhaseNames.distribute}> task completed.")
 
 
+def _prepare_checkpoint_for_commit(
+    config,
+    wallet,
+    shared_state: SharedState,
+) -> ModelCheckpoint:
+    """Pick the latest local checkpoint, sign it, and publish the path to
+    shared state. The HF-uploaded flag is reset here because a new
+    latest_checkpoint_path supersedes any prior cycle's upload.
+    """
+    latest_checkpoint = select_best_checkpoint(
+        primary_dir=config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt
+    )
+    if latest_checkpoint is None or latest_checkpoint.path is None:
+        raise FileNotReadyError("Not checkpoint found, skip commit.")
+
+    latest_checkpoint.expert_group = config.task.exp.group_id
+    latest_checkpoint.sign_hash(wallet=wallet)
+
+    with shared_state.lock:
+        shared_state.latest_checkpoint_path = latest_checkpoint.path
+        shared_state.latest_checkpoint_hf_uploaded = False
+
+    return latest_checkpoint
+
+
+def _commit_signed_model_hash(
+    config,
+    wallet,
+    subtensor,
+    latest_checkpoint: ModelCheckpoint,
+) -> None:
+    logger.info(
+        f"<{PhaseNames.miner_commit_1}> committing",
+        model_version=latest_checkpoint.global_ver,
+        hash=latest_checkpoint.model_hash,
+        path=latest_checkpoint.path,
+    )
+    commit_status(
+        config,
+        wallet,
+        subtensor,
+        SignedModelHashChainCommit(
+            signed_model_hash=latest_checkpoint.signed_model_hash,
+        ),
+    )
+
+
+def _upload_checkpoint_to_hf_safe(
+    config,
+    latest_checkpoint: ModelCheckpoint,
+) -> tuple[str | None, str | None]:
+    """Resolve the miner's HF repo and upload the checkpoint directory.
+
+    Returns ``(chain_repo_id, revision)`` — both ``None`` if the HF transport
+    isn't configured or the upload fails. Every failure is logged and the
+    caller falls through to the HTTP /submit-checkpoint path, so HF is always
+    additive, never load-bearing.
+    """
+    try:
+        hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(
+            config.hf,
+            max_chain_repo_chars=CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
+        )
+    except Exception as e:
+        logger.error(
+            f"<{PhaseNames.miner_commit_1}> HF repo id resolution failed; falling back to HTTP submission",
+            error=str(e),
+            exc_info=True,
+        )
+        return None, None
+
+    hf_ready, hf_reason = get_hf_upload_readiness(
+        repo_id=hf_upload_repo_id,
+        token_env_var=config.hf.token_env_var,
+    )
+    if not (hf_ready and latest_checkpoint.path is not None):
+        logger.warning(
+            f"<{PhaseNames.miner_commit_1}> HF upload unavailable; validator will use HTTP submission fallback",
+            reason=hf_reason,
+            upload_checkpoint_repo=hf_upload_repo_id,
+            has_ckpt_path=latest_checkpoint.path is not None,
+        )
+        return None, None
+
+    try:
+        hf_revision = upload_checkpoint_to_hf(
+            ckpt_dir=latest_checkpoint.path,
+            repo_id=hf_upload_repo_id,
+            token_env_var=config.hf.token_env_var,
+            commit_message=(
+                f"miner submission global_ver={latest_checkpoint.global_ver} "
+                f"expert_group={config.task.exp.group_id}"
+            ),
+        )
+    except Exception as e:
+        logger.error(
+            f"<{PhaseNames.miner_commit_1}> HF upload failed; validator will use HTTP submission fallback",
+            upload_checkpoint_repo=hf_upload_repo_id,
+            error=str(e),
+            exc_info=True,
+        )
+        return None, None
+
+    return hf_chain_repo_id, hf_revision
+
+
+def _commit_model_hash(
+    config,
+    wallet,
+    subtensor,
+    latest_checkpoint: ModelCheckpoint,
+    hf_chain_repo_id: str | None,
+    hf_revision: str | None,
+) -> None:
+    """Emit the miner_commit_2 payload. Omits block and inner_opt so the
+    serialized JSON stays within the 128-byte chain budget shared with the
+    validator commit.
+    """
+    short_revision = hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None
+    logger.info(
+        f"<{PhaseNames.miner_commit_2}> committing",
+        model_version=latest_checkpoint.global_ver,
+        hash=latest_checkpoint.model_hash,
+        path=latest_checkpoint.path,
+        hf_repo_id=hf_chain_repo_id if hf_revision else None,
+        hf_revision=short_revision,
+    )
+    commit_status(
+        config,
+        wallet,
+        subtensor,
+        MinerChainCommit(
+            expert_group=config.task.exp.group_id,
+            model_hash=latest_checkpoint.model_hash,
+            global_ver=latest_checkpoint.global_ver,
+            hf_repo_id=hf_chain_repo_id if hf_revision else None,
+            hf_revision=short_revision,
+        ),
+    )
+
+
 def commit_worker(
     config,
     commit_queue: Queue,
@@ -175,8 +336,9 @@ def commit_worker(
     shared_state: SharedState,
     subtensor=None,
 ):
-    """
-    Consumes COMMIT model and runs the submission phase logic.
+    """Consume COMMIT jobs. For each cycle: sign+publish the checkpoint hash
+    (miner_commit_1), upload to HF, then commit the hash+HF coords
+    (miner_commit_2). Each step lives in its own helper for readability.
     """
     if subtensor is None:
         subtensor = bittensor.Subtensor(config.chain.network)
@@ -187,56 +349,29 @@ def commit_worker(
             logger.info(f"<{PhaseNames.miner_commit_1}> shutdown signal received.")
             return
         try:
-            latest_checkpoint = select_best_checkpoint(
-                primary_dir=config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt
-            )
-            latest_checkpoint.expert_group = config.task.exp.group_id
-            latest_checkpoint.sign_hash(wallet=wallet)
-
-            with shared_state.lock:
-                shared_state.latest_checkpoint_path = latest_checkpoint.path
-
-            if latest_checkpoint is None or latest_checkpoint.path is None:
-                raise FileNotReadyError("Not checkpoint found, skip commit.")
-
-            logger.info(
-                f"<{PhaseNames.miner_commit_1}> committing",
-                model_version=latest_checkpoint.global_ver,
-                hash=latest_checkpoint.model_hash,
-                path=latest_checkpoint.path,
-            )
-
-            commit_status(
-                config,
-                wallet,
-                subtensor,
-                SignedModelHashChainCommit(
-                    signed_model_hash=latest_checkpoint.signed_model_hash,
-                ),
-            )
-
+            latest_checkpoint = _prepare_checkpoint_for_commit(config, wallet, shared_state)
+            _commit_signed_model_hash(config, wallet, subtensor, latest_checkpoint)
             check_phase_expired(subtensor, job.phase_response)
 
+            # HF upload runs between the two commits so the revision is known
+            # by the time we write miner_commit_2. Failure returns (None, None)
+            # and the chain commit goes out without r/rv — validator then pulls
+            # via HTTP /submit-checkpoint as before.
+            hf_chain_repo_id, hf_revision = _upload_checkpoint_to_hf_safe(config, latest_checkpoint)
+
+            # Signal submit_worker that HF has the bytes. Guard with the path
+            # so a stale flag can't survive a checkpoint rotation: if another
+            # thread has already moved latest_checkpoint_path forward, we know
+            # this cycle was superseded and don't overwrite.
+            if hf_revision is not None:
+                with shared_state.lock:
+                    if shared_state.latest_checkpoint_path == latest_checkpoint.path:
+                        shared_state.latest_checkpoint_hf_uploaded = True
+
             phase_response = wait_till(config, PhaseNames.miner_commit_2)
-
-            logger.info(
-                f"<{PhaseNames.miner_commit_2}> committing",
-                model_version=latest_checkpoint.global_ver,
-                hash=latest_checkpoint.model_hash,
-                path=latest_checkpoint.path,
-            )
-
-            commit_status(
-                config,
-                wallet,
-                subtensor,
-                MinerChainCommit(
-                    expert_group=config.task.exp.group_id,
-                    model_hash=latest_checkpoint.model_hash,
-                    block=subtensor.block,
-                    global_ver=latest_checkpoint.global_ver,
-                    inner_opt=latest_checkpoint.inner_opt,
-                ),
+            _commit_model_hash(
+                config, wallet, subtensor, latest_checkpoint,
+                hf_chain_repo_id, hf_revision,
             )
             check_phase_expired(subtensor, phase_response)
 
@@ -271,9 +406,20 @@ def submit_worker(
         try:
             with shared_state.lock:
                 latest_checkpoint_path = shared_state.latest_checkpoint_path
+                hf_uploaded = shared_state.latest_checkpoint_hf_uploaded
 
             if latest_checkpoint_path is None:
                 raise FileNotReadyError("Not checkpoint found, skip submission.")
+
+            # HF has the bytes. Validator pulls the miner's shard directly from
+            # HuggingFace based on the MinerChainCommit coords, so the HTTP
+            # /submit-checkpoint POST would just duplicate a multi-GB upload.
+            if hf_uploaded:
+                logger.info(
+                    f"<{PhaseNames.submission}> HF upload already succeeded this cycle — skipping HTTP submission",
+                    path=latest_checkpoint_path,
+                )
+                continue
 
             destination_axon = search_model_submission_destination(
                 wallet=wallet,
