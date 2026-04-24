@@ -52,7 +52,7 @@ def _get_with_retry(
                         body_snippet,
                     )
                     return None
-                logger.warning(
+                logger.debug(
                     "HTTP error, will retry",
                     url=url,
                     status_code=resp.status_code,
@@ -61,14 +61,14 @@ def _get_with_retry(
             else:
                 return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-            logger.warning(
+            logger.debug(
                 "Network error calling %s, will retry",
                 url,
                 error=str(net_err),
                 attempt=attempt + 1,
             )
         except requests.exceptions.RequestException as req_err:
-            logger.warning(
+            logger.debug(
                 "Request error calling %s, will retry",
                 url,
                 error=str(req_err),
@@ -297,7 +297,7 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
     miners_with_checkpoint = {ckpt.hotkey for ckpt in chain_checkpoints.checkpoints}
     excluded_miners = [m for m in miners if m not in miners_with_checkpoint]
     if excluded_miners and len(excluded_miners) == len(miners):
-        logger.warning(
+        logger.info(
             "get_validator_miner_assignment: all miners excluded — none have chain checkpoint",
             excluded_count=len(excluded_miners),
             excluded_miners=[f"{hk[:4]}...{hk[-4:]}" for hk in excluded_miners],

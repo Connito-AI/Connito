@@ -156,7 +156,7 @@ def download_worker(
                 shared_state.current_model_hash = current_model_meta.model_hash
 
         except FileNotReadyError as e:
-            logger.warning(f"<{PhaseNames.distribute}> File not ready error: {e}")
+            logger.debug(f"<{PhaseNames.distribute}> File not ready error: {e}")
 
         except Exception as e:
             logger.error(f"<{PhaseNames.distribute}> Error while handling job", error=str(e), exc_info=True)
@@ -241,7 +241,7 @@ def commit_worker(
             check_phase_expired(subtensor, phase_response)
 
         except FileNotReadyError as e:
-            logger.warning(f"<{PhaseNames.miner_commit_1}> File not ready error: {e}")
+            logger.debug(f"<{PhaseNames.miner_commit_1}> File not ready error: {e}")
 
         except Exception as e:
             logger.error(f"<{PhaseNames.miner_commit_1}> Error while handling job", error=str(e), exc_info=True)
@@ -282,7 +282,7 @@ def submit_worker(
             )
 
             if destination_axon is None:
-                logger.warning(
+                logger.info(
                     f"<{PhaseNames.submission}> No validator assigned to this miner — skipping submission",
                     miner_hotkey=wallet.hotkey.ss58_address[:6],
                 )
@@ -322,7 +322,7 @@ def submit_worker(
             )
 
         except FileNotReadyError as e:
-            logger.warning(f"<{PhaseNames.submission}> File not ready error: {e}")
+            logger.debug(f"<{PhaseNames.submission}> File not ready error: {e}")
 
         except Exception as e:
             logger.error(f"<{PhaseNames.submission}> Error while handling job", error=str(e), exc_info=True)

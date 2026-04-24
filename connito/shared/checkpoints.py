@@ -620,7 +620,7 @@ def build_chain_checkpoints(
             logger.warning("Cannot read signed hash commit", commit=commit, error=str(e))
 
     if not signed_by_hotkey:
-        logger.warning("No signed hash commits indexed")
+        logger.debug("No signed hash commits indexed")
     else:
         logger.debug(
             "Signed hash commits indexed",
@@ -654,7 +654,7 @@ def build_chain_checkpoints(
             logger.warning("Cannot append commit", commit=commit, error=str(e))
 
     if not checkpoints:
-        logger.warning(
+        logger.debug(
             "No pre-filter checkpoints built",
             for_role=for_role,
         )
@@ -672,7 +672,7 @@ def build_chain_checkpoints(
     )
 
     if not filtered_checkpoints:
-        logger.warning("No checkpoints remain after filtering", for_role=for_role)
+        logger.debug("No checkpoints remain after filtering", for_role=for_role)
     else:
         logger.debug(
             "Post-filter checkpoints",
