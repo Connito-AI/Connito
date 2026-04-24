@@ -308,6 +308,8 @@ class ChainCheckpoint(ModelCheckpoint):
     port: int | None = None
     hotkey: str | None = None
     stake: float = 0.0
+    hf_repo_id: str | None = None
+    hf_revision: str | None = None
 
     def __init__(self, **data: Any):
         data.setdefault("place", "onchain")
@@ -375,8 +377,6 @@ class ChainCheckpoints(BaseModel):
                 missing.append("global_ver")
             if ckpt.expert_group is None:
                 missing.append("expert_group")
-            if ckpt.miner_seed is None and for_role == "validator":
-                missing.append("miner_seed")
             if ckpt.uid is None:
                 missing.append("uid")
             if ckpt.ip is None:
@@ -428,7 +428,7 @@ class ChainCheckpoints(BaseModel):
                         max_allowed_version=max_allowed_version,
                     )
                 elif ver is not None and min_allowed_version is not None and ver < min_allowed_version:
-                    logger.warning(
+                    logger.info(
                         "filter_checkpoints: excluded (version too old)",
                         hotkey=ckpt.hotkey,
                         uid=ckpt.uid,
@@ -647,13 +647,14 @@ def build_chain_checkpoints(
                     model_hash=getattr(commit, "model_hash", None),
                     global_ver=getattr(commit, "global_ver", None),
                     expert_group=getattr(commit, "expert_group", None),
-                    miner_seed=getattr(commit, "miner_seed", None),
                     inner_opt=getattr(commit, "inner_opt", None),
                     uid=getattr(neuron, "uid", None),
                     ip=getattr(neuron.axon_info, "ip", None),
                     port=getattr(neuron.axon_info, "port", None),
                     hotkey=hotkey,
                     stake=float(getattr(neuron, "stake", 0.0)),
+                    hf_repo_id=getattr(commit, "hf_repo_id", None),
+                    hf_revision=getattr(commit, "hf_revision", None),
                     signature_required=True,
                     hash_required=True,
                     expert_group_check_required=True,
@@ -793,45 +794,88 @@ def delete_old_checkpoints(checkpoint_path: str | Path, topk: int) -> list[str]:
     return ckpt_deleted
 
 
-def delete_old_checkpoints_by_hotkey(folder_path: Path) -> list[str]:
+def prune_miner_submission_files(
+    folder_path: Path,
+    current_block: int,
+    cycle_length: int,
+    max_age_cycles: float = 1.5,
+) -> list[str]:
     """
-    Deletes all non-latest submission files coming from the same hotkey.
-    Keeps only the file with the highest block number per hotkey.
+    Delete miner submission files older than the allowed history window.
+
+    Files are identified by the embedded `block` in their filename. Any file
+    older than `max_age_cycles * cycle_length` relative to `current_block` is
+    removed.
     """
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
 
-    submissions_by_hotkey: dict[str, list[tuple[int, Path]]] = {}
+    max_age_blocks = max(0, int(cycle_length * max_age_cycles))
+    min_allowed_block = current_block - max_age_blocks
+
     for file_path in folder_path.glob("*.pt"):
         meta = parse_dynamic_filename(file_path.name)
         if "hotkey" not in meta or "block" not in meta:
-            print(f"Skipping malformed filename: {file_path.name}")
+            logger.warning("Skipping malformed submission filename", file=file_path.name)
+            continue
+
+    deleted_files: list[str] = []
+    for file_path in folder_path.glob("*.pt"):
+        meta = parse_dynamic_filename(file_path.name)
+        if "hotkey" not in meta or "block" not in meta:
             continue
 
         hotkey = meta["hotkey"]
         block = meta["block"]
+        if not isinstance(block, int):
+            logger.warning("Skipping submission with non-integer block", file=file_path.name, block=block)
+            continue
+        if block > min_allowed_block:
+            continue
 
-        if hotkey not in submissions_by_hotkey:
-            submissions_by_hotkey[hotkey] = []
-        submissions_by_hotkey[hotkey].append((block, file_path))
-
-    deleted_files = []
-    for _, entries in submissions_by_hotkey.items():
-        entries.sort(key=lambda x: x[0], reverse=True)
-
-        for _, file_path in entries[2:]:
-            try:
-                os.remove(file_path)
-                deleted_files.append(file_path.name)
-            except Exception as exc:
-                print(f"Failed to delete {file_path.name}: {exc}")
+        try:
+            os.remove(file_path)
+            deleted_files.append(file_path.name)
+        except Exception as exc:
+            logger.warning("Failed to delete aged submission file", file=file_path.name, error=str(exc), hotkey=hotkey)
 
     if deleted_files:
-        logger.info("Deleted outdated submissions", count=len(deleted_files), files=deleted_files)
+        logger.info(
+            "Deleted aged submissions",
+            count=len(deleted_files),
+            files=deleted_files,
+            current_block=current_block,
+            cycle_length=cycle_length,
+            max_age_cycles=max_age_cycles,
+            min_allowed_block=min_allowed_block,
+        )
     else:
-        logger.debug("No outdated submissions to delete")
+        logger.debug(
+            "No aged submissions to delete",
+            current_block=current_block,
+            cycle_length=cycle_length,
+            max_age_cycles=max_age_cycles,
+            min_allowed_block=min_allowed_block,
+        )
 
     return deleted_files
+
+
+def delete_old_checkpoints_by_hotkey(
+    folder_path: Path,
+    current_block: int,
+    cycle_length: int,
+    max_age_cycles: float = 1.5,
+) -> list[str]:
+    """
+    Backward-compatible wrapper for miner submission pruning.
+    """
+    return prune_miner_submission_files(
+        folder_path,
+        current_block=current_block,
+        cycle_length=cycle_length,
+        max_age_cycles=max_age_cycles,
+    )
 
 
 def archive_top_miner_submissions(

@@ -21,6 +21,7 @@ multihash==0.1.1
 # -----------------------------
 transformers==5.4.0
 datasets==3.0.0
+huggingface_hub==1.10.1
 torchdata==0.11.0
 scipy==1.15.3
 prefetch_generator==1.0.3

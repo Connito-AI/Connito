@@ -302,6 +302,7 @@ async def stream_gather_and_evaluate(
     tokenizer,
     combined_seed: str,
     end_block: int,
+    validator_miner_assignment: dict[str, list[str]],
     poll_interval_sec: float = 6.0,
 ) -> list[MinerEvalJob]:
     """
@@ -315,16 +316,36 @@ async def stream_gather_and_evaluate(
     `subtensor.block > end_block`; the queue is then drained and the
     worker shut down.
 
+    `validator_miner_assignment` is provided by the caller (computed once
+    at submission start) so the penalty pass after evaluation can reuse
+    the exact same set of miners, avoiding drift from a later recompute.
+
     Returns the list of MinerEvalJobs that were evaluated so downstream
     aggregation can operate on the same set.
     """
     # Deferred import — gather_validation_job depends on config schemas that
     # would otherwise create a circular import at module load.
-    from connito.shared.cycle import gather_validation_job, get_validator_miner_assignment
+    from connito.shared.cycle import gather_validation_job, hydrate_miner_submissions_from_hf
 
-    # Compute once and reuse across every poll tick — the assignment is
-    # stable for the duration of this Submission window.
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+    # Pull HF-committed miner checkpoints in the background while baseline and
+    # polling run. All HF coords are on chain by Submission phase (miners upload
+    # during MinerCommit2), so a single pass is enough; the HTTP
+    # /submit-checkpoint path fills in miners who couldn't use HF. Written files
+    # land atomically (os.replace) so the poll loop picks them up as soon as
+    # each shard lands without racing partial data.
+    async def _hydrate_and_log() -> None:
+        try:
+            hydrated = await asyncio.to_thread(
+                hydrate_miner_submissions_from_hf,
+                config,
+                subtensor,
+                validator_miner_assignment,
+            )
+            logger.info("Streaming eval: hydrated miner submissions from HF", count=hydrated)
+        except Exception as e:
+            logger.warning("Streaming eval: HF hydration failed, continuing with HTTP only", error=str(e))
+
+    hydration_task = asyncio.create_task(_hydrate_and_log())
 
     # --- Baseline: unmerged base model scored once, reused for all deltas ---
     baseline_metrics = await _evaluate_on_fresh_loader(
@@ -401,6 +422,18 @@ async def stream_gather_and_evaluate(
                 break
             await asyncio.sleep(poll_interval_sec)
     finally:
+        # Don't extend the Submission phase waiting on a slow HF peer. Anything
+        # already downloaded was picked up by the poll loop via filename scan;
+        # anything mid-download at phase end is abandoned and will be retried
+        # next cycle. Cancel doesn't kill the underlying worker thread from
+        # asyncio.to_thread, but the result is discarded so the coroutine exits
+        # cleanly and no "Task was destroyed" warning fires.
+        if not hydration_task.done():
+            hydration_task.cancel()
+        try:
+            await hydration_task
+        except (asyncio.CancelledError, Exception):
+            pass
         # Drain whatever is still in the queue before stopping the worker.
         await jobs_q.join()
         await jobs_q.put(None)  # type: ignore[arg-type]

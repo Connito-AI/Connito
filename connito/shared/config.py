@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Iterable, Literal
 
 import bittensor
 import fsspec
@@ -170,7 +170,7 @@ class CycleCfg(BaseConfig):
     cycle_length: int = 448 # 1.5 hr
     distribute_period: int = 20 # 4 mins
     train_period: int = 300 # 1 hr (will adjust to 500 mins when mature to align with Diloco)
-    commit_period: int = 8 # 1.6 mins
+    commit_period: int = 10 # 2 mins
     submission_period: int = 60 # 4 mins
     validate_period: int = 10 # 10 mins
     merge_period: int = 50 # 10 mins
@@ -180,7 +180,7 @@ class CycleCfg(BaseConfig):
     version_range_cycles: int = 3  # how many cycles back to accept checkpoints
     # Owner-node API retry policy
     api_timeout_sec: int = 10
-    api_retries: int = 3
+    api_retries: int = 5
     api_backoff_sec: int = 2
 
 
@@ -291,6 +291,60 @@ class CheckpointCfg(BaseConfig):
     full_validation_interval: PositiveInt | None = None
     checkpoint_topk: PositiveInt = 2
     validator_checkpoint_path: Path = Path("validator_checkpoint")
+    # Legacy compatibility knob. Miner checkpoint downloads currently use an
+    # ordered HF -> validator HTTP fallback path rather than parallel shard
+    # fan-out, but older configs may still include this field.
+    download_concurrency: PositiveInt = 4
+
+
+class HfCfg(BaseConfig):
+    # HuggingFace Hub is the checkpoint transport: validators upload the
+    # checkpoint directory, commit the revision SHA to the Bittensor chain,
+    # and miners download from the returned repo@revision.
+    #
+    # checkpoint_repo: the HF repo the validator pushes to. Must exist and
+    # be writable by the HF_TOKEN. If omitted, runtime will derive
+    # {authenticated_hf_user}/{default_repo_name}. The on-chain advertised
+    # repo can diverge from this upload target; validator code currently
+    # derives the advertised repo as {owner}/cycle from the upload repo.
+    checkpoint_repo: str | None = None
+    default_repo_name: str = "co"
+    # Read from HF_TOKEN env at runtime — not stored in config YAML.
+    # Validators need write access; miners need read access (or public repo).
+    token_env_var: str = "HF_TOKEN"
+
+    @staticmethod
+    def _normalize_checkpoint_repo_value(value: str | None) -> str | None:
+        checkpoint_repo = (value or "").strip()
+        if checkpoint_repo and "/" not in checkpoint_repo:
+            raise ValueError("hf.checkpoint_repo must be '<namespace>/<repo>'")
+        return checkpoint_repo or None
+
+    @staticmethod
+    def _normalize_default_repo_name(value: str) -> str:
+        default_repo_name = value.strip()
+        if not default_repo_name:
+            raise ValueError("hf.default_repo_name cannot be empty")
+        if "/" in default_repo_name:
+            raise ValueError("hf.default_repo_name must be a repo name, not '<namespace>/<repo>'")
+        return default_repo_name
+
+    def resolve_upload_repo(self, derived_repo: str | None = None) -> str | None:
+        return self.checkpoint_repo or self._normalize_checkpoint_repo_value(derived_repo)
+
+    def advertised_repo_id(self, upload_repo: str | None) -> str | None:
+        if not upload_repo:
+            return None
+        return upload_repo
+
+    def uses_explicit_checkpoint_repo(self) -> bool:
+        return self.checkpoint_repo is not None
+
+    @model_validator(mode="after")
+    def _validate_hf_repo_settings(self):
+        self.checkpoint_repo = self._normalize_checkpoint_repo_value(self.checkpoint_repo)
+        self.default_repo_name = self._normalize_default_repo_name(self.default_repo_name)
+        return self
 
 
 class LoggingCfg(BaseConfig):
@@ -312,15 +366,13 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
-    # Max concurrent /get-checkpoint serves. During Distribute bursts 20+ peers
-    # hit the server in seconds; uncapped they each get link_capacity/N
-    # (≈3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
-    # active transfer at full line rate.
-    download_concurrency: int = 4
     # Max concurrent /submit-checkpoint streams. Protects the server downlink
     # and disk write throughput from N parallel 3.35 GiB uploads dragging each
     # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
     submission_concurrency: int = 2
+    cleanup_stale_temporary_checkpoints: bool = True
+    miner_submission_max_age_cycles: PositiveFloat = 1.5
+    miner_submission_archive_max_files: PositiveInt = 500
 
 
 class DhtCfg(BaseConfig):
@@ -362,6 +414,7 @@ class WorkerConfig(BaseConfig):
     model: ModelCfg = Field(default_factory=ModelCfg)
     moe: MoECfg = Field(default_factory=MoECfg)
     ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
+    hf: HfCfg = Field(default_factory=HfCfg)
     sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
     log: LoggingCfg = Field(default_factory=LoggingCfg)
     opt: OptimizerCfg = Field(default_factory=OptimizerCfg)

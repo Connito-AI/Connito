@@ -14,6 +14,7 @@ from connito.shared.chain import (
     SignedModelHashChainCommit,
     get_chain_commits,
 )
+from connito.shared.client import download_model
 from connito.shared.checkpoint_helper import compile_full_state_dict_from_path, load_checkpoint
 from connito.shared.checkpoints import (
     ChainCheckpoints,
@@ -23,8 +24,8 @@ from connito.shared.checkpoints import (
     delete_old_checkpoints,
     select_best_checkpoint,
 )
-from connito.shared.client import download_model
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.shared.cycle import PhaseNames, get_blocks_from_previous_phase_from_api
 from connito.shared.expert_manager import (
     ExpertManager,
@@ -36,6 +37,56 @@ from connito.shared.modeling.mycelia import get_base_model
 from connito.shared.schema import verify_message
 
 logger = structlog.get_logger(__name__)
+
+
+def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int | str, str]]:
+    targets: list[tuple[int | str, str]] = []
+    for expert_group_id in expert_group_ids:
+        if isinstance(expert_group_id, int):
+            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
+        elif expert_group_id == "shared":
+            targets.append((expert_group_id, "model_shared.pt"))
+        else:
+            logger.warning("Invalid expert_group_id, skipping", expert_group_id=expert_group_id)
+    return targets
+
+
+def _build_validator_checkpoint_url(config: WorkerConfig, chain_checkpoint: ModelCheckpoint) -> str | None:
+    protocol = getattr(getattr(config, "miner", None), "protocol", "http")
+    if getattr(chain_checkpoint, "ip", None) and getattr(chain_checkpoint, "port", None):
+        return f"{protocol}://{chain_checkpoint.ip}:{chain_checkpoint.port}/get-checkpoint"
+    return None
+
+
+def _clear_download_targets(out_folder: Path, filenames: list[str]) -> None:
+    for filename in filenames:
+        (out_folder / filename).unlink(missing_ok=True)
+
+
+def _download_checkpoint_from_validator_http(
+    chain_checkpoint: ModelCheckpoint,
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    wallet: bittensor.Wallet,
+    targets: list[tuple[int | str, str]],
+    out_folder: Path,
+) -> str:
+    url = _build_validator_checkpoint_url(config, chain_checkpoint)
+    if url is None:
+        raise RuntimeError("validator endpoint unavailable for HTTP checkpoint fallback")
+
+    for expert_group_id, filename in targets:
+        download_model(
+            url=url,
+            my_hotkey=wallet.hotkey,  # type: ignore[arg-type]
+            target_hotkey_ss58=chain_checkpoint.hotkey,
+            block=subtensor.block,
+            expert_group_id=expert_group_id,
+            token=getattr(config.cycle, "token", ""),
+            out_dir=out_folder / filename,
+        )
+
+    return url
 
 
 def grad_hook(name):
@@ -259,84 +310,108 @@ def fetch_model_from_chain_validator(
     if should_download and chain_checkpoints:
         download_success = False
         retries = 0
-        max_retries = 3
-        base_delay_s = 5  # backoff base
+        max_retries = 6
+        base_delay_s = 60  # exponential backoff: 1/2/4/8/16 min between the 6 attempts
 
         while (not download_success) and (retries < max_retries):
             for chain_checkpoint in chain_checkpoints.checkpoints:
                 logger.info(f"Downloading from chain: uid = {chain_checkpoint.uid}", chain_checkpoint=chain_checkpoint)
 
-                # Resolve URL if not provided; fall back to ip/port + default route
-                # Best-effort defaults; customize if your API differs
-                protocol = getattr(getattr(config, "miner", object()), "protocol", "http")
-                if chain_checkpoint.ip and chain_checkpoint.port:
-                    url = f"{protocol}://{chain_checkpoint.ip}:{chain_checkpoint.port}/get-checkpoint"
-                else:
-                    logger.warning("Skipping meta without URL or ip:port: %s", chain_checkpoint)
-                    continue
-
                 out_folder = Path(config.ckpt.validator_checkpoint_path) / (
                     f"uid_{chain_checkpoint.uid}_hotkey_{chain_checkpoint.hotkey}_globalver_{chain_checkpoint.global_ver}"
                 )
-
                 out_folder.mkdir(parents=True, exist_ok=True)
 
-                for expert_group_id in expert_group_ids:
-                    if isinstance(expert_group_id, int):
-                        out_file = f"model_expgroup_{expert_group_id}.pt"
-                    elif expert_group_id == "shared":
-                        out_file = "model_shared.pt"
-                    else:
-                        logger.warning("Invalid expert_group_id, skipping:", expert_group_id=expert_group_id)
+                targets = _build_download_targets(expert_group_ids)
+                filenames = [filename for _, filename in targets]
+                if not filenames:
+                    continue
+
+                download_attempts: list[tuple[str, str | None]] = []
+                if chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision:
+                    download_attempts.append(("hf", None))
+                download_attempts.append(("validator-http", _build_validator_checkpoint_url(config, chain_checkpoint)))
+
+                for transport, transport_detail in download_attempts:
+                    if transport == "validator-http" and transport_detail is None:
                         continue
 
-                    out_path = out_folder / out_file
+                    _clear_download_targets(out_folder, filenames)
+
                     try:
-                        download_model(
-                            url=url,
-                            my_hotkey=wallet.hotkey,  # type: ignore
-                            target_hotkey_ss58=chain_checkpoint.hotkey,
-                            block=subtensor.block,
-                            expert_group_id=expert_group_id,
-                            token=getattr(config.cycle, "token", ""),
-                            out_dir=out_path,
-                        )
-
-                        chain_checkpoint.path = out_folder
-                        validated = chain_checkpoint.validate(expert_group_assignment = expert_group_assignment)
-
-                        if not validated:
-                            logger.warning(
-                                "❌ Downloaded checkpoint failed validation",
-                                out_path=out_path,
-                                current_model_version=current_model_meta.global_ver
-                                if current_model_meta
-                                else None,
-                                current_model_hash=current_model_meta.model_hash if current_model_meta else None,
+                        if transport == "hf":
+                            download_checkpoint_from_hf(
+                                repo_id=chain_checkpoint.hf_repo_id,
+                                revision=chain_checkpoint.hf_revision,
+                                filenames=filenames,
+                                dest_dir=out_folder,
+                                token_env_var=config.hf.token_env_var,
                             )
-                            continue
-                        # If download + verification succeed, consider it a success
-                        download_success = validated
-
-                        current_model_version = chain_checkpoint.global_ver
-                        current_model_hash = chain_checkpoint.model_hash
-                        
-                        logger.info(
-                            "✅ Downloaded checkpoint (verified)",
-                            out_path=out_path,
-                            current_model_version=current_model_version,
-                            current_model_hash=current_model_hash,
-                            validation_success=validated,
-                        )
-
-                        delete_old_checkpoints(
-                            checkpoint_path=Path(config.ckpt.validator_checkpoint_path),
-                            topk=config.ckpt.checkpoint_topk,
-                        )
-
-                        return chain_checkpoint
+                        else:
+                            _download_checkpoint_from_validator_http(
+                                chain_checkpoint=chain_checkpoint,
+                                config=config,
+                                subtensor=subtensor,
+                                wallet=wallet,
+                                targets=targets,
+                                out_folder=out_folder,
+                            )
                     except Exception as e:
-                        logger.warning("Download failed", url=url, error=str(e), exc_info=True)
+                        logger.warning(
+                            "Checkpoint download attempt failed",
+                            transport=transport,
+                            transport_detail=transport_detail,
+                            uid=chain_checkpoint.uid,
+                            hotkey=chain_checkpoint.hotkey,
+                            hf_repo_id=chain_checkpoint.hf_repo_id,
+                            hf_revision=chain_checkpoint.hf_revision,
+                            error=str(e),
+                            exc_info=True,
+                        )
+                        continue
+
+                    chain_checkpoint.path = out_folder
+                    validated = chain_checkpoint.validate(expert_group_assignment=expert_group_assignment)
+
+                    if not validated:
+                        logger.warning(
+                            "Downloaded checkpoint failed validation",
+                            transport=transport,
+                            out_folder=out_folder,
+                            current_model_version=current_model_meta.global_ver if current_model_meta else None,
+                            current_model_hash=current_model_meta.model_hash if current_model_meta else None,
+                        )
+                        continue
+
+                    download_success = True
+                    current_model_version = chain_checkpoint.global_ver
+                    current_model_hash = chain_checkpoint.model_hash
+
+                    logger.info(
+                        "Downloaded checkpoint (verified)",
+                        transport=transport,
+                        out_folder=out_folder,
+                        hf_repo_id=chain_checkpoint.hf_repo_id,
+                        hf_revision=chain_checkpoint.hf_revision,
+                        current_model_version=current_model_version,
+                        current_model_hash=current_model_hash,
+                    )
+
+                    delete_old_checkpoints(
+                        checkpoint_path=Path(config.ckpt.validator_checkpoint_path),
+                        topk=config.ckpt.checkpoint_topk,
+                    )
+
+                    return chain_checkpoint
+
+                logger.warning(
+                    "All transports failed for checkpoint candidate",
+                    uid=chain_checkpoint.uid,
+                    hotkey=chain_checkpoint.hotkey,
+                    hf_repo_id=chain_checkpoint.hf_repo_id,
+                    hf_revision=chain_checkpoint.hf_revision,
+                    http_url=_build_validator_checkpoint_url(config, chain_checkpoint),
+                )
 
             if not download_success:
                 retries += 1

@@ -61,7 +61,7 @@ def submit_model(
     block: int,
     timeout_s: int = 300,
     retries: int = 3,
-    backoff: float = 1.8,
+    backoff_s: float = 60.0,
     expert_groups: list[int | str] | None = None,
     extra_form: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -190,9 +190,8 @@ def submit_model(
         # If we got here, we plan to retry
         attempt += 1
         if attempt <= retries:
-            sleep_s = backoff**attempt
-            logger.info("Retrying after backoff", sleep_seconds=sleep_s, attempt=attempt + 1)
-            time.sleep(sleep_s)
+            logger.info("Retrying after backoff", sleep_seconds=backoff_s, attempt=attempt + 1)
+            time.sleep(backoff_s)
 
     # Exhausted retries
     logger.error("Submission failed after all retries exhausted", total_attempts=retries + 1, last_error=str(last_exc))
@@ -225,7 +224,6 @@ def download_model(
         if tmp_path.exists():
             start_at = tmp_path.stat().st_size
         elif out_path.exists():
-            # Resume from a previously completed/partial download by moving it to tmp
             out_path.replace(tmp_path)
             start_at = tmp_path.stat().st_size
 
@@ -249,7 +247,7 @@ def download_model(
         logger.info("HTTP response received", status_code=r.status_code)
 
         if r.status_code in (401, 403):
-            sys.exit(f"Auth failed (HTTP {r.status_code}). Check your token.")
+            raise RuntimeError(f"Auth failed (HTTP {r.status_code}). Check your token.")
         if r.status_code == 416:
             logger.info("Nothing to resume; file already complete.")
             if tmp_path.exists():
@@ -285,15 +283,13 @@ def download_model(
                 now = time.time()
                 if now - last_print >= 0.5:
                     if total:
-                        pct = downloaded / total * 100
-                        bar = f"{human(downloaded)} / {human(total)} ({pct:5.1f}%)"
+                        bar = f"{human(downloaded)} / {human(total)} ({downloaded / total * 100:5.1f}%)"
                     else:
                         bar = f"{human(downloaded)}"
                     rate = (downloaded - start_at) / max(1e-6, (now - t0))
                     logger.info(f"\rDownloading: {bar} @ {human(rate)}/s", end="", flush=True)
                     last_print = now
 
-        # final line
         elapsed = max(1e-6, time.time() - t0)
         rate = (downloaded - start_at) / elapsed
         if total:
@@ -306,18 +302,3 @@ def download_model(
         r.close()
 
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Download a checkpoint with optional bearer auth.")
-    p.add_argument("--url", default="http://localhost:8000/checkpoint", help="Download URL")
-    p.add_argument("--token", default="supersecrettoken", help="Bearer auth token (omit if not required)")
-    p.add_argument("-o", "--output", default="model.pt", help="Output file path")
-    p.add_argument("--resume", action="store_true", help="Resume if partial file exists")
-    p.add_argument("--timeout", type=int, default=30, help="Request timeout seconds")
-    args = p.parse_args()
-
-    try:
-        download_model(args.url, args.token, args.output, resume=args.resume, timeout=args.timeout)
-    except requests.RequestException as e:
-        sys.exit(f"Network error: {e}")
-    except KeyboardInterrupt:
-        sys.exit("\nCanceled.")

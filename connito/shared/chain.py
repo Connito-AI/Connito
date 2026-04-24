@@ -19,6 +19,17 @@ from connito.shared.telemetry import track_chain_commit_latency, count_rpc_error
 
 logger = structlog.get_logger(__name__)
 
+# The Bittensor commitments pallet caps this subnet's per-hotkey commit payload
+# — validator and miner commits share the same budget and the same per-field
+# ceiling on the HF repo id. Both paths go through validate_chain_commit_payload.
+CHAIN_COMMIT_MAX_BYTES = 128
+CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS = 32
+# Back-compat aliases for callers that imported the old names.
+VALIDATOR_COMMIT_MAX_BYTES = CHAIN_COMMIT_MAX_BYTES
+VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS = CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS
+MINER_COMMIT_MAX_BYTES = CHAIN_COMMIT_MAX_BYTES
+MINER_COMMIT_MAX_HF_REPO_ID_CHARS = CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS
+
 # Global lock for subtensor WebSocket access to prevent concurrent recv calls
 _subtensor_lock = threading.Lock()
 
@@ -38,22 +49,90 @@ class SignedModelHashChainCommit(BaseModel):
 
 class ValidatorChainCommit(WorkerChainCommit):
     model_config = ConfigDict(populate_by_name=True)
-    signed_model_hash: str | None = Field(default=None, alias="m")
     model_hash: str | None = Field(default=None, alias="h")
     global_ver: int | None = Field(default=None, alias="v")
     expert_group: int | None = Field(default=None, alias="e")
     miner_seed: int | None = Field(default=None, alias="s")
-    block: int | None = Field(default=None, alias="b")
+    # HuggingFace is the checkpoint transport: the validator uploads the
+    # checkpoint directory to `hf_repo_id`, and `hf_revision` carries a short
+    # commit SHA prefix so miners pull a pinned snapshot even if the repo
+    # advances. model_hash still verifies integrity post-download.
+    hf_repo_id: str | None = Field(default=None, alias="r")
+    hf_revision: str | None = Field(default=None, alias="rv")
 
 
 class MinerChainCommit(WorkerChainCommit):
     model_config = ConfigDict(populate_by_name=True)
+    # block and inner_opt default to None (not 0) so they're excluded from the
+    # serialized payload when the caller leaves them out — miner commits have
+    # to share the 128-byte budget with HF coords, and every field that isn't
+    # load-bearing pushes the HF repo id length allowance down. Older commits
+    # that still set them parse fine.
     block: int | None = Field(default=None, alias="b")
     expert_group: int | None = Field(default=None, alias="e")
     signed_model_hash: str | None = Field(default=None, alias="m")
     model_hash: str | None = Field(default=None, alias="h")
-    global_ver: int | None = Field(default=0, alias="v")
-    inner_opt: int | None = Field(default=0, alias="i")
+    global_ver: int | None = Field(default=None, alias="v")
+    inner_opt: int | None = Field(default=None, alias="i")
+    # HuggingFace is the preferred submission transport: the miner uploads the
+    # checkpoint directory to `hf_repo_id` and `hf_revision` pins a short commit
+    # SHA prefix so validators pull the exact bytes the miner advertised. The
+    # existing HTTP /submit-checkpoint path remains the fallback.
+    hf_repo_id: str | None = Field(default=None, alias="r")
+    hf_revision: str | None = Field(default=None, alias="rv")
+
+
+def serialize_chain_status(
+    status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
+) -> tuple[dict, str]:
+    data_dict = status.model_dump(by_alias=True, exclude_none=True)
+    data = json.dumps(data_dict, separators=(",", ":"))
+    return data_dict, data
+
+
+def validate_chain_commit_payload(
+    status: ValidatorChainCommit | MinerChainCommit,
+    max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
+    max_hf_repo_id_chars: int = CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
+) -> tuple[dict, str]:
+    """Serialize a commit and assert it fits the chain's payload budget.
+
+    Shared by validator and miner commits — the Bittensor commitments pallet
+    doesn't distinguish between the two, so the budgets are identical. The
+    per-field HF repo id cap gives a clearer error than the raw byte-count
+    check when a user configures a pathologically long repo.
+    """
+    data_dict, data = serialize_chain_status(status)
+    hf_repo_id = getattr(status, "hf_repo_id", None)
+    if hf_repo_id and len(hf_repo_id) > max_hf_repo_id_chars:
+        raise ValueError(
+            "HF repo id is too long for the chain payload budget: "
+            f"{len(hf_repo_id)} > {max_hf_repo_id_chars}"
+        )
+
+    payload_bytes = len(data.encode())
+    if payload_bytes > max_bytes:
+        raise ValueError(
+            f"Chain commit exceeds payload budget: {payload_bytes} > {max_bytes} bytes"
+        )
+
+    return data_dict, data
+
+
+# Back-compat wrappers for existing callers. Kept so external imports don't
+# break; new code should use validate_chain_commit_payload directly.
+def validate_validator_chain_commit_payload(
+    status: ValidatorChainCommit,
+    max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
+) -> tuple[dict, str]:
+    return validate_chain_commit_payload(status, max_bytes=max_bytes)
+
+
+def validate_miner_chain_commit_payload(
+    status: MinerChainCommit,
+    max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
+) -> tuple[dict, str]:
+    return validate_chain_commit_payload(status, max_bytes=max_bytes)
 
 @track_chain_commit_latency()
 @count_rpc_errors()
@@ -79,10 +158,10 @@ def commit_status(
         - config.chain.timelock_rounds_ahead: how many Drand rounds in the future
           you want the data to be revealed (fallback to 200 if missing).
     """
-    # Serialize status first; same input for both plain + encrypted paths
-    data_dict = status.model_dump(by_alias=True)
-
-    data = json.dumps(data_dict)
+    if isinstance(status, ValidatorChainCommit | MinerChainCommit):
+        data_dict, data = validate_chain_commit_payload(status)
+    else:
+        data_dict, data = serialize_chain_status(status)
 
     success = subtensor.set_commitment(wallet=wallet, netuid=config.chain.netuid, data=data, raise_error=False)
 
@@ -126,18 +205,19 @@ def get_chain_commits(
 
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
     whitelisted_validators = get_validator_whitelist_from_api(config)
+    hotkey_to_uid = {metagraph_hotkey: uid for uid, metagraph_hotkey in enumerate(metagraph.hotkeys)}
 
     parsed = []
 
     for hotkey, commit in all_commitments.items():
-        if hotkey not in metagraph.hotkeys:
+        uid = hotkey_to_uid.get(hotkey)
+        if uid is None:
             logger.debug(
                 "Skipping commit from hotkey not in metagraph (likely deregistered)",
                 hotkey=hotkey,
                 block=current_block,
             )
             continue
-        uid = metagraph.hotkeys.index(hotkey)
         neuron = metagraph.neurons[uid]
         age = current_block - int(getattr(neuron, "last_update", 0))
 
@@ -291,8 +371,15 @@ def _submit_fallback_weights(
         }
         dropped = len(prev_weights) - len(miner_prev_weights)
 
+        # Detect the fallback shape on chain: all miner weights equal. Covers
+        # both the current top-3-even pattern and the legacy many-miner
+        # uniform pattern; if we see it we recompute rather than reuse.
         values = list(miner_prev_weights.values())
-        is_even = len(values) >= 2 and (max(values) - min(values)) < 1e-9
+        is_even = (
+            len(values) >= 1
+            and max(values) > 0
+            and (max(values) - min(values)) < 1e-9
+        )
 
         if miner_prev_weights and not is_even:
             logger.info(
@@ -305,37 +392,49 @@ def _submit_fallback_weights(
                                   wait_for_finalization=wait_for_finalization)
         if is_even:
             logger.info(
-                "Previous on-chain weights are uniform; treating as no prev_weights and recomputing",
+                "Previous on-chain weights are even (fallback pattern); recomputing",
                 count=len(miner_prev_weights),
             )
         else:
-            logger.warning("No miner weights remain after excluding validators, falling through to uniform")
+            logger.warning("No miner weights remain after excluding validators, falling through to fallback")
 
-    # Uniform path: target miners receiving non-zero weight from any other
-    # validator (excluding self). Avoids weighting UIDs the rest of the
-    # subnet has already abandoned.
-    miner_uids_set: set[int] = set()
+    # Fallback path: submit even weight to the top-3 miners ranked by
+    # stake-weighted votes from other validators (excluding self). Each
+    # miner's score = sum over (other validators) of
+    # (validator_stake * weight_from_validator_to_miner).
+    miner_score: dict[int, float] = {}
     for vuid in validator_uids - {my_uid}:
         vneuron = subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
         if vneuron is None:
             continue
+        v_stake = float(getattr(vneuron, "stake", 0.0))
+        if v_stake <= 0:
+            continue
         for uid, w in vneuron.weights:
-            if float(w) > 0 and int(uid) not in validator_uids:
-                miner_uids_set.add(int(uid))
-    miner_uids = sorted(miner_uids_set)
+            uid_i = int(uid)
+            if uid_i in validator_uids or uid_i == my_uid:
+                continue
+            fw = float(w)
+            if fw <= 0:
+                continue
+            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
+
+    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    miner_uids = [uid for uid, _ in top_peers]
     if not miner_uids:
         logger.warning(
-            "No miner UIDs found with non-zero weight from other validators, skipping uniform weight set",
+            "No miner UIDs with stake-weighted votes from other validators, skipping fallback",
             other_validator_count=len(validator_uids - {my_uid}),
         )
         return False
 
+    weight = 1.0 / len(miner_uids)
     logger.warning(
-        "No previous weights found on chain, submitting uniform weights to miners",
-        miner_count=len(miner_uids),
+        "No previous weights found on chain, submitting even fallback weights to top stake-weighted miners",
+        top_uids=miner_uids,
+        top_scores=[round(s, 6) for _, s in top_peers],
         excluded_validator_count=len(validator_uids),
     )
-    weight = 1.0 / len(miner_uids)
     result = subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
@@ -346,9 +445,9 @@ def _submit_fallback_weights(
     )
     success = result[0] if isinstance(result, tuple) else bool(result)
     if success:
-        logger.info("Uniform weights set successfully", count=len(miner_uids))
+        logger.info("Fallback weights set successfully", count=len(miner_uids))
     else:
-        logger.warning("Failed to set uniform weights")
+        logger.warning("Failed to set fallback weights")
     return success
 
 
