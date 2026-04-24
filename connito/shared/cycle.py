@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -21,6 +22,7 @@ from connito.shared.chain import (
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.helper import h256_int, parse_dynamic_filename
+from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.validator.evaluator import MinerEvalJob
 
 configure_logging()
@@ -536,6 +538,103 @@ def load_submission_files(folder: str = "miner_submission"):
         files_dict[file_name.name] = meta
 
     return files_dict
+
+
+def hydrate_miner_submissions_from_hf(
+    config: ValidatorConfig,
+    subtensor: bittensor.Subtensor,
+    validator_miner_assignment: dict[str, list[str]],
+) -> int:
+    """Pull HF-committed miner checkpoints into the local submission dir.
+
+    Miners that upload to HuggingFace during MinerCommit2 advertise
+    ``(hf_repo_id, hf_revision)`` in their chain commit. By Submission phase
+    those coords are on chain, so the validator can pull the shard directly
+    instead of waiting on the miner's HTTP ``/submit-checkpoint`` push. The
+    downloaded file is written with the same ``hotkey_*_block_*.pt`` naming
+    the HTTP path uses so downstream scanning is transport-agnostic. Miners
+    without HF coords, or whose HF download fails, are handled by the
+    existing HTTP path — no extra code path.
+
+    Returns the number of miners hydrated this call.
+    """
+    # Local imports: checkpoints.py imports this module, so a module-level
+    # import of build_chain_checkpoints_from_previous_phase is circular.
+    from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
+
+    miner_assignment = set(validator_miner_assignment.get(config.chain.hotkey_ss58, []))
+    if not miner_assignment:
+        return 0
+
+    submission_dir = Path(config.ckpt.miner_submission_path)
+    submission_dir.mkdir(parents=True, exist_ok=True)
+
+    # A miner with any existing submission file is skipped — don't clobber an
+    # HTTP upload already received, and don't re-download on subsequent polls.
+    existing_hotkeys: set[str] = set()
+    for file_path in submission_dir.glob("*.pt"):
+        if file_path.name.startswith(".tmp"):
+            continue
+        meta = parse_dynamic_filename(file_path.name)
+        if meta and "hotkey" in meta:
+            existing_hotkeys.add(meta["hotkey"])
+
+    try:
+        chain_checkpoints = build_chain_checkpoints_from_previous_phase(
+            config=config, subtensor=subtensor, for_role="miner",
+        )
+    except Exception as e:
+        logger.warning("hydrate_miner_submissions_from_hf: failed to build chain checkpoints", error=str(e))
+        return 0
+
+    expert_group_id = config.task.exp.group_id
+    filename_in_hf = f"model_expgroup_{expert_group_id}.pt"
+
+    hydrated = 0
+    for ckpt in chain_checkpoints.checkpoints:
+        if ckpt.hotkey is None or ckpt.hotkey not in miner_assignment:
+            continue
+        if ckpt.hotkey in existing_hotkeys:
+            continue
+        if not (ckpt.hf_repo_id and ckpt.hf_revision):
+            continue
+
+        tmp_dir = submission_dir / f".tmp_hf_{ckpt.hotkey}"
+        dest_name = f"hotkey_{ckpt.hotkey}_block_{subtensor.block}.pt"
+        dest = submission_dir / dest_name
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            download_checkpoint_from_hf(
+                repo_id=ckpt.hf_repo_id,
+                revision=ckpt.hf_revision,
+                filenames=[filename_in_hf],
+                dest_dir=tmp_dir,
+                token_env_var=config.hf.token_env_var,
+            )
+            # Atomic rename so gather_validation_job never sees a partial file.
+            (tmp_dir / filename_in_hf).replace(dest)
+            existing_hotkeys.add(ckpt.hotkey)
+            hydrated += 1
+            logger.info(
+                "Hydrated miner submission from HF",
+                hotkey=ckpt.hotkey[:6],
+                uid=ckpt.uid,
+                hf_repo_id=ckpt.hf_repo_id,
+                hf_revision=ckpt.hf_revision,
+                dest=str(dest),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to hydrate miner submission from HF",
+                hotkey=ckpt.hotkey[:6] if ckpt.hotkey else None,
+                hf_repo_id=ckpt.hf_repo_id,
+                hf_revision=ckpt.hf_revision,
+                error=str(e),
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return hydrated
 
 
 def gather_validation_job(

@@ -325,7 +325,27 @@ async def stream_gather_and_evaluate(
     """
     # Deferred import — gather_validation_job depends on config schemas that
     # would otherwise create a circular import at module load.
-    from connito.shared.cycle import gather_validation_job
+    from connito.shared.cycle import gather_validation_job, hydrate_miner_submissions_from_hf
+
+    # Pull HF-committed miner checkpoints in the background while baseline and
+    # polling run. All HF coords are on chain by Submission phase (miners upload
+    # during MinerCommit2), so a single pass is enough; the HTTP
+    # /submit-checkpoint path fills in miners who couldn't use HF. Written files
+    # land atomically (os.replace) so the poll loop picks them up as soon as
+    # each shard lands without racing partial data.
+    async def _hydrate_and_log() -> None:
+        try:
+            hydrated = await asyncio.to_thread(
+                hydrate_miner_submissions_from_hf,
+                config,
+                subtensor,
+                validator_miner_assignment,
+            )
+            logger.info("Streaming eval: hydrated miner submissions from HF", count=hydrated)
+        except Exception as e:
+            logger.warning("Streaming eval: HF hydration failed, continuing with HTTP only", error=str(e))
+
+    hydration_task = asyncio.create_task(_hydrate_and_log())
 
     # --- Baseline: unmerged base model scored once, reused for all deltas ---
     baseline_metrics = await _evaluate_on_fresh_loader(
@@ -402,6 +422,18 @@ async def stream_gather_and_evaluate(
                 break
             await asyncio.sleep(poll_interval_sec)
     finally:
+        # Don't extend the Submission phase waiting on a slow HF peer. Anything
+        # already downloaded was picked up by the poll loop via filename scan;
+        # anything mid-download at phase end is abandoned and will be retried
+        # next cycle. Cancel doesn't kill the underlying worker thread from
+        # asyncio.to_thread, but the result is discarded so the coroutine exits
+        # cleanly and no "Task was destroyed" warning fires.
+        if not hydration_task.done():
+            hydration_task.cancel()
+        try:
+            await hydration_task
+        except (asyncio.CancelledError, Exception):
+            pass
         # Drain whatever is still in the queue before stopping the worker.
         await jobs_q.join()
         await jobs_q.put(None)  # type: ignore[arg-type]

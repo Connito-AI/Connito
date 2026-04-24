@@ -19,8 +19,16 @@ from connito.shared.telemetry import track_chain_commit_latency, count_rpc_error
 
 logger = structlog.get_logger(__name__)
 
-VALIDATOR_COMMIT_MAX_BYTES = 128
-VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS = 32
+# The Bittensor commitments pallet caps this subnet's per-hotkey commit payload
+# — validator and miner commits share the same budget and the same per-field
+# ceiling on the HF repo id. Both paths go through validate_chain_commit_payload.
+CHAIN_COMMIT_MAX_BYTES = 128
+CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS = 32
+# Back-compat aliases for callers that imported the old names.
+VALIDATOR_COMMIT_MAX_BYTES = CHAIN_COMMIT_MAX_BYTES
+VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS = CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS
+MINER_COMMIT_MAX_BYTES = CHAIN_COMMIT_MAX_BYTES
+MINER_COMMIT_MAX_HF_REPO_ID_CHARS = CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS
 
 # Global lock for subtensor WebSocket access to prevent concurrent recv calls
 _subtensor_lock = threading.Lock()
@@ -55,12 +63,23 @@ class ValidatorChainCommit(WorkerChainCommit):
 
 class MinerChainCommit(WorkerChainCommit):
     model_config = ConfigDict(populate_by_name=True)
+    # block and inner_opt default to None (not 0) so they're excluded from the
+    # serialized payload when the caller leaves them out — miner commits have
+    # to share the 128-byte budget with HF coords, and every field that isn't
+    # load-bearing pushes the HF repo id length allowance down. Older commits
+    # that still set them parse fine.
     block: int | None = Field(default=None, alias="b")
     expert_group: int | None = Field(default=None, alias="e")
     signed_model_hash: str | None = Field(default=None, alias="m")
     model_hash: str | None = Field(default=None, alias="h")
-    global_ver: int | None = Field(default=0, alias="v")
-    inner_opt: int | None = Field(default=0, alias="i")
+    global_ver: int | None = Field(default=None, alias="v")
+    inner_opt: int | None = Field(default=None, alias="i")
+    # HuggingFace is the preferred submission transport: the miner uploads the
+    # checkpoint directory to `hf_repo_id` and `hf_revision` pins a short commit
+    # SHA prefix so validators pull the exact bytes the miner advertised. The
+    # existing HTTP /submit-checkpoint path remains the fallback.
+    hf_repo_id: str | None = Field(default=None, alias="r")
+    hf_revision: str | None = Field(default=None, alias="rv")
 
 
 def serialize_chain_status(
@@ -71,26 +90,49 @@ def serialize_chain_status(
     return data_dict, data
 
 
-def validate_validator_chain_commit_payload(
-    status: ValidatorChainCommit,
-    max_bytes: int = VALIDATOR_COMMIT_MAX_BYTES,
+def validate_chain_commit_payload(
+    status: ValidatorChainCommit | MinerChainCommit,
+    max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
+    max_hf_repo_id_chars: int = CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
 ) -> tuple[dict, str]:
+    """Serialize a commit and assert it fits the chain's payload budget.
+
+    Shared by validator and miner commits — the Bittensor commitments pallet
+    doesn't distinguish between the two, so the budgets are identical. The
+    per-field HF repo id cap gives a clearer error than the raw byte-count
+    check when a user configures a pathologically long repo.
+    """
     data_dict, data = serialize_chain_status(status)
-    hf_repo_id = status.hf_repo_id
-    if hf_repo_id and len(hf_repo_id) > VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS:
+    hf_repo_id = getattr(status, "hf_repo_id", None)
+    if hf_repo_id and len(hf_repo_id) > max_hf_repo_id_chars:
         raise ValueError(
-            "Validator HF repo id is too long for the chain payload budget: "
-            f"{len(hf_repo_id)} > {VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS}"
+            "HF repo id is too long for the chain payload budget: "
+            f"{len(hf_repo_id)} > {max_hf_repo_id_chars}"
         )
 
     payload_bytes = len(data.encode())
     if payload_bytes > max_bytes:
         raise ValueError(
-            "Validator chain commit exceeds payload budget: "
-            f"{payload_bytes} > {max_bytes} bytes"
+            f"Chain commit exceeds payload budget: {payload_bytes} > {max_bytes} bytes"
         )
 
     return data_dict, data
+
+
+# Back-compat wrappers for existing callers. Kept so external imports don't
+# break; new code should use validate_chain_commit_payload directly.
+def validate_validator_chain_commit_payload(
+    status: ValidatorChainCommit,
+    max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
+) -> tuple[dict, str]:
+    return validate_chain_commit_payload(status, max_bytes=max_bytes)
+
+
+def validate_miner_chain_commit_payload(
+    status: MinerChainCommit,
+    max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
+) -> tuple[dict, str]:
+    return validate_chain_commit_payload(status, max_bytes=max_bytes)
 
 @track_chain_commit_latency()
 @count_rpc_errors()
@@ -116,8 +158,8 @@ def commit_status(
         - config.chain.timelock_rounds_ahead: how many Drand rounds in the future
           you want the data to be revealed (fallback to 200 if missing).
     """
-    if isinstance(status, ValidatorChainCommit):
-        data_dict, data = validate_validator_chain_commit_payload(status)
+    if isinstance(status, ValidatorChainCommit | MinerChainCommit):
+        data_dict, data = validate_chain_commit_payload(status)
     else:
         data_dict, data = serialize_chain_status(status)
 

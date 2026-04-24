@@ -71,6 +71,34 @@ def get_hf_upload_readiness(
     return True, "ready"
 
 
+def resolve_hf_repo_ids(
+    hf_cfg,
+    max_chain_repo_chars: int | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve (upload_repo_id, chain_repo_id) from an HfCfg-shaped object.
+
+    Shared between validator and miner so the derivation rules are identical:
+    honor the explicit ``checkpoint_repo`` if set, otherwise derive
+    ``{authenticated_hf_user}/{default_repo_name}`` from the HF token.
+    ``max_chain_repo_chars`` enforces the role-specific chain payload budget
+    (validators have a tighter one than miners).
+    """
+    derived_repo = resolve_default_checkpoint_repo(
+        token_env_var=hf_cfg.token_env_var,
+        default_repo_name=hf_cfg.default_repo_name,
+    )
+    upload_repo_id = hf_cfg.resolve_upload_repo(derived_repo)
+    chain_repo_id = hf_cfg.advertised_repo_id(upload_repo_id)
+
+    if chain_repo_id and max_chain_repo_chars is not None and len(chain_repo_id) > max_chain_repo_chars:
+        raise ValueError(
+            "HF chain repo id is too long for the chain payload budget: "
+            f"{len(chain_repo_id)} > {max_chain_repo_chars}"
+        )
+
+    return upload_repo_id, chain_repo_id
+
+
 def upload_checkpoint_to_hf(
     ckpt_dir: Path,
     repo_id: str,
