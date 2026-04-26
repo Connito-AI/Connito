@@ -1,0 +1,55 @@
+name: Run tests
+
+# Runs the non-integration pytest suite on every push and PR. Integration tests
+# (marked `pytest.mark.integration`) need a real GPU and large model downloads,
+# so they are skipped here — they must be run locally on a CUDA box.
+#
+# CI runners have no GPU, so we install the CPU build of torch (much smaller,
+# much faster) instead of the cu124 wheel used in production. The version pin
+# (torch==2.10.0) is the same — only the wheel build differs.
+
+on:
+  push:
+    branches: [master, staging]
+  pull_request:
+    branches: [master, staging]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Install the CPU torch wheel first, pinned to the same version as
+      # requirements.txt (torch==2.10.0). The subsequent `pip install -r
+      # requirements.txt` then sees torch satisfied and skips it.
+      - name: Install CPU torch
+        run: |
+          pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.10.0
+
+      - name: Install project dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      # pyproject.toml's testpaths points at "tests/" but the real tests live
+      # under connito/test/ (see CLAUDE.md). Point pytest at the real dir.
+      - name: Run pytest (non-integration only)
+        run: |
+          pytest connito/test -v -m "not integration"
