@@ -334,11 +334,22 @@ async def stream_gather_and_evaluate(
     # land atomically (os.replace) so the poll loop picks them up as soon as
     # each shard lands without racing partial data.
     async def _hydrate_and_log() -> None:
+        # Dedicated Subtensor for the hydration thread — sharing the caller's
+        # subtensor here triggers websockets ConcurrencyError, since the main
+        # coroutine concurrently drives subtensor.block / gather_validation_job
+        # against the same WS connection.
+        try:
+            hydration_subtensor = await asyncio.to_thread(
+                bittensor.Subtensor, network=subtensor.network
+            )
+        except Exception as e:
+            logger.warning("Streaming eval: failed to open hydration subtensor, skipping HF hydration", error=str(e))
+            return
         try:
             hydrated = await asyncio.to_thread(
                 hydrate_miner_submissions_from_hf,
                 config,
-                subtensor,
+                hydration_subtensor,
                 validator_miner_assignment,
             )
             logger.info("Streaming eval: hydrated miner submissions from HF", count=hydrated)
