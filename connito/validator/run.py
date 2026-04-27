@@ -635,8 +635,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     poller.start()
 
 
-    # === commit status ===
-    async_runner.run(acommit_status(
+    # === commit status === (non-blocking; coroutine queued on async_runner)
+    async_runner.submit(acommit_status(
         config,
         wallet,
         lite_subtensor,
@@ -802,13 +802,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             current_block = async_runner.run(lite_subtensor.get_current_block())
             weight_age = current_block - last_update
             if weight_age > max_weight_age:
-                logger.info("Weights stale, submitting fallback", weight_age=weight_age, max_weight_age=max_weight_age)
-                async_runner.run(_asubmit_fallback_weights(
+                logger.info("Weights stale, submitting fallback (non-blocking)",
+                            weight_age=weight_age, max_weight_age=max_weight_age)
+                # Non-blocking; the runner serializes this with the
+                # commit_status that follows, so order is preserved.
+                async_runner.submit(_asubmit_fallback_weights(
                     config, wallet, lite_subtensor,
-                    wait_for_inclusion=True, wait_for_finalization=True,
+                    wait_for_inclusion=False, wait_for_finalization=False,
                 ))
 
-            async_runner.run(acommit_status(
+            async_runner.submit(acommit_status(
                 config,
                 wallet,
                 lite_subtensor,
@@ -1050,8 +1053,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
-                logger.info("(7) Commit new signed_model_hash for next validation")
-                async_runner.run(acommit_status(
+                logger.info("(7) Commit new signed_model_hash for next validation (non-blocking)")
+                async_runner.submit(acommit_status(
                     config,
                     wallet,
                     lite_subtensor,
@@ -1121,8 +1124,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
 
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
-                logger.info("(8) Commit model_hash for next validation")
-                async_runner.run(acommit_status(
+                logger.info("(8) Commit model_hash for next validation (non-blocking)")
+                async_runner.submit(acommit_status(
                     config,
                     wallet,
                     lite_subtensor,
