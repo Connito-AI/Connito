@@ -47,23 +47,6 @@ are scored against is the current global model, not the one you started training
 from. If the global model improved since your last run, your previously-competitive
 submission may now fall above the new (higher) baseline.
 
-### 3. SGD does not converge on large MoE models
-
-The production training loop in `connito/miner/train.py` uses:
-
-| Component | Production setting |
-|---|---|
-| Optimizer | **AdamW** (`lr=1e-5`, `weight_decay=0.1`, `betas=(0.9, 0.95)`) |
-| Mixed precision | **fp16-mixed** with `GradScaler` |
-| Trainable params | Upcast to fp32 master weights (`upcast_trainable=True`) |
-| Gradient clipping | `clip_grad_norm_(params, 1.0)` |
-| LR schedule | Cosine warmup |
-| Gradient accumulation | `config.local_par.gradient_accumulation_steps` |
-
-Running with plain SGD (no momentum, no adaptive per-parameter lr) produces a
-random walk around baseline, not a descent. After 500 steps the final loss is
-indistinguishable from the starting loss.
-
 ---
 
 ## What a successful submission looks like
