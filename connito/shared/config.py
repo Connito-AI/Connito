@@ -165,7 +165,6 @@ class CycleCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "cycle_length", "distribute_period", "train_period", "commit_period",
         "submission_period", "validate_period", "merge_period", "owner_url",
-        "max_miners_per_validator",
     })
     cycle_length: int = 448 # 1.5 hr
     distribute_period: int = 20 # 4 mins
@@ -176,7 +175,6 @@ class CycleCfg(BaseConfig):
     merge_period: int = 50 # 10 mins
 
     owner_url: str = "https://cycle-api.connito.ai:443"
-    max_miners_per_validator: int = 10  # max miners assigned to each validator
     version_range_cycles: int = 3  # how many cycles back to accept checkpoints
     # Owner-node API retry policy
     api_timeout_sec: int = 10
@@ -811,7 +809,7 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window",
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)

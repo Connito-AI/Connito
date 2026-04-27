@@ -19,9 +19,9 @@ class ValidatorMinerAssignment(NamedTuple):
             penalty pass.
         miners_with_checkpoint: every miner that has a chain checkpoint
             this cycle (in the configured expert group), *before* the
-            `max_miners_per_validator * num_validators` incentive
-            truncation. Background download/eval can use this wider set
-            so it covers miners outside this validator's slice.
+            `foreground_top_n * num_validators` incentive truncation.
+            Background download/eval can use this wider set so it covers
+            miners outside this validator's slice.
     """
     assignment: dict[str, list[str]]
     miners_with_checkpoint: list[str]
@@ -417,7 +417,7 @@ def get_validator_miner_assignment(
     miners = [m for m in miners if m in miners_with_checkpoint]
 
     # Rank miners by incentive desc and keep only the top
-    # max_miners_per_validator * num_validators. The remainder is dropped
+    # foreground_top_n * num_validators. The remainder is dropped
     # before assignment so validators do not waste cycles on low-incentive
     # miners that would never be reached anyway.
     metagraph = subtensor.metagraph(netuid=config.chain.netuid)
@@ -440,7 +440,7 @@ def get_validator_miner_assignment(
     # this; foreground assignment still uses the truncated slice.
     all_miners_with_checkpoint = list(miners)
 
-    cap = config.cycle.max_miners_per_validator * max(len(validator_seeds), 1)
+    cap = config.evaluation.foreground_top_n * max(len(validator_seeds), 1)
     truncated = miners[cap:]
     miners = miners[:cap]
     if truncated:
@@ -461,7 +461,7 @@ def get_validator_miner_assignment(
     )
 
     validator_miner_assignment = assign_miners_to_validators(
-        validator_seeds, miners, max_miners_per_validator=config.cycle.max_miners_per_validator,
+        validator_seeds, miners, max_miners_per_validator=config.evaluation.foreground_top_n,
     )
 
     logger.info(
