@@ -18,6 +18,10 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.telemetry import (
+    VALIDATOR_ROUND_MINER_LANE,
+    VALIDATOR_ROUND_ROSTER_SIZE,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -134,6 +138,14 @@ class Round:
             foreground_uids=list(foreground_uids),
         )
 
+        rid_label = str(rid)
+        VALIDATOR_ROUND_ROSTER_SIZE.labels(round_id=rid_label, lane="foreground").set(len(foreground_uids))
+        VALIDATOR_ROUND_ROSTER_SIZE.labels(round_id=rid_label, lane="background").set(len(background_uids))
+        for uid in foreground_uids:
+            VALIDATOR_ROUND_MINER_LANE.labels(round_id=rid_label, miner_uid=str(uid), lane="foreground").set(1)
+        for uid in background_uids:
+            VALIDATOR_ROUND_MINER_LANE.labels(round_id=rid_label, miner_uid=str(uid), lane="background").set(1)
+
         return cls(
             round_id=rid,
             seed=seed,
@@ -143,6 +155,29 @@ class Round:
             uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
         )
+
+    # ---------------- Cleanup ----------------
+    def clear_lane_metrics(self) -> None:
+        """Drop the per-(uid, lane) gauges for this round so cardinality stays
+        bounded across many rounds. Called by the main loop right before the
+        next Round.freeze swaps in.
+        """
+        rid_label = str(self.round_id)
+        for uid in self.foreground_uids:
+            try:
+                VALIDATOR_ROUND_MINER_LANE.remove(rid_label, str(uid), "foreground")
+            except KeyError:
+                pass
+        for uid in self.background_uids:
+            try:
+                VALIDATOR_ROUND_MINER_LANE.remove(rid_label, str(uid), "background")
+            except KeyError:
+                pass
+        for lane in ("foreground", "background"):
+            try:
+                VALIDATOR_ROUND_ROSTER_SIZE.remove(rid_label, lane)
+            except KeyError:
+                pass
 
     # ---------------- Claim / score helpers ----------------
     def claim_for_foreground(self, uid: int) -> bool:

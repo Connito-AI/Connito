@@ -801,6 +801,7 @@ def hydrate_miner_submissions_from_hf(
                 filenames=[filename_in_hf],
                 dest_dir=tmp_dir,
                 token_env_var=config.hf.token_env_var,
+                kind="miner_submission",
             )
             # Atomic rename so gather_validation_job never sees a partial file.
             (tmp_dir / filename_in_hf).replace(dest)

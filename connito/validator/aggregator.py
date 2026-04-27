@@ -77,7 +77,11 @@ class MinerSeries:
         return float(sum(v for _, v, _ in pts) / len(pts)) if pts else 0.0
 
 
-from connito.shared.telemetry import VALIDATOR_MINER_SCORE
+from connito.shared.telemetry import (
+    VALIDATOR_MINER_SCORE,
+    VALIDATOR_MINER_SCORE_AVG,
+    VALIDATOR_MINER_SCORE_POINTS,
+)
 
 @dataclass
 class MinerState:
@@ -132,9 +136,13 @@ class MinerScoreAggregator:
                 state.series.clear()
 
             state.series.add(ts, float(score), round_id)
-            # Push metric update to prometheus
+            # Push metric updates to prometheus: latest score, rolling-avg
+            # (the actual reward signal), and the point count for this miner.
             try:
-                VALIDATOR_MINER_SCORE.labels(miner_uid=str(uid)).set(float(score))
+                uid_str = str(uid)
+                VALIDATOR_MINER_SCORE.labels(miner_uid=uid_str).set(float(score))
+                VALIDATOR_MINER_SCORE_AVG.labels(miner_uid=uid_str).set(state.series.avg())
+                VALIDATOR_MINER_SCORE_POINTS.labels(miner_uid=uid_str).set(len(state.series.points))
             except Exception:
                 pass
 

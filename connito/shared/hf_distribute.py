@@ -8,8 +8,32 @@ from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
 
 from connito.shared.app_logging import structlog
+from connito.shared.telemetry import (
+    HF_TRANSFER_BYTES_TOTAL,
+    HF_TRANSFER_LATENCY_SECONDS,
+    HF_TRANSFER_RESULT_TOTAL,
+    inc_error,
+)
 
 logger = structlog.get_logger(__name__)
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                continue
+    return total
 
 
 def _resolve_token(token: str | None, env_var: str) -> str | None:
@@ -106,6 +130,7 @@ def upload_checkpoint_to_hf(
     token_env_var: str = "HF_TOKEN",
     commit_message: str | None = None,
     allow_patterns: list[str] | None = None,
+    kind: str = "unknown",
 ) -> str:
     """Upload a checkpoint directory to HF and return a short commit revision.
 
@@ -113,12 +138,20 @@ def upload_checkpoint_to_hf(
     use a shorter immutable revision token downstream. `main` is updated to
     point at the new commit as a side effect, but miners should pin to the
     revision from the chain, not the branch name.
+
+    `kind` labels the Prometheus metrics:
+    `validator_checkpoint` (validator publish) or `miner_submission` (miner
+    publish). Defaults to `unknown` for legacy callers.
     """
     ready, reason = get_hf_upload_readiness(repo_id=repo_id, token=token, token_env_var=token_env_var)
     if not ready:
+        HF_TRANSFER_RESULT_TOTAL.labels(direction="upload", kind=kind, result="failure").inc()
+        inc_error(component="hf_upload", kind="validation")
         raise RuntimeError(reason)
     resolved_token = _resolve_token(token, token_env_var)
     if not ckpt_dir.exists() or not ckpt_dir.is_dir():
+        HF_TRANSFER_RESULT_TOTAL.labels(direction="upload", kind=kind, result="failure").inc()
+        inc_error(component="hf_upload", kind="validation")
         raise FileNotFoundError(f"checkpoint dir not found: {ckpt_dir}")
 
     api = HfApi(token=resolved_token)
@@ -127,18 +160,29 @@ def upload_checkpoint_to_hf(
     except HfHubHTTPError as e:
         # 409 on already-exists races is fine; anything else is real.
         if getattr(e.response, "status_code", None) not in (409,):
+            HF_TRANSFER_RESULT_TOTAL.labels(direction="upload", kind=kind, result="failure").inc()
+            inc_error(component="hf_upload", kind="network")
             raise
 
-    # Default uploads model_expgroup_N.pt + model_shared.pt (validator publish);
-    # miners override to drop model_shared.pt since validators only fetch the
-    # expert-group shard from miner submissions.
-    commit_info = api.upload_folder(
-        folder_path=str(ckpt_dir),
-        repo_id=repo_id,
-        commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
-        allow_patterns=allow_patterns if allow_patterns is not None else ["model*.pt"],
-    )
+    try:
+        with HF_TRANSFER_LATENCY_SECONDS.labels(direction="upload", kind=kind).time():
+            # Default uploads model_expgroup_N.pt + model_shared.pt (validator
+            # publish); miners override to drop model_shared.pt since
+            # validators only fetch the expert-group shard from miner submissions.
+            commit_info = api.upload_folder(
+                folder_path=str(ckpt_dir),
+                repo_id=repo_id,
+                commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
+                allow_patterns=allow_patterns if allow_patterns is not None else ["model*.pt"],
+            )
+    except Exception:
+        HF_TRANSFER_RESULT_TOTAL.labels(direction="upload", kind=kind, result="failure").inc()
+        inc_error(component="hf_upload", kind="network")
+        raise
+
     revision = commit_info.oid[:12]
+    HF_TRANSFER_BYTES_TOTAL.labels(direction="upload", kind=kind).inc(_dir_size_bytes(ckpt_dir))
+    HF_TRANSFER_RESULT_TOTAL.labels(direction="upload", kind=kind, result="success").inc()
     logger.info(
         "Uploaded checkpoint to HF",
         repo_id=repo_id,
@@ -155,30 +199,45 @@ def download_checkpoint_from_hf(
     dest_dir: Path,
     token: str | None = None,
     token_env_var: str = "HF_TOKEN",
+    kind: str = "unknown",
 ) -> Path:
     """Download specific files from a HF repo revision into dest_dir.
 
     We download only the shards the caller needs (e.g. `model_expgroup_3.pt`
     + `model_shared.pt`) rather than the whole repo, since a validator may
     publish every expert group and a given miner only needs one or two.
+
+    `kind` labels the Prometheus metrics:
+    `validator_checkpoint` (validator pulling validator publish) or
+    `miner_submission` (validator pulling miner publish). Defaults to
+    `unknown` for legacy callers.
     """
     resolved_token = _resolve_token(token, token_env_var)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        for fname in filenames:
-            hf_hub_download(
-                repo_id=repo_id,
-                revision=revision,
-                filename=fname,
-                local_dir=str(dest_dir),
-                token=resolved_token,
-            )
+        with HF_TRANSFER_LATENCY_SECONDS.labels(direction="download", kind=kind).time():
+            for fname in filenames:
+                hf_hub_download(
+                    repo_id=repo_id,
+                    revision=revision,
+                    filename=fname,
+                    local_dir=str(dest_dir),
+                    token=resolved_token,
+                )
     except RepositoryNotFoundError as e:
+        HF_TRANSFER_RESULT_TOTAL.labels(direction="download", kind=kind, result="failure").inc()
+        inc_error(component="hf_download", kind="validation")
         raise RuntimeError(
             f"HF repo not found or unauthorized: {repo_id}@{revision}"
         ) from e
+    except Exception:
+        HF_TRANSFER_RESULT_TOTAL.labels(direction="download", kind=kind, result="failure").inc()
+        inc_error(component="hf_download", kind="network")
+        raise
 
+    HF_TRANSFER_BYTES_TOTAL.labels(direction="download", kind=kind).inc(_dir_size_bytes(dest_dir))
+    HF_TRANSFER_RESULT_TOTAL.labels(direction="download", kind=kind, result="success").inc()
     logger.debug(
         "Downloaded checkpoint from HF",
         repo_id=repo_id,
