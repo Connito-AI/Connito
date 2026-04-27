@@ -1239,6 +1239,10 @@ if __name__ == "__main__":
     print(f"Connito validator — version={pkg_version}  git_sha={git_sha[:12]}", flush=True)
     logger.info("Validator starting", version=pkg_version, git_sha=git_sha[:12])
 
+    if getattr(args, "test", False):
+        from connito.shared.cycle import set_test_mode
+        set_test_mode(True)
+
     if args.path:
         config = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
     else:

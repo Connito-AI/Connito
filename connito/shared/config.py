@@ -813,9 +813,9 @@ class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window",
     })
-    top_k_miners_to_merge: int = 3    # top-N miners whose gradients are merged into global model
+    top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
-    score_window: int = 16            # max number of phases (points) retained per miner in MinerScoreAggregator
+    score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
     foreground_top_n: PositiveInt = 5
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 120
@@ -906,6 +906,11 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite current config with on-disk one.")
     parser.add_argument("--no_bump", action="store_true", help="Do not bump run_name on config diff.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test mode: wait_till() short-circuits without sleeping or polling the chain.",
+    )
     return parser.parse_args()
 
 

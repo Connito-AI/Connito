@@ -49,6 +49,20 @@ logger = structlog.get_logger(__name__)
 
 BITTENSOR_BLOCK_TIME_SECONDS: int = 12
 
+# Test toggle: when set, `wait_till` returns a synthetic PhaseResponse
+# immediately without sleeping or polling the chain. Drives end-to-end
+# integration tests / local replays that don't have a live subtensor.
+_TEST_MODE: bool = False
+
+
+def set_test_mode(enabled: bool) -> None:
+    """Enable/disable wait_till short-circuiting for tests."""
+    global _TEST_MODE
+    _TEST_MODE = bool(enabled)
+    if _TEST_MODE:
+        logger.warning("cycle: TEST MODE enabled — wait_till() will not block")
+
+
 def _get_with_retry(
     url: str,
     *,
@@ -136,7 +150,60 @@ class PhaseNames:
     validator_commit_2: str = "ValidatorCommit2"  # validator commit model_hash
 
 
+_PHASE_PERIOD_ATTR: dict[str, str] = {
+    PhaseNames.distribute: "distribute_period",
+    PhaseNames.train: "train_period",
+    PhaseNames.miner_commit_1: "commit_period",
+    PhaseNames.miner_commit_2: "commit_period",
+    PhaseNames.submission: "submission_period",
+    PhaseNames.validate: "validate_period",
+    PhaseNames.merge: "merge_period",
+    PhaseNames.validator_commit_1: "commit_period",
+    PhaseNames.validator_commit_2: "commit_period",
+}
+
+
+def _synth_phase_response_for_test(
+    config: MinerConfig | ValidatorConfig,
+    phase_name: str,
+    last_phase_response: PhaseResponse | None,
+) -> PhaseResponse:
+    """Build a fake PhaseResponse anchored at the current chain block,
+    with phase_end_block derived from the per-phase period in config.cycle.
+    """
+    current_block = last_phase_response.block if last_phase_response is not None else 0
+    period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
+    period = int(getattr(config.cycle, period_attr, 0))
+    return PhaseResponse(
+        block=current_block,
+        cycle_length=int(getattr(config.cycle, "cycle_length", 0)),
+        cycle_index=last_phase_response.cycle_index if last_phase_response is not None else 0,
+        cycle_block_index=0,
+        phase_name=phase_name,
+        phase_index=last_phase_response.phase_index if last_phase_response is not None else 0,
+        phase_start_block=current_block,
+        phase_end_block=current_block + period,
+        blocks_into_phase=0,
+        blocks_remaining_in_phase=period,
+    )
+
+
 def wait_till(config: MinerConfig | ValidatorConfig, phase_name: str, poll_fallback_block: int = 3) -> PhaseResponse:
+    if _TEST_MODE:
+        # Still hit should_act so the owner-API path is exercised, but
+        # ignore the result for the wait-condition and synthesize a
+        # PhaseResponse anchored at the current chain block with the
+        # requested phase_name + a config-derived end block.
+        _, _, last_phase_response = should_act(
+            config, phase_name, retry_blocks=poll_fallback_block,
+        )
+        synthetic = _synth_phase_response_for_test(config, phase_name, last_phase_response)
+        log_phase(
+            f"<{phase_name}> [TEST MODE] returning synthetic phase_response "
+            f"(block={synthetic.phase_start_block}, end={synthetic.phase_end_block})"
+        )
+        return synthetic
+
     ready = False
     phase_response: PhaseResponse | None = None
     first_print = True
