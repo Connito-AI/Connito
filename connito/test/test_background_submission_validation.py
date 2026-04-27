@@ -119,14 +119,13 @@ def _freeze_round(
     if global_model is None:
         global_model = _make_model()
     subtensor = _fake_subtensor(metagraph, block=round_id)
-    lite_subtensor = subtensor
 
     with patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
          patch("connito.shared.cycle.get_validator_miner_assignment", return_value=assignment):
         return Round.freeze(
             config=config,
             subtensor=subtensor,
-            lite_subtensor=lite_subtensor,
+            metagraph=metagraph,
             global_model=global_model,
             top_n=top_n,
             round_id=round_id,

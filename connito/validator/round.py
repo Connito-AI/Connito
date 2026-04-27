@@ -63,15 +63,18 @@ class Round:
         *,
         config,
         subtensor,
-        lite_subtensor,
+        metagraph,
         global_model: nn.Module,
         top_n: int,
         round_id: int | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
-        Captures the metagraph incentive snapshot and the global_model
-        state_dict (CPU clone) before Merge(K) can mutate either.
+        Caller pre-fetches `metagraph` (sync or async, depending on the
+        validator's subtensor type) and passes it in so this method has
+        no opinion on the connection model. Captures the metagraph
+        incentive snapshot and the global_model state_dict (CPU clone)
+        before Merge(K) can mutate either.
         """
         from connito.shared.cycle import (
             get_combined_validator_seed,
@@ -82,7 +85,6 @@ class Round:
         assignment = get_validator_miner_assignment(config, subtensor)
         my_assignment = assignment.get(config.chain.hotkey_ss58, [])
 
-        metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
         incentive = metagraph.incentive  # torch.Tensor
         hotkeys = list(metagraph.hotkeys)
 
