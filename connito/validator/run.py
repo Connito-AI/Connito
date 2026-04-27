@@ -976,7 +976,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         )
                     except Exception as e:
                         logger.error(
-                            "HF checkpoint upload failed; miners will use validator HTTP fallback",
+                            "HF checkpoint upload failed; miners will be unable to pull this checkpoint",
                             upload_checkpoint_repo=hf_upload_repo_id,
                             advertised_checkpoint_repo=hf_chain_repo_id,
                             error=str(e),
@@ -984,7 +984,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         )
                 else:
                     logger.warning(
-                        "HF checkpoint upload unavailable; miners will use validator HTTP fallback",
+                        "HF checkpoint upload unavailable; miners will be unable to pull this checkpoint",
                         upload_checkpoint_repo=hf_upload_repo_id,
                         advertised_checkpoint_repo=hf_chain_repo_id,
                         reason=hf_reason,

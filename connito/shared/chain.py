@@ -74,10 +74,11 @@ class MinerChainCommit(WorkerChainCommit):
     model_hash: str | None = Field(default=None, alias="h")
     global_ver: int | None = Field(default=None, alias="v")
     inner_opt: int | None = Field(default=None, alias="i")
-    # HuggingFace is the preferred submission transport: the miner uploads the
+    # HuggingFace is the only submission transport: the miner uploads the
     # checkpoint directory to `hf_repo_id` and `hf_revision` pins a short commit
-    # SHA prefix so validators pull the exact bytes the miner advertised. The
-    # existing HTTP /submit-checkpoint path remains the fallback.
+    # SHA prefix so validators pull the exact bytes the miner advertised. A
+    # missing/failed HF upload means the miner is treated as missing for the
+    # round.
     hf_repo_id: str | None = Field(default=None, alias="r")
     hf_revision: str | None = Field(default=None, alias="rv")
 

@@ -329,10 +329,11 @@ async def stream_gather_and_evaluate(
 
     # Pull HF-committed miner checkpoints in the background while baseline and
     # polling run. All HF coords are on chain by Submission phase (miners upload
-    # during MinerCommit2), so a single pass is enough; the HTTP
-    # /submit-checkpoint path fills in miners who couldn't use HF. Written files
-    # land atomically (os.replace) so the poll loop picks them up as soon as
-    # each shard lands without racing partial data.
+    # during MinerCommit2), so a single pass is enough; miners without HF
+    # coords are simply absent from the submission dir and the missed-
+    # submission penalty pass handles them. Written files land atomically
+    # (os.replace) so the poll loop picks them up as soon as each shard
+    # lands without racing partial data.
     async def _hydrate_and_log() -> None:
         # Dedicated Subtensor for the hydration thread — sharing the caller's
         # subtensor here triggers websockets ConcurrencyError, since the main
@@ -354,7 +355,7 @@ async def stream_gather_and_evaluate(
             )
             logger.info("Streaming eval: hydrated miner submissions from HF", count=hydrated)
         except Exception as e:
-            logger.warning("Streaming eval: HF hydration failed, continuing with HTTP only", error=str(e))
+            logger.warning("Streaming eval: HF hydration failed", error=str(e))
 
     hydration_task = asyncio.create_task(_hydrate_and_log())
 

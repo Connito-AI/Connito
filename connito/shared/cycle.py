@@ -185,29 +185,6 @@ def should_act(config: MinerConfig | ValidatorConfig, phase_name: str, retry_blo
     return ready, blocks_till, phase_response
 
 
-def search_model_submission_destination(
-    wallet: bittensor.Wallet, config: MinerConfig, subtensor: bittensor.Subtensor
-) -> bittensor.Axon:
-    
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
-
-    assigned_validator_hotkey = None
-    for validator, miners in validator_miner_assignment.items():
-        if wallet.hotkey.ss58_address in miners:
-            assigned_validator_hotkey = validator
-            break
-
-    if assigned_validator_hotkey is None:
-        return None
-
-    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
-    uid = metagraph.hotkeys.index(assigned_validator_hotkey)
-
-    logger.debug("Resolved validator axon", hotkey=f"{assigned_validator_hotkey[:4]}...{assigned_validator_hotkey[-4:]}", uid=uid)
-
-    return metagraph.axons[uid]
-
-
 def assign_miners_to_validators(
     validators: dict[str, Any],  # {validator_id: seed}
     miners: list[str],
@@ -549,12 +526,11 @@ def hydrate_miner_submissions_from_hf(
 
     Miners that upload to HuggingFace during MinerCommit2 advertise
     ``(hf_repo_id, hf_revision)`` in their chain commit. By Submission phase
-    those coords are on chain, so the validator can pull the shard directly
-    instead of waiting on the miner's HTTP ``/submit-checkpoint`` push. The
-    downloaded file is written with the same ``hotkey_*_block_*.pt`` naming
-    the HTTP path uses so downstream scanning is transport-agnostic. Miners
-    without HF coords, or whose HF download fails, are handled by the
-    existing HTTP path — no extra code path.
+    those coords are on chain, so the validator pulls the shard directly.
+    The downloaded file is written with the conventional
+    ``hotkey_*_block_*.pt`` naming so downstream scanning stays consistent.
+    Miners without HF coords, or whose HF download fails, are recorded as
+    missing for the round.
 
     Returns the number of miners hydrated this call.
     """
@@ -569,8 +545,8 @@ def hydrate_miner_submissions_from_hf(
     submission_dir = Path(config.ckpt.miner_submission_path)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
-    # A miner with any existing submission file is skipped — don't clobber an
-    # HTTP upload already received, and don't re-download on subsequent polls.
+    # A miner with any existing submission file is skipped — avoids
+    # re-downloading on subsequent polls within the same cycle.
     existing_hotkeys: set[str] = set()
     for file_path in submission_dir.glob("*.pt"):
         if file_path.name.startswith(".tmp"):
