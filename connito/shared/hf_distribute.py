@@ -105,6 +105,7 @@ def upload_checkpoint_to_hf(
     token: str | None = None,
     token_env_var: str = "HF_TOKEN",
     commit_message: str | None = None,
+    allow_patterns: list[str] | None = None,
 ) -> str:
     """Upload a checkpoint directory to HF and return a short commit revision.
 
@@ -128,13 +129,14 @@ def upload_checkpoint_to_hf(
         if getattr(e.response, "status_code", None) not in (409,):
             raise
 
+    # Default uploads model_expgroup_N.pt + model_shared.pt (validator publish);
+    # miners override to drop model_shared.pt since validators only fetch the
+    # expert-group shard from miner submissions.
     commit_info = api.upload_folder(
         folder_path=str(ckpt_dir),
         repo_id=repo_id,
         commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
-        # Only upload model shards — validators download model_expgroup_N.pt and
-        # model_shared.pt exclusively; optimizer/dataloader state is never fetched.
-        allow_patterns=["model*.pt"],
+        allow_patterns=allow_patterns if allow_patterns is not None else ["model*.pt"],
     )
     revision = commit_info.oid[:12]
     logger.info(

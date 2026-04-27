@@ -176,7 +176,7 @@ class CycleCfg(BaseConfig):
     merge_period: int = 50 # 10 mins
 
     owner_url: str = "https://cycle-api.connito.ai:443"
-    max_miners_per_validator: int = 10  # max miners assigned to each validator
+    max_miners_per_validator: int = 5  # max miners assigned to each validator
     version_range_cycles: int = 3  # how many cycles back to accept checkpoints
     # Owner-node API retry policy
     api_timeout_sec: int = 10
