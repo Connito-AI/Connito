@@ -8,6 +8,7 @@ background workers (download + eval) all anchor on the same `Round`.
 
 from __future__ import annotations
 
+import random
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,6 +106,16 @@ class Round:
             (foreground if hk in my_assignment_set else background).append(uid)
 
         foreground_uids = tuple(foreground)
+
+        rid = int(round_id) if round_id is not None else int(subtensor.block)
+
+        # Shuffle background deterministically per (validator, round) so each
+        # validator hits HF in a different order — spreads download load
+        # across the subnet instead of every validator racing for the same
+        # top-incentive miners first. Stable within a round (workers see the
+        # same order across re-reads) but varies cycle-to-cycle so no miner
+        # is permanently stuck at the back of any one validator's queue.
+        random.Random(f"{config.chain.hotkey_ss58}:{rid}").shuffle(background)
         background_uids = tuple(background)
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
@@ -113,8 +124,6 @@ class Round:
         snapshot = {
             k: v.detach().clone().cpu() for k, v in global_model.state_dict().items()
         }
-
-        rid = int(round_id) if round_id is not None else int(subtensor.block)
 
         logger.info(
             "Round.freeze: roster locked",
