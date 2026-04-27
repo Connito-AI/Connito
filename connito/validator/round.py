@@ -215,10 +215,18 @@ class Round:
         )
 
     def next_for_download(self) -> Iterable[RosterEntry]:
-        """Yield background_uids in incentive order that are not yet
-        downloaded, scored, or claimed. Re-checks state each iteration so
-        pause/resume stays correct."""
-        for uid in self.background_uids:
+        """Yield roster UIDs (foreground first, then background) in priority
+        order that are not yet downloaded, scored, or claimed. Re-checks state
+        each iteration so pause/resume stays correct.
+
+        Foreground UIDs are yielded first because they are this validator's
+        assignment slice — `gather_validation_job` (called by
+        `evaluate_foreground_round`) scans `miner_submission_path`, so until
+        bg-download writes a foreground miner's shard to disk, foreground eval
+        polls forever and finds nothing. Walking foreground first puts the
+        priority work where it's needed.
+        """
+        for uid in (*self.foreground_uids, *self.background_uids):
             with self._lock:
                 if (
                     uid in self.scored_uids
