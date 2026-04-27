@@ -203,14 +203,16 @@ reachable.
 
 ## Hugging Face distribution
 
-If you enable HF-backed checkpoint distribution, set `hf.checkpoint_repo` in
+Hugging Face is the only checkpoint transport. Set `hf.checkpoint_repo` in
 your validator YAML and provide a writable `HF_TOKEN` in the compose `.env`.
-The validator will upload the merged checkpoint to that repo and commit the
-exact HF revision to chain.
+The validator uploads the merged checkpoint to that repo and commits the
+exact HF revision to chain; miners pull from the repo@revision pinned on
+chain.
 
-If HF is misconfigured or temporarily unavailable, miners can still fall back
-to the validator's `/get-checkpoint` endpoint. HF is the preferred transport;
-the validator HTTP path remains as compatibility and outage backup.
+If HF is misconfigured or temporarily unavailable the validator cannot
+distribute the checkpoint that cycle, and miners with no usable HF
+coordinates skip the cycle. Make sure `HF_TOKEN` is set and the repo is
+writable before starting the stack.
 
 ## Operational notes
 

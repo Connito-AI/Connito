@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import bisect
 import json
+import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
+
+# Score-aggregator on-disk format version. v2 wraps miners in a top-level
+# envelope and tags each (ts, score) with the round_id it was recorded under,
+# so a restart mid-round can drop the in-flight round's partial scores.
+SCHEMA_VERSION = 2
 
 
 def _utc_now() -> datetime:
@@ -14,39 +22,45 @@ def _utc_now() -> datetime:
 
 @dataclass
 class MinerSeries:
-    """Holds a single miner's (timestamp, score) points, kept sorted by time."""
+    """Holds a single miner's (timestamp, score, round_id) points, kept sorted by time."""
 
-    points: list[tuple[datetime, float]] = field(default_factory=list)
+    points: list[tuple[datetime, float, int | None]] = field(default_factory=list)
     max_points: int = 16
 
-    def add(self, ts: datetime, score: float) -> None:
+    def add(self, ts: datetime, score: float, round_id: int | None = None) -> None:
         if ts.tzinfo is None:
             raise ValueError("Timestamp must be timezone-aware (e.g., UTC).")
-        i = bisect.bisect_left(self.points, (ts, float("-inf")))
+        i = bisect.bisect_left(self.points, (ts, float("-inf"), -1))
         if i < len(self.points) and self.points[i][0] == ts:
-            self.points[i] = (ts, score)  # overwrite same-ts
+            self.points[i] = (ts, score, round_id)  # overwrite same-ts
         else:
-            self.points.insert(i, (ts, score))
+            self.points.insert(i, (ts, score, round_id))
 
         # Keep only the last max_points phases per miner to compute rolling average
         if len(self.points) > self.max_points:
             self.points = self.points[-self.max_points:]
 
-    def slice(self, start: datetime | None, end: datetime | None) -> list[tuple[datetime, float]]:
+    def slice(self, start: datetime | None, end: datetime | None) -> list[tuple[datetime, float, int | None]]:
         if start and start.tzinfo is None:
             raise ValueError("start must be timezone-aware.")
         if end and end.tzinfo is None:
             raise ValueError("end must be timezone-aware.")
-        lo = 0 if start is None else bisect.bisect_left(self.points, (start, float("-inf")))
-        hi = len(self.points) if end is None else bisect.bisect_right(self.points, (end, float("inf")))
+        lo = 0 if start is None else bisect.bisect_left(self.points, (start, float("-inf"), -1))
+        hi = len(self.points) if end is None else bisect.bisect_right(self.points, (end, float("inf"), 2**63 - 1))
         return self.points[lo:hi]
 
     def prune_before(self, cutoff: datetime) -> None:
         if cutoff.tzinfo is None:
             raise ValueError("cutoff must be timezone-aware.")
-        idx = bisect.bisect_left(self.points, (cutoff, float("-inf")))
+        idx = bisect.bisect_left(self.points, (cutoff, float("-inf"), -1))
         if idx > 0:
             del self.points[:idx]
+
+    def drop_round(self, round_id: int) -> int:
+        """Remove every point tagged with the given round_id. Returns how many were dropped."""
+        before = len(self.points)
+        self.points = [p for p in self.points if p[2] != round_id]
+        return before - len(self.points)
 
     def clear(self) -> None:
         self.points.clear()
@@ -56,11 +70,11 @@ class MinerSeries:
 
     def sum(self, start: datetime | None = None, end: datetime | None = None) -> float:
         pts = self.slice(start, end) if (start or end) else self.points
-        return float(sum(v for _, v in pts))
+        return float(sum(v for _, v, _ in pts))
 
     def avg(self, start: datetime | None = None, end: datetime | None = None) -> float:
         pts = self.slice(start, end) if (start or end) else self.points
-        return float(sum(v for _, v in pts) / len(pts)) if pts else 0.0
+        return float(sum(v for _, v, _ in pts) / len(pts)) if pts else 0.0
 
 
 from connito.shared.telemetry import VALIDATOR_MINER_SCORE
@@ -84,11 +98,22 @@ class MinerScoreAggregator:
         self._max_points = max_points
 
     # ---------- Recording ----------
-    def add_score(self, uid: int, hotkey: str, score: float, ts: datetime | None = None) -> None:
+    def add_score(
+        self,
+        uid: int,
+        hotkey: str,
+        score: float,
+        ts: datetime | None = None,
+        round_id: int | None = None,
+    ) -> None:
         """
         Add a score point for a uid at timestamp ts (UTC if omitted).
         If the provided hotkey differs from the stored hotkey for this uid,
         the uid's score history is RESET before recording this new point.
+
+        round_id tags the score with the lifecycle round that produced it.
+        Pass None for legacy callers; restart recovery uses the tag to drop
+        partial in-flight rounds.
         """
         uid = int(uid)
         if ts is None:
@@ -106,12 +131,25 @@ class MinerScoreAggregator:
                 state.hotkey = hotkey
                 state.series.clear()
 
-            state.series.add(ts, float(score))
+            state.series.add(ts, float(score), round_id)
             # Push metric update to prometheus
             try:
                 VALIDATOR_MINER_SCORE.labels(miner_uid=str(uid)).set(float(score))
             except Exception:
                 pass
+
+    def drop_round(self, round_id: int) -> int:
+        """Remove all score points tagged with the given round_id across every miner.
+
+        Used at restart to drop the partial score set from a round whose
+        weight submission never landed. Returns the total number of points
+        dropped.
+        """
+        dropped = 0
+        with self._lock:
+            for state in self._miners.values():
+                dropped += state.series.drop_round(round_id)
+        return dropped
 
     def set_hotkey(self, uid: int, new_hotkey: str) -> None:
         """
@@ -132,12 +170,14 @@ class MinerScoreAggregator:
     def get_history(
         self, uid: int, start: datetime | None = None, end: datetime | None = None
     ) -> list[tuple[datetime, float]]:
+        """Return [(ts, score), ...] for the uid; round_id is dropped here so
+        callers that predate schema v2 still see the legacy 2-tuple shape."""
         uid = int(uid)
         with self._lock:
             s = self._miners.get(uid)
             if not s:
                 return []
-            return s.series.slice(start, end)
+            return [(ts, v) for ts, v, _rid in s.series.slice(start, end)]
 
     # ---------- Aggregates ----------
     def sum_over(self, uid: int, start: datetime | None = None, end: datetime | None = None) -> float:
@@ -257,31 +297,68 @@ class MinerScoreAggregator:
 
     # ---------- Persistence ----------
     def to_json(self) -> str:
-        """Serialize miners to JSON (timestamps as ISO 8601 strings).
-        JSON keys are always strings, so uid is serialized as str and
-        converted back to int in from_json."""
+        """Serialize miners to JSON (schema v2: envelope + round_id per point)."""
         with self._lock:
-            payload = {
+            miners_payload = {
                 str(uid): {
                     "hotkey": state.hotkey,
-                    "points": [(ts.isoformat(), v) for ts, v in state.series.points],
+                    "points": [
+                        [ts.isoformat(), v, rid] for ts, v, rid in state.series.points
+                    ],
                 }
                 for uid, state in self._miners.items()
             }
-        return json.dumps(payload)
+        return json.dumps({"schema_version": SCHEMA_VERSION, "miners": miners_payload})
 
     @classmethod
     def from_json(cls, data: str, max_points: int = 16) -> MinerScoreAggregator:
         raw = json.loads(data)
+        # v2 has a top-level envelope; v1 was a bare {uid: {...}} mapping.
+        if isinstance(raw, dict) and "miners" in raw and "schema_version" in raw:
+            miners = raw["miners"]
+        else:
+            miners = raw  # legacy v1
+
         agg = cls(max_points=max_points)
         with agg._lock:
-            for uid_str, body in raw.items():
+            for uid_str, body in miners.items():
                 uid = int(uid_str)
                 hotkey = body.get("hotkey", "")
                 pts = body.get("points", [])
                 state = MinerState(uid=uid, hotkey=hotkey, series=MinerSeries(max_points=max_points))
-                for ts_str, v in pts:
+                for entry in pts:
+                    # v2 entries are [ts, score, round_id]; v1 are [ts, score].
+                    if len(entry) == 3:
+                        ts_str, v, rid = entry
+                    else:
+                        ts_str, v = entry
+                        rid = None
                     ts = datetime.fromisoformat(ts_str)
-                    state.series.add(ts, float(v))
+                    state.series.add(ts, float(v), rid if rid is None else int(rid))
                 agg._miners[uid] = state
         return agg
+
+    def persist_atomic(self, path: str | os.PathLike) -> None:
+        """Write to_json() to `path` atomically (tmp file + os.replace).
+
+        Concurrent writers serialize on the aggregator's RLock. The on-disk
+        file therefore never reflects a half-written state, so a crash
+        between writes leaves the most recent fully-flushed snapshot intact.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            payload = self.to_json()
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp.write(payload)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                tmp_name = tmp.name
+            os.replace(tmp_name, path)

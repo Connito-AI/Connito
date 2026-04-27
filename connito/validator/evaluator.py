@@ -4,6 +4,7 @@ import asyncio
 import copy
 import gc
 from dataclasses import dataclass
+from pathlib import Path
 
 import bittensor
 import torch
@@ -12,7 +13,6 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
-from connito.shared.helper import get_model_hash
 from connito.shared.telemetry import track_eval_latency, track_model_load_latency
 
 logger = structlog.get_logger(__name__)
@@ -149,220 +149,147 @@ async def _evaluate_on_fresh_loader(
         del dataloader
 
 
-async def evaluator_worker(
-    name: str,
+async def evaluate_one_miner(
+    *,
     config,
-    jobs_q: asyncio.Queue[MinerEvalJob],
-    aggregator: MinerScoreAggregator,
-    device: torch.device,
+    model_path: str | Path,
+    uid: int,
+    hotkey: str,
     base_model: nn.Module,
     tokenizer,
-    combinded_seed: str,
+    combined_seed: str,
+    device: torch.device,
+    score_aggregator,
     baseline_loss: float,
+    step: int,
+    round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
-):
-    import gc
+) -> "MinerEvalJob | None":
+    """Evaluate a single miner and record the score.
 
-    while True:
-        job = await jobs_q.get()
-        if job is None:  # type: ignore
-            jobs_q.task_done()
-            logger.debug(f"{name}: shutdown signal received.")
-            break
+    Shared between foreground (`evaluate_foreground_round`) and the
+    `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
+    is responsible for not mutating it across calls so successive miners
+    see an identical baseline.
 
-        try:
-            snap = torch.cuda.memory_snapshot()
-            if not snap:
-                logger.warning(f"{name}: no CUDA memory segments found")
-            else:
-                logger.debug(f"{name}: CUDA memory segments", count=len(snap))
-
-            # Clear memory before loading
-            gc.collect()
+    Returns a `MinerEvalJob` on success (so the caller can later use
+    `model_path` for gradient aggregation), or None on failure.
+    """
+    job = MinerEvalJob(uid=int(uid), hotkey=hotkey, model_path=str(model_path), step=int(step))
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-            logger.debug(f"{name}: Evaluating hotkey={job.hotkey}")
+        miner_model = await asyncio.to_thread(load_model_from_path, str(model_path), base_model, device)
 
-            # Load model (potentially blocking) in a thread
-
-            model = await asyncio.to_thread(load_model_from_path, job.model_path, base_model, device)
-
-            logger.info(
-                f"{name}: starting evaluation",
-                hotkey=job.hotkey,
-                base_hash=get_model_hash(base_model.state_dict(), hex=True)[:6],
-                merged_hash=get_model_hash(model.state_dict(), hex=True)[:6],
-            )
-
+        try:
             metrics = await _evaluate_on_fresh_loader(
                 config=config,
                 tokenizer=tokenizer,
-                combinded_seed=combinded_seed,
-                step=job.step,
-                model=model,
+                combinded_seed=combined_seed,
+                step=step,
+                model=miner_model,
                 device=device,
                 max_eval_batches=max_eval_batches,
                 rank=rank,
             )
-
-            # Score = (baseline_loss - miner_loss) ** 1.5. Direct loss-space delta
-            # isolates the miner's contribution over the un-merged baseline. Clamped
-            # at 0 because (-x) ** 1.5 returns a complex number in Python.
-            val_loss = float(metrics.get("val_loss", 100))
-            delta = max(0.0, baseline_loss - val_loss)
-            score = delta ** 1.2
-            aggregator.add_score(job.uid, job.hotkey, score)
-            logger.info(
-                f"{name}: evaluation complete",
-                uid=job.uid,
-                hotkey=job.hotkey[:6],
-                val_loss=round(val_loss, 4),
-                baseline_loss=round(baseline_loss, 4),
-                delta=round(delta, 4),
-                score=round(score, 6),
-            )
-
-            # Explicit cleanup
-            del model, metrics
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        except torch.cuda.OutOfMemoryError:
-            logger.error(f"{name}: OOM for uid={job.uid}")
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        except Exception as e:
-            logger.exception(f"{name}: Evaluation failed for uid={job.uid}: {e}")
         finally:
-            jobs_q.task_done()
+            del miner_model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-
-async def run_evaluation(
-    config, step, device, miners, score_aggregator, base_model: nn.Module, tokenizer, combinded_seed
-):
-    import gc
-
-    # --- Baseline: evaluate the un-merged base model on the same eval stream so
-    # each miner's score can be expressed as an improvement delta over it. ---
-    baseline_metrics = await _evaluate_on_fresh_loader(
-        config=config,
-        tokenizer=tokenizer,
-        combinded_seed=combinded_seed,
-        step=step,
-        model=base_model,
-        device=device,
-        max_eval_batches=EVAL_MAX_BATCHES,
-    )
-    baseline_loss = float(baseline_metrics.get("val_loss", 100))
-    logger.info(
-        "Baseline evaluation complete (no miner merged)",
-        val_loss=round(baseline_loss, 4),
-    )
-
-    del baseline_metrics
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    miners_q: asyncio.Queue[MinerEvalJob] = asyncio.Queue()
-
-    # Enqueue miners
-    for m in miners:
-        await miners_q.put(m)
-
-    # Spin up evaluator workers
-    eval_workers = [
-        asyncio.create_task(
-            evaluator_worker(
-                f"evaluator-{i+1}", config, miners_q, score_aggregator, device,
-                base_model, tokenizer, combinded_seed, baseline_loss=baseline_loss,
-            )
+        val_loss = float(metrics.get("val_loss", 100))
+        delta = max(0.0, baseline_loss - val_loss)
+        score = delta ** 1.2
+        score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=score, round_id=round_id)
+        logger.info(
+            "evaluate_one_miner: complete",
+            uid=int(uid),
+            hotkey=hotkey[:6],
+            val_loss=round(val_loss, 4),
+            baseline_loss=round(baseline_loss, 4),
+            delta=round(delta, 4),
+            score=round(score, 6),
+            round_id=round_id,
         )
-        for i in range(EVAL_WORKERS)
-    ]
+        return job
+    except torch.cuda.OutOfMemoryError:
+        logger.error("evaluate_one_miner: OOM", uid=int(uid))
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None
+    except Exception as e:
+        logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
+        return None
 
-    # Wait for all miners to be processed
-    await miners_q.join()
 
-    # Signal evaluator workers to stop
-    for _ in eval_workers:
-        await miners_q.put(None)
-
-    await asyncio.gather(*eval_workers)
-
-
-async def stream_gather_and_evaluate(
+def resolve_miner_hf_target(
+    *,
     config,
+    subtensor: bittensor.Subtensor,
+    hotkey: str,
+) -> tuple[str, str] | None:
+    """Resolve a miner's (hf_repo_id, hf_revision) from the chain commits.
+
+    Returns None when the miner has no chain commit, no HF coords, or
+    when fetching commits fails.
+    """
+    from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
+
+    try:
+        chain_checkpoints = build_chain_checkpoints_from_previous_phase(
+            config=config, subtensor=subtensor, for_role="miner",
+        )
+    except Exception as e:
+        logger.warning("resolve_miner_hf_target: failed to fetch chain checkpoints", error=str(e))
+        return None
+
+    for ckpt in chain_checkpoints.checkpoints:
+        if ckpt.hotkey != hotkey:
+            continue
+        if not (ckpt.hf_repo_id and ckpt.hf_revision):
+            return None
+        return ckpt.hf_repo_id, ckpt.hf_revision
+    return None
+
+
+async def evaluate_foreground_round(
+    *,
+    config,
+    round_obj,  # connito.validator.round.Round
     subtensor: bittensor.Subtensor,
     step: int,
     device: torch.device,
     score_aggregator,
     base_model: nn.Module,
     tokenizer,
-    combined_seed: str,
     end_block: int,
-    validator_miner_assignment: dict[str, list[str]],
     poll_interval_sec: float = 6.0,
+    per_miner_eval_timeout_sec: float | None = None,
 ) -> list[MinerEvalJob]:
+    """Foreground (step 2): evaluate the round's top-N miners during
+    Submission + Validate.
+
+    Walks `round_obj.foreground_uids` only and calls `evaluate_one_miner`
+    for each. Miner checkpoints are made available locally by the
+    `BackgroundDownloadWorker` (HF); this function does not pull from HF
+    itself. UIDs that exceed the per-miner budget or fail to land by
+    `end_block` are left unclaimed so the `BackgroundEvalWorker` can pick
+    them up in step 3.
     """
-    Stream-evaluate miner submissions as they land during the combined
-    Submission + Validate window.
+    from connito.shared.cycle import gather_validation_job
 
-    Runs the baseline once, spins up a single evaluator worker, and polls
-    `config.ckpt.miner_submission_path` via gather_validation_job every
-    `poll_interval_sec` seconds. New qualifying submissions are enqueued
-    as they appear (deduped by hotkey). Polling stops once
-    `subtensor.block > end_block`; the queue is then drained and the
-    worker shut down.
-
-    `validator_miner_assignment` is provided by the caller (computed once
-    at submission start) so the penalty pass after evaluation can reuse
-    the exact same set of miners, avoiding drift from a later recompute.
-
-    Returns the list of MinerEvalJobs that were evaluated so downstream
-    aggregation can operate on the same set.
-    """
-    # Deferred import — gather_validation_job depends on config schemas that
-    # would otherwise create a circular import at module load.
-    from connito.shared.cycle import gather_validation_job, hydrate_miner_submissions_from_hf
-
-    # Pull HF-committed miner checkpoints in the background while baseline and
-    # polling run. All HF coords are on chain by Submission phase (miners upload
-    # during MinerCommit2), so a single pass is enough; the HTTP
-    # /submit-checkpoint path fills in miners who couldn't use HF. Written files
-    # land atomically (os.replace) so the poll loop picks them up as soon as
-    # each shard lands without racing partial data.
-    async def _hydrate_and_log() -> None:
-        # Dedicated Subtensor for the hydration thread — sharing the caller's
-        # subtensor here triggers websockets ConcurrencyError, since the main
-        # coroutine concurrently drives subtensor.block / gather_validation_job
-        # against the same WS connection.
-        try:
-            hydration_subtensor = await asyncio.to_thread(
-                bittensor.Subtensor, network=subtensor.network
-            )
-        except Exception as e:
-            logger.warning("Streaming eval: failed to open hydration subtensor, skipping HF hydration", error=str(e))
-            return
-        try:
-            hydrated = await asyncio.to_thread(
-                hydrate_miner_submissions_from_hf,
-                config,
-                hydration_subtensor,
-                validator_miner_assignment,
-            )
-            logger.info("Streaming eval: hydrated miner submissions from HF", count=hydrated)
-        except Exception as e:
-            logger.warning("Streaming eval: HF hydration failed, continuing with HTTP only", error=str(e))
-
-    hydration_task = asyncio.create_task(_hydrate_and_log())
-
-    # --- Baseline: unmerged base model scored once, reused for all deltas ---
+    # Baseline once against the round's input model (= live `base_model`,
+    # which equals round.model_snapshot_cpu since the foreground runs
+    # before Merge(K)).
     baseline_metrics = await _evaluate_on_fresh_loader(
         config=config,
         tokenizer=tokenizer,
-        combinded_seed=combined_seed,
+        combinded_seed=round_obj.seed,
         step=step,
         model=base_model,
         device=device,
@@ -371,89 +298,114 @@ async def stream_gather_and_evaluate(
     baseline_loss = float(baseline_metrics.get("val_loss", 100))
     del baseline_metrics
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    foreground_set = set(round_obj.foreground_uids)
+    completed: list[MinerEvalJob] = []
+
     logger.info(
-        "Streaming evaluation baseline complete",
-        val_loss=round(baseline_loss, 4),
+        "foreground eval: starting",
+        round_id=round_obj.round_id,
+        foreground_uids=list(round_obj.foreground_uids),
         end_block=end_block,
         current_block=subtensor.block,
+        baseline_loss=round(baseline_loss, 4),
+        per_miner_eval_timeout_sec=per_miner_eval_timeout_sec,
     )
 
-    jobs_q: asyncio.Queue[MinerEvalJob] = asyncio.Queue()
-    enqueued_hotkeys: set[str] = set()
-    all_jobs: list[MinerEvalJob] = []
-
-    worker = asyncio.create_task(
-        evaluator_worker(
-            "evaluator-streaming",
-            config,
-            jobs_q,
-            score_aggregator,
-            device,
-            base_model,
-            tokenizer,
-            combined_seed,
-            baseline_loss=baseline_loss,
-        )
-    )
-
-    try:
-        while subtensor.block <= end_block:
-            try:
-                jobs = gather_validation_job(
-                    config,
-                    subtensor,
-                    step=step,
-                    validator_miner_assignment=validator_miner_assignment,
-                )
-            except Exception as e:
-                logger.warning("stream_evaluate: gather_validation_job failed", error=str(e))
-                jobs = []
-
-            new_count = 0
-            for job in jobs:
-                if job.hotkey in enqueued_hotkeys:
-                    continue
-                enqueued_hotkeys.add(job.hotkey)
-                all_jobs.append(job)
-                await jobs_q.put(job)
-                new_count += 1
-
-            if new_count:
-                logger.info(
-                    "Streaming eval: enqueued new submissions",
-                    enqueued=new_count,
-                    total_enqueued=len(all_jobs),
-                    queued_waiting=jobs_q.qsize(),
-                    current_block=subtensor.block,
-                    end_block=end_block,
-                )
-
-            if subtensor.block > end_block:
-                break
-            await asyncio.sleep(poll_interval_sec)
-    finally:
-        # Don't extend the Submission phase waiting on a slow HF peer. Anything
-        # already downloaded was picked up by the poll loop via filename scan;
-        # anything mid-download at phase end is abandoned and will be retried
-        # next cycle. Cancel doesn't kill the underlying worker thread from
-        # asyncio.to_thread, but the result is discarded so the coroutine exits
-        # cleanly and no "Task was destroyed" warning fires.
-        if not hydration_task.done():
-            hydration_task.cancel()
+    poll_idx = 0
+    while subtensor.block <= end_block:
         try:
-            await hydration_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        # Drain whatever is still in the queue before stopping the worker.
-        await jobs_q.join()
-        await jobs_q.put(None)  # type: ignore[arg-type]
-        await worker
+            discovered = gather_validation_job(
+                config,
+                subtensor,
+                step=step,
+                validator_miner_assignment=round_obj.validator_miner_assignment,
+            )
+        except Exception as e:
+            logger.warning("foreground eval: gather_validation_job failed", error=str(e))
+            discovered = []
+
+        # Walk foreground UIDs in incentive order; pick up any whose
+        # checkpoint has landed and is not yet claimed/scored.
+        by_uid: dict[int, MinerEvalJob] = {j.uid: j for j in discovered if j.uid in foreground_set}
+        scored_count = sum(1 for u in foreground_set if u in round_obj.scored_uids)
+        current_block = subtensor.block
+        logger.info(
+            "foreground eval: poll",
+            round_id=round_obj.round_id,
+            poll_idx=poll_idx,
+            current_block=current_block,
+            blocks_remaining=max(0, end_block - current_block),
+            discovered_total=len(discovered),
+            discovered_in_foreground=len(by_uid),
+            ready_uids=sorted(by_uid.keys()),
+            scored=scored_count,
+            foreground_total=len(foreground_set),
+        )
+        poll_idx += 1
+        progressed = False
+        for uid in round_obj.foreground_uids:
+            if uid not in by_uid:
+                continue
+            if not round_obj.claim_for_foreground(uid):
+                continue
+            job = by_uid[uid]
+            hotkey = round_obj.uid_to_hotkey[uid]
+            progressed = True
+            eval_coro = evaluate_one_miner(
+                config=config,
+                model_path=job.model_path,
+                uid=uid,
+                hotkey=hotkey,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                combined_seed=round_obj.seed,
+                device=device,
+                score_aggregator=score_aggregator,
+                baseline_loss=baseline_loss,
+                step=step,
+                round_id=round_obj.round_id,
+            )
+            try:
+                if per_miner_eval_timeout_sec:
+                    evaluated = await asyncio.wait_for(eval_coro, timeout=per_miner_eval_timeout_sec)
+                else:
+                    evaluated = await eval_coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "foreground eval: per-miner timeout — marking failed",
+                    uid=uid, hotkey=hotkey[:6],
+                )
+                round_obj.mark_failed(uid)
+                continue
+            except Exception as e:
+                logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
+                round_obj.mark_failed(uid)
+                continue
+
+            if evaluated is None:
+                round_obj.mark_failed(uid)
+                continue
+            round_obj.mark_scored(uid)
+            completed.append(evaluated)
+
+        # Stop once every top-N UID is scored or the phase boundary hits.
+        scored_top_n = sum(1 for u in foreground_set if u in round_obj.scored_uids)
+        if scored_top_n >= len(foreground_set):
+            break
+
+        if subtensor.block > end_block:
+            break
+        if not progressed:
+            await asyncio.sleep(poll_interval_sec)
 
     logger.info(
-        "Streaming evaluation finished",
-        evaluated=len(all_jobs),
-        final_block=subtensor.block,
-        end_block=end_block,
+        "foreground eval: complete",
+        round_id=round_obj.round_id,
+        top_n=len(foreground_set),
+        scored=len(completed),
+        spilled=len(foreground_set) - len(completed),
     )
-    return all_jobs
+    return completed

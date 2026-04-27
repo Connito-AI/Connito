@@ -165,7 +165,6 @@ class CycleCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "cycle_length", "distribute_period", "train_period", "commit_period",
         "submission_period", "validate_period", "merge_period", "owner_url",
-        "max_miners_per_validator",
     })
     cycle_length: int = 448 # 1.5 hr
     distribute_period: int = 20 # 4 mins
@@ -176,7 +175,6 @@ class CycleCfg(BaseConfig):
     merge_period: int = 50 # 10 mins
 
     owner_url: str = "https://cycle-api.connito.ai:443"
-    max_miners_per_validator: int = 5  # max miners assigned to each validator
     version_range_cycles: int = 3  # how many cycles back to accept checkpoints
     # Owner-node API retry policy
     api_timeout_sec: int = 10
@@ -291,9 +289,8 @@ class CheckpointCfg(BaseConfig):
     full_validation_interval: PositiveInt | None = None
     checkpoint_topk: PositiveInt = 2
     validator_checkpoint_path: Path = Path("validator_checkpoint")
-    # Legacy compatibility knob. Miner checkpoint downloads currently use an
-    # ordered HF -> validator HTTP fallback path rather than parallel shard
-    # fan-out, but older configs may still include this field.
+    # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
+    # but older configs may still include this field.
     download_concurrency: PositiveInt = 4
 
 
@@ -359,17 +356,10 @@ class LoggingCfg(BaseConfig):
 
 
 class ValidatorCheckpointCfg(CheckpointCfg):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"max_submission_bytes", "max_submission_bytes_per_expert"})
     base_checkpoint_path: Path = Path("checkpoints/validator")
     miner_submission_path: Path = Path("miner_submission")
-    max_submission_bytes: int = 8 * 1024**3
-    max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
-    # Max concurrent /submit-checkpoint streams. Protects the server downlink
-    # and disk write throughput from N parallel 3.35 GiB uploads dragging each
-    # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
-    submission_concurrency: int = 2
     cleanup_stale_temporary_checkpoints: bool = True
     miner_submission_max_age_cycles: PositiveFloat = 1.5
     miner_submission_archive_max_files: PositiveInt = 500
@@ -811,11 +801,15 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window",
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
     })
-    top_k_miners_to_merge: int = 3    # top-N miners whose gradients are merged into global model
+    top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
-    score_window: int = 16            # max number of phases (points) retained per miner in MinerScoreAggregator
+    score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
+    foreground_top_n: PositiveInt = 5
+    background_worker_enabled: bool = True
+    per_miner_download_timeout_sec: PositiveInt = 180
+    per_miner_eval_timeout_sec: PositiveInt = 300
 
 
 class ValidatorConfig(WorkerConfig):
@@ -849,7 +843,6 @@ class ValidatorConfig(WorkerConfig):
             f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
             f"EXPERT_GROUPS_PATH={expert_groups_path}",
             f"VALIDATOR_GPU_ID=0",
-            f"SERVER_GPU_ID=0",
             f"HF_TOKEN=",
             f"WANDB_API_KEY=",
             f"WANDB_MODE=online",
@@ -902,6 +895,11 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite current config with on-disk one.")
     parser.add_argument("--no_bump", action="store_true", help="Do not bump run_name on config diff.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test mode: wait_till() short-circuits without sleeping or polling the chain.",
+    )
     return parser.parse_args()
 
 

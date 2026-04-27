@@ -6,7 +6,25 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+
+class ValidatorMinerAssignment(NamedTuple):
+    """Result of `get_validator_miner_assignment`.
+
+    Attributes:
+        assignment: validator_hotkey -> assigned miner hotkeys, post
+            incentive truncation and seeded distribution. This is the
+            "official" assignment used for foreground evaluation and the
+            penalty pass.
+        miners_with_checkpoint: every miner that has a chain checkpoint
+            this cycle (in the configured expert group), *before* the
+            `foreground_top_n * num_validators` incentive truncation.
+            Background download/eval can use this wider set so it covers
+            miners outside this validator's slice.
+    """
+    assignment: dict[str, list[str]]
+    miners_with_checkpoint: list[str]
 
 import bittensor
 import requests
@@ -34,6 +52,20 @@ BITTENSOR_BLOCK_TIME_SECONDS: int = 12
 # for half an hour without re-checking the chain — it should wake up at least
 # every 15 minutes to handle phase resets, clock drift, and chain hiccups.
 WAIT_TILL_MAX_SLEEP_SECONDS: int = 15 * 60
+
+# Test toggle: when set, `wait_till` returns a synthetic PhaseResponse
+# immediately without sleeping or polling the chain. Drives end-to-end
+# integration tests / local replays that don't have a live subtensor.
+_TEST_MODE: bool = False
+
+
+def set_test_mode(enabled: bool) -> None:
+    """Enable/disable wait_till short-circuiting for tests."""
+    global _TEST_MODE
+    _TEST_MODE = bool(enabled)
+    if _TEST_MODE:
+        logger.warning("cycle: TEST MODE enabled — wait_till() will not block")
+
 
 def _get_with_retry(
     url: str,
@@ -122,31 +154,144 @@ class PhaseNames:
     validator_commit_2: str = "ValidatorCommit2"  # validator commit model_hash
 
 
-def wait_till(config: MinerConfig | ValidatorConfig, phase_name: str, poll_fallback_block: int = 3) -> PhaseResponse:
-    ready = False
+_PHASE_PERIOD_ATTR: dict[str, str] = {
+    PhaseNames.distribute: "distribute_period",
+    PhaseNames.train: "train_period",
+    PhaseNames.miner_commit_1: "commit_period",
+    PhaseNames.miner_commit_2: "commit_period",
+    PhaseNames.submission: "submission_period",
+    PhaseNames.validate: "validate_period",
+    PhaseNames.merge: "merge_period",
+    PhaseNames.validator_commit_1: "commit_period",
+    PhaseNames.validator_commit_2: "commit_period",
+}
+
+
+def _synth_phase_response_for_test(
+    config: MinerConfig | ValidatorConfig,
+    phase_name: str,
+    last_phase_response: PhaseResponse | None,
+) -> PhaseResponse:
+    """Build a fake PhaseResponse anchored at the current chain block,
+    with phase_end_block derived from the per-phase period in config.cycle.
+    """
+    current_block = last_phase_response.block if last_phase_response is not None else 0
+    period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
+    period = int(getattr(config.cycle, period_attr, 0))
+    # In test mode, give Submission a fixed 30-block window so foreground
+    # evaluation has room to land miners regardless of the prod cycle config.
+    if phase_name == PhaseNames.submission:
+        period = 60
+    return PhaseResponse(
+        block=current_block,
+        cycle_length=int(getattr(config.cycle, "cycle_length", 0)),
+        cycle_index=last_phase_response.cycle_index if last_phase_response is not None else 0,
+        cycle_block_index=0,
+        phase_name=phase_name,
+        phase_index=last_phase_response.phase_index if last_phase_response is not None else 0,
+        phase_start_block=current_block,
+        phase_end_block=current_block + period,
+        blocks_into_phase=0,
+        blocks_remaining_in_phase=period,
+    )
+
+
+def wait_till(
+    config: MinerConfig | ValidatorConfig,
+    phase_name: str,
+    poll_fallback_block: int = 3,
+    block_offset: int = 0,
+) -> PhaseResponse:
+    """Block until the chain reaches `phase_start_block + block_offset`.
+
+    - `block_offset == 0` (default): return when `phase_name` begins.
+    - `block_offset > 0`: return `block_offset` blocks INTO `phase_name`.
+    - `block_offset < 0`: return `|block_offset|` blocks BEFORE
+      `phase_name` begins; the caller is still inside the previous phase
+      at return time.
+
+    The returned `PhaseResponse` reflects chain state at return time, so
+    for negative offsets it describes the previous phase. In test mode
+    `block_offset` is ignored; the synthesized response is returned as-is.
+    """
+    if _TEST_MODE:
+        # Still hit should_act so the owner-API path is exercised, but
+        # ignore the result for the wait-condition and synthesize a
+        # PhaseResponse anchored at the current chain block with the
+        # requested phase_name + a config-derived end block.
+        _, _, last_phase_response = should_act(
+            config, phase_name, retry_blocks=poll_fallback_block,
+        )
+        synthetic = _synth_phase_response_for_test(config, phase_name, last_phase_response)
+        period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
+        upstream_phase = last_phase_response.phase_name if last_phase_response is not None else None
+        upstream_block = last_phase_response.block if last_phase_response is not None else None
+        log_phase(
+            f"<{phase_name}> [TEST MODE] returning synthetic phase_response",
+            phase_name=synthetic.phase_name,
+            block=synthetic.block,
+            phase_start_block=synthetic.phase_start_block,
+            phase_end_block=synthetic.phase_end_block,
+            blocks_into_phase=synthetic.blocks_into_phase,
+            blocks_remaining_in_phase=synthetic.blocks_remaining_in_phase,
+            cycle_length=synthetic.cycle_length,
+            cycle_index=synthetic.cycle_index,
+            cycle_block_index=synthetic.cycle_block_index,
+            phase_index=synthetic.phase_index,
+            period_attr=period_attr,
+            upstream_phase_from_api=upstream_phase,
+            upstream_block_from_api=upstream_block,
+        )
+        return synthetic
+
     phase_response: PhaseResponse | None = None
     first_print = True
-    while not ready:
+    while True:
         ready, blocks_till, phase_response = should_act(config, phase_name, retry_blocks=poll_fallback_block)
         if ready is False and blocks_till > 0:
             sleep_sec = min(blocks_till, max(poll_fallback_block, blocks_till * 0.9)) * BITTENSOR_BLOCK_TIME_SECONDS
             sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
 
-            check_time = datetime.now() + timedelta(seconds=sleep_sec)
-            check_time_str = check_time.strftime("%H:%M:%S")
+        # Blocks remaining until target = phase_start_block + block_offset.
+        # Once `ready` flips True we're inside the named phase; before that
+        # `blocks_till` counts down to its start.
+        if ready and phase_response is not None:
+            blocks_remaining = block_offset - phase_response.blocks_into_phase
+        else:
+            blocks_remaining = blocks_till + block_offset
 
-            expect_time = datetime.now() + timedelta(seconds=blocks_till * BITTENSOR_BLOCK_TIME_SECONDS)
-            expect_time_str = expect_time.strftime("%H:%M:%S")
+        if blocks_remaining <= 0:
+            break
 
-            if first_print: log_phase(f"<{phase_name}> to begin in {blocks_till} blocks, at {expect_time_str}")
-            first_print = False
-            time.sleep(sleep_sec)
+        sleep_sec = min(
+            blocks_remaining,
+            max(poll_fallback_block, blocks_remaining * 0.9),
+        ) * BITTENSOR_BLOCK_TIME_SECONDS
+
+        if first_print:
+            offset_label = ""
+            if block_offset > 0:
+                offset_label = f" + {block_offset} blocks"
+            elif block_offset < 0:
+                offset_label = f" - {-block_offset} blocks"
+            expect_time = datetime.now() + timedelta(seconds=blocks_remaining * BITTENSOR_BLOCK_TIME_SECONDS)
+            log_phase(
+                f"<{phase_name}>{offset_label} target in {blocks_remaining} blocks, "
+                f"at {expect_time.strftime('%H:%M:%S')}"
+            )
+        first_print = False
+        time.sleep(sleep_sec)
 
     if phase_response is None:
-        logger.warning(f"wait_till: loop exited with ready=True but phase_response is None for phase '{phase_name}'")
+        logger.warning(
+            f"wait_till: loop exited but phase_response is None for phase "
+            f"'{phase_name}' (block_offset={block_offset})"
+        )
     log_phase(
-        f"<{phase_name}> has started, {phase_response.blocks_into_phase} blocks passed,"
-        f" {phase_response.blocks_remaining_in_phase} blocks left in phase."
+        f"<{phase_name}> reached (block_offset={block_offset}); "
+        f"current phase=<{phase_response.phase_name}>, "
+        f"{phase_response.blocks_into_phase} blocks into it, "
+        f"{phase_response.blocks_remaining_in_phase} blocks left."
     )
     return phase_response
 
@@ -194,7 +339,7 @@ def search_model_submission_destination(
     wallet: bittensor.Wallet, config: MinerConfig, subtensor: bittensor.Subtensor
 ) -> bittensor.Axon:
     
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+    validator_miner_assignment = get_validator_miner_assignment(config, subtensor).assignment
 
     assigned_validator_hotkey = None
     for validator, miners in validator_miner_assignment.items():
@@ -292,7 +437,9 @@ def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subte
     return hashlib.sha256(combined_seed_str.encode()).hexdigest()
 
 
-def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Subtensor):
+def get_validator_miner_assignment(
+    config: WorkerConfig, subtensor: bittensor.Subtensor,
+) -> ValidatorMinerAssignment:
     from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
 
     commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
@@ -319,6 +466,41 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
         )
     miners = [m for m in miners if m in miners_with_checkpoint]
 
+    # Rank miners by incentive desc and keep only the top
+    # foreground_top_n * num_validators. The remainder is dropped
+    # before assignment so validators do not waste cycles on low-incentive
+    # miners that would never be reached anyway.
+    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+    hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
+
+    def _incentive(hk: str) -> float:
+        uid = hotkey_to_uid.get(hk)
+        if uid is None:
+            return 0.0
+        try:
+            return float(metagraph.incentive[uid].item())
+        except Exception:
+            return 0.0
+
+    # Tie-break on hotkey for determinism across validators.
+    miners.sort(key=lambda hk: (-_incentive(hk), hk))
+
+    # Snapshot the full incentive-ordered checkpoint set before truncation —
+    # callers that want subnet-wide coverage (e.g. bg-download/eval) need
+    # this; foreground assignment still uses the truncated slice.
+    all_miners_with_checkpoint = list(miners)
+
+    cap = config.evaluation.foreground_top_n * max(len(validator_seeds), 1)
+    truncated = miners[cap:]
+    miners = miners[:cap]
+    if truncated:
+        logger.debug(
+            "get_validator_miner_assignment: dropped low-incentive miners beyond capacity",
+            kept=len(miners),
+            dropped=len(truncated),
+            cap=cap,
+        )
+
     logger.debug(
         "get_validator_miner_assignment: inputs",
         expert_group_id=config.task.exp.group_id,
@@ -329,7 +511,7 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
     )
 
     validator_miner_assignment = assign_miners_to_validators(
-        validator_seeds, miners, max_miners_per_validator=config.cycle.max_miners_per_validator,
+        validator_seeds, miners, max_miners_per_validator=config.evaluation.foreground_top_n,
     )
 
     logger.info(
@@ -340,7 +522,10 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
             for v, ms in validator_miner_assignment.items()
         },
     )
-    return validator_miner_assignment
+    return ValidatorMinerAssignment(
+        assignment=validator_miner_assignment,
+        miners_with_checkpoint=all_miners_with_checkpoint,
+    )
 
 
 def get_validator_seed_from_commit(config, commits):
@@ -554,12 +739,12 @@ def hydrate_miner_submissions_from_hf(
 
     Miners that upload to HuggingFace during MinerCommit2 advertise
     ``(hf_repo_id, hf_revision)`` in their chain commit. By Submission phase
-    those coords are on chain, so the validator can pull the shard directly
-    instead of waiting on the miner's HTTP ``/submit-checkpoint`` push. The
-    downloaded file is written with the same ``hotkey_*_block_*.pt`` naming
-    the HTTP path uses so downstream scanning is transport-agnostic. Miners
-    without HF coords, or whose HF download fails, are handled by the
-    existing HTTP path — no extra code path.
+    those coords are on chain, so the validator pulls the shard directly
+    from HuggingFace. The downloaded file is written with the
+    ``hotkey_*_block_*.pt`` naming convention so ``gather_validation_job``
+    can pick it up. Miners without HF coords, or whose HF download fails,
+    are missing for this round and receive the zero-score penalty via the
+    existing missing-submission pass.
 
     Returns the number of miners hydrated this call.
     """
@@ -574,8 +759,9 @@ def hydrate_miner_submissions_from_hf(
     submission_dir = Path(config.ckpt.miner_submission_path)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
-    # A miner with any existing submission file is skipped — don't clobber an
-    # HTTP upload already received, and don't re-download on subsequent polls.
+    # A miner with any existing submission file is skipped — the background
+    # download worker may have already placed the file, and we don't want to
+    # re-download on subsequent polls.
     existing_hotkeys: set[str] = set()
     for file_path in submission_dir.glob("*.pt"):
         if file_path.name.startswith(".tmp"):

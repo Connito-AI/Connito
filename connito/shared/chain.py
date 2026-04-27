@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import threading
@@ -74,10 +75,9 @@ class MinerChainCommit(WorkerChainCommit):
     model_hash: str | None = Field(default=None, alias="h")
     global_ver: int | None = Field(default=None, alias="v")
     inner_opt: int | None = Field(default=None, alias="i")
-    # HuggingFace is the preferred submission transport: the miner uploads the
+    # HuggingFace is the only submission transport: the miner uploads the
     # checkpoint directory to `hf_repo_id` and `hf_revision` pins a short commit
-    # SHA prefix so validators pull the exact bytes the miner advertised. The
-    # existing HTTP /submit-checkpoint path remains the fallback.
+    # SHA prefix so validators pull the exact bytes the miner advertised.
     hf_repo_id: str | None = Field(default=None, alias="r")
     hf_revision: str | None = Field(default=None, alias="rv")
 
@@ -133,6 +133,33 @@ def validate_miner_chain_commit_payload(
     max_bytes: int = CHAIN_COMMIT_MAX_BYTES,
 ) -> tuple[dict, str]:
     return validate_chain_commit_payload(status, max_bytes=max_bytes)
+
+async def acommit_status(
+    config: WorkerConfig,
+    wallet: bittensor.Wallet,
+    async_subtensor: "bittensor.AsyncSubtensor",
+    status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
+) -> dict:
+    """Async equivalent of `commit_status` for use against an AsyncSubtensor."""
+    if isinstance(status, ValidatorChainCommit | MinerChainCommit):
+        data_dict, data = validate_chain_commit_payload(status)
+    else:
+        data_dict, data = serialize_chain_status(status)
+
+    try:
+        success = await async_subtensor.set_commitment(
+            wallet=wallet, netuid=config.chain.netuid, data=data, raise_error=False,
+        )
+    except Exception as exc:
+        logger.warning("acommit_status: set_commitment raised", error=str(exc))
+        return data_dict
+
+    if not success:
+        logger.warning("Failed to commit status to chain (async)", status=data_dict)
+    else:
+        logger.info("Committed status to chain (async)", status=data_dict)
+    return data_dict
+
 
 @track_chain_commit_latency()
 @count_rpc_errors()
@@ -296,9 +323,7 @@ def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
     - ``subtensor`` uses ``config.chain.network`` and must be an archive node
       because ``get_chain_commits`` issues historical ``block=N`` queries.
     - ``lite_subtensor`` uses ``config.chain.lite_network`` (defaults to
-      ``finney``) for operations that only need the current head (axon
-      serving, set_weights, head-level metagraph reads). When
-      ``lite_network == network`` the same connection is reused.
+      ``finney``) for operations that only need the current head.
     """
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     if subtensor is None:
@@ -451,6 +476,93 @@ def _submit_fallback_weights(
     return success
 
 
+async def _asubmit_fallback_weights(
+    config: WorkerConfig,
+    wallet: bittensor.Wallet,
+    async_subtensor: "bittensor.AsyncSubtensor",
+    wait_for_inclusion: bool = False,
+    wait_for_finalization: bool = False,
+) -> bool:
+    """Async equivalent of `_submit_fallback_weights`."""
+    from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402
+
+    metagraph = await async_subtensor.metagraph(netuid=config.chain.netuid)
+    my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+    full_neuron = await async_subtensor.neuron_for_uid(uid=my_uid, netuid=config.chain.netuid)
+    prev_weights = {uid: float(w) for uid, w in full_neuron.weights} if full_neuron else {}
+
+    validator_hotkeys = get_validator_whitelist_from_api(config)
+    validator_uids = {
+        metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
+    }
+
+    if prev_weights:
+        miner_prev_weights = {
+            uid: w for uid, w in prev_weights.items()
+            if int(uid) not in validator_uids
+        }
+        dropped = len(prev_weights) - len(miner_prev_weights)
+        values = list(miner_prev_weights.values())
+        is_even = (
+            len(values) >= 1
+            and max(values) > 0
+            and (max(values) - min(values)) < 1e-9
+        )
+        if miner_prev_weights and not is_even:
+            logger.info(
+                "Falling back to previous weights from chain (miners only)",
+                count=len(miner_prev_weights), dropped_validator_uids=dropped,
+            )
+            return await submit_weights_async(
+                config, wallet, async_subtensor, miner_prev_weights, normalize=True,
+                wait_for_inclusion=wait_for_inclusion,
+                wait_for_finalization=wait_for_finalization,
+            )
+
+    miner_score: dict[int, float] = {}
+    for vuid in validator_uids - {my_uid}:
+        vneuron = await async_subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
+        if vneuron is None:
+            continue
+        v_stake = float(getattr(vneuron, "stake", 0.0))
+        if v_stake <= 0:
+            continue
+        for uid, w in vneuron.weights:
+            uid_i = int(uid)
+            if uid_i in validator_uids or uid_i == my_uid:
+                continue
+            fw = float(w)
+            if fw <= 0:
+                continue
+            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
+
+    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    miner_uids = [uid for uid, _ in top_peers]
+    if not miner_uids:
+        logger.warning("No miner UIDs with stake-weighted votes from other validators")
+        return False
+
+    weight = 1.0 / len(miner_uids)
+    logger.warning(
+        "No previous weights found on chain (async); submitting even fallback weights",
+        top_uids=miner_uids,
+    )
+    result = await async_subtensor.set_weights(
+        wallet=wallet,
+        netuid=config.chain.netuid,
+        uids=miner_uids,
+        weights=[weight] * len(miner_uids),
+        wait_for_inclusion=wait_for_inclusion,
+        wait_for_finalization=wait_for_finalization,
+    )
+    success = result[0] if isinstance(result, tuple) else bool(result)
+    if success:
+        logger.info("Fallback weights set successfully (async)", count=len(miner_uids))
+    else:
+        logger.warning("Failed to set fallback weights (async)")
+    return success
+
+
 # --- Chain weight submission ---
 @track_chain_commit_latency()
 @count_rpc_errors()
@@ -565,3 +677,122 @@ def submit_weights(
 
             logger.warning("set_weights failed; giving up", error=msg)
             return False
+
+
+def _normalize_uid_weights(
+    uid_weights: dict[int | str, float],
+    *,
+    normalize: bool,
+    top_k: int | None,
+) -> tuple[list[int], list[float]] | None:
+    """Filter, top-k, and normalize a uid → weight dict.
+
+    Returns (uids, weights) ready for `set_weights`, or None if no valid
+    weights remained after filtering.
+    """
+    filtered: list[tuple[int, float]] = []
+    for uid, w in uid_weights.items():
+        if w is None or not math.isfinite(w) or w <= 0:
+            continue
+        filtered.append((int(uid), float(w)))
+
+    if not filtered:
+        return None
+
+    if top_k is not None:
+        if top_k <= 0:
+            raise ValueError("top_k must be > 0 when provided.")
+        filtered = sorted(filtered, key=lambda x: x[1], reverse=True)[:top_k]
+
+    uids_f, weights_f = zip(*filtered, strict=True)
+    weights_list = list(weights_f)
+
+    if normalize:
+        total = sum(weights_list)
+        if total <= 0:
+            return None
+        weights_list = [w / total for w in weights_list]
+
+    return list(uids_f), weights_list
+
+
+async def submit_weights_async(
+    config: WorkerConfig,
+    wallet: bittensor.Wallet,
+    async_subtensor: "bittensor.AsyncSubtensor",
+    uid_weights: dict[int | str, float],
+    normalize: bool = True,
+    top_k: int | None = None,
+    wait_for_inclusion: bool = False,
+    wait_for_finalization: bool = False,
+) -> bool:
+    """Async equivalent of `submit_weights` for use against an AsyncSubtensor.
+
+    On transient WS failures the caller's AsyncSubtensor is reused for
+    retries — its WebSocket reconnects on its own; reopening it from
+    inside this helper would race the caller's other in-flight calls.
+    """
+    prepared = _normalize_uid_weights(uid_weights, normalize=normalize, top_k=top_k)
+    if prepared is None:
+        logger.warning(
+            "submit_weights_async: no valid weights to submit",
+            uids=len(uid_weights),
+        )
+        return False
+    uids, weights_list = prepared
+
+    kwargs = dict(
+        wallet=wallet,
+        netuid=config.chain.netuid,
+        uids=uids,
+        weights=weights_list,
+        wait_for_inclusion=wait_for_inclusion,
+        wait_for_finalization=wait_for_finalization,
+    )
+
+    max_retries = _WEIGHT_SUBMIT_MAX_RETRIES
+    backoff_s = _WEIGHT_SUBMIT_BACKOFF_S
+
+    for attempt in range(max_retries + 1):
+        try:
+            try:
+                result = await async_subtensor.set_weights(**kwargs)
+            except TypeError:
+                kwargs.pop("wait_for_inclusion", None)
+                kwargs.pop("wait_for_finalization", None)
+                result = await async_subtensor.set_weights(**kwargs)
+
+            success = result[0] if isinstance(result, tuple) else bool(result)
+            if not success:
+                logger.warning(
+                    "submit_weights_async: chain rejected weights",
+                    netuid=config.chain.netuid, count=len(weights_list),
+                )
+            else:
+                logger.info(
+                    "submit_weights_async: set weights on chain",
+                    netuid=config.chain.netuid,
+                    count=len(weights_list),
+                    weights={int(uid): round(w, 4) for uid, w in zip(uids, weights_list, strict=True)},
+                )
+            return success
+        except Exception as exc:
+            msg = str(exc)
+            retryable = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+            if ConnectionClosedError is not None and isinstance(exc, ConnectionClosedError):
+                retryable = True
+            if "keepalive ping timeout" in msg or "ConnectionClosedError" in msg:
+                retryable = True
+
+            if attempt < max_retries and retryable:
+                logger.warning(
+                    "submit_weights_async: retrying",
+                    attempt=attempt + 1, max_retries=max_retries, error=msg,
+                )
+                await asyncio.sleep(backoff_s * (attempt + 1))
+                continue
+
+            logger.warning("submit_weights_async: giving up", error=msg)
+            return False
+
+    return False

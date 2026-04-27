@@ -179,7 +179,7 @@ def download_checkpoint_from_hf(
             f"HF repo not found or unauthorized: {repo_id}@{revision}"
         ) from e
 
-    logger.info(
+    logger.debug(
         "Downloaded checkpoint from HF",
         repo_id=repo_id,
         revision=revision,
