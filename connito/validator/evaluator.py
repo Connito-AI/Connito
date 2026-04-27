@@ -274,35 +274,14 @@ async def evaluate_foreground_round(
     """Foreground (step 2): evaluate the round's top-N miners during
     Submission + Validate.
 
-    Walks `round_obj.foreground_uids` only; downloads miner checkpoints
-    from HF and from the existing HTTP submission path; calls
-    `evaluate_one_miner` for each. UIDs that exceed the per-miner budget
-    or fail to download by `end_block` are left unclaimed so the
-    `BackgroundEvalWorker` can pick them up in step 3.
+    Walks `round_obj.foreground_uids` only and calls `evaluate_one_miner`
+    for each. Miner checkpoints are made available locally by the
+    `BackgroundDownloadWorker` (HF) and the HTTP `/submit-checkpoint`
+    path; this function does not pull from HF itself. UIDs that exceed
+    the per-miner budget or fail to land by `end_block` are left
+    unclaimed so the `BackgroundEvalWorker` can pick them up in step 3.
     """
-    from connito.shared.cycle import gather_validation_job, hydrate_miner_submissions_from_hf
-
-    # Kick off HF hydration in the background while baseline + polling run.
-    async def _hydrate() -> None:
-        try:
-            hydration_subtensor = await asyncio.to_thread(
-                bittensor.Subtensor, network=subtensor.network
-            )
-        except Exception as e:
-            logger.warning("foreground eval: failed to open hydration subtensor", error=str(e))
-            return
-        try:
-            hydrated = await asyncio.to_thread(
-                hydrate_miner_submissions_from_hf,
-                config,
-                hydration_subtensor,
-                round_obj.validator_miner_assignment,
-            )
-            logger.info("foreground eval: hydrated miner submissions from HF", count=hydrated)
-        except Exception as e:
-            logger.warning("foreground eval: HF hydration failed", error=str(e))
-
-    hydration_task = asyncio.create_task(_hydrate())
+    from connito.shared.cycle import gather_validation_job
 
     # Baseline once against the round's input model (= live `base_model`,
     # which equals round.model_snapshot_cpu since the foreground runs
@@ -325,85 +304,77 @@ async def evaluate_foreground_round(
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = []
 
-    try:
-        while subtensor.block <= end_block:
-            try:
-                discovered = gather_validation_job(
-                    config,
-                    subtensor,
-                    step=step,
-                    validator_miner_assignment=round_obj.validator_miner_assignment,
-                )
-            except Exception as e:
-                logger.warning("foreground eval: gather_validation_job failed", error=str(e))
-                discovered = []
-
-            # Walk top-N in incentive order; pick up any whose checkpoint
-            # has landed and is not yet claimed/scored.
-            by_uid: dict[int, MinerEvalJob] = {j.uid: j for j in discovered if j.uid in foreground_set}
-            progressed = False
-            for entry in round_obj.roster:
-                if entry.uid not in foreground_set:
-                    continue
-                if entry.uid not in by_uid:
-                    continue
-                if not round_obj.claim_for_foreground(entry.uid):
-                    continue
-                job = by_uid[entry.uid]
-                progressed = True
-                eval_coro = evaluate_one_miner(
-                    config=config,
-                    model_path=job.model_path,
-                    uid=entry.uid,
-                    hotkey=entry.hotkey,
-                    base_model=base_model,
-                    tokenizer=tokenizer,
-                    combined_seed=round_obj.seed,
-                    device=device,
-                    score_aggregator=score_aggregator,
-                    baseline_loss=baseline_loss,
-                    step=step,
-                    round_id=round_obj.round_id,
-                )
-                try:
-                    if per_miner_eval_timeout_sec:
-                        evaluated = await asyncio.wait_for(eval_coro, timeout=per_miner_eval_timeout_sec)
-                    else:
-                        evaluated = await eval_coro
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "foreground eval: per-miner timeout — leaving for background spillover",
-                        uid=entry.uid, hotkey=entry.hotkey[:6],
-                    )
-                    round_obj.release_claim(entry.uid)
-                    continue
-                except Exception as e:
-                    logger.exception("foreground eval: unexpected failure", uid=entry.uid, error=str(e))
-                    round_obj.release_claim(entry.uid)
-                    continue
-
-                if evaluated is None:
-                    round_obj.release_claim(entry.uid)
-                    continue
-                round_obj.mark_scored(entry.uid)
-                completed.append(evaluated)
-
-            # Stop once every top-N UID is scored or the phase boundary hits.
-            scored_top_n = sum(1 for u in foreground_set if u in round_obj.scored_uids)
-            if scored_top_n >= len(foreground_set):
-                break
-
-            if subtensor.block > end_block:
-                break
-            if not progressed:
-                await asyncio.sleep(poll_interval_sec)
-    finally:
-        if not hydration_task.done():
-            hydration_task.cancel()
+    while subtensor.block <= end_block:
         try:
-            await hydration_task
-        except (asyncio.CancelledError, Exception):
-            pass
+            discovered = gather_validation_job(
+                config,
+                subtensor,
+                step=step,
+                validator_miner_assignment=round_obj.validator_miner_assignment,
+            )
+        except Exception as e:
+            logger.warning("foreground eval: gather_validation_job failed", error=str(e))
+            discovered = []
+
+        # Walk top-N in incentive order; pick up any whose checkpoint
+        # has landed and is not yet claimed/scored.
+        by_uid: dict[int, MinerEvalJob] = {j.uid: j for j in discovered if j.uid in foreground_set}
+        progressed = False
+        for entry in round_obj.roster:
+            if entry.uid not in foreground_set:
+                continue
+            if entry.uid not in by_uid:
+                continue
+            if not round_obj.claim_for_foreground(entry.uid):
+                continue
+            job = by_uid[entry.uid]
+            progressed = True
+            eval_coro = evaluate_one_miner(
+                config=config,
+                model_path=job.model_path,
+                uid=entry.uid,
+                hotkey=entry.hotkey,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                combined_seed=round_obj.seed,
+                device=device,
+                score_aggregator=score_aggregator,
+                baseline_loss=baseline_loss,
+                step=step,
+                round_id=round_obj.round_id,
+            )
+            try:
+                if per_miner_eval_timeout_sec:
+                    evaluated = await asyncio.wait_for(eval_coro, timeout=per_miner_eval_timeout_sec)
+                else:
+                    evaluated = await eval_coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "foreground eval: per-miner timeout — leaving for background spillover",
+                    uid=entry.uid, hotkey=entry.hotkey[:6],
+                )
+                round_obj.release_claim(entry.uid)
+                continue
+            except Exception as e:
+                logger.exception("foreground eval: unexpected failure", uid=entry.uid, error=str(e))
+                round_obj.release_claim(entry.uid)
+                continue
+
+            if evaluated is None:
+                round_obj.release_claim(entry.uid)
+                continue
+            round_obj.mark_scored(entry.uid)
+            completed.append(evaluated)
+
+        # Stop once every top-N UID is scored or the phase boundary hits.
+        scored_top_n = sum(1 for u in foreground_set if u in round_obj.scored_uids)
+        if scored_top_n >= len(foreground_set):
+            break
+
+        if subtensor.block > end_block:
+            break
+        if not progressed:
+            await asyncio.sleep(poll_interval_sec)
 
     logger.info(
         "foreground eval: complete",
