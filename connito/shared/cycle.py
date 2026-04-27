@@ -48,6 +48,10 @@ logger = structlog.get_logger(__name__)
 
 
 BITTENSOR_BLOCK_TIME_SECONDS: int = 12
+# Cap wait_till sleeps so a long phase-distance doesn't leave the process idle
+# for half an hour without re-checking the chain — it should wake up at least
+# every 15 minutes to handle phase resets, clock drift, and chain hiccups.
+WAIT_TILL_MAX_SLEEP_SECONDS: int = 15 * 60
 
 # Test toggle: when set, `wait_till` returns a synthetic PhaseResponse
 # immediately without sleeping or polling the chain. Drives end-to-end
@@ -244,6 +248,9 @@ def wait_till(
     first_print = True
     while True:
         ready, blocks_till, phase_response = should_act(config, phase_name, retry_blocks=poll_fallback_block)
+        if ready is False and blocks_till > 0:
+            sleep_sec = min(blocks_till, max(poll_fallback_block, blocks_till * 0.9)) * BITTENSOR_BLOCK_TIME_SECONDS
+            sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
 
         # Blocks remaining until target = phase_start_block + block_offset.
         # Once `ready` flips True we're inside the named phase; before that
