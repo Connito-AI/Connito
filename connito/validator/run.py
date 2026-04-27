@@ -649,6 +649,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     outer_optimizer.zero_grad()
 
     current_model_hash = None
+    # Last successfully-published HF coordinates from the validator_commit_2 path
+    # below. Re-emitted in every miner_commit_1 commit so the chain commit slot
+    # never goes empty between cycles (commit_status replaces the slot, not appends).
+    last_published_hf_chain_repo_id: str | None = None
+    last_published_hf_revision: str | None = None
 
     if config.ckpt.cleanup_stale_temporary_checkpoints:
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
@@ -707,6 +712,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     model_hash=current_model_hash,
                     global_ver=global_opt_step,
                     expert_group=config.task.exp.group_id,
+                    hf_repo_id=last_published_hf_chain_repo_id if last_published_hf_revision else None,
+                    hf_revision=(
+                        last_published_hf_revision[:HF_CHAIN_REVISION_LENGTH]
+                        if last_published_hf_revision
+                        else None
+                    ),
                 ),
             )
 
@@ -1005,6 +1016,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
                     ),
                 )
+                # Remember the last successful HF coordinates so the next cycle's
+                # miner_commit_1 commit can re-advertise them instead of blanking.
+                if hf_revision:
+                    last_published_hf_chain_repo_id = hf_chain_repo_id
+                    last_published_hf_revision = hf_revision
 
                 if config.ckpt.checkpoint_topk is not None:
                     ckpt_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, config.ckpt.checkpoint_topk)
