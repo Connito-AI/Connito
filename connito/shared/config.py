@@ -816,8 +816,8 @@ class EvalCfg(BaseConfig):
     score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
     foreground_top_n: PositiveInt = 5
     background_worker_enabled: bool = True
-    per_miner_download_timeout_sec: PositiveInt = 120
-    per_miner_eval_timeout_sec: PositiveInt = 60
+    per_miner_download_timeout_sec: PositiveInt = 180
+    per_miner_eval_timeout_sec: PositiveInt = 300
 
 
 class ValidatorConfig(WorkerConfig):

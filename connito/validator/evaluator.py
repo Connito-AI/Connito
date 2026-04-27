@@ -304,6 +304,17 @@ async def evaluate_foreground_round(
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = []
 
+    logger.info(
+        "foreground eval: starting",
+        round_id=round_obj.round_id,
+        foreground_uids=list(round_obj.foreground_uids),
+        end_block=end_block,
+        current_block=subtensor.block,
+        baseline_loss=round(baseline_loss, 4),
+        per_miner_eval_timeout_sec=per_miner_eval_timeout_sec,
+    )
+
+    poll_idx = 0
     while subtensor.block <= end_block:
         try:
             discovered = gather_validation_job(
@@ -319,6 +330,21 @@ async def evaluate_foreground_round(
         # Walk foreground UIDs in incentive order; pick up any whose
         # checkpoint has landed and is not yet claimed/scored.
         by_uid: dict[int, MinerEvalJob] = {j.uid: j for j in discovered if j.uid in foreground_set}
+        scored_count = sum(1 for u in foreground_set if u in round_obj.scored_uids)
+        current_block = subtensor.block
+        logger.info(
+            "foreground eval: poll",
+            round_id=round_obj.round_id,
+            poll_idx=poll_idx,
+            current_block=current_block,
+            blocks_remaining=max(0, end_block - current_block),
+            discovered_total=len(discovered),
+            discovered_in_foreground=len(by_uid),
+            ready_uids=sorted(by_uid.keys()),
+            scored=scored_count,
+            foreground_total=len(foreground_set),
+        )
+        poll_idx += 1
         progressed = False
         for uid in round_obj.foreground_uids:
             if uid not in by_uid:
@@ -349,18 +375,18 @@ async def evaluate_foreground_round(
                     evaluated = await eval_coro
             except asyncio.TimeoutError:
                 logger.warning(
-                    "foreground eval: per-miner timeout — leaving for background spillover",
+                    "foreground eval: per-miner timeout — marking failed",
                     uid=uid, hotkey=hotkey[:6],
                 )
-                round_obj.release_claim(uid)
+                round_obj.mark_failed(uid)
                 continue
             except Exception as e:
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
-                round_obj.release_claim(uid)
+                round_obj.mark_failed(uid)
                 continue
 
             if evaluated is None:
-                round_obj.release_claim(uid)
+                round_obj.mark_failed(uid)
                 continue
             round_obj.mark_scored(uid)
             completed.append(evaluated)

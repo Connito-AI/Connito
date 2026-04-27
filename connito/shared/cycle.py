@@ -174,6 +174,10 @@ def _synth_phase_response_for_test(
     current_block = last_phase_response.block if last_phase_response is not None else 0
     period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
     period = int(getattr(config.cycle, period_attr, 0))
+    # In test mode, give Submission a fixed 30-block window so foreground
+    # evaluation has room to land miners regardless of the prod cycle config.
+    if phase_name == PhaseNames.submission:
+        period = 30
     return PhaseResponse(
         block=current_block,
         cycle_length=int(getattr(config.cycle, "cycle_length", 0)),

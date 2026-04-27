@@ -74,10 +74,22 @@ class BackgroundDownloadWorker(threading.Thread):
             logger.warning("BackgroundDownloadWorker: failed to open subtensor; exiting", error=str(e))
             return
 
+        logger.info(
+            "BackgroundDownloadWorker: started",
+            network=self.config.chain.network,
+            poll_interval_sec=self.poll_interval_sec,
+        )
+
+        # Rate-limit idle-state logs to roughly once every IDLE_LOG_EVERY ticks.
+        IDLE_LOG_EVERY = 5
+        idle_ticks = 0
         try:
             while not self.stop_event.is_set():
                 round_obj = self.round_ref.current
                 if round_obj is None:
+                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                        logger.info("bg-download: idle — no current round")
+                    idle_ticks += 1
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
 
@@ -88,16 +100,34 @@ class BackgroundDownloadWorker(threading.Thread):
                 except Exception:
                     pass
                 if paused:
+                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                        logger.info(
+                            "bg-download: paused",
+                            foreground_active=self.foreground_active.is_set(),
+                            merge_phase_active=self.merge_phase_active.is_set(),
+                        )
+                    idle_ticks += 1
                     await self._wait_clear()
                     continue
 
                 # Pick the next UID to download.
                 target = self._next_target(round_obj)
                 if target is None:
-                    # Nothing to do for the current round; sleep and re-check.
+                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                        try:
+                            stats = round_obj.stats()
+                        except Exception:
+                            stats = None
+                        logger.info(
+                            "bg-download: no pending targets",
+                            round_id=getattr(round_obj, "round_id", None),
+                            round_stats=stats,
+                        )
+                    idle_ticks += 1
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
 
+                idle_ticks = 0
                 uid, hotkey = target
                 await self._download_one(round_obj, uid=uid, hotkey=hotkey)
         finally:
@@ -150,6 +180,10 @@ class BackgroundDownloadWorker(threading.Thread):
             # (HTTP path or earlier hydration may have written it).
             existing = self._existing_submission(submission_dir, hotkey)
             if existing is not None:
+                logger.info(
+                    "bg-download: submission already on disk; reusing",
+                    uid=uid, hotkey=hotkey[:6], path=str(existing),
+                )
                 round_obj.publish_download(uid, existing)
                 self._update_pending_metric(round_obj)
                 return
@@ -159,6 +193,13 @@ class BackgroundDownloadWorker(threading.Thread):
             dest_name = f"hotkey_{hotkey}_block_{block}.pt"
             dest = submission_dir / dest_name
 
+            logger.info(
+                "bg-download: fetching",
+                uid=uid, hotkey=hotkey[:6],
+                repo_id=repo_id,
+                revision=(revision[:8] if revision else None),
+                timeout_sec=timeout,
+            )
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(
@@ -187,7 +228,16 @@ class BackgroundDownloadWorker(threading.Thread):
 
             round_obj.publish_download(uid, dest)
             self._update_pending_metric(round_obj)
-            logger.info("bg-download: published", uid=uid, hotkey=hotkey[:6], dest=str(dest))
+            try:
+                size_bytes = dest.stat().st_size
+            except OSError:
+                size_bytes = None
+            logger.info(
+                "bg-download: success",
+                uid=uid, hotkey=hotkey[:6],
+                dest=str(dest),
+                size_bytes=size_bytes,
+            )
         except Exception as e:
             logger.exception("bg-download: unexpected failure", uid=uid, error=str(e))
 

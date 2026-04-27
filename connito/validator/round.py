@@ -138,14 +138,22 @@ class Round:
     # ---------------- Claim / score helpers ----------------
     def claim_for_foreground(self, uid: int) -> bool:
         with self._lock:
-            if uid in self.claimed_uids or uid in self.scored_uids:
+            if (
+                uid in self.claimed_uids
+                or uid in self.scored_uids
+                or uid in self.failed_uids
+            ):
                 return False
             self.claimed_uids.add(uid)
             return True
 
     def claim_for_eval(self, uid: int) -> bool:
         with self._lock:
-            if uid in self.claimed_uids or uid in self.scored_uids:
+            if (
+                uid in self.claimed_uids
+                or uid in self.scored_uids
+                or uid in self.failed_uids
+            ):
                 return False
             self.claimed_uids.add(uid)
             return True
@@ -214,11 +222,13 @@ class Round:
 
     def next_for_eval(self) -> Iterable[RosterEntry]:
         """Yield (uid, hotkey) for every miner whose checkpoint is downloaded
-        and not yet scored/claimed, in foreground-then-background order."""
+        and not yet scored/claimed/failed, in foreground-then-background order."""
         with self._lock:
             candidates = {
                 u for u in self.downloaded_pool
-                if u not in self.scored_uids and u not in self.claimed_uids
+                if u not in self.scored_uids
+                and u not in self.claimed_uids
+                and u not in self.failed_uids
             }
         for uid in (*self.foreground_uids, *self.background_uids):
             if uid in candidates:

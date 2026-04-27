@@ -93,6 +93,16 @@ class BackgroundEvalWorker(threading.Thread):
             logger.exception("BackgroundEvalWorker: failed to construct eval_base_model", error=str(e))
             return
 
+        logger.info(
+            "BackgroundEvalWorker: started",
+            device=str(self.device),
+            poll_interval_sec=self.poll_interval_sec,
+            per_miner_eval_timeout_sec=self.config.evaluation.per_miner_eval_timeout_sec,
+        )
+
+        # Rate-limit idle-state logs.
+        IDLE_LOG_EVERY = 10  # ~20s at 2s poll interval
+        idle_ticks = 0
         try:
             while not self.stop_event.is_set():
                 # Invariant: do not enter waits while owning the lock.
@@ -109,6 +119,14 @@ class BackgroundEvalWorker(threading.Thread):
                 except Exception:
                     pass
                 if gated:
+                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                        logger.info(
+                            "bg-eval: gated",
+                            has_round=round_obj is not None,
+                            merge_phase_active=self.merge_phase_active.is_set(),
+                            eval_window_active=self.eval_window_active.is_set(),
+                        )
+                    idle_ticks += 1
                     await self._wait_clear()
                     continue
 
@@ -118,9 +136,21 @@ class BackgroundEvalWorker(threading.Thread):
 
                 target = self._next_target(round_obj)
                 if target is None:
+                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                        try:
+                            stats = round_obj.stats()
+                        except Exception:
+                            stats = None
+                        logger.info(
+                            "bg-eval: no pending targets",
+                            round_id=round_obj.round_id,
+                            round_stats=stats,
+                        )
+                    idle_ticks += 1
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
 
+                idle_ticks = 0
                 uid, hotkey = target
                 await self._evaluate_one(round_obj, uid=uid, hotkey=hotkey)
         finally:
@@ -217,6 +247,14 @@ class BackgroundEvalWorker(threading.Thread):
         timeout = float(self.config.evaluation.per_miner_eval_timeout_sec)
         baseline = self._loaded_baseline_loss if self._loaded_baseline_loss is not None else 100.0
 
+        logger.info(
+            "bg-eval: evaluating",
+            round_id=round_obj.round_id,
+            uid=uid, hotkey=hotkey[:6],
+            model_path=str(path),
+            timeout_sec=timeout,
+        )
+
         # Wrap the GPU-touching work so the lock is held only for the eval
         # itself. evaluate_one_miner is async but the heavy GPU ops happen
         # inside asyncio.to_thread; we acquire the lock around the whole
@@ -259,6 +297,11 @@ class BackgroundEvalWorker(threading.Thread):
             return
 
         round_obj.mark_scored(uid)
+        logger.info(
+            "bg-eval: success",
+            round_id=round_obj.round_id,
+            uid=uid, hotkey=hotkey[:6],
+        )
         # Persist the aggregator atomically after each scored miner so a
         # crash mid-round does not lose work already done.
         try:
