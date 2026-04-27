@@ -314,6 +314,36 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
         )
     miners = [m for m in miners if m in miners_with_checkpoint]
 
+    # Rank miners by incentive desc and keep only the top
+    # max_miners_per_validator * num_validators. The remainder is dropped
+    # before assignment so validators do not waste cycles on low-incentive
+    # miners that would never be reached anyway.
+    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+    hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
+
+    def _incentive(hk: str) -> float:
+        uid = hotkey_to_uid.get(hk)
+        if uid is None:
+            return 0.0
+        try:
+            return float(metagraph.incentive[uid].item())
+        except Exception:
+            return 0.0
+
+    # Tie-break on hotkey for determinism across validators.
+    miners.sort(key=lambda hk: (-_incentive(hk), hk))
+
+    cap = config.cycle.max_miners_per_validator * max(len(validator_seeds), 1)
+    truncated = miners[cap:]
+    miners = miners[:cap]
+    if truncated:
+        logger.debug(
+            "get_validator_miner_assignment: dropped low-incentive miners beyond capacity",
+            kept=len(miners),
+            dropped=len(truncated),
+            cap=cap,
+        )
+
     logger.debug(
         "get_validator_miner_assignment: inputs",
         expert_group_id=config.task.exp.group_id,
