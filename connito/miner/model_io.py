@@ -281,6 +281,9 @@ def _upload_checkpoint_to_hf_safe(
                 f"miner submission global_ver={latest_checkpoint.global_ver} "
                 f"expert_group={config.task.exp.group_id}"
             ),
+            # Validators only fetch model_expgroup_{group_id}.pt from miner
+            # submissions, so skip model_shared.pt to keep uploads small.
+            allow_patterns=[f"model_expgroup_{config.task.exp.group_id}.pt"],
         )
     except Exception as e:
         logger.error(
