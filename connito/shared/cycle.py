@@ -198,9 +198,24 @@ def wait_till(config: MinerConfig | ValidatorConfig, phase_name: str, poll_fallb
             config, phase_name, retry_blocks=poll_fallback_block,
         )
         synthetic = _synth_phase_response_for_test(config, phase_name, last_phase_response)
+        period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
+        upstream_phase = last_phase_response.phase_name if last_phase_response is not None else None
+        upstream_block = last_phase_response.block if last_phase_response is not None else None
         log_phase(
-            f"<{phase_name}> [TEST MODE] returning synthetic phase_response "
-            f"(block={synthetic.phase_start_block}, end={synthetic.phase_end_block})"
+            f"<{phase_name}> [TEST MODE] returning synthetic phase_response",
+            phase_name=synthetic.phase_name,
+            block=synthetic.block,
+            phase_start_block=synthetic.phase_start_block,
+            phase_end_block=synthetic.phase_end_block,
+            blocks_into_phase=synthetic.blocks_into_phase,
+            blocks_remaining_in_phase=synthetic.blocks_remaining_in_phase,
+            cycle_length=synthetic.cycle_length,
+            cycle_index=synthetic.cycle_index,
+            cycle_block_index=synthetic.cycle_block_index,
+            phase_index=synthetic.phase_index,
+            period_attr=period_attr,
+            upstream_phase_from_api=upstream_phase,
+            upstream_block_from_api=upstream_block,
         )
         return synthetic
 

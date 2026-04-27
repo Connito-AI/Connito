@@ -7,8 +7,8 @@ result, mirroring the previous sync behaviour without making the whole
 main loop async.
 
 Single instance per process (one persistent connection cache, one
-in-flight queue). The `BackgroundWeightSubmitter` shares the same runner
-so its async `set_weights` calls don't race the main loop's `set_commitment`.
+in-flight queue). The `ChainSubmitter` owns this runner so its async
+`set_weights` and `set_commitment` calls share one loop and don't race.
 """
 
 from __future__ import annotations

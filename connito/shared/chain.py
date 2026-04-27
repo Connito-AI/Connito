@@ -316,7 +316,7 @@ def get_chain_commits(
 
 
 # --- setup chain worker ---
-def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True, async_lite=False):
+def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
     """Create the chain connections this worker needs.
 
     Returns ``(wallet, subtensor, lite_subtensor)``:
@@ -325,20 +325,7 @@ def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True, 
       because ``get_chain_commits`` issues historical ``block=N`` queries.
     - ``lite_subtensor`` uses ``config.chain.lite_network`` (defaults to
       ``finney``) for operations that only need the current head.
-
-    When ``async_lite=True``, the lite slot is opened as a
-    ``bittensor.AsyncSubtensor`` instead of a sync ``Subtensor`` — sync
-    callers must drive its calls through `connito.shared.async_runner.AsyncRunner`.
-    The validator uses the async path so chain RPCs run on a single
-    connection-managed loop alongside the background weight submitter.
-    Miners keep the sync default.
-
-    ``serve=True`` requires a sync ``Subtensor`` for axon registration; it
-    is incompatible with ``async_lite=True``.
     """
-    if async_lite and serve:
-        raise ValueError("async_lite=True is incompatible with serve=True")
-
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     if subtensor is None:
         logger.debug("setup_chain_worker: creating archive Subtensor connection", network=config.chain.network)
@@ -348,19 +335,7 @@ def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True, 
 
     if lite_subtensor is None:
         lite_network = config.chain.lite_network
-        if async_lite:
-            logger.debug("setup_chain_worker: creating lite AsyncSubtensor", lite_network=lite_network or config.chain.network)
-            lite_subtensor = bittensor.AsyncSubtensor(network=lite_network or config.chain.network)
-            # Initialize the underlying connection synchronously by driving
-            # its initialize() coroutine on a one-shot loop. After this the
-            # caller must use AsyncRunner (or its own loop) for further calls.
-            init = getattr(lite_subtensor, "initialize", None)
-            if init is not None:
-                try:
-                    asyncio.run(init())
-                except Exception as e:
-                    logger.warning("setup_chain_worker: AsyncSubtensor.initialize() failed", error=str(e))
-        elif lite_network and lite_network != config.chain.network:
+        if lite_network and lite_network != config.chain.network:
             logger.debug("setup_chain_worker: creating lite Subtensor connection", lite_network=lite_network)
             lite_subtensor = bittensor.Subtensor(network=lite_network)
         else:

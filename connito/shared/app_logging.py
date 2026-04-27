@@ -44,7 +44,7 @@ def configure_logging() -> None:
             structlog.dev.ConsoleRenderer(
                 colors=True,
                 pad_event=28,  # adjust to your taste
-                exception_formatter=structlog.dev.rich_traceback,  # nicer tracebacks if 'rich' installed
+                exception_formatter=structlog.dev.plain_traceback,
             )
         ]
 

@@ -69,11 +69,8 @@ from connito.shared.chain import (
     ValidatorChainCommit,
     VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
     validate_validator_chain_commit_payload,
-    _asubmit_fallback_weights,
-    acommit_status,
     setup_chain_worker,
 )
-from connito.shared.async_runner import AsyncRunner
 from connito.shared.checkpoint_helper import (
     cleanup_temporary_checkpoint_dirs,
     load_checkpoint,
@@ -111,7 +108,7 @@ from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
-from connito.validator.background_weight_submitter import BackgroundWeightSubmitter
+from connito.validator.chain_submitter import ChainSubmitter
 from connito.validator.evaluator import (
     MinerEvalJob,
     evaluate_foreground_round,
@@ -558,14 +555,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     os.makedirs(config.ckpt.miner_submission_path, exist_ok=True)
 
     # === set up chain worker ===
-    # subtensor: archive connection (used by setup_training → load_model →
-    # get_chain_commits with historical block=).
-    # lite_subtensor: AsyncSubtensor (head-only ops). All sync call sites in
-    # this module drive its coroutines through `async_runner` so chain
-    # RPCs share a single managed connection with the BackgroundWeightSubmitter.
+    # subtensor: archive connection — only used by Round.freeze, which
+    # captures historical chain state at the round boundary.
+    # lite_subtensor: sync Subtensor for everything else in the main loop
+    # (metagraph, current block, peer connect, model load, phase checks).
+    # chain_submitter: owns an AsyncSubtensor + AsyncRunner; handles every
+    # non-blocking commit_status / set_weights call for this validator.
     validate_hf_distribution_config(config)
-    wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False, async_lite=True)
-    async_runner = AsyncRunner(name="connito-validator-async-runner")
+    wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
+    chain_submitter = ChainSubmitter(
+        config,
+        wallet,
+        normalize=True,
+        top_k=config.evaluation.top_k_miners_to_reward,
+    )
 
     # === set logging ===
     metric_logger = MetricLogger(config, rank)
@@ -585,7 +588,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         start_step,
         expert_manager,
         train_dataloader,
-    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+    ) = setup_training(config, rank, device, tokenizer, lite_subtensor, wallet, current_model_meta=None)
 
     global_opt_step = start_step
     # Tracks whether this validator participated in the last allreduce.
@@ -621,30 +624,25 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         logger.info("Disabling averager for non-active expert group", excluded_group_id=gid, active_group_id=active_group_id)
         del group_grad_buff_meta[gid]
 
-    dht = connect_with_peers(config, wallet, subtensor)
+    dht = connect_with_peers(config, wallet, lite_subtensor)
 
     group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
 
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
-        subtensor=subtensor, 
-        phase_manager=PhaseManager(config, subtensor),
+        subtensor=lite_subtensor,
+        phase_manager=PhaseManager(config, lite_subtensor),
         group_averagers=group_averagers,
         interval_sec=12.0
     )
     poller.start()
 
 
-    # === commit status === (non-blocking; coroutine queued on async_runner)
-    async_runner.submit(acommit_status(
-        config,
-        wallet,
-        lite_subtensor,
-        ValidatorChainCommit(
-            model_hash=None,
-            global_ver=global_opt_step,
-            expert_group=config.task.exp.group_id,
-        ),
+    # === commit status === (non-blocking; queued on chain_submitter)
+    chain_submitter.async_commit(ValidatorChainCommit(
+        model_hash=None,
+        global_ver=global_opt_step,
+        expert_group=config.task.exp.group_id,
     ))
 
     # === training ===
@@ -678,10 +676,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     eval_worker: BackgroundEvalWorker | None = None
     if config.evaluation.background_worker_enabled:
         def _eval_model_factory():
-            # Build a fresh model with the same architecture as global_model;
-            # state_dict is loaded later from each round's CPU snapshot.
+            # Runs on a worker thread (via asyncio.to_thread). Open a
+            # dedicated Subtensor here so its WebSocket is not shared with
+            # the main loop's lite_subtensor — the substrate WS is not
+            # safe to use from two threads concurrently.
+            eval_subtensor = bittensor.Subtensor(
+                network=config.chain.lite_network or config.chain.network,
+            )
             new_model, _ = load_model(
-                rank, config, expert_manager, subtensor, wallet, None,
+                rank, config, expert_manager, eval_subtensor, wallet, None,
                 partial=True, checkpoint_device=device,
             )
             return new_model
@@ -708,18 +711,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         eval_worker.start()
         logger.info("Background download + eval workers started")
 
-    # Background weight submitter — schedules weight submission coroutines on
-    # the shared async_runner so they share a single AsyncSubtensor connection
-    # with the main loop's commit_status / fallback / metagraph calls.
-    weight_submitter = BackgroundWeightSubmitter(
-        config=config,
-        wallet=wallet,
-        async_subtensor=lite_subtensor,
-        runner=async_runner,
-        normalize=True,
-        top_k=config.evaluation.top_k_miners_to_reward,
-    )
-    logger.info("Background weight submitter ready")
+    logger.info("ChainSubmitter ready")
 
     try:
         while True:
@@ -738,7 +730,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     global_model=global_model,
                     expert_manager=expert_manager,
                     device=device,
-                    subtensor=subtensor,
+                    subtensor=lite_subtensor,
                     wallet=wallet,
                 )
                 if success:
@@ -782,10 +774,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     round_id=pending_round.round_id,
                 )
                 uid_weights = score_aggregator.uid_score_pairs(how="avg")
-                # Fire-and-forget. The submitter runs on the shared
-                # async_runner loop and sets pending_round.weights_submitted
-                # once the chain accepts the call.
-                weight_submitter.submit(pending_round, uid_weights)
+                # Fire-and-forget. ChainSubmitter sets
+                # pending_round.weights_submitted once the chain accepts the call.
+                chain_submitter.async_submit_weight(pending_round, uid_weights)
 
                 try:
                     score_aggregator.persist_atomic(score_path)
@@ -796,33 +787,25 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Fetch the metagraph once per cycle — it holds per-neuron tensors and
             # is reused later for penalizing missing submissions.
             max_weight_age = int(config.cycle.cycle_length)
-            metagraph = async_runner.run(lite_subtensor.metagraph(netuid=config.chain.netuid))
+            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
-            current_block = async_runner.run(lite_subtensor.get_current_block())
+            current_block = lite_subtensor.get_current_block()
             weight_age = current_block - last_update
             if weight_age > max_weight_age:
                 logger.info("Weights stale, submitting fallback (non-blocking)",
                             weight_age=weight_age, max_weight_age=max_weight_age)
-                # Non-blocking; the runner serializes this with the
+                # Non-blocking; ChainSubmitter serializes this with the
                 # commit_status that follows, so order is preserved.
-                async_runner.submit(_asubmit_fallback_weights(
-                    config, wallet, lite_subtensor,
-                    wait_for_inclusion=False, wait_for_finalization=False,
-                ))
+                chain_submitter.async_submit_fallback_weights()
 
-            async_runner.submit(acommit_status(
-                config,
-                wallet,
-                lite_subtensor,
-                ValidatorChainCommit(
-                    model_hash=current_model_hash,
-                    global_ver=global_opt_step,
-                    expert_group=config.task.exp.group_id,
-                ),
+            chain_submitter.async_commit(ValidatorChainCommit(
+                model_hash=current_model_hash,
+                global_ver=global_opt_step,
+                expert_group=config.task.exp.group_id,
             ))
 
-            check_phase_expired(subtensor, phase_response)
+            check_phase_expired(lite_subtensor, phase_response)
 
             # === Wait till Submission phase; freeze the round and start
             # foreground evaluation of the top-N (step 2). The round is the
@@ -835,7 +818,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 "(0) Submission phase entered — freezing round",
                 submission_start=phase_response.phase_start_block,
                 submission_end=phase_response.phase_end_block,
-                current_block=subtensor.block,
+                current_block=lite_subtensor.block,
             )
 
             cleanup(global_model)
@@ -864,7 +847,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     evaluate_foreground_round(
                         config=config,
                         round_obj=new_round,
-                        subtensor=subtensor,
+                        subtensor=lite_subtensor,
                         step=global_opt_step,
                         device=device,
                         score_aggregator=score_aggregator,
@@ -952,7 +935,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             cleanup(global_model)
 
-            check_phase_expired(subtensor, phase_response)
+            check_phase_expired(lite_subtensor, phase_response)
 
             # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
@@ -1042,7 +1025,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception:
                 pass
 
-            check_phase_expired(subtensor, phase_response)
+            check_phase_expired(lite_subtensor, phase_response)
 
             # === Comit to chain for new model ===
             model_ckpt = build_local_checkpoint(ckpt_path)
@@ -1053,16 +1036,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 current_model_hash = model_ckpt.model_hash
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
                 logger.info("(7) Commit new signed_model_hash for next validation (non-blocking)")
-                async_runner.submit(acommit_status(
-                    config,
-                    wallet,
-                    lite_subtensor,
-                    SignedModelHashChainCommit(
-                        signed_model_hash=model_ckpt.signed_model_hash,
-                    ),
+                chain_submitter.async_commit(SignedModelHashChainCommit(
+                    signed_model_hash=model_ckpt.signed_model_hash,
                 ))
 
-                check_phase_expired(subtensor, phase_response)
+                check_phase_expired(lite_subtensor, phase_response)
 
                 # Upload checkpoint to HuggingFace so miners can pull it during
                 # the Distribute phase. The returned revision SHA pins the exact
@@ -1124,17 +1102,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
                 logger.info("(8) Commit model_hash for next validation (non-blocking)")
-                async_runner.submit(acommit_status(
-                    config,
-                    wallet,
-                    lite_subtensor,
-                    ValidatorChainCommit(
-                        model_hash=model_ckpt.model_hash,
-                        global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
-                        expert_group=config.task.exp.group_id,
-                        hf_repo_id=hf_chain_repo_id if hf_revision else None,
-                        hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
-                    ),
+                chain_submitter.async_commit(ValidatorChainCommit(
+                    model_hash=model_ckpt.model_hash,
+                    global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
+                    expert_group=config.task.exp.group_id,
+                    hf_repo_id=hf_chain_repo_id if hf_revision else None,
+                    hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
                 ))
 
                 if config.ckpt.checkpoint_topk is not None:
@@ -1160,14 +1133,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             deleted = prune_miner_submission_files(
                 config.ckpt.miner_submission_path,
-                current_block=subtensor.block,
+                current_block=lite_subtensor.block,
                 cycle_length=config.cycle.cycle_length,
                 max_age_cycles=0,
             )
             logger.info(
                 "(10) Pruned aged miner submissions after cycle",
                 deleted=len(deleted),
-                current_block=subtensor.block,
+                current_block=lite_subtensor.block,
                 cycle_length=config.cycle.cycle_length,
                 max_age_cycles=0,
             )
@@ -1194,7 +1167,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
         # Stop the producer first so the eval worker drains its remaining
-        # claims; then stop the eval worker; finally stop the async_runner
+        # claims; then stop the eval worker; finally stop the chain_submitter
         # so any in-flight chain RPCs get cancelled cleanly.
         if download_worker is not None:
             download_worker.stop()
@@ -1204,7 +1177,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             download_worker.join(timeout=30)
         if eval_worker is not None:
             eval_worker.join(timeout=30)
-        async_runner.stop()
+        chain_submitter.stop()
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
@@ -1221,7 +1194,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             download_worker.join(timeout=30)
         if eval_worker is not None:
             eval_worker.join(timeout=30)
-        async_runner.stop()
+        chain_submitter.stop()
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
