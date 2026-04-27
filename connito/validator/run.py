@@ -555,10 +555,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     os.makedirs(config.ckpt.miner_submission_path, exist_ok=True)
 
     # === set up chain worker ===
-    # subtensor: archive connection — only used by Round.freeze, which
-    # captures historical chain state at the round boundary.
-    # lite_subtensor: sync Subtensor for everything else in the main loop
-    # (metagraph, current block, peer connect, model load, phase checks).
+    # subtensor: archive connection — required by callers that issue
+    # historical block queries (Round.freeze, setup_training/load_model,
+    # reload_model_inplace, evaluate_foreground_round, eval factory).
+    # lite_subtensor: sync Subtensor for head-only reads (metagraph,
+    # current block, peer connect, phase checks).
     # chain_submitter: owns an AsyncSubtensor + AsyncRunner; handles every
     # non-blocking commit_status / set_weights call for this validator.
     validate_hf_distribution_config(config)
@@ -588,7 +589,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         start_step,
         expert_manager,
         train_dataloader,
-    ) = setup_training(config, rank, device, tokenizer, lite_subtensor, wallet, current_model_meta=None)
+    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
     global_opt_step = start_step
     # Tracks whether this validator participated in the last allreduce.
@@ -677,12 +678,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     if config.evaluation.background_worker_enabled:
         def _eval_model_factory():
             # Runs on a worker thread (via asyncio.to_thread). Open a
-            # dedicated Subtensor here so its WebSocket is not shared with
-            # the main loop's lite_subtensor — the substrate WS is not
-            # safe to use from two threads concurrently.
-            eval_subtensor = bittensor.Subtensor(
-                network=config.chain.lite_network or config.chain.network,
-            )
+            # dedicated archive Subtensor here so its WebSocket is not
+            # shared with the main loop's subtensor — the substrate WS is
+            # not safe across threads — and load_model issues historical
+            # block queries that only an archive node can serve.
+            eval_subtensor = bittensor.Subtensor(network=config.chain.network)
             new_model, _ = load_model(
                 rank, config, expert_manager, eval_subtensor, wallet, None,
                 partial=True, checkpoint_device=device,
@@ -730,7 +730,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     global_model=global_model,
                     expert_manager=expert_manager,
                     device=device,
-                    subtensor=lite_subtensor,
+                    subtensor=subtensor,
                     wallet=wallet,
                 )
                 if success:
@@ -847,7 +847,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     evaluate_foreground_round(
                         config=config,
                         round_obj=new_round,
-                        subtensor=lite_subtensor,
+                        subtensor=subtensor,
                         step=global_opt_step,
                         device=device,
                         score_aggregator=score_aggregator,
