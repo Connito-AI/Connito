@@ -848,7 +848,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 subtensor=subtensor,
                 metagraph=metagraph,
                 global_model=global_model,
-                top_n=int(config.evaluation.foreground_top_n),
                 round_id=phase_response.phase_start_block,
             )
             round_ref.swap(new_current=new_round)

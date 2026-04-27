@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -21,30 +21,33 @@ from connito.shared.app_logging import structlog
 logger = structlog.get_logger(__name__)
 
 
-@dataclass(frozen=True)
-class RosterEntry:
+class RosterEntry(NamedTuple):
+    """Lightweight (uid, hotkey) pair yielded by Round iteration helpers."""
     uid: int
     hotkey: str
-    incentive: float
 
 
 @dataclass
 class Round:
     """Immutable snapshot of round K's inputs + mutable per-worker state.
 
-    The frozen pieces (round_id, seed, validator_miner_assignment, roster,
-    foreground_uids, background_uids, model_snapshot_cpu) are written once
-    by `Round.freeze` and never changed. The mutable pieces
-    (downloaded_pool, scored_uids, failed_uids, weights_submitted) are
-    guarded by an internal lock and are updated by the workers.
+    The frozen pieces are written once by `Round.freeze` and never changed.
+    The mutable pieces (downloaded_pool, scored_uids, failed_uids,
+    weights_submitted) are guarded by an internal lock and are updated by
+    the workers.
+
+    `foreground_uids` is this validator's assignment slice; `background_uids`
+    is every other miner with a chain checkpoint this cycle. `uid_to_hotkey`
+    covers the union, so workers don't need to hold a metagraph reference
+    to translate a UID back to a hotkey.
     """
 
     round_id: int
     seed: str
     validator_miner_assignment: dict[str, list[str]]
-    roster: tuple[RosterEntry, ...]
     foreground_uids: tuple[int, ...]
     background_uids: tuple[int, ...]
+    uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
 
     # Mutable, lock-guarded
@@ -65,7 +68,6 @@ class Round:
         subtensor,
         metagraph,
         global_model: nn.Module,
-        top_n: int,
         round_id: int | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
@@ -82,32 +84,28 @@ class Round:
         )
 
         seed = get_combined_validator_seed(config, subtensor)
-        assignment = get_validator_miner_assignment(config, subtensor)
-        my_assignment = assignment.get(config.chain.hotkey_ss58, [])
+        assignment_result = get_validator_miner_assignment(config, subtensor)
+        assignment = assignment_result.assignment
+        my_assignment_set = set(assignment.get(config.chain.hotkey_ss58, []))
 
-        incentive = metagraph.incentive  # torch.Tensor
-        hotkeys = list(metagraph.hotkeys)
+        hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
 
-        roster_entries: list[RosterEntry] = []
-        for hk in my_assignment:
-            try:
-                uid = hotkeys.index(hk)
-            except ValueError:
-                logger.warning("Round.freeze: assigned hotkey not in metagraph; skipping", hotkey=hk[:6])
+        # `miners_with_checkpoint` is already incentive-ranked. Walk it once
+        # and split into foreground (this validator's assignment) and
+        # background (everyone else with a checkpoint).
+        foreground: list[int] = []
+        background: list[int] = []
+        uid_to_hotkey: dict[int, str] = {}
+        for hk in assignment_result.miners_with_checkpoint:
+            uid = hotkey_to_uid.get(hk)
+            if uid is None:
+                logger.warning("Round.freeze: hotkey not in metagraph; skipping", hotkey=hk[:6])
                 continue
-            try:
-                inc = float(incentive[uid].item())
-            except Exception:
-                inc = 0.0
-            roster_entries.append(RosterEntry(uid=uid, hotkey=hk, incentive=inc))
+            uid_to_hotkey[uid] = hk
+            (foreground if hk in my_assignment_set else background).append(uid)
 
-        # Sort by incentive desc; tie-break on uid for determinism.
-        roster_entries.sort(key=lambda e: (-e.incentive, e.uid))
-        roster = tuple(roster_entries)
-
-        cap = max(0, int(top_n))
-        foreground_uids = tuple(e.uid for e in roster[:cap])
-        background_uids = tuple(e.uid for e in roster[cap:])
+        foreground_uids = tuple(foreground)
+        background_uids = tuple(background)
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
         # move to CPU so subsequent in-place mutations of global_model
@@ -121,19 +119,19 @@ class Round:
         logger.info(
             "Round.freeze: roster locked",
             round_id=rid,
-            roster_size=len(roster),
+            roster_size=len(uid_to_hotkey),
             foreground_size=len(foreground_uids),
             background_size=len(background_uids),
-            top_uids=[e.uid for e in roster[:cap]],
+            foreground_uids=list(foreground_uids),
         )
 
         return cls(
             round_id=rid,
             seed=seed,
             validator_miner_assignment=assignment,
-            roster=roster,
             foreground_uids=foreground_uids,
             background_uids=background_uids,
+            uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
         )
 
@@ -182,51 +180,72 @@ class Round:
             return uid in self.downloaded_pool
 
     # ---------------- Iteration helpers ----------------
+    @property
+    def assigned_uids(self) -> tuple[int, ...]:
+        """Alias for `foreground_uids` — the validator's assignment slice.
+        Kept under a separate name so callers (e.g. the missed-submission
+        penalty pass) can express *intent* without coupling to the fact
+        that today every assigned miner is also evaluated in foreground.
+        """
+        return self.foreground_uids
+
+    @property
+    def roster(self) -> tuple[RosterEntry, ...]:
+        """Foreground first, then background, both already incentive-ordered."""
+        return tuple(
+            RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
+            for uid in (*self.foreground_uids, *self.background_uids)
+        )
+
     def next_for_download(self) -> Iterable[RosterEntry]:
         """Yield background_uids in incentive order that are not yet
         downloaded, scored, or claimed. Re-checks state each iteration so
         pause/resume stays correct."""
-        bg_set = set(self.background_uids)
-        # Walk roster in original (incentive-desc) order to preserve priority.
-        for entry in self.roster:
-            if entry.uid not in bg_set:
-                continue
+        for uid in self.background_uids:
             with self._lock:
                 if (
-                    entry.uid in self.scored_uids
-                    or entry.uid in self.failed_uids
-                    or entry.uid in self.downloaded_pool
-                    or entry.uid in self.claimed_uids
+                    uid in self.scored_uids
+                    or uid in self.failed_uids
+                    or uid in self.downloaded_pool
+                    or uid in self.claimed_uids
                 ):
                     continue
-            yield entry
+            yield RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
 
     def next_for_eval(self) -> Iterable[RosterEntry]:
-        """Yield roster entries whose checkpoint is downloaded and not yet
-        scored/claimed."""
-        by_uid = {e.uid: e for e in self.roster}
+        """Yield (uid, hotkey) for every miner whose checkpoint is downloaded
+        and not yet scored/claimed, in foreground-then-background order."""
         with self._lock:
-            candidates = [u for u in self.downloaded_pool if u not in self.scored_uids and u not in self.claimed_uids]
-        # Iterate in incentive order over candidates to keep behavior
-        # deterministic across validators.
-        ordered = [e for e in self.roster if e.uid in candidates and e.uid in by_uid]
-        for entry in ordered:
-            yield entry
+            candidates = {
+                u for u in self.downloaded_pool
+                if u not in self.scored_uids and u not in self.claimed_uids
+            }
+        for uid in (*self.foreground_uids, *self.background_uids):
+            if uid in candidates:
+                yield RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
 
     def unscored_roster_uids(self) -> list[RosterEntry]:
+        """Assigned miners this validator did not score this round. Scoped
+        to `foreground_uids` so the penalty pass does not zero out miners
+        that belong to other validators' assignments."""
         with self._lock:
-            return [e for e in self.roster if e.uid not in self.scored_uids]
+            return [
+                RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
+                for uid in self.foreground_uids
+                if uid not in self.scored_uids
+            ]
 
     # ---------------- Stats ----------------
     def stats(self) -> dict[str, int]:
+        roster_size = len(self.foreground_uids) + len(self.background_uids)
         with self._lock:
             return {
-                "roster": len(self.roster),
+                "roster": roster_size,
                 "scored": len(self.scored_uids),
                 "failed": len(self.failed_uids),
                 "downloaded": len(self.downloaded_pool),
                 "claimed": len(self.claimed_uids),
-                "pending": len(self.roster) - len(self.scored_uids) - len(self.failed_uids),
+                "pending": roster_size - len(self.scored_uids) - len(self.failed_uids),
             }
 
 

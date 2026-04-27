@@ -110,8 +110,8 @@ def _freeze_round(
     config,
     metagraph,
     assignment: dict[str, list[str]],
+    miners_with_checkpoint: list[str] | None = None,
     seed: str = "deadbeef",
-    top_n: int = 2,
     round_id: int = 100,
     global_model: nn.Module | None = None,
 ) -> Round:
@@ -120,14 +120,27 @@ def _freeze_round(
         global_model = _make_model()
     subtensor = _fake_subtensor(metagraph, block=round_id)
 
+    if miners_with_checkpoint is None:
+        # Default: every miner across all validators' assignments has a
+        # checkpoint, ranked by metagraph incentive desc.
+        union = set()
+        for ms in assignment.values():
+            union.update(ms)
+        miners_with_checkpoint = sorted(
+            union,
+            key=lambda hk: (-metagraph.incentive[metagraph.hotkeys.index(hk)].item(), hk),
+        )
+    assignment_result = SimpleNamespace(
+        assignment=assignment,
+        miners_with_checkpoint=miners_with_checkpoint,
+    )
     with patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
-         patch("connito.shared.cycle.get_validator_miner_assignment", return_value=assignment):
+         patch("connito.shared.cycle.get_validator_miner_assignment", return_value=assignment_result):
         return Round.freeze(
             config=config,
             subtensor=subtensor,
             metagraph=metagraph,
             global_model=global_model,
-            top_n=top_n,
             round_id=round_id,
         )
 
@@ -138,26 +151,28 @@ def _freeze_round(
 
 class TestRoundFreeze:
     def test_roster_ordered_by_incentive_desc(self) -> None:
+        # Foreground == this validator's assignment (whole slice). Background
+        # is the rest of the roster — for a single-validator universe that
+        # set is empty.
         config = _fake_validator_config(my_hotkey="vhk")
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5, "hk_d": 0.3})
         assignment = {"vhk": ["hk_a", "hk_b", "hk_c", "hk_d"]}
 
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=2)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Ranked b > c > d > a by incentive
         assert [e.hotkey for e in rnd.roster] == ["hk_b", "hk_c", "hk_d", "hk_a"]
-        assert rnd.foreground_uids == (1, 2)  # uids of hk_b, hk_c
-        assert rnd.background_uids == (3, 0)  # uids of hk_d, hk_a
+        assert rnd.foreground_uids == (1, 2, 3, 0)  # all four, incentive desc
+        assert rnd.background_uids == ()
+        assert rnd.assigned_uids == rnd.foreground_uids
 
     def test_foreground_and_background_disjoint_and_cover_roster(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
         assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
 
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         all_uids = set(rnd.foreground_uids) | set(rnd.background_uids)
-        assert len(all_uids) == 3
         assert set(rnd.foreground_uids).isdisjoint(rnd.background_uids)
         assert all_uids == {e.uid for e in rnd.roster}
 
@@ -169,19 +184,26 @@ class TestRoundFreeze:
         # excluded.
         assignment = {"vhk": ["hk_a", "hk_b"]}
 
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         assert {e.hotkey for e in rnd.roster} == {"hk_a", "hk_b"}
 
-    def test_assignment_outside_validator_excluded(self) -> None:
+    def test_other_validators_assignment_lands_in_background(self) -> None:
         config = _fake_validator_config(my_hotkey="vhk")
         metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4})
-        # Some other validator's assignment shouldn't leak into ours.
+        # Other validators' miners are still in the roster — they end up
+        # in background_uids so bg-download can fetch them — but they are
+        # excluded from foreground and from the penalty pass (assigned_uids).
         assignment = {"vhk": ["hk_a"], "other_validator": ["hk_b"]}
 
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        assert [e.hotkey for e in rnd.roster] == ["hk_a"]
+        assert {e.hotkey for e in rnd.roster} == {"hk_a", "hk_b"}
+        uid_a = next(e.uid for e in rnd.roster if e.hotkey == "hk_a")
+        uid_b = next(e.uid for e in rnd.roster if e.hotkey == "hk_b")
+        assert rnd.foreground_uids == (uid_a,)
+        assert rnd.background_uids == (uid_b,)
+        assert rnd.assigned_uids == (uid_a,)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +220,7 @@ class TestSnapshotIsolation:
         global_model = _make_model(val=0.1)
         rnd = _freeze_round(
             config=config, metagraph=metagraph, assignment=assignment,
-            top_n=1, global_model=global_model,
+            global_model=global_model,
         )
 
         # Mutate the live model.
@@ -218,8 +240,9 @@ class TestBackgroundQueue:
     def test_next_for_download_walks_background_in_incentive_order(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5, "hk_d": 0.3})
-        assignment = {"vhk": ["hk_a", "hk_b", "hk_c", "hk_d"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        # Only hk_b is mine; the rest belong to other validators (background).
+        assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c", "hk_d"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         # Foreground = hk_b. Background = hk_c, hk_d, hk_a (incentive desc).
         order = [e.hotkey for e in rnd.next_for_download()]
@@ -228,8 +251,9 @@ class TestBackgroundQueue:
     def test_foreground_claim_removes_from_background_queue(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
-        assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        # hk_b is mine; hk_a and hk_c are someone else's so they go background.
+        assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         # Background candidates begin as [hk_c, hk_a].
         assert [e.hotkey for e in rnd.next_for_download()] == ["hk_c", "hk_a"]
@@ -243,8 +267,9 @@ class TestBackgroundQueue:
     def test_publish_download_then_pop_round_trip(self, tmp_path: Path) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.6})
-        assignment = {"vhk": ["hk_a", "hk_b"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        # hk_a is mine; hk_b belongs to another validator (background).
+        assignment = {"vhk": ["hk_a"], "other_validator": ["hk_b"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         bg_uid = rnd.background_uids[0]
         fake_path = tmp_path / "ckpt.pt"
@@ -269,7 +294,7 @@ class TestRoundClaims:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5})
         assignment = {"vhk": ["hk_a"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
         uid = rnd.foreground_uids[0]
 
         assert rnd.claim_for_foreground(uid) is True
@@ -284,12 +309,24 @@ class TestRoundClaims:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4})
         assignment = {"vhk": ["hk_a", "hk_b"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         # Score one; the other remains unscored.
         rnd.mark_scored(rnd.roster[0].uid)
         unscored = rnd.unscored_roster_uids()
         assert {e.uid for e in unscored} == {rnd.roster[1].uid}
+
+    def test_unscored_roster_uids_scoped_to_assigned(self) -> None:
+        # Other validators' miners are in the roster (so bg-download can
+        # reach them) but must not appear in the missed-submission penalty
+        # pass — that's only for miners *this* validator is responsible for.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4})
+        assignment = {"vhk": ["hk_a"], "other_validator": ["hk_b"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
+
+        unscored = rnd.unscored_roster_uids()
+        assert {e.hotkey for e in unscored} == {"hk_a"}
 
 
 # ---------------------------------------------------------------------------
@@ -399,12 +436,12 @@ class TestRoundRefSwap:
         assignment = {"vhk": ["hk_a"]}
 
         ref = RoundRef()
-        r1 = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1, round_id=100)
+        r1 = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=100)
         ref.swap(new_current=r1)
         assert ref.current is r1
         assert ref.previous is None
 
-        r2 = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1, round_id=200)
+        r2 = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=200)
         ref.swap(new_current=r2)
         assert ref.current is r2
         assert ref.previous is r1
@@ -457,7 +494,7 @@ class TestBackgroundEvalWorker:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5})
         assignment = {"vhk": ["hk_a"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1, round_id=100)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=100)
 
         ref = RoundRef()
         ref.swap(new_current=rnd)
@@ -492,7 +529,7 @@ class TestDelayedSubmission:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4, "hk_c": 0.3})
         assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1, round_id=999)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=999)
 
         agg = MinerScoreAggregator(max_points=8)
         # Score one miner during the cycle.
@@ -520,7 +557,7 @@ class TestDelayedSubmission:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5})
         assignment = {"vhk": ["hk_a"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, top_n=1)
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         rnd.weights_submitted = True
         # Mirroring run.py top-of-loop: only submit if not weights_submitted.

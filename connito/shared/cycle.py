@@ -6,7 +6,25 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+
+class ValidatorMinerAssignment(NamedTuple):
+    """Result of `get_validator_miner_assignment`.
+
+    Attributes:
+        assignment: validator_hotkey -> assigned miner hotkeys, post
+            incentive truncation and seeded distribution. This is the
+            "official" assignment used for foreground evaluation and the
+            penalty pass.
+        miners_with_checkpoint: every miner that has a chain checkpoint
+            this cycle (in the configured expert group), *before* the
+            `max_miners_per_validator * num_validators` incentive
+            truncation. Background download/eval can use this wider set
+            so it covers miners outside this validator's slice.
+    """
+    assignment: dict[str, list[str]]
+    miners_with_checkpoint: list[str]
 
 import bittensor
 import requests
@@ -189,7 +207,7 @@ def search_model_submission_destination(
     wallet: bittensor.Wallet, config: MinerConfig, subtensor: bittensor.Subtensor
 ) -> bittensor.Axon:
     
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
+    validator_miner_assignment = get_validator_miner_assignment(config, subtensor).assignment
 
     assigned_validator_hotkey = None
     for validator, miners in validator_miner_assignment.items():
@@ -287,7 +305,9 @@ def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subte
     return hashlib.sha256(combined_seed_str.encode()).hexdigest()
 
 
-def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Subtensor):
+def get_validator_miner_assignment(
+    config: WorkerConfig, subtensor: bittensor.Subtensor,
+) -> ValidatorMinerAssignment:
     from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
 
     commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
@@ -333,6 +353,11 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
     # Tie-break on hotkey for determinism across validators.
     miners.sort(key=lambda hk: (-_incentive(hk), hk))
 
+    # Snapshot the full incentive-ordered checkpoint set before truncation —
+    # callers that want subnet-wide coverage (e.g. bg-download/eval) need
+    # this; foreground assignment still uses the truncated slice.
+    all_miners_with_checkpoint = list(miners)
+
     cap = config.cycle.max_miners_per_validator * max(len(validator_seeds), 1)
     truncated = miners[cap:]
     miners = miners[:cap]
@@ -365,7 +390,10 @@ def get_validator_miner_assignment(config: WorkerConfig, subtensor: bittensor.Su
             for v, ms in validator_miner_assignment.items()
         },
     )
-    return validator_miner_assignment
+    return ValidatorMinerAssignment(
+        assignment=validator_miner_assignment,
+        miners_with_checkpoint=all_miners_with_checkpoint,
+    )
 
 
 def get_validator_seed_from_commit(config, commits):

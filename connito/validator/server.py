@@ -245,7 +245,7 @@ class ValidatorStateCache:
             or (prev_miner_commit_2_end is not None and prev_miner_commit_2_end != self._assignment_cache_block)
         )
         if should_refresh:
-            self._assignment_cache = get_validator_miner_assignment(self._config, self._subtensor)
+            self._assignment_cache = get_validator_miner_assignment(self._config, self._subtensor).assignment
             self._assignment_cache_block = prev_miner_commit_2_end
 
         return self._assignment_cache
