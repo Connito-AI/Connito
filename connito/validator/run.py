@@ -665,11 +665,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # eval_window_active: set after Merge(K) completes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
+    # download_window_closed: set when the main loop begins waiting for
+    #   MinerCommit1 of the next round (round K's downloads are dead weight
+    #   past that point); cleared at the next freeze. Pauses bg-download
+    #   from MinerCommit1(K+1) → Submission(K+1).
     # gpu_eval_lock: held by the eval worker only across its load_state_dict
     #   and evaluate_one_miner calls (yielded everywhere else; see plan).
     foreground_active = threading.Event()
     merge_phase_active = threading.Event()
     eval_window_active = threading.Event()
+    download_window_closed = threading.Event()
     gpu_eval_lock = threading.Lock()
     round_ref = RoundRef()
 
@@ -694,6 +699,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             round_ref=round_ref,
             foreground_active=foreground_active,
             merge_phase_active=merge_phase_active,
+            download_window_closed=download_window_closed,
         )
         eval_worker = BackgroundEvalWorker(
             config=config,
@@ -743,6 +749,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 _participated_in_merge = True  # reset regardless; try allreduce next cycle
 
             # === Wait till commit phase to submit random seed ===
+            # Round K's downloads are stale past this point — the eval window
+            # is closed by Merge and weights are about to be submitted below.
+            # Pause bg-download until the next freeze re-opens it.
+            download_window_closed.set()
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
             logger.info("(0) Commit new seed for next validation")
@@ -834,6 +844,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 round_id=phase_response.phase_start_block,
             )
             round_ref.swap(new_current=new_round)
+            download_window_closed.clear()
             try:
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
             except Exception:

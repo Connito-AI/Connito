@@ -3,11 +3,14 @@ background, in incentive order, into the round's `downloaded_pool`.
 
 This worker is network-only. It is paused while:
   - the foreground holds GPU/HF (`foreground_active` set), or
-  - the main loop is in the Merge phase (`merge_phase_active` set).
+  - the main loop is in the Merge phase (`merge_phase_active` set), or
+  - the download window has closed (`download_window_closed` set), which
+    the main loop sets when it begins waiting for MinerCommit1 of the
+    next round and clears at the next freeze.
 
 It does not gate on `eval_window_active`; download continues across the
-entire round (Submission → Train(K+1)) so the eval worker has work
-queued when its window opens.
+round's eval window (Submission → MinerCommit1(K+1)) so the eval worker
+has work queued when its window opens.
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ class BackgroundDownloadWorker(threading.Thread):
         round_ref: RoundRef,
         foreground_active: threading.Event,
         merge_phase_active: threading.Event,
+        download_window_closed: threading.Event | None = None,
         stop_event: threading.Event | None = None,
         poll_interval_sec: float = 6.0,
     ) -> None:
@@ -49,6 +53,7 @@ class BackgroundDownloadWorker(threading.Thread):
         self.round_ref = round_ref
         self.foreground_active = foreground_active
         self.merge_phase_active = merge_phase_active
+        self.download_window_closed = download_window_closed or threading.Event()
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
         self._subtensor: bittensor.Subtensor | None = None
@@ -94,7 +99,11 @@ class BackgroundDownloadWorker(threading.Thread):
                     continue
 
                 # Snapshot pause state for telemetry.
-                paused = self.foreground_active.is_set() or self.merge_phase_active.is_set()
+                paused = (
+                    self.foreground_active.is_set()
+                    or self.merge_phase_active.is_set()
+                    or self.download_window_closed.is_set()
+                )
                 try:
                     VALIDATOR_BG_WORKER_PAUSED.labels(worker="download").set(1 if paused else 0)
                 except Exception:
@@ -105,6 +114,7 @@ class BackgroundDownloadWorker(threading.Thread):
                             "bg-download: paused",
                             foreground_active=self.foreground_active.is_set(),
                             merge_phase_active=self.merge_phase_active.is_set(),
+                            download_window_closed=self.download_window_closed.is_set(),
                         )
                     idle_ticks += 1
                     await self._wait_clear()
@@ -145,7 +155,11 @@ class BackgroundDownloadWorker(threading.Thread):
         # Coarse polling: wake every 0.5s so stop and gate transitions
         # propagate without spinning.
         while not self.stop_event.is_set():
-            if not self.foreground_active.is_set() and not self.merge_phase_active.is_set():
+            if (
+                not self.foreground_active.is_set()
+                and not self.merge_phase_active.is_set()
+                and not self.download_window_closed.is_set()
+            ):
                 return
             await asyncio.sleep(0.5)
 
