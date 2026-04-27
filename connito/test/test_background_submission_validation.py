@@ -466,7 +466,6 @@ class TestBackgroundEvalWorker:
             dataloader=SimpleNamespace(world_size=1),
         )
 
-        eval_base_model = _make_model()
         agg = MinerScoreAggregator(max_points=8)
 
         gpu_lock = threading.Lock()
@@ -477,7 +476,6 @@ class TestBackgroundEvalWorker:
         worker = BackgroundEvalWorker(
             config=cfg,
             round_ref=round_ref,
-            model_factory=lambda: _make_model(),
             device=torch.device("cpu"),
             tokenizer=MagicMock(),
             score_aggregator=agg,
@@ -488,6 +486,7 @@ class TestBackgroundEvalWorker:
             stop_event=stop,
             poll_interval_sec=0.05,
         )
+        worker.set_eval_base_model(_make_model())
         return worker, agg, gpu_lock, merge_active, eval_window, stop
 
     def test_lock_unheld_at_iteration_boundary(self, tmp_path: Path) -> None:

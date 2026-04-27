@@ -93,7 +93,7 @@ class BackgroundDownloadWorker(threading.Thread):
                 round_obj = self.round_ref.current
                 if round_obj is None:
                     if idle_ticks % IDLE_LOG_EVERY == 0:
-                        logger.info("bg-download: idle — no current round")
+                        logger.debug("bg-download: idle — no current round")
                     idle_ticks += 1
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
@@ -154,12 +154,19 @@ class BackgroundDownloadWorker(threading.Thread):
     async def _wait_clear(self) -> None:
         # Coarse polling: wake every 0.5s so stop and gate transitions
         # propagate without spinning.
+        logger.info(
+            "bg-download: deactivated — gates blocked, pausing downloads",
+            foreground_active=self.foreground_active.is_set(),
+            merge_phase_active=self.merge_phase_active.is_set(),
+            download_window_closed=self.download_window_closed.is_set(),
+        )
         while not self.stop_event.is_set():
             if (
                 not self.foreground_active.is_set()
                 and not self.merge_phase_active.is_set()
                 and not self.download_window_closed.is_set()
             ):
+                logger.info("bg-download: active — gates cleared, resuming downloads")
                 return
             await asyncio.sleep(0.5)
 
@@ -249,6 +256,8 @@ class BackgroundDownloadWorker(threading.Thread):
             logger.info(
                 "bg-download: success",
                 uid=uid, hotkey=hotkey[:6],
+                repo_id=repo_id,
+                revision=(revision[:8] if revision else None),
                 dest=str(dest),
                 size_bytes=size_bytes,
             )

@@ -68,7 +68,7 @@ Sign and announce the new model:
 
 - **`build_local_checkpoint`** + `model_ckpt.sign_hash(wallet)`. `current_model_hash` is updated for use by next cycle's MinerCommit1.
 - **(7) `commit_status(SignedModelHashChainCommit(signed_model_hash=...))`.** This is the validator's commit-reveal of the new model hash. (`run.py:929-938`)
-- **HuggingFace upload** (`run.py:942-992`). Resolve the upload + chain-advertised repo ids from `config.hf`. If `get_hf_upload_readiness` says we can write, call `upload_checkpoint_to_hf(...)` and capture the returned revision SHA — this pins the exact bytes miners will pull during the next Distribute, even if `:main` advances afterward. On failure, log and continue: miners fall back to the validator HTTP `/get-checkpoint` endpoint served by `connito.validator.server`.
+- **HuggingFace upload** (`run.py:942-992`). Resolve the upload + chain-advertised repo ids from `config.hf`. If `get_hf_upload_readiness` says we can write, call `upload_checkpoint_to_hf(...)` and capture the returned revision SHA — this pins the exact bytes miners will pull during the next Distribute, even if `:main` advances afterward. HF is the only distribute path; on upload failure, miners with no usable checkpoint coords on chain skip the cycle.
 
 ### ValidatorCommit2 — `wait_till(PhaseNames.validator_commit_2)` (`run.py:994`)
 

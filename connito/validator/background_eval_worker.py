@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -40,7 +39,6 @@ class BackgroundEvalWorker(threading.Thread):
         *,
         config,
         round_ref: RoundRef,
-        model_factory: Callable[[], nn.Module],
         device: torch.device,
         tokenizer,
         score_aggregator,
@@ -54,7 +52,6 @@ class BackgroundEvalWorker(threading.Thread):
         super().__init__(daemon=True, name="connito-bg-eval")
         self.config = config
         self.round_ref = round_ref
-        self.model_factory = model_factory
         self.device = device
         self.tokenizer = tokenizer
         self.score_aggregator = score_aggregator
@@ -64,13 +61,35 @@ class BackgroundEvalWorker(threading.Thread):
         self.gpu_eval_lock = gpu_eval_lock
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
+        # Model is handed in by the main loop (see set_eval_base_model)
+        # right after foreground eval completes, instead of being
+        # re-fetched from chain at startup.
         self._eval_base_model: nn.Module | None = None
+        self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
 
     # ---------------- Public lifecycle ----------------
     def stop(self) -> None:
         self.stop_event.set()
+
+    def set_eval_base_model(self, model: nn.Module) -> None:
+        """Hand the worker a model to use as its eval base.
+
+        Called by the main loop after foreground eval completes, so the
+        worker doesn't need to re-fetch and re-construct the model from
+        chain. The state_dict is reloaded per round from
+        `round.model_snapshot_cpu`, so what matters here is the model
+        architecture, not its current weights.
+        """
+        model.to(self.device)
+        model.eval()
+        with self._eval_base_model_lock:
+            self._eval_base_model = model
+
+    def has_eval_base_model(self) -> bool:
+        with self._eval_base_model_lock:
+            return self._eval_base_model is not None
 
     # ---------------- Thread body ----------------
     def run(self) -> None:
@@ -81,18 +100,10 @@ class BackgroundEvalWorker(threading.Thread):
 
     # ---------------- Internal ----------------
     async def _loop(self) -> None:
-        # Allocate the worker's own eval base model on `device` once. We do
-        # NOT receive a reference to the main loop's global_model — the
-        # snapshot-on-freeze + load_state_dict-per-round pattern makes the
-        # round's input model immutable from the worker's perspective.
-        try:
-            self._eval_base_model = await asyncio.to_thread(self.model_factory)
-            self._eval_base_model.to(self.device)
-            self._eval_base_model.eval()
-        except Exception as e:
-            logger.exception("BackgroundEvalWorker: failed to construct eval_base_model", error=str(e))
-            return
-
+        # The eval_base_model is handed to us by the main loop via
+        # set_eval_base_model() after foreground eval completes. Until
+        # then we just gate-loop. This avoids duplicating chain fetches
+        # + MoE construction on a separate thread at startup.
         logger.info(
             "BackgroundEvalWorker: started",
             device=str(self.device),
@@ -111,6 +122,7 @@ class BackgroundEvalWorker(threading.Thread):
                 round_obj = self.round_ref.current
                 gated = (
                     round_obj is None
+                    or self._eval_base_model is None
                     or self.merge_phase_active.is_set()
                     or not self.eval_window_active.is_set()
                 )
@@ -120,9 +132,10 @@ class BackgroundEvalWorker(threading.Thread):
                     pass
                 if gated:
                     if idle_ticks % IDLE_LOG_EVERY == 0:
-                        logger.info(
+                        logger.debug(
                             "bg-eval: gated",
                             has_round=round_obj is not None,
+                            has_eval_base_model=self._eval_base_model is not None,
                             merge_phase_active=self.merge_phase_active.is_set(),
                             eval_window_active=self.eval_window_active.is_set(),
                         )
@@ -136,13 +149,16 @@ class BackgroundEvalWorker(threading.Thread):
 
                 target = self._next_target(round_obj)
                 if target is None:
-                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                    # Log only on the transition into idle; stay quiet until
+                    # new work arrives (idle_ticks resets to 0 on the next
+                    # successful claim, re-arming this log for the next gap).
+                    if idle_ticks == 0:
                         try:
                             stats = round_obj.stats()
                         except Exception:
                             stats = None
                         logger.info(
-                            "bg-eval: no pending targets",
+                            "bg-eval: no pending targets — going idle",
                             round_id=round_obj.round_id,
                             round_stats=stats,
                         )
@@ -173,13 +189,23 @@ class BackgroundEvalWorker(threading.Thread):
         return None
 
     async def _wait_clear(self) -> None:
+        round_obj = self.round_ref.current
+        logger.info(
+            "bg-eval: deactivating — gates set, pausing evaluations",
+            has_round=round_obj is not None,
+            has_eval_base_model=self._eval_base_model is not None,
+            merge_phase_active=self.merge_phase_active.is_set(),
+            eval_window_active=self.eval_window_active.is_set(),
+        )
         while not self.stop_event.is_set():
             round_obj = self.round_ref.current
             if (
                 round_obj is not None
+                and self._eval_base_model is not None
                 and not self.merge_phase_active.is_set()
                 and self.eval_window_active.is_set()
             ):
+                logger.info("bg-eval: active — gates cleared, resuming evaluations")
                 return
             await asyncio.sleep(0.5)
 

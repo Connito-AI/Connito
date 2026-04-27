@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import ctypes
 import gc
 import math
@@ -234,6 +235,41 @@ def cleanup(global_model) -> None:
     _release_cpu_ram()
 
     _cuda_mem_report("VRAM after GPU cleanup")
+
+
+def _shutdown_background_workers(
+    download_worker: "BackgroundDownloadWorker | None",
+    eval_worker: "BackgroundEvalWorker | None",
+    join_timeout_sec: float = 30.0,
+) -> None:
+    """Signal both background workers to stop and wait for them to exit.
+
+    Logs each step so an operator can see which worker is still running
+    when the join times out.
+    """
+    logger.info("Shutdown: signaling background workers to stop")
+    if download_worker is not None:
+        download_worker.stop()
+    if eval_worker is not None:
+        eval_worker.stop()
+
+    for worker in (download_worker, eval_worker):
+        if worker is None:
+            continue
+        logger.info(
+            "Shutdown: joining background worker",
+            thread_name=worker.name,
+            timeout_sec=join_timeout_sec,
+        )
+        worker.join(timeout=join_timeout_sec)
+        if worker.is_alive():
+            logger.warning(
+                "Shutdown: background worker did not exit within timeout",
+                thread_name=worker.name,
+                timeout_sec=join_timeout_sec,
+            )
+        else:
+            logger.info("Shutdown: background worker joined", thread_name=worker.name)
 
 
 def setup_training(
@@ -557,7 +593,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up chain worker ===
     # subtensor: archive connection — required by callers that issue
     # historical block queries (Round.freeze, setup_training/load_model,
-    # reload_model_inplace, evaluate_foreground_round, eval factory).
+    # reload_model_inplace, evaluate_foreground_round).
     # lite_subtensor: sync Subtensor for head-only reads (metagraph,
     # current block, peer connect, phase checks).
     # chain_submitter: owns an AsyncSubtensor + AsyncRunner; handles every
@@ -600,8 +636,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.2":
-        logger.info("Skipping historic score_aggregator load for v0.1.2", pkg_version=pkg_version)
+    if pkg_version == "v0.1.17":
+        logger.info("Skipping historic score_aggregator load for v0.1.17", pkg_version=pkg_version)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
         try:
@@ -681,19 +717,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     download_worker: BackgroundDownloadWorker | None = None
     eval_worker: BackgroundEvalWorker | None = None
     if config.evaluation.background_worker_enabled:
-        def _eval_model_factory():
-            # Runs on a worker thread (via asyncio.to_thread). Open a
-            # dedicated archive Subtensor here so its WebSocket is not
-            # shared with the main loop's subtensor — the substrate WS is
-            # not safe across threads — and load_model issues historical
-            # block queries that only an archive node can serve.
-            eval_subtensor = bittensor.Subtensor(network=config.chain.network)
-            new_model, _ = load_model(
-                rank, config, expert_manager, eval_subtensor, wallet, None,
-                partial=True, checkpoint_device=device,
-            )
-            return new_model
-
         download_worker = BackgroundDownloadWorker(
             config=config,
             round_ref=round_ref,
@@ -701,10 +724,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
+        # bg-eval idles until the main loop hands it a copy of
+        # global_model after foreground eval completes (see below).
         eval_worker = BackgroundEvalWorker(
             config=config,
             round_ref=round_ref,
-            model_factory=_eval_model_factory,
             device=device,
             tokenizer=tokenizer,
             score_aggregator=score_aggregator,
@@ -715,7 +739,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
         download_worker.start()
         eval_worker.start()
-        logger.info("Background download + eval workers started")
+        logger.info(
+            "Background workers launched",
+            download_thread=download_worker.name,
+            download_ident=download_worker.ident,
+            eval_thread=eval_worker.name,
+            eval_ident=eval_worker.ident,
+        )
 
     logger.info("ChainSubmitter ready")
 
@@ -726,36 +756,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
-            # === (0) Re-sync from peer if we were excluded last cycle ===
-            if not _participated_in_merge:
-                logger.info(
-                    "(0) Re-syncing model from peer validator (was excluded from allreduce last cycle)"
-                )
-                success = reload_model_inplace(
-                    config=config,
-                    global_model=global_model,
-                    expert_manager=expert_manager,
-                    device=device,
-                    subtensor=subtensor,
-                    wallet=wallet,
-                )
-                if success:
-                    logger.info("(0) Peer sync successful — model updated")
-                else:
-                    logger.warning(
-                        "(0) Peer sync failed — continuing with current model; "
-                        "weight quality may be reduced this cycle"
-                    )
-                _participated_in_merge = True  # reset regardless; try allreduce next cycle
-
             # === Wait till commit phase to submit random seed ===
-            # Round K's downloads are stale past this point — the eval window
-            # is closed by Merge and weights are about to be submitted below.
-            # Pause bg-download until the next freeze re-opens it.
-            download_window_closed.set()
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
-            logger.info("(0) Commit new seed for next validation")
+            logger.info("Commit new seed for next validation")
 
             # === (4) Close the (3) window and submit weights for the round
             # whose evaluation just ended. This used to live at the bottom of
@@ -870,6 +874,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
             finally:
                 foreground_active.clear()
+
+            # Hand bg-eval a copy of global_model the first time foreground
+            # eval finishes — Merge hasn't run yet, so global_model still
+            # matches new_round.model_snapshot_cpu. The worker uses this
+            # only as an architecture template; per-round state comes from
+            # round.model_snapshot_cpu.
+            if eval_worker is not None and not eval_worker.has_eval_base_model():
+                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
             try:
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
             except Exception:
@@ -903,7 +915,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
-            logger.info("(3) Aggregating miner gradient change locally")
+            logger.info("Aggregating miner gradient change locally")
             merged_uids = asyncio.run(
                 aggregate_miner_gradient_change(
                     config=config,
@@ -957,7 +969,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active.set()
             try:
                 if grad_is_valid:
-                    logger.info("(4) Syncing gradient across validators")
+                    logger.info("Syncing gradient across validators")
                     sync_grad_across_validators(
                         config=config,
                         group_averagers=group_averagers,
@@ -966,7 +978,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
 
                     # === global optimizer ===
-                    logger.info("(5) Running global model optimization step")
+                    logger.info("Running global model optimization step")
 
                     org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
@@ -987,7 +999,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     _participated_in_merge = True
                 else:
                     logger.info(
-                        "(4/5) Skipping gradient sync and optimizer — "
+                        "Skipping gradient sync and optimizer — "
                         "no valid gradient contribution this cycle"
                     )
                     _participated_in_merge = False
@@ -995,7 +1007,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 cleanup(global_model)
 
                 # === save checkpoint ===
-                logger.info("(6) Saving checkpoint")
+                logger.info("Saving checkpoint")
                 ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
 
                 presave_keep = None
@@ -1046,7 +1058,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
-                logger.info("(7) Commit new signed_model_hash for next validation (non-blocking)")
+                logger.info("Commit new signed_model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(SignedModelHashChainCommit(
                     signed_model_hash=model_ckpt.signed_model_hash,
                 ))
@@ -1094,7 +1106,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         )
                     except Exception as e:
                         logger.error(
-                            "HF checkpoint upload failed; miners will use validator HTTP fallback",
+                            "HF checkpoint upload failed; miners cannot pull this checkpoint",
                             upload_checkpoint_repo=hf_upload_repo_id,
                             advertised_checkpoint_repo=hf_chain_repo_id,
                             error=str(e),
@@ -1103,8 +1115,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     finally:
                         merge_phase_active.clear()
                 else:
-                    logger.warning(
-                        "HF checkpoint upload unavailable; miners will use validator HTTP fallback",
+                    logger.error(
+                        "HF checkpoint upload unavailable; miners cannot pull this checkpoint",
                         upload_checkpoint_repo=hf_upload_repo_id,
                         advertised_checkpoint_repo=hf_chain_repo_id,
                         reason=hf_reason,
@@ -1112,7 +1124,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
 
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
-                logger.info("(8) Commit model_hash for next validation (non-blocking)")
+                logger.info("Commit model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(ValidatorChainCommit(
                     model_hash=model_ckpt.model_hash,
                     global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
@@ -1126,14 +1138,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     if ckpt_deleted:
                         logger.debug(f"Deleted old checkpoints: {ckpt_deleted}")
 
-            # === (9) Set weight to chain ===
+            # === (4) Set weight to chain ===
             # Relocated to the top of the next iteration's MinerCommit1 block
             # so it can incorporate the (3) background scores collected from
             # end-of-Validate(K) through end-of-Train(K+1).
 
-            # === archive top-k submissions, delete the rest ===
+            # === Close download window, archive top-k, prune the rest ===
+            # Wait until 20 blocks before the next MinerCommit1 so the cleanup
+            # finishes inside the quiet window just before the new cycle begins.
+            wait_till(config, PhaseNames.miner_commit_1, block_offset=-20)
+            download_window_closed.set()
+
             if config.ckpt.archive_submissions:
-                logger.info("(10) Archiving top miner submissions")
+                logger.info("Archiving top miner submissions")
                 archive_top_miner_submissions(
                     submission_dir=config.ckpt.miner_submission_path,
                     archive_dir=config.ckpt.miner_submission_archive_path,
@@ -1149,17 +1166,38 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 max_age_cycles=0,
             )
             logger.info(
-                "(10) Pruned aged miner submissions after cycle",
+                "Pruned aged miner submissions after cycle",
                 deleted=len(deleted),
                 current_block=lite_subtensor.block,
                 cycle_length=config.cycle.cycle_length,
                 max_age_cycles=0,
             )
 
-            # === validation and log metric ===
-            # Local evaluation step disabled to reduce per-cycle RAM/compute load.
-            logger.info("(11) Local evaluation disabled, skipping")
+            # === Re-sync from peer if we were excluded last cycle ===
+            # Done in the same quiet pre-MinerCommit1 window as the cleanup
+            # above so the sync settles before the new cycle begins.
+            if not _participated_in_merge:
+                logger.info(
+                    "Re-syncing model from peer validator (was excluded from allreduce last cycle)"
+                )
+                success = reload_model_inplace(
+                    config=config,
+                    global_model=global_model,
+                    expert_manager=expert_manager,
+                    device=device,
+                    subtensor=subtensor,
+                    wallet=wallet,
+                )
+                if success:
+                    logger.info("Peer sync successful — model updated")
+                else:
+                    logger.warning(
+                        "Peer sync failed — continuing with current model; "
+                        "weight quality may be reduced next cycle"
+                    )
+                _participated_in_merge = True  # reset regardless; try allreduce next cycle
 
+            # === validation and log metric ===
             metrics = get_status(
                 config=config,
                 model=global_model,
@@ -1180,14 +1218,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         # Stop the producer first so the eval worker drains its remaining
         # claims; then stop the eval worker; finally stop the chain_submitter
         # so any in-flight chain RPCs get cancelled cleanly.
-        if download_worker is not None:
-            download_worker.stop()
-        if eval_worker is not None:
-            eval_worker.stop()
-        if download_worker is not None:
-            download_worker.join(timeout=30)
-        if eval_worker is not None:
-            eval_worker.join(timeout=30)
+        _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
         cleanup(global_model)
@@ -1197,14 +1228,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         raise
     except Exception:
         logger.error("Quit training", exc_info=True)
-        if download_worker is not None:
-            download_worker.stop()
-        if eval_worker is not None:
-            eval_worker.stop()
-        if download_worker is not None:
-            download_worker.join(timeout=30)
-        if eval_worker is not None:
-            eval_worker.join(timeout=30)
+        _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
         cleanup(global_model)

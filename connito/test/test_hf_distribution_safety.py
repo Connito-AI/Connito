@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from connito.shared.chain import (
@@ -25,7 +24,6 @@ from connito.shared.hf_distribute import (
 from connito.shared.model import fetch_model_from_chain_validator
 from connito.shared.cycle import get_validator_seed_from_commit, hydrate_miner_submissions_from_hf
 from connito.validator.run import validate_hf_distribution_config
-from connito.validator import server
 
 
 def _make_config(tmp_path: Path):
@@ -37,8 +35,6 @@ def _make_config(tmp_path: Path):
             checkpoint_path=tmp_path / "checkpoints",
         ),
         hf=SimpleNamespace(token_env_var="HF_TOKEN"),
-        cycle=SimpleNamespace(token=""),
-        miner=SimpleNamespace(protocol="http"),
     )
 
 
@@ -141,48 +137,7 @@ def test_checkpoint_cfg_restores_download_concurrency_for_compatibility():
     assert CheckpointCfg().download_concurrency == 4
 
 
-def test_fetch_model_falls_back_to_http_when_hf_download_fails(tmp_path, monkeypatch):
-    config = _make_config(tmp_path)
-    config.ckpt.validator_checkpoint_path.mkdir(parents=True)
-    wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey"))
-    subtensor = SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner-hotkey")
-    chain_checkpoint = _make_chain_checkpoint()
-
-    monkeypatch.setattr(
-        "connito.shared.model.build_chain_checkpoints_from_previous_phase",
-        lambda **kwargs: ChainCheckpoints(checkpoints=[chain_checkpoint]),
-    )
-    monkeypatch.setattr("connito.shared.model.download_checkpoint_from_hf", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("hf down")))
-    monkeypatch.setattr("connito.shared.model.delete_old_checkpoints", lambda **kwargs: None)
-    monkeypatch.setattr(ChainCheckpoint, "validate", lambda self, expert_group_assignment: True)
-
-    seen = []
-
-    def fake_download_model(**kwargs):
-        out_path = Path(kwargs["out_dir"])
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(b"ok")
-        seen.append((kwargs["url"], out_path.name, kwargs["expert_group_id"]))
-
-    monkeypatch.setattr("connito.shared.model.download_model", fake_download_model)
-
-    result = fetch_model_from_chain_validator(
-        current_model_meta=None,
-        config=config,
-        subtensor=subtensor,
-        wallet=wallet,
-        expert_group_ids=[0, "shared"],
-        expert_group_assignment={},
-    )
-
-    assert result is chain_checkpoint
-    assert seen == [
-        ("http://127.0.0.1:8000/get-checkpoint", "model_expgroup_0.pt", 0),
-        ("http://127.0.0.1:8000/get-checkpoint", "model_shared.pt", "shared"),
-    ]
-
-
-def test_fetch_model_uses_http_when_hf_metadata_missing(tmp_path, monkeypatch):
+def test_fetch_model_skips_chain_checkpoint_without_hf_metadata(tmp_path, monkeypatch):
     config = _make_config(tmp_path)
     config.ckpt.validator_checkpoint_path.mkdir(parents=True)
     wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey"))
@@ -193,19 +148,13 @@ def test_fetch_model_uses_http_when_hf_metadata_missing(tmp_path, monkeypatch):
         "connito.shared.model.build_chain_checkpoints_from_previous_phase",
         lambda **kwargs: ChainCheckpoints(checkpoints=[chain_checkpoint]),
     )
-    monkeypatch.setattr("connito.shared.model.download_checkpoint_from_hf", lambda **kwargs: (_ for _ in ()).throw(AssertionError("HF should not be used")))
+    monkeypatch.setattr(
+        "connito.shared.model.download_checkpoint_from_hf",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HF should not be invoked when coords missing")),
+    )
     monkeypatch.setattr("connito.shared.model.delete_old_checkpoints", lambda **kwargs: None)
+    monkeypatch.setattr("connito.shared.model.time.sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(ChainCheckpoint, "validate", lambda self, expert_group_assignment: True)
-
-    seen = []
-
-    def fake_download_model(**kwargs):
-        out_path = Path(kwargs["out_dir"])
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(b"ok")
-        seen.append(out_path.name)
-
-    monkeypatch.setattr("connito.shared.model.download_model", fake_download_model)
 
     result = fetch_model_from_chain_validator(
         current_model_meta=None,
@@ -216,70 +165,7 @@ def test_fetch_model_uses_http_when_hf_metadata_missing(tmp_path, monkeypatch):
         expert_group_assignment={},
     )
 
-    assert result is chain_checkpoint
-    assert seen == ["model_expgroup_0.pt"]
-
-
-def test_get_checkpoint_endpoint_serves_local_checkpoint(tmp_path, monkeypatch):
-    checkpoint_dir = tmp_path / "ckpt"
-    checkpoint_dir.mkdir()
-    shard = checkpoint_dir / "model_expgroup_0.pt"
-    shard.write_bytes(b"checkpoint-bytes")
-
-    server.config = SimpleNamespace(
-        chain=SimpleNamespace(hotkey_ss58="validator-hotkey"),
-        ckpt=SimpleNamespace(checkpoint_path=tmp_path / "checkpoints"),
-    )
-    server.subtensor = SimpleNamespace(block=999)
-    monkeypatch.setattr(server, "verify_message", lambda **kwargs: True)
-    monkeypatch.setattr(server, "construct_block_message", lambda **kwargs: b"msg")
-    monkeypatch.setattr(server, "select_best_checkpoint", lambda primary_dir: SimpleNamespace(path=checkpoint_dir, global_ver=42))
-
-    client = TestClient(server.app)
-    response = client.request(
-        "GET",
-        "/get-checkpoint",
-        data={
-            "target_hotkey_ss58": "validator-hotkey",
-            "origin_hotkey_ss58": "miner-hotkey",
-            "origin_block": "123",
-            "signature": "sig",
-            "expert_group_id": "0",
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.content == b"checkpoint-bytes"
-
-
-def test_get_checkpoint_endpoint_rejects_wrong_target(tmp_path, monkeypatch):
-    checkpoint_dir = tmp_path / "ckpt"
-    checkpoint_dir.mkdir()
-    (checkpoint_dir / "model_expgroup_0.pt").write_bytes(b"checkpoint-bytes")
-
-    server.config = SimpleNamespace(
-        chain=SimpleNamespace(hotkey_ss58="validator-hotkey"),
-        ckpt=SimpleNamespace(checkpoint_path=tmp_path / "checkpoints"),
-    )
-    server.subtensor = SimpleNamespace(block=999)
-    monkeypatch.setattr(server, "verify_message", lambda **kwargs: True)
-    monkeypatch.setattr(server, "construct_block_message", lambda **kwargs: b"msg")
-    monkeypatch.setattr(server, "select_best_checkpoint", lambda primary_dir: SimpleNamespace(path=checkpoint_dir, global_ver=42))
-
-    client = TestClient(server.app)
-    response = client.request(
-        "GET",
-        "/get-checkpoint",
-        data={
-            "target_hotkey_ss58": "different-validator",
-            "origin_hotkey_ss58": "miner-hotkey",
-            "origin_block": "123",
-            "signature": "sig",
-            "expert_group_id": "0",
-        },
-    )
-
-    assert response.status_code == 403
+    assert result is None
 
 
 def test_validator_chain_commit_payload_stays_compact_with_hf_fields():
@@ -452,7 +338,7 @@ def test_hydrate_miner_submissions_from_hf_writes_assigned_miners_only(tmp_path,
     )
     without_hf = ChainCheckpoint(
         uid=9,
-        hotkey="miner-http-only",
+        hotkey="miner-no-hf",
         global_ver=10,
         model_hash="abcf",
         signed_model_hash="signed3",
@@ -480,7 +366,7 @@ def test_hydrate_miner_submissions_from_hf_writes_assigned_miners_only(tmp_path,
     hydrated = hydrate_miner_submissions_from_hf(
         config=config,
         subtensor=subtensor,
-        validator_miner_assignment={"validator-hotkey": ["miner-assigned", "miner-http-only"]},
+        validator_miner_assignment={"validator-hotkey": ["miner-assigned", "miner-no-hf"]},
     )
 
     assert hydrated == 1
@@ -489,8 +375,8 @@ def test_hydrate_miner_submissions_from_hf_writes_assigned_miners_only(tmp_path,
     assert (submission_dir / "hotkey_miner-assigned_block_999.pt").exists()
     # Unassigned miner is skipped even though it has HF coords.
     assert not list(submission_dir.glob("*miner-unassigned*"))
-    # HTTP-only miner with no HF coords is skipped (HTTP /submit-checkpoint handles it).
-    assert not list(submission_dir.glob("*miner-http-only*"))
+    # Miner without HF coords is missing for this round and gets the zero-score penalty.
+    assert not list(submission_dir.glob("*miner-no-hf*"))
     # No leftover tmp dirs from atomic-rename path.
     assert not list(submission_dir.glob(".tmp_*"))
 
@@ -498,8 +384,9 @@ def test_hydrate_miner_submissions_from_hf_writes_assigned_miners_only(tmp_path,
 def test_hydrate_miner_submissions_skips_when_local_file_already_present(tmp_path, monkeypatch):
     submission_dir = tmp_path / "miner_submission"
     submission_dir.mkdir()
-    # Simulate an HTTP /submit-checkpoint upload that already landed.
-    (submission_dir / "hotkey_miner-assigned_block_500.pt").write_bytes(b"http-upload")
+    # Simulate a submission already landed (e.g. by the background download worker)
+    # before the hydrator polls.
+    (submission_dir / "hotkey_miner-assigned_block_500.pt").write_bytes(b"prior-upload")
 
     config = SimpleNamespace(
         chain=SimpleNamespace(netuid=102, hotkey_ss58="validator-hotkey"),

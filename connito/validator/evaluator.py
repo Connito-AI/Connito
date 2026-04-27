@@ -276,10 +276,10 @@ async def evaluate_foreground_round(
 
     Walks `round_obj.foreground_uids` only and calls `evaluate_one_miner`
     for each. Miner checkpoints are made available locally by the
-    `BackgroundDownloadWorker` (HF) and the HTTP `/submit-checkpoint`
-    path; this function does not pull from HF itself. UIDs that exceed
-    the per-miner budget or fail to land by `end_block` are left
-    unclaimed so the `BackgroundEvalWorker` can pick them up in step 3.
+    `BackgroundDownloadWorker` (HF); this function does not pull from HF
+    itself. UIDs that exceed the per-miner budget or fail to land by
+    `end_block` are left unclaimed so the `BackgroundEvalWorker` can pick
+    them up in step 3.
     """
     from connito.shared.cycle import gather_validation_job
 

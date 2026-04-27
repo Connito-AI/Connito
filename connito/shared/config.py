@@ -289,9 +289,8 @@ class CheckpointCfg(BaseConfig):
     full_validation_interval: PositiveInt | None = None
     checkpoint_topk: PositiveInt = 2
     validator_checkpoint_path: Path = Path("validator_checkpoint")
-    # Legacy compatibility knob. Miner checkpoint downloads currently use an
-    # ordered HF -> validator HTTP fallback path rather than parallel shard
-    # fan-out, but older configs may still include this field.
+    # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
+    # but older configs may still include this field.
     download_concurrency: PositiveInt = 4
 
 
@@ -357,17 +356,10 @@ class LoggingCfg(BaseConfig):
 
 
 class ValidatorCheckpointCfg(CheckpointCfg):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"max_submission_bytes", "max_submission_bytes_per_expert"})
     base_checkpoint_path: Path = Path("checkpoints/validator")
     miner_submission_path: Path = Path("miner_submission")
-    max_submission_bytes: int = 8 * 1024**3
-    max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
-    # Max concurrent /submit-checkpoint streams. Protects the server downlink
-    # and disk write throughput from N parallel 3.35 GiB uploads dragging each
-    # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
-    submission_concurrency: int = 2
     cleanup_stale_temporary_checkpoints: bool = True
     miner_submission_max_age_cycles: PositiveFloat = 1.5
     miner_submission_archive_max_files: PositiveInt = 500
@@ -851,7 +843,6 @@ class ValidatorConfig(WorkerConfig):
             f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
             f"EXPERT_GROUPS_PATH={expert_groups_path}",
             f"VALIDATOR_GPU_ID=0",
-            f"SERVER_GPU_ID=0",
             f"HF_TOKEN=",
             f"WANDB_API_KEY=",
             f"WANDB_MODE=online",

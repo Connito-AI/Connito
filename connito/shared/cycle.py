@@ -177,7 +177,7 @@ def _synth_phase_response_for_test(
     # In test mode, give Submission a fixed 30-block window so foreground
     # evaluation has room to land miners regardless of the prod cycle config.
     if phase_name == PhaseNames.submission:
-        period = 30
+        period = 60
     return PhaseResponse(
         block=current_block,
         cycle_length=int(getattr(config.cycle, "cycle_length", 0)),
@@ -192,7 +192,24 @@ def _synth_phase_response_for_test(
     )
 
 
-def wait_till(config: MinerConfig | ValidatorConfig, phase_name: str, poll_fallback_block: int = 3) -> PhaseResponse:
+def wait_till(
+    config: MinerConfig | ValidatorConfig,
+    phase_name: str,
+    poll_fallback_block: int = 3,
+    block_offset: int = 0,
+) -> PhaseResponse:
+    """Block until the chain reaches `phase_start_block + block_offset`.
+
+    - `block_offset == 0` (default): return when `phase_name` begins.
+    - `block_offset > 0`: return `block_offset` blocks INTO `phase_name`.
+    - `block_offset < 0`: return `|block_offset|` blocks BEFORE
+      `phase_name` begins; the caller is still inside the previous phase
+      at return time.
+
+    The returned `PhaseResponse` reflects chain state at return time, so
+    for negative offsets it describes the previous phase. In test mode
+    `block_offset` is ignored; the synthesized response is returned as-is.
+    """
     if _TEST_MODE:
         # Still hit should_act so the owner-API path is exercised, but
         # ignore the result for the wait-condition and synthesize a
@@ -223,29 +240,51 @@ def wait_till(config: MinerConfig | ValidatorConfig, phase_name: str, poll_fallb
         )
         return synthetic
 
-    ready = False
     phase_response: PhaseResponse | None = None
     first_print = True
-    while not ready:
+    while True:
         ready, blocks_till, phase_response = should_act(config, phase_name, retry_blocks=poll_fallback_block)
-        if ready is False and blocks_till > 0:
-            sleep_sec = min(blocks_till, max(poll_fallback_block, blocks_till * 0.9)) * BITTENSOR_BLOCK_TIME_SECONDS
 
-            check_time = datetime.now() + timedelta(seconds=sleep_sec)
-            check_time_str = check_time.strftime("%H:%M:%S")
+        # Blocks remaining until target = phase_start_block + block_offset.
+        # Once `ready` flips True we're inside the named phase; before that
+        # `blocks_till` counts down to its start.
+        if ready and phase_response is not None:
+            blocks_remaining = block_offset - phase_response.blocks_into_phase
+        else:
+            blocks_remaining = blocks_till + block_offset
 
-            expect_time = datetime.now() + timedelta(seconds=blocks_till * BITTENSOR_BLOCK_TIME_SECONDS)
-            expect_time_str = expect_time.strftime("%H:%M:%S")
+        if blocks_remaining <= 0:
+            break
 
-            if first_print: log_phase(f"<{phase_name}> to begin in {blocks_till} blocks, at {expect_time_str}")
-            first_print = False
-            time.sleep(sleep_sec)
+        sleep_sec = min(
+            blocks_remaining,
+            max(poll_fallback_block, blocks_remaining * 0.9),
+        ) * BITTENSOR_BLOCK_TIME_SECONDS
+
+        if first_print:
+            offset_label = ""
+            if block_offset > 0:
+                offset_label = f" + {block_offset} blocks"
+            elif block_offset < 0:
+                offset_label = f" - {-block_offset} blocks"
+            expect_time = datetime.now() + timedelta(seconds=blocks_remaining * BITTENSOR_BLOCK_TIME_SECONDS)
+            log_phase(
+                f"<{phase_name}>{offset_label} target in {blocks_remaining} blocks, "
+                f"at {expect_time.strftime('%H:%M:%S')}"
+            )
+        first_print = False
+        time.sleep(sleep_sec)
 
     if phase_response is None:
-        logger.warning(f"wait_till: loop exited with ready=True but phase_response is None for phase '{phase_name}'")
+        logger.warning(
+            f"wait_till: loop exited but phase_response is None for phase "
+            f"'{phase_name}' (block_offset={block_offset})"
+        )
     log_phase(
-        f"<{phase_name}> has started, {phase_response.blocks_into_phase} blocks passed,"
-        f" {phase_response.blocks_remaining_in_phase} blocks left in phase."
+        f"<{phase_name}> reached (block_offset={block_offset}); "
+        f"current phase=<{phase_response.phase_name}>, "
+        f"{phase_response.blocks_into_phase} blocks into it, "
+        f"{phase_response.blocks_remaining_in_phase} blocks left."
     )
     return phase_response
 
@@ -693,12 +732,12 @@ def hydrate_miner_submissions_from_hf(
 
     Miners that upload to HuggingFace during MinerCommit2 advertise
     ``(hf_repo_id, hf_revision)`` in their chain commit. By Submission phase
-    those coords are on chain, so the validator can pull the shard directly
-    instead of waiting on the miner's HTTP ``/submit-checkpoint`` push. The
-    downloaded file is written with the same ``hotkey_*_block_*.pt`` naming
-    the HTTP path uses so downstream scanning is transport-agnostic. Miners
-    without HF coords, or whose HF download fails, are handled by the
-    existing HTTP path — no extra code path.
+    those coords are on chain, so the validator pulls the shard directly
+    from HuggingFace. The downloaded file is written with the
+    ``hotkey_*_block_*.pt`` naming convention so ``gather_validation_job``
+    can pick it up. Miners without HF coords, or whose HF download fails,
+    are missing for this round and receive the zero-score penalty via the
+    existing missing-submission pass.
 
     Returns the number of miners hydrated this call.
     """
@@ -713,8 +752,9 @@ def hydrate_miner_submissions_from_hf(
     submission_dir = Path(config.ckpt.miner_submission_path)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
-    # A miner with any existing submission file is skipped — don't clobber an
-    # HTTP upload already received, and don't re-download on subsequent polls.
+    # A miner with any existing submission file is skipped — the background
+    # download worker may have already placed the file, and we don't want to
+    # re-download on subsequent polls.
     existing_hotkeys: set[str] = set()
     for file_path in submission_dir.glob("*.pt"):
         if file_path.name.startswith(".tmp"):
