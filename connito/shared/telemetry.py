@@ -62,6 +62,33 @@ VALIDATOR_AVG_STEP_STATUS = Counter("validator_avg_step_status", "Averager sync 
 VALIDATOR_EVAL_LOSS = Gauge("validator_eval_loss", "Evaluation loss", ["expert_group"])
 VALIDATOR_EVAL_BATCH_COUNT = Counter("validator_eval_batch_count", "Evaluation batch count")
 
+# Per-round lifecycle (background submission validation)
+VALIDATOR_ROUND_LIFECYCLE_STEP = Gauge(
+    "validator_round_lifecycle_step",
+    "Current lifecycle step (0-4) for the round identified by round_id",
+    ["round_id"],
+)
+VALIDATOR_ROUND_MINERS_PENDING = Gauge(
+    "validator_round_miners_pending",
+    "Roster miners not yet scored for the round",
+    ["round_id"],
+)
+VALIDATOR_ROUND_MINERS_SCORED = Gauge(
+    "validator_round_miners_scored",
+    "Roster miners scored so far for the round",
+    ["round_id"],
+)
+VALIDATOR_ROUND_MINERS_FAILED = Gauge(
+    "validator_round_miners_failed",
+    "Roster miners that failed download/eval for the round",
+    ["round_id"],
+)
+VALIDATOR_BG_WORKER_PAUSED = Gauge(
+    "validator_bg_worker_paused",
+    "1 while a background worker is paused on foreground_active or merge_phase_active",
+    ["worker"],
+)
+
 # Miner (Gauges)
 MINER_TRAINING_LOSS = Gauge("miner_training_loss", "Local model training loss", ["expert_group"])
 MINER_GRAD_NORM = Gauge("miner_gradient_norm", "Gradient norm per step")

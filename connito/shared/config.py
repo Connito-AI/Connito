@@ -816,6 +816,10 @@ class EvalCfg(BaseConfig):
     top_k_miners_to_merge: int = 3    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
     score_window: int = 16            # max number of phases (points) retained per miner in MinerScoreAggregator
+    foreground_top_n: PositiveInt = 5
+    background_worker_enabled: bool = True
+    per_miner_download_timeout_sec: PositiveInt = 120
+    per_miner_eval_timeout_sec: PositiveInt = 60
 
 
 class ValidatorConfig(WorkerConfig):

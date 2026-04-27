@@ -3,6 +3,7 @@ import ctypes
 import gc
 import math
 import os
+import threading
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
@@ -94,7 +95,6 @@ from connito.shared.hf_distribute import (
 )
 from connito.shared.cycle import (
     check_phase_expired,
-    get_combined_validator_seed,
     wait_till,
 )
 from connito.shared.dataloader import get_dataloader
@@ -109,11 +109,14 @@ from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
+from connito.validator.background_download_worker import BackgroundDownloadWorker
+from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.evaluator import (
     MinerEvalJob,
+    evaluate_foreground_round,
     load_model_from_path,
-    stream_gather_and_evaluate,
 )
+from connito.validator.round import Round, RoundRef
 HF_CHAIN_REVISION_LENGTH = 7
 
 
@@ -162,6 +165,7 @@ from connito.validator.inter_validator_connection import (
 from connito.shared.telemetry import (
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
+    VALIDATOR_ROUND_LIFECYCLE_STEP,
     SystemStatePoller
 )
 from datetime import datetime
@@ -653,6 +657,54 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     if config.ckpt.cleanup_stale_temporary_checkpoints:
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
+    # === Round-lifecycle scaffolding ===
+    # foreground_active: set while the foreground evaluation pass holds GPU/HF.
+    # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
+    # eval_window_active: set after Merge(K) completes so the eval worker may
+    #   evaluate round K's downloaded miners; cleared at the top of the next
+    #   cycle right before submit_weights for round K.
+    # gpu_eval_lock: held by the eval worker only across its load_state_dict
+    #   and evaluate_one_miner calls (yielded everywhere else; see plan).
+    foreground_active = threading.Event()
+    merge_phase_active = threading.Event()
+    eval_window_active = threading.Event()
+    gpu_eval_lock = threading.Lock()
+    round_ref = RoundRef()
+
+    download_worker: BackgroundDownloadWorker | None = None
+    eval_worker: BackgroundEvalWorker | None = None
+    if config.evaluation.background_worker_enabled:
+        def _eval_model_factory():
+            # Build a fresh model with the same architecture as global_model;
+            # state_dict is loaded later from each round's CPU snapshot.
+            new_model, _ = load_model(
+                rank, config, expert_manager, subtensor, wallet, None,
+                partial=True, checkpoint_device=device,
+            )
+            return new_model
+
+        download_worker = BackgroundDownloadWorker(
+            config=config,
+            round_ref=round_ref,
+            foreground_active=foreground_active,
+            merge_phase_active=merge_phase_active,
+        )
+        eval_worker = BackgroundEvalWorker(
+            config=config,
+            round_ref=round_ref,
+            model_factory=_eval_model_factory,
+            device=device,
+            tokenizer=tokenizer,
+            score_aggregator=score_aggregator,
+            score_path=score_path,
+            merge_phase_active=merge_phase_active,
+            eval_window_active=eval_window_active,
+            gpu_eval_lock=gpu_eval_lock,
+        )
+        download_worker.start()
+        eval_worker.start()
+        logger.info("Background download + eval workers started")
+
     try:
         while True:
 
@@ -687,6 +739,60 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             global_opt_step = phase_response.phase_start_block
             logger.info("(0) Commit new seed for next validation")
 
+            # === (4) Close the (3) window and submit weights for the round
+            # whose evaluation just ended. This used to live at the bottom of
+            # the cycle (after ValidatorCommit2); it now happens here, at end
+            # of Train(K+1) = start of MinerCommit1(K+1), so the weights
+            # reflect both (2) foreground and (3) background scores.
+            eval_window_active.clear()
+            pending_round: Round | None = round_ref.current
+            if pending_round is not None and not pending_round.weights_submitted:
+                # Missed-submission penalty pass against the frozen roster.
+                for entry in pending_round.unscored_roster_uids():
+                    score_aggregator.add_score(
+                        uid=entry.uid,
+                        hotkey=entry.hotkey,
+                        score=0.0,
+                        round_id=pending_round.round_id,
+                    )
+                    logger.info(
+                        "Penalizing missing submission",
+                        uid=entry.uid, hotkey=entry.hotkey[:6], score=0.0,
+                        round_id=pending_round.round_id,
+                    )
+
+                logger.info(
+                    "(4) Set weight to chain (delayed for round)",
+                    round_id=pending_round.round_id,
+                )
+                uid_weights = score_aggregator.uid_score_pairs(how="avg")
+                logger.info(
+                    "Submitting weights derived from avg scores",
+                    top_weights={
+                        str(k): round(v, 4)
+                        for k, v in sorted(
+                            uid_weights.items(), key=lambda item: item[1], reverse=True,
+                        )[:5]
+                    },
+                )
+                try:
+                    submit_weights(
+                        config=config,
+                        wallet=wallet,
+                        subtensor=lite_subtensor,
+                        uid_weights=uid_weights,
+                        normalize=True,
+                        top_k=config.evaluation.top_k_miners_to_reward,
+                    )
+                    pending_round.weights_submitted = True
+                except Exception as e:
+                    logger.error("(4) submit_weights failed", error=str(e), exc_info=True)
+
+                try:
+                    score_aggregator.persist_atomic(score_path)
+                except Exception as e:
+                    logger.warning("Failed to persist score_aggregator after submit_weights", error=str(e))
+
             # Submit fallback weights if last_update is stale (past max_weight_age).
             # Fetch the metagraph once per cycle — it holds per-neuron tensors and
             # is reused later for penalizing missing submissions.
@@ -712,91 +818,89 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(subtensor, phase_response)
 
-            # === Wait till Submission phase; stream-evaluate during Submission only ===
-            # Start eval as soon as miners can submit so slow uploads get picked
-            # up and scored the moment they land. Evaluation runs one miner at a
-            # time and stops at the Submission phase boundary.
+            # === Wait till Submission phase; freeze the round and start
+            # foreground evaluation of the top-N (step 2). The round is the
+            # unit of work for the rest of the lifecycle: download worker
+            # picks up its background_uids, eval worker waits for
+            # eval_window_active to open after Merge.
             phase_response = wait_till(config, PhaseNames.submission)
 
             logger.info(
-                "(1) Starting streaming miner evaluation",
+                "(0) Submission phase entered — freezing round",
                 submission_start=phase_response.phase_start_block,
                 submission_end=phase_response.phase_end_block,
                 current_block=subtensor.block,
             )
 
             cleanup(global_model)
-            # Compute once at submission start and reuse for both streaming
-            # evaluation and the post-evaluation penalty pass. Recomputing
-            # later would query a different block/phase and could yield a
-            # different assignment.
-            from connito.shared.cycle import get_validator_miner_assignment
-            validator_miner_assignment = get_validator_miner_assignment(config, subtensor)
-            miner_jobs = asyncio.run(
-                stream_gather_and_evaluate(
-                    config=config,
-                    subtensor=subtensor,
-                    step=global_opt_step,
-                    device=device,
-                    score_aggregator=score_aggregator,
-                    base_model=global_model,
-                    tokenizer=tokenizer,
-                    combined_seed=get_combined_validator_seed(config, subtensor),
-                    end_block=phase_response.phase_end_block,
-                    validator_miner_assignment=validator_miner_assignment,
-                )
+
+            # (0) Lock and prioritize: build the round roster (incentive-ranked,
+            # restricted to this validator's assignment), capture the seed, and
+            # snapshot global_model.state_dict() to CPU before Merge can mutate it.
+            new_round = Round.freeze(
+                config=config,
+                subtensor=subtensor,
+                lite_subtensor=lite_subtensor,
+                global_model=global_model,
+                top_n=int(config.evaluation.foreground_top_n),
+                round_id=phase_response.phase_start_block,
             )
+            round_ref.swap(new_current=new_round)
+            try:
+                VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
+            except Exception:
+                pass
+
+            # (2) Foreground evaluation: top-N miners only, by incentive,
+            # bounded by per_miner_eval_timeout_sec; spillover lands in (3).
+            foreground_active.set()
+            try:
+                miner_jobs = asyncio.run(
+                    evaluate_foreground_round(
+                        config=config,
+                        round_obj=new_round,
+                        subtensor=subtensor,
+                        step=global_opt_step,
+                        device=device,
+                        score_aggregator=score_aggregator,
+                        base_model=global_model,
+                        tokenizer=tokenizer,
+                        end_block=phase_response.phase_end_block,
+                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
+                    )
+                )
+            finally:
+                foreground_active.clear()
+            try:
+                VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
+            except Exception:
+                pass
 
             phase_response = wait_till(config, PhaseNames.validate)
 
-            logger.info("(2) Streaming evaluation complete, aggregating score", evaluated=len(miner_jobs))
+            logger.info("(2) Foreground evaluation complete", evaluated=len(miner_jobs))
             if len(miner_jobs) == 0:
-                logger.warning("No miner jobs evaluated", step=global_opt_step)
+                logger.warning("No foreground miners evaluated", round_id=new_round.round_id)
 
             cleanup(global_model)
 
-            # Penalize assigned miners that missed their submission. Reuse the
-            # assignment computed at submission start — recomputing here would
-            # query a later block/phase and could penalize a different set.
-            miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
+            # Logging — show scores for foreground miners only; the (3)
+            # background scores accumulate after Merge.
             submitted_uids = {job.uid for job in miner_jobs}
-            # Reuse the metagraph fetched above for this cycle
-            for expected_hotkey in miner_assignment:
-                try:
-                    uid = metagraph.hotkeys.index(expected_hotkey)
-                    if uid not in submitted_uids:
-                        score_aggregator.add_score(uid=uid, hotkey=expected_hotkey, score=0.0)
-                        logger.info("Penalizing missing submission", uid=uid, hotkey=expected_hotkey[:6], score=0.0)
-                except ValueError:
-                    continue
- 
-            # Logging - Only show scores for miners evaluated or penalized this round
-            this_round_uids = {job.uid for job in miner_jobs} | {
-                metagraph.hotkeys.index(hk) for hk in miner_assignment
-                if hk in metagraph.hotkeys and metagraph.hotkeys.index(hk) not in submitted_uids
-            }
             all_latest = score_aggregator.uid_score_pairs(how="latest")
-            round_scores = {uid: round(s, 4) for uid, s in all_latest.items() if uid in this_round_uids}
+            round_scores = {uid: round(s, 4) for uid, s in all_latest.items() if uid in submitted_uids}
             logger.info(
-                "Evaluation results (latest this round)",
+                "Foreground evaluation results",
                 miners_evaluated=len(submitted_uids),
-                miners_penalized=len(this_round_uids) - len(submitted_uids),
+                round_id=new_round.round_id,
                 scores=round_scores,
             )
 
-            avg_scores = score_aggregator.uid_score_pairs(how="avg")
-            logger.info(
-                "Evaluation results (avg scores)",
-                total_miners=len(avg_scores),
-                scores={uid: round(s, 4) for uid, s in avg_scores.items()},
-            )
-
-            # Persist aggregator state locally for restarts
+            # Persist aggregator state atomically.
             try:
-                with open(score_path, "w") as f:
-                    f.write(score_aggregator.to_json())
+                score_aggregator.persist_atomic(score_path)
             except Exception as e:
-                logger.warning(f"Failed to save score_aggregator.json: {e}")
+                logger.warning(f"Failed to persist score_aggregator: {e}")
 
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
@@ -848,74 +952,90 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
 
-            if grad_is_valid:
-                logger.info("(4) Syncing gradient across validators")
-                sync_grad_across_validators(
-                    config=config,
-                    group_averagers=group_averagers,
-                    group_grad_buff_meta=group_grad_buff_meta,
-                    model=global_model,
-                )
-
-                # === global optimizer ===
-                logger.info("(5) Running global model optimization step")
-
-                org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
-
-                run_global_optimization(
-                    global_model=global_model,
-                    device=device,
-                    rank=rank,
-                    outer_optimizer=outer_optimizer,
-                    miner_jobs=miner_jobs,
-                    score_aggregator=score_aggregator,
-                )
-
-                logger.info(
-                    "Optimization step complete",
-                    org_model_hash=org_model_hash,
-                    new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                )
-                _participated_in_merge = True
-            else:
-                logger.info(
-                    "(4/5) Skipping gradient sync and optimizer — "
-                    "no valid gradient contribution this cycle"
-                )
-                _participated_in_merge = False
-
-            cleanup(global_model)
-
-            # === save checkpoint ===
-            logger.info("(6) Saving checkpoint")
-            ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
-
-            presave_keep = None
-            if config.ckpt.checkpoint_topk is not None:
-                presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
-            if presave_keep is not None:
-                presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
-                if presave_deleted:
-                    logger.info(
-                        "Pruned older checkpoints before save",
-                        keep=presave_keep,
-                        deleted=presave_deleted,
+            # Suspend both background workers for the entire Merge window —
+            # they share GPU and DHT resources with sync_grad_across_validators
+            # and run_global_optimization.
+            merge_phase_active.set()
+            try:
+                if grad_is_valid:
+                    logger.info("(4) Syncing gradient across validators")
+                    sync_grad_across_validators(
+                        config=config,
+                        group_averagers=group_averagers,
+                        group_grad_buff_meta=group_grad_buff_meta,
+                        model=global_model,
                     )
 
-            save_checkpoint(
-                checkpoint_path=ckpt_path,
-                model=global_model,
-                outer_optimizer=outer_optimizer,
-                loss=loss_batch.item(),
-                outer_scaler=outer_scaler,
-                data_loader=train_dataloader,
-                save_global_state=rank == 0,
-                rank=rank,
-                expert_manager=expert_manager,
-                save_model_by_expert_group=True,
-                strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
-                active_expert_group_id=config.task.exp.group_id,
-            )
+                    # === global optimizer ===
+                    logger.info("(5) Running global model optimization step")
+
+                    org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
+
+                    run_global_optimization(
+                        global_model=global_model,
+                        device=device,
+                        rank=rank,
+                        outer_optimizer=outer_optimizer,
+                        miner_jobs=miner_jobs,
+                        score_aggregator=score_aggregator,
+                    )
+
+                    logger.info(
+                        "Optimization step complete",
+                        org_model_hash=org_model_hash,
+                        new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
+                    )
+                    _participated_in_merge = True
+                else:
+                    logger.info(
+                        "(4/5) Skipping gradient sync and optimizer — "
+                        "no valid gradient contribution this cycle"
+                    )
+                    _participated_in_merge = False
+
+                cleanup(global_model)
+
+                # === save checkpoint ===
+                logger.info("(6) Saving checkpoint")
+                ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
+
+                presave_keep = None
+                if config.ckpt.checkpoint_topk is not None:
+                    presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
+                if presave_keep is not None:
+                    presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
+                    if presave_deleted:
+                        logger.info(
+                            "Pruned older checkpoints before save",
+                            keep=presave_keep,
+                            deleted=presave_deleted,
+                        )
+
+                save_checkpoint(
+                    checkpoint_path=ckpt_path,
+                    model=global_model,
+                    outer_optimizer=outer_optimizer,
+                    loss=loss_batch.item(),
+                    outer_scaler=outer_scaler,
+                    data_loader=train_dataloader,
+                    save_global_state=rank == 0,
+                    rank=rank,
+                    expert_manager=expert_manager,
+                    save_model_by_expert_group=True,
+                    strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
+                    active_expert_group_id=config.task.exp.group_id,
+                )
+            finally:
+                merge_phase_active.clear()
+
+            # (3) Open the eval window for the round we just merged. The eval
+            # worker uses round.model_snapshot_cpu (taken at freeze time) so
+            # the post-Merge mutation of global_model does not affect it.
+            eval_window_active.set()
+            try:
+                VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
+            except Exception:
+                pass
 
             check_phase_expired(subtensor, phase_response)
 
@@ -964,6 +1084,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         advertised_checkpoint_repo=hf_chain_repo_id,
                     )
                 elif hf_ready:
+                    # Pause the background workers while we hold the HF
+                    # bandwidth — the download worker also pulls from HF and
+                    # would contend on the same network/disk.
+                    merge_phase_active.set()
                     try:
                         hf_revision = upload_checkpoint_to_hf(
                             ckpt_dir=model_ckpt.path,
@@ -982,6 +1106,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             error=str(e),
                             exc_info=True,
                         )
+                    finally:
+                        merge_phase_active.clear()
                 else:
                     logger.warning(
                         "HF checkpoint upload unavailable; miners will use validator HTTP fallback",
@@ -1011,21 +1137,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     if ckpt_deleted:
                         logger.debug(f"Deleted old checkpoints: {ckpt_deleted}")
 
-            # === Set weight to chain ===
-            logger.info("(9) Set weight to chain")
-            uid_weights = score_aggregator.uid_score_pairs(how="avg")
-            logger.info(
-                "Submitting weights derived from avg scores",
-                top_weights={str(k): round(v, 4) for k, v in sorted(uid_weights.items(), key=lambda item: item[1], reverse=True)[:5]}
-            )
-            submit_weights(
-                config=config,
-                wallet=wallet,
-                subtensor=lite_subtensor,
-                uid_weights=uid_weights,
-                normalize=True,
-                top_k=config.evaluation.top_k_miners_to_reward,
-            )
+            # === (9) Set weight to chain ===
+            # Relocated to the top of the next iteration's MinerCommit1 block
+            # so it can incorporate the (3) background scores collected from
+            # end-of-Validate(K) through end-of-Train(K+1).
 
             # === archive top-k submissions, delete the rest ===
             if config.ckpt.archive_submissions:
@@ -1073,6 +1188,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
+        # Stop the producer first so the eval worker drains its remaining
+        # claims; then stop the eval worker.
+        if download_worker is not None:
+            download_worker.stop()
+        if eval_worker is not None:
+            eval_worker.stop()
+        if download_worker is not None:
+            download_worker.join(timeout=30)
+        if eval_worker is not None:
+            eval_worker.join(timeout=30)
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
@@ -1081,6 +1206,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         raise
     except Exception:
         logger.error("Quit training", exc_info=True)
+        if download_worker is not None:
+            download_worker.stop()
+        if eval_worker is not None:
+            eval_worker.stop()
+        if download_worker is not None:
+            download_worker.join(timeout=30)
+        if eval_worker is not None:
+            eval_worker.join(timeout=30)
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
