@@ -79,10 +79,24 @@ class ChainSubmitter:
         round_obj: Round,
         uid_weights: dict[int | str, float],
     ) -> Future:
+        nonzero = sum(1 for v in uid_weights.values() if v > 0)
+        logger.info(
+            "ChainSubmitter: scheduling weight submission",
+            round_id=round_obj.round_id,
+            total_uids=len(uid_weights),
+            nonzero_uids=nonzero,
+            top_k=self.top_k,
+            normalize=self.normalize,
+        )
         coro = self._submit_weight_one(round_obj, uid_weights)
         return self._runner.submit(coro)
 
     def async_submit_fallback_weights(self) -> Future:
+        logger.info(
+            "ChainSubmitter: scheduling fallback weight submission",
+            wait_for_inclusion=self.wait_for_inclusion,
+            wait_for_finalization=self.wait_for_finalization,
+        )
         coro = _asubmit_fallback_weights(
             self.config,
             self.wallet,
@@ -100,9 +114,16 @@ class ChainSubmitter:
         round_obj: Round,
         uid_weights: dict[int | str, float],
     ) -> bool:
+        nonzero = sum(1 for v in uid_weights.values() if v > 0)
         logger.info(
-            "ChainSubmitter: submitting weights",
+            "ChainSubmitter: submitting weights to chain (RPC starting)",
             round_id=round_obj.round_id,
+            total_uids=len(uid_weights),
+            nonzero_uids=nonzero,
+            top_k=self.top_k,
+            normalize=self.normalize,
+            wait_for_inclusion=self.wait_for_inclusion,
+            wait_for_finalization=self.wait_for_finalization,
             top_weights={
                 str(k): round(v, 4)
                 for k, v in sorted(
