@@ -85,7 +85,7 @@ VALIDATOR_ROUND_MINERS_FAILED = Gauge(
 )
 VALIDATOR_BG_WORKER_PAUSED = Gauge(
     "validator_bg_worker_paused",
-    "1 while a background worker is paused on foreground_active or merge_phase_active",
+    "1 while a background worker is paused on merge_phase_active / eval_window / download_window",
     ["worker"],
 )
 
@@ -122,6 +122,11 @@ CHAIN_CYCLE_LATENCY_SECONDS = Histogram("chain_cycle_duration_seconds", "Time pe
 RPC_ERRORS_TOTAL = Counter("chain_rpc_errors_total", "Bittensor RPC/timeout errors")
 CHAIN_WEIGHT_SET_SUCCESS = Counter("chain_weight_set_success", "Successful weight settings")
 CHAIN_WEIGHT_SET_FAILURE = Counter("chain_weight_set_failure", "Failed weight settings")
+ERRORS_TOTAL = Counter("validator_errors_total", "Errors counted by component and kind", ["component", "kind"])
+
+
+def inc_error(component: str, kind: str) -> None:
+    ERRORS_TOTAL.labels(component=component, kind=kind).inc()
 
 # ==============================================================================
 # Validator health, per-phase timing, errors, foreground/background visibility,

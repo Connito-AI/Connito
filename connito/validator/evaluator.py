@@ -26,6 +26,65 @@ logger = structlog.get_logger(__name__)
 
 
 # -----------------------------------------------------------------------------
+def validate_miner_submission(
+    *,
+    round_obj,  # connito.validator.round.Round
+    uid: int,
+    model_path: str | Path,
+    expert_group_assignment,
+) -> str | None:
+    """Run the existing `ChainCheckpoint.validate(...)` against a miner's
+    on-disk submission before it is fed to `evaluate_one_miner`.
+
+    Returns ``None`` on success. On failure returns a short reason string —
+    one of ``no_chain_commit | signature | hash | expert_group | nan_inf``,
+    or a generic ``"unknown"`` if the helper raised. The reason is intended
+    to be plumbed into telemetry labels and log lines.
+
+    The chain checkpoint is read from `round_obj.uid_to_chain_checkpoint`
+    so this never re-fetches anything from the chain. The check itself is
+    `ChainCheckpoint.validate(expert_group_assignment=…)`, which runs:
+
+    - `_verify_signature` — the chain hotkey signed `model_hash`.
+    - `_verify_hash` — the on-disk shard's hash matches the chain commit.
+    - `_verify_expert_group` — every routed-expert key in the state dict
+      belongs to the miner's assigned group, and no tensor contains NaN/Inf.
+    """
+    chain_checkpoint = round_obj.uid_to_chain_checkpoint.get(int(uid))
+    if chain_checkpoint is None:
+        return "no_chain_commit"
+
+    # `validate()` reads the state dict from `chain_checkpoint.path`; point
+    # it at the on-disk submission for this round.
+    chain_checkpoint.path = Path(model_path)
+
+    try:
+        ok = chain_checkpoint.validate(expert_group_assignment=expert_group_assignment)
+    except Exception as e:
+        logger.warning(
+            "validate_miner_submission: validate() raised",
+            uid=int(uid), error=str(e), exc_info=True,
+        )
+        return "unknown"
+
+    if ok:
+        return None
+
+    # `validate()` already logged a structured warning per failed sub-check.
+    # Map the per-check booleans to a single short reason for telemetry.
+    if not getattr(chain_checkpoint, "signature_verified", False):
+        return "signature"
+    if not getattr(chain_checkpoint, "hash_verified", False):
+        return "hash"
+    if not getattr(chain_checkpoint, "expert_group_verified", False):
+        # _verify_expert_group folds the NaN/Inf scan in with the routing
+        # check, so we cannot tell them apart from the booleans alone. The
+        # underlying logger.warning at the failure site distinguishes them.
+        return "expert_group_or_nan"
+    return "unknown"
+
+
+# -----------------------------------------------------------------------------
 @dataclass(frozen=True)
 class MinerEvalJob:
     uid: int
@@ -285,6 +344,7 @@ async def evaluate_foreground_round(
     base_model: nn.Module,
     tokenizer,
     end_block: int,
+    expert_group_assignment,
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
 ) -> list[MinerEvalJob]:
@@ -372,6 +432,31 @@ async def evaluate_foreground_round(
             job = by_uid[uid]
             hotkey = round_obj.uid_to_hotkey[uid]
             progressed = True
+
+            # Verify the on-disk submission against the chain commit (signed
+            # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
+            # GPU eval. A failure here means the submission is off-spec —
+            # mark the miner failed so the missed-submission penalty pass
+            # zeroes their score for the round.
+            fail_reason = await asyncio.to_thread(
+                validate_miner_submission,
+                round_obj=round_obj,
+                uid=uid,
+                model_path=job.model_path,
+                expert_group_assignment=expert_group_assignment,
+            )
+            if fail_reason is not None:
+                logger.warning(
+                    "foreground eval: submission failed validation — marking failed",
+                    uid=uid, hotkey=hotkey[:6],
+                    round_id=round_obj.round_id,
+                    reason=fail_reason,
+                )
+                from connito.shared.telemetry import inc_error
+                inc_error(component="foreground_eval", kind="validation")
+                round_obj.mark_failed(uid)
+                continue
+
             eval_coro = evaluate_one_miner(
                 config=config,
                 model_path=job.model_path,

@@ -673,12 +673,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.18":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.18
+    if pkg_version == "v0.1.20":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.1.20
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.18 fall through the `score_path.exists()` branch and
+        # restarts on v0.1.20 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.18", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.1.20", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
@@ -738,8 +738,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
     # === Round-lifecycle scaffolding ===
-    # foreground_active: set while the foreground evaluation pass holds GPU/HF.
     # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
+    #   Pauses bg-download (HF bandwidth contention with the validator's own
+    #   HF upload) and bg-eval (GPU contention with allreduce / optimizer step).
     # eval_window_active: set after Merge(K) completes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
@@ -749,7 +750,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     #   from MinerCommit1(K+1) → Submission(K+1).
     # gpu_eval_lock: held by the eval worker only across its load_state_dict
     #   and evaluate_one_miner calls (yielded everywhere else; see plan).
-    foreground_active = threading.Event()
+    #
+    # Note: bg-download intentionally does NOT pause on the foreground eval
+    # pass. Foreground reads from `miner_submission_path`, which bg-download
+    # is responsible for filling, so they MUST run concurrently or foreground
+    # never finds anything to evaluate.
     merge_phase_active = threading.Event()
     eval_window_active = threading.Event()
     download_window_closed = threading.Event()
@@ -762,7 +767,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         download_worker = BackgroundDownloadWorker(
             config=config,
             round_ref=round_ref,
-            foreground_active=foreground_active,
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
@@ -778,6 +782,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             eval_window_active=eval_window_active,
             gpu_eval_lock=gpu_eval_lock,
+            expert_group_assignment=expert_manager.expert_group_assignment,
         )
         download_worker.start()
         eval_worker.start()
@@ -799,9 +804,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
             # === Wait till commit phase to submit random seed ===
-            phase_response = wait_till(config, PhaseNames.miner_commit_1)
-            _mark_phase("miner_commit_1")
-            global_opt_step = phase_response.phase_start_block
+            phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
             logger.info("Commit new seed for next validation")
 
             # === (4) Close the (3) window and submit weights for the round
@@ -811,6 +814,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # reflect both (2) foreground and (3) background scores.
             eval_window_active.clear()
             pending_round: Round | None = round_ref.current
+            scheduled_round_weights = False
             if pending_round is not None and not pending_round.weights_submitted:
                 # Missed-submission penalty pass against the frozen roster.
                 for entry in pending_round.unscored_roster_uids():
@@ -834,27 +838,43 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
+                scheduled_round_weights = True
 
                 try:
                     score_aggregator.persist_atomic(score_path)
                 except Exception as e:
                     logger.warning("Failed to persist score_aggregator after submit_weights", error=str(e))
 
-            # Submit fallback weights if last_update is stale (past max_weight_age).
-            # Fetch the metagraph once per cycle — it holds per-neuron tensors and
-            # is reused later for penalizing missing submissions.
+            # Submit fallback weights if last_update is stale (past max_weight_age)
+            # AND we did not just schedule a fresh round-weight submission. The
+            # round's set_weights will bump last_update once it lands, which is
+            # exactly what the fallback would do — and racing both extrinsics on
+            # the same wallet caused substrate "Invalid Transaction" / "Priority
+            # is too low" errors and let the (older) fallback weights overwrite
+            # the round's weights on chain. If the round's submit fails, next
+            # cycle's stale-weights check catches it (no race that cycle).
             max_weight_age = int(config.cycle.cycle_length)
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
             current_block = lite_subtensor.get_current_block()
             weight_age = current_block - last_update
-            if weight_age > max_weight_age:
+            if scheduled_round_weights:
+                logger.debug(
+                    "Skipping fallback weights this cycle (round weights already scheduled)",
+                    weight_age=weight_age,
+                    max_weight_age=max_weight_age,
+                )
+            elif weight_age > max_weight_age:
                 logger.info("Weights stale, submitting fallback (non-blocking)",
                             weight_age=weight_age, max_weight_age=max_weight_age)
                 # Non-blocking; ChainSubmitter serializes this with the
                 # commit_status that follows, so order is preserved.
                 chain_submitter.async_submit_fallback_weights()
+
+            phase_response = wait_till(config, PhaseNames.miner_commit_1)
+            _mark_phase("miner_commit_1")
+            global_opt_step = phase_response.phase_start_block
 
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
@@ -900,24 +920,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # (2) Foreground evaluation: top-N miners only, by incentive,
             # bounded by per_miner_eval_timeout_sec; spillover lands in (3).
-            foreground_active.set()
-            try:
-                miner_jobs = asyncio.run(
-                    evaluate_foreground_round(
-                        config=config,
-                        round_obj=new_round,
-                        subtensor=subtensor,
-                        step=global_opt_step,
-                        device=device,
-                        score_aggregator=score_aggregator,
-                        base_model=global_model,
-                        tokenizer=tokenizer,
-                        end_block=phase_response.phase_end_block,
-                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                    )
+            # bg-download runs concurrently here, filling
+            # `miner_submission_path` with foreground UIDs first so this loop
+            # has work to discover.
+            miner_jobs = asyncio.run(
+                evaluate_foreground_round(
+                    config=config,
+                    round_obj=new_round,
+                    subtensor=subtensor,
+                    step=global_opt_step,
+                    device=device,
+                    score_aggregator=score_aggregator,
+                    base_model=global_model,
+                    tokenizer=tokenizer,
+                    end_block=phase_response.phase_end_block,
+                    expert_group_assignment=expert_manager.expert_group_assignment,
+                    per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                 )
-            finally:
-                foreground_active.clear()
+            )
 
             # Hand bg-eval a copy of global_model the first time foreground
             # eval finishes — Merge hasn't run yet, so global_model still
@@ -1203,7 +1223,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === Close download window, archive top-k, prune the rest ===
             # Wait until 20 blocks before the next MinerCommit1 so the cleanup
             # finishes inside the quiet window just before the new cycle begins.
-            wait_till(config, PhaseNames.miner_commit_1, block_offset=-20)
+            wait_till(config, PhaseNames.miner_commit_1, block_offset=-30)
             download_window_closed.set()
 
             if config.ckpt.archive_submissions:

@@ -22,9 +22,15 @@ class ValidatorMinerAssignment(NamedTuple):
             `foreground_top_n * num_validators` incentive truncation.
             Background download/eval can use this wider set so it covers
             miners outside this validator's slice.
+        chain_checkpoints_by_hotkey: hotkey -> the miner's `ChainCheckpoint`
+            (carrying signed_model_hash, model_hash, expert_group, etc.).
+            The eval path uses this to verify each submission via
+            `ChainCheckpoint.validate(expert_group_assignment=...)` without
+            re-fetching anything from chain at eval time.
     """
     assignment: dict[str, list[str]]
     miners_with_checkpoint: list[str]
+    chain_checkpoints_by_hotkey: dict[str, "ChainCheckpoint"] = {}
 
 import bittensor
 import requests
@@ -420,13 +426,25 @@ def assign_miners_to_validators(
     return assignment
 
 
-def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subtensor) -> str:
+def get_combined_validator_seed(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    commits: list[tuple[WorkerChainCommit, bittensor.Neuron]] | None = None,
+) -> str:
     """
     Deterministically combine validator seeds into a single hex string.
 
     We sort validator IDs so the result is independent of dict iteration order.
+
+    `commits` is the head-block result of `get_chain_commits(config,
+    subtensor)`. Pass it explicitly when the caller has already fetched it
+    (e.g. inside `Round.freeze`, where the same head-block fetch is shared
+    with `get_validator_miner_assignment`) to avoid duplicating a slow
+    archive RPC.
     """
-    commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
+    if commits is None:
+        commits = get_chain_commits(config, subtensor)
 
     validator_seeds = get_validator_seed_from_commit(config, commits)
     if not validator_seeds:
@@ -438,11 +456,24 @@ def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subte
 
 
 def get_validator_miner_assignment(
-    config: WorkerConfig, subtensor: bittensor.Subtensor,
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    commits: list[tuple[WorkerChainCommit, bittensor.Neuron]] | None = None,
+    metagraph: bittensor.Metagraph | None = None,
 ) -> ValidatorMinerAssignment:
+    """Resolve the validator → miner assignment for the current phase.
+
+    `commits` and `metagraph` are head-block reads that callers often already
+    have in hand (e.g. `Round.freeze` is invoked with a metagraph and
+    immediately needs commits twice — once for the seed and once here).
+    Passing them in skips the duplicate RPCs against the archive endpoint
+    that share the global `_subtensor_lock`.
+    """
     from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
 
-    commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
+    if commits is None:
+        commits = get_chain_commits(config, subtensor)
     validator_seeds = get_validator_seed_from_commit(config, commits)
     miners = get_miners_from_commit(config, commits)
 
@@ -450,7 +481,12 @@ def get_validator_miner_assignment(
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
         config=config, subtensor=subtensor, for_role="miner",
     )
-    miners_with_checkpoint = {ckpt.hotkey for ckpt in chain_checkpoints.checkpoints}
+    # Index by hotkey so the eval path can look up signed_model_hash /
+    # model_hash / expert_group for `_verify_*` without re-touching the chain.
+    chain_checkpoints_by_hotkey = {
+        ckpt.hotkey: ckpt for ckpt in chain_checkpoints.checkpoints if ckpt.hotkey
+    }
+    miners_with_checkpoint = set(chain_checkpoints_by_hotkey.keys())
     excluded_miners = [m for m in miners if m not in miners_with_checkpoint]
     if excluded_miners and len(excluded_miners) == len(miners):
         logger.info(
@@ -470,7 +506,8 @@ def get_validator_miner_assignment(
     # foreground_top_n * num_validators. The remainder is dropped
     # before assignment so validators do not waste cycles on low-incentive
     # miners that would never be reached anyway.
-    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+    if metagraph is None:
+        metagraph = subtensor.metagraph(netuid=config.chain.netuid)
     hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
 
     def _incentive(hk: str) -> float:
@@ -525,6 +562,7 @@ def get_validator_miner_assignment(
     return ValidatorMinerAssignment(
         assignment=validator_miner_assignment,
         miners_with_checkpoint=all_miners_with_checkpoint,
+        chain_checkpoints_by_hotkey=chain_checkpoints_by_hotkey,
     )
 
 
