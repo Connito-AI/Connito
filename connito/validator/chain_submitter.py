@@ -48,6 +48,7 @@ class ChainSubmitter:
         top_k: int | None = None,
         wait_for_inclusion: bool = False,
         wait_for_finalization: bool = False,
+        post_submit_delay_s: float = 14.0,
         runner_name: str = "connito-validator-chain-submitter",
     ) -> None:
         self.config = config
@@ -56,6 +57,11 @@ class ChainSubmitter:
         self.top_k = top_k
         self.wait_for_inclusion = wait_for_inclusion
         self.wait_for_finalization = wait_for_finalization
+        # Held inside the lock after each extrinsic so the wallet's nonce on
+        # chain has time to increment before the next caller submits. Without
+        # this, back-to-back submissions land in the substrate tx pool with
+        # the same nonce and collide ("Priority is too low (1 vs 1)").
+        self.post_submit_delay_s = post_submit_delay_s
 
         self._runner = AsyncRunner(name=runner_name)
         self._async_subtensor = bittensor.AsyncSubtensor(
@@ -78,22 +84,35 @@ class ChainSubmitter:
             self._submit_lock = asyncio.Lock()
         return self._submit_lock
 
+    async def _hold_for_nonce_advance(self) -> None:
+        """Held inside the lock after a successful chain extrinsic so the
+        wallet's on-chain nonce has time to advance before the next caller
+        submits — defending against substrate tx-pool collisions."""
+        if self.post_submit_delay_s > 0:
+            await asyncio.sleep(self.post_submit_delay_s)
+
     async def _commit_locked(
         self,
         status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
     ):
         async with self._get_lock():
-            return await acommit_status(self.config, self.wallet, self._async_subtensor, status)
+            try:
+                return await acommit_status(self.config, self.wallet, self._async_subtensor, status)
+            finally:
+                await self._hold_for_nonce_advance()
 
     async def _submit_fallback_locked(self):
         async with self._get_lock():
-            return await _asubmit_fallback_weights(
-                self.config,
-                self.wallet,
-                self._async_subtensor,
-                wait_for_inclusion=self.wait_for_inclusion,
-                wait_for_finalization=self.wait_for_finalization,
-            )
+            try:
+                return await _asubmit_fallback_weights(
+                    self.config,
+                    self.wallet,
+                    self._async_subtensor,
+                    wait_for_inclusion=self.wait_for_inclusion,
+                    wait_for_finalization=self.wait_for_finalization,
+                )
+            finally:
+                await self._hold_for_nonce_advance()
 
     def async_commit(
         self,
@@ -154,16 +173,19 @@ class ChainSubmitter:
 
         try:
             async with self._get_lock():
-                success = await submit_weights_async(
-                    config=self.config,
-                    wallet=self.wallet,
-                    async_subtensor=self._async_subtensor,
-                    uid_weights=uid_weights,
-                    normalize=self.normalize,
-                    top_k=self.top_k,
-                    wait_for_inclusion=self.wait_for_inclusion,
-                    wait_for_finalization=self.wait_for_finalization,
-                )
+                try:
+                    success = await submit_weights_async(
+                        config=self.config,
+                        wallet=self.wallet,
+                        async_subtensor=self._async_subtensor,
+                        uid_weights=uid_weights,
+                        normalize=self.normalize,
+                        top_k=self.top_k,
+                        wait_for_inclusion=self.wait_for_inclusion,
+                        wait_for_finalization=self.wait_for_finalization,
+                    )
+                finally:
+                    await self._hold_for_nonce_advance()
         except Exception as e:
             logger.error(
                 "ChainSubmitter: submit_weights_async raised",
