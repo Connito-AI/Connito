@@ -420,13 +420,25 @@ def assign_miners_to_validators(
     return assignment
 
 
-def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subtensor) -> str:
+def get_combined_validator_seed(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    commits: list[tuple[WorkerChainCommit, bittensor.Neuron]] | None = None,
+) -> str:
     """
     Deterministically combine validator seeds into a single hex string.
 
     We sort validator IDs so the result is independent of dict iteration order.
+
+    `commits` is the head-block result of `get_chain_commits(config,
+    subtensor)`. Pass it explicitly when the caller has already fetched it
+    (e.g. inside `Round.freeze`, where the same head-block fetch is shared
+    with `get_validator_miner_assignment`) to avoid duplicating a slow
+    archive RPC.
     """
-    commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
+    if commits is None:
+        commits = get_chain_commits(config, subtensor)
 
     validator_seeds = get_validator_seed_from_commit(config, commits)
     if not validator_seeds:
@@ -438,11 +450,24 @@ def get_combined_validator_seed(config: WorkerConfig, subtensor: bittensor.Subte
 
 
 def get_validator_miner_assignment(
-    config: WorkerConfig, subtensor: bittensor.Subtensor,
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    commits: list[tuple[WorkerChainCommit, bittensor.Neuron]] | None = None,
+    metagraph: bittensor.Metagraph | None = None,
 ) -> ValidatorMinerAssignment:
+    """Resolve the validator → miner assignment for the current phase.
+
+    `commits` and `metagraph` are head-block reads that callers often already
+    have in hand (e.g. `Round.freeze` is invoked with a metagraph and
+    immediately needs commits twice — once for the seed and once here).
+    Passing them in skips the duplicate RPCs against the archive endpoint
+    that share the global `_subtensor_lock`.
+    """
     from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
 
-    commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(config, subtensor)
+    if commits is None:
+        commits = get_chain_commits(config, subtensor)
     validator_seeds = get_validator_seed_from_commit(config, commits)
     miners = get_miners_from_commit(config, commits)
 
@@ -470,7 +495,8 @@ def get_validator_miner_assignment(
     # foreground_top_n * num_validators. The remainder is dropped
     # before assignment so validators do not waste cycles on low-incentive
     # miners that would never be reached anyway.
-    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+    if metagraph is None:
+        metagraph = subtensor.metagraph(netuid=config.chain.netuid)
     hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
 
     def _incentive(hk: str) -> float:
