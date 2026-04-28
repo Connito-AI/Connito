@@ -297,6 +297,7 @@ class BackgroundEvalWorker(threading.Thread):
                 reason=fail_reason,
             )
             inc_error(component="bg_eval", kind="validation")
+            self.score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=0, round_id=round_obj.round_id)
             round_obj.mark_failed(uid)
             self._record_metrics(round_obj, scored_inc=False)
             return
