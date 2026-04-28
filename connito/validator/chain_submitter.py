@@ -16,6 +16,7 @@ Each method is fire-and-forget — the returned `Future` can be ignored.
 
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import Future
 
 import bittensor
@@ -60,6 +61,11 @@ class ChainSubmitter:
         self._async_subtensor = bittensor.AsyncSubtensor(
             network=config.chain.lite_network or config.chain.network
         )
+        # Serializes every chain extrinsic this submitter issues.
+        # Why: same wallet → substrate tx pool collisions ("Priority is too
+        # low", "Invalid Transaction") when set_weights and set_commitment
+        # land concurrently. Lazy-init inside the runner loop.
+        self._submit_lock: asyncio.Lock | None = None
         init = getattr(self._async_subtensor, "initialize", None)
         if init is not None:
             try:
@@ -67,12 +73,33 @@ class ChainSubmitter:
             except Exception as e:
                 logger.warning("ChainSubmitter: AsyncSubtensor.initialize() failed", error=str(e))
 
+    def _get_lock(self) -> asyncio.Lock:
+        if self._submit_lock is None:
+            self._submit_lock = asyncio.Lock()
+        return self._submit_lock
+
+    async def _commit_locked(
+        self,
+        status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
+    ):
+        async with self._get_lock():
+            return await acommit_status(self.config, self.wallet, self._async_subtensor, status)
+
+    async def _submit_fallback_locked(self):
+        async with self._get_lock():
+            return await _asubmit_fallback_weights(
+                self.config,
+                self.wallet,
+                self._async_subtensor,
+                wait_for_inclusion=self.wait_for_inclusion,
+                wait_for_finalization=self.wait_for_finalization,
+            )
+
     def async_commit(
         self,
         status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
     ) -> Future:
-        coro = acommit_status(self.config, self.wallet, self._async_subtensor, status)
-        return self._runner.submit(coro)
+        return self._runner.submit(self._commit_locked(status))
 
     def async_submit_weight(
         self,
@@ -97,14 +124,7 @@ class ChainSubmitter:
             wait_for_inclusion=self.wait_for_inclusion,
             wait_for_finalization=self.wait_for_finalization,
         )
-        coro = _asubmit_fallback_weights(
-            self.config,
-            self.wallet,
-            self._async_subtensor,
-            wait_for_inclusion=self.wait_for_inclusion,
-            wait_for_finalization=self.wait_for_finalization,
-        )
-        return self._runner.submit(coro)
+        return self._runner.submit(self._submit_fallback_locked())
 
     def stop(self) -> None:
         self._runner.stop()
@@ -133,16 +153,17 @@ class ChainSubmitter:
         )
 
         try:
-            success = await submit_weights_async(
-                config=self.config,
-                wallet=self.wallet,
-                async_subtensor=self._async_subtensor,
-                uid_weights=uid_weights,
-                normalize=self.normalize,
-                top_k=self.top_k,
-                wait_for_inclusion=self.wait_for_inclusion,
-                wait_for_finalization=self.wait_for_finalization,
-            )
+            async with self._get_lock():
+                success = await submit_weights_async(
+                    config=self.config,
+                    wallet=self.wallet,
+                    async_subtensor=self._async_subtensor,
+                    uid_weights=uid_weights,
+                    normalize=self.normalize,
+                    top_k=self.top_k,
+                    wait_for_inclusion=self.wait_for_inclusion,
+                    wait_for_finalization=self.wait_for_finalization,
+                )
         except Exception as e:
             logger.error(
                 "ChainSubmitter: submit_weights_async raised",
