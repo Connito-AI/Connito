@@ -63,10 +63,16 @@ Defined at `run.py:671-674`:
 
 | Name                 | Type            | Set by                                                                                        | Cleared by                                                                | Effect |
 |----------------------|-----------------|-----------------------------------------------------------------------------------------------|---------------------------------------------------------------------------|--------|
-| `foreground_active`  | `Event`         | main, before `evaluate_foreground_round`                                                      | main, in `finally`                                                        | bg-download paused (no HF bandwidth contention with foreground HF hydration) |
 | `merge_phase_active` | `Event`         | main, around Merge / global-optimizer / save **and** around HF upload (`run.py:1096-1116`)    | main, in `finally`                                                        | both bg workers paused (DHT/GPU/HF) |
 | `eval_window_active` | `Event`         | main, after Merge completes (`run.py:1040`)                                                   | main, at top of next cycle's MinerCommit1 (`run.py:763`)                  | bg-eval may run; cleared so step (4) sees a stable score set |
+| `download_window_closed` | `Event`     | main, before `wait_till(MinerCommit1, block_offset=-20)`                                      | main, after the next `Round.freeze`                                       | bg-download paused while round-K downloads are dead weight (post-MinerCommit1(K+1)) |
 | `gpu_eval_lock`      | `Lock`          | bg-eval, briefly around `load_state_dict` and `evaluate_one_miner`                            | bg-eval, in `finally`                                                     | the *worker's* contract for serializing its own GPU work; **foreground does not take it** |
+
+bg-download intentionally does NOT pause on the foreground eval pass.
+Foreground reads from `miner_submission_path`, which bg-download is
+responsible for filling, so the two MUST run concurrently or foreground
+never finds anything to evaluate. Foreground does not pull from HF
+itself, so there is no bandwidth contention between the two.
 
 Workers re-check the gate Events only **between iterations**, never mid-call.
 
@@ -96,10 +102,12 @@ real-world collision and the consequence if it happens.
 
 ### 5.1 GPU contention between foreground eval and bg-eval — **medium**
 
-- Foreground does not acquire `gpu_eval_lock`. It relies entirely on
-  `foreground_active` to keep bg-eval out.
+- Foreground does not acquire `gpu_eval_lock`. It relies on
+  `eval_window_active` (set only after Merge completes) to keep bg-eval
+  out — bg-eval is gated on this and on `merge_phase_active`, so it
+  never runs during the Submission window when foreground is active.
 - Bg-eval re-checks gates only at iteration boundaries. If the worker
-  is mid-`_evaluate_one` when main sets `foreground_active`, the in-flight
+  is mid-`_evaluate_one` when the window closes, the in-flight
   evaluation finishes on its own clock — bounded by
   `per_miner_eval_timeout_sec`.
 - Two CUDA streams will run in parallel for at most one bg-eval miner.
@@ -219,11 +227,12 @@ real-world collision and the consequence if it happens.
 2. Bg workers re-check gating Events only between iterations. If a new
    gate is added, set it **before** the protected work begins and clear
    it **after**, with a `try/finally` — same pattern as
-   `foreground_active` and `merge_phase_active`.
+   `merge_phase_active` and `download_window_closed`.
 3. Any new GPU code path that runs concurrently with bg-eval must
    acquire `gpu_eval_lock`. Foreground today does not, which is OK only
-   because `foreground_active` keeps bg-eval out at iteration
-   boundaries. Don't add a new producer that doesn't gate or lock.
+   because `eval_window_active` is unset during the Submission window
+   so bg-eval never runs alongside foreground. Don't add a new producer
+   that doesn't gate or lock.
 4. If you add a new shared mutable state, decide up front: thread-local,
    lock-protected (and which lock), or atomic flag. Don't rely on
    "the GIL will sort it out" — it won't for compound updates.

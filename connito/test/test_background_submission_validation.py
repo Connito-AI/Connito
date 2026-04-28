@@ -249,7 +249,7 @@ class TestBackgroundQueue:
         # shuffled (PR #55), so assert set membership instead of list order.
         assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_c", "hk_d"}
 
-    def test_foreground_claim_removes_from_background_queue(self) -> None:
+    def test_foreground_claim_removes_uid_from_download_queue(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
         # hk_b is mine; hk_a and hk_c are someone else's so they go background.
@@ -259,11 +259,10 @@ class TestBackgroundQueue:
         # Background candidates begin as {hk_a, hk_c} in shuffled order.
         assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_c"}
 
-        # If we claim hk_c via foreground (simulating spillover), it should
-        # disappear from the background queue.
+        # Claiming a UID via foreground removes it from the download queue.
         uid_c = next(e.uid for e in rnd.roster if e.hotkey == "hk_c")
         assert rnd.claim_for_foreground(uid_c) is True
-        assert [e.hotkey for e in rnd.next_for_download()] == ["hk_a"]
+        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b"}
 
     def test_publish_download_then_pop_round_trip(self, tmp_path: Path) -> None:
         config = _fake_validator_config()

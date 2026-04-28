@@ -85,7 +85,7 @@ VALIDATOR_ROUND_MINERS_FAILED = Gauge(
 )
 VALIDATOR_BG_WORKER_PAUSED = Gauge(
     "validator_bg_worker_paused",
-    "1 while a background worker is paused on foreground_active or merge_phase_active",
+    "1 while a background worker is paused on merge_phase_active / eval_window / download_window",
     ["worker"],
 )
 

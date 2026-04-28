@@ -701,8 +701,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
     # === Round-lifecycle scaffolding ===
-    # foreground_active: set while the foreground evaluation pass holds GPU/HF.
     # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
+    #   Pauses bg-download (HF bandwidth contention with the validator's own
+    #   HF upload) and bg-eval (GPU contention with allreduce / optimizer step).
     # eval_window_active: set after Merge(K) completes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
@@ -712,7 +713,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     #   from MinerCommit1(K+1) → Submission(K+1).
     # gpu_eval_lock: held by the eval worker only across its load_state_dict
     #   and evaluate_one_miner calls (yielded everywhere else; see plan).
-    foreground_active = threading.Event()
+    #
+    # Note: bg-download intentionally does NOT pause on the foreground eval
+    # pass. Foreground reads from `miner_submission_path`, which bg-download
+    # is responsible for filling, so they MUST run concurrently or foreground
+    # never finds anything to evaluate.
     merge_phase_active = threading.Event()
     eval_window_active = threading.Event()
     download_window_closed = threading.Event()
@@ -725,7 +730,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         download_worker = BackgroundDownloadWorker(
             config=config,
             round_ref=round_ref,
-            foreground_active=foreground_active,
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
@@ -861,24 +865,23 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # (2) Foreground evaluation: top-N miners only, by incentive,
             # bounded by per_miner_eval_timeout_sec; spillover lands in (3).
-            foreground_active.set()
-            try:
-                miner_jobs = asyncio.run(
-                    evaluate_foreground_round(
-                        config=config,
-                        round_obj=new_round,
-                        subtensor=subtensor,
-                        step=global_opt_step,
-                        device=device,
-                        score_aggregator=score_aggregator,
-                        base_model=global_model,
-                        tokenizer=tokenizer,
-                        end_block=phase_response.phase_end_block,
-                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                    )
+            # bg-download runs concurrently here, filling
+            # `miner_submission_path` with foreground UIDs first so this loop
+            # has work to discover.
+            miner_jobs = asyncio.run(
+                evaluate_foreground_round(
+                    config=config,
+                    round_obj=new_round,
+                    subtensor=subtensor,
+                    step=global_opt_step,
+                    device=device,
+                    score_aggregator=score_aggregator,
+                    base_model=global_model,
+                    tokenizer=tokenizer,
+                    end_block=phase_response.phase_end_block,
+                    per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                 )
-            finally:
-                foreground_active.clear()
+            )
 
             # Hand bg-eval a copy of global_model the first time foreground
             # eval finishes — Merge hasn't run yet, so global_model still
