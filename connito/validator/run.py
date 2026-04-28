@@ -778,6 +778,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # reflect both (2) foreground and (3) background scores.
             eval_window_active.clear()
             pending_round: Round | None = round_ref.current
+            scheduled_round_weights = False
             if pending_round is not None and not pending_round.weights_submitted:
                 # Missed-submission penalty pass against the frozen roster.
                 for entry in pending_round.unscored_roster_uids():
@@ -801,22 +802,34 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
+                scheduled_round_weights = True
 
                 try:
                     score_aggregator.persist_atomic(score_path)
                 except Exception as e:
                     logger.warning("Failed to persist score_aggregator after submit_weights", error=str(e))
 
-            # Submit fallback weights if last_update is stale (past max_weight_age).
-            # Fetch the metagraph once per cycle — it holds per-neuron tensors and
-            # is reused later for penalizing missing submissions.
+            # Submit fallback weights if last_update is stale (past max_weight_age)
+            # AND we did not just schedule a fresh round-weight submission. The
+            # round's set_weights will bump last_update once it lands, which is
+            # exactly what the fallback would do — and racing both extrinsics on
+            # the same wallet caused substrate "Invalid Transaction" / "Priority
+            # is too low" errors and let the (older) fallback weights overwrite
+            # the round's weights on chain. If the round's submit fails, next
+            # cycle's stale-weights check catches it (no race that cycle).
             max_weight_age = int(config.cycle.cycle_length)
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
             current_block = lite_subtensor.get_current_block()
             weight_age = current_block - last_update
-            if weight_age > max_weight_age:
+            if scheduled_round_weights:
+                logger.debug(
+                    "Skipping fallback weights this cycle (round weights already scheduled)",
+                    weight_age=weight_age,
+                    max_weight_age=max_weight_age,
+                )
+            elif weight_age > max_weight_age:
                 logger.info("Weights stale, submitting fallback (non-blocking)",
                             weight_age=weight_age, max_weight_age=max_weight_age)
                 # Non-blocking; ChainSubmitter serializes this with the
