@@ -745,6 +745,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             eval_window_active=eval_window_active,
             gpu_eval_lock=gpu_eval_lock,
+            expert_group_assignment=expert_manager.expert_group_assignment,
         )
         download_worker.start()
         eval_worker.start()
@@ -879,6 +880,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     base_model=global_model,
                     tokenizer=tokenizer,
                     end_block=phase_response.phase_end_block,
+                    expert_group_assignment=expert_manager.expert_group_assignment,
                     per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                 )
             )

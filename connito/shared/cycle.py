@@ -22,9 +22,15 @@ class ValidatorMinerAssignment(NamedTuple):
             `foreground_top_n * num_validators` incentive truncation.
             Background download/eval can use this wider set so it covers
             miners outside this validator's slice.
+        chain_checkpoints_by_hotkey: hotkey -> the miner's `ChainCheckpoint`
+            (carrying signed_model_hash, model_hash, expert_group, etc.).
+            The eval path uses this to verify each submission via
+            `ChainCheckpoint.validate(expert_group_assignment=...)` without
+            re-fetching anything from chain at eval time.
     """
     assignment: dict[str, list[str]]
     miners_with_checkpoint: list[str]
+    chain_checkpoints_by_hotkey: dict[str, "ChainCheckpoint"] = {}
 
 import bittensor
 import requests
@@ -475,7 +481,12 @@ def get_validator_miner_assignment(
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
         config=config, subtensor=subtensor, for_role="miner",
     )
-    miners_with_checkpoint = {ckpt.hotkey for ckpt in chain_checkpoints.checkpoints}
+    # Index by hotkey so the eval path can look up signed_model_hash /
+    # model_hash / expert_group for `_verify_*` without re-touching the chain.
+    chain_checkpoints_by_hotkey = {
+        ckpt.hotkey: ckpt for ckpt in chain_checkpoints.checkpoints if ckpt.hotkey
+    }
+    miners_with_checkpoint = set(chain_checkpoints_by_hotkey.keys())
     excluded_miners = [m for m in miners if m not in miners_with_checkpoint]
     if excluded_miners and len(excluded_miners) == len(miners):
         logger.info(
@@ -551,6 +562,7 @@ def get_validator_miner_assignment(
     return ValidatorMinerAssignment(
         assignment=validator_miner_assignment,
         miners_with_checkpoint=all_miners_with_checkpoint,
+        chain_checkpoints_by_hotkey=chain_checkpoints_by_hotkey,
     )
 
 
