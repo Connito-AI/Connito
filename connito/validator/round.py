@@ -12,12 +12,15 @@ import random
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import TYPE_CHECKING, Iterable, NamedTuple
 
 import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+
+if TYPE_CHECKING:
+    from connito.shared.checkpoints import ChainCheckpoint
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +53,10 @@ class Round:
     background_uids: tuple[int, ...]
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
+    # Per-uid `ChainCheckpoint` snapshot captured at freeze time so the eval
+    # path can run `validate(expert_group_assignment=...)` (signature, hash,
+    # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
+    uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = field(default_factory=dict)
 
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
@@ -107,12 +114,19 @@ class Round:
         foreground: list[int] = []
         background: list[int] = []
         uid_to_hotkey: dict[int, str] = {}
+        uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = {}
+        chain_checkpoints_by_hotkey = getattr(
+            assignment_result, "chain_checkpoints_by_hotkey", {}
+        ) or {}
         for hk in assignment_result.miners_with_checkpoint:
             uid = hotkey_to_uid.get(hk)
             if uid is None:
                 logger.warning("Round.freeze: hotkey not in metagraph; skipping", hotkey=hk[:6])
                 continue
             uid_to_hotkey[uid] = hk
+            ckpt = chain_checkpoints_by_hotkey.get(hk)
+            if ckpt is not None:
+                uid_to_chain_checkpoint[uid] = ckpt
             (foreground if hk in my_assignment_set else background).append(uid)
 
         foreground_uids = tuple(foreground)
@@ -152,6 +166,7 @@ class Round:
             background_uids=background_uids,
             uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
+            uid_to_chain_checkpoint=uid_to_chain_checkpoint,
         )
 
     # ---------------- Claim / score helpers ----------------
