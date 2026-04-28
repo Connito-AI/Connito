@@ -134,7 +134,8 @@ def _freeze_round(
         assignment=assignment,
         miners_with_checkpoint=miners_with_checkpoint,
     )
-    with patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
+    with patch("connito.shared.chain.get_chain_commits", return_value=[]), \
+         patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
          patch("connito.shared.cycle.get_validator_miner_assignment", return_value=assignment_result):
         return Round.freeze(
             config=config,
@@ -237,19 +238,16 @@ class TestSnapshotIsolation:
 # ---------------------------------------------------------------------------
 
 class TestBackgroundQueue:
-    def test_next_for_download_includes_foreground_first(self) -> None:
+    def test_next_for_download_yields_full_background_set(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5, "hk_d": 0.3})
         # Only hk_b is mine; the rest belong to other validators (background).
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c", "hk_d"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Foreground = [hk_b]. Background is shuffled per-(validator, round)
-        # so we assert set-membership for the background tail and exact order
-        # only for the foreground prefix.
-        order = [e.hotkey for e in rnd.next_for_download()]
-        assert order[: len(rnd.foreground_uids)] == ["hk_b"]
-        assert set(order[len(rnd.foreground_uids):]) == {"hk_a", "hk_c", "hk_d"}
+        # Foreground = hk_b. Background order is per-(validator, round)
+        # shuffled (PR #55), so assert set membership instead of list order.
+        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_c", "hk_d"}
 
     def test_foreground_claim_removes_uid_from_download_queue(self) -> None:
         config = _fake_validator_config()
@@ -258,8 +256,8 @@ class TestBackgroundQueue:
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Roster covers foreground + background.
-        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b", "hk_c"}
+        # Background candidates begin as {hk_a, hk_c} in shuffled order.
+        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_c"}
 
         # Claiming a UID via foreground removes it from the download queue.
         uid_c = next(e.uid for e in rnd.roster if e.hotkey == "hk_c")

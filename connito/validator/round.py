@@ -79,13 +79,23 @@ class Round:
         incentive snapshot and the global_model state_dict (CPU clone)
         before Merge(K) can mutate either.
         """
+        from connito.shared.chain import get_chain_commits
         from connito.shared.cycle import (
             get_combined_validator_seed,
             get_validator_miner_assignment,
         )
 
-        seed = get_combined_validator_seed(config, subtensor)
-        assignment_result = get_validator_miner_assignment(config, subtensor)
+        # Fetch head-block chain commits ONCE and pass to both helpers; they
+        # would otherwise each issue a duplicate `get_all_commitments` +
+        # `metagraph()` pair against the archive endpoint, serialized through
+        # the global subtensor lock. Same for the metagraph already passed in
+        # by the caller — `get_validator_miner_assignment` reuses it instead
+        # of re-fetching head-block state.
+        commits = get_chain_commits(config, subtensor)
+        seed = get_combined_validator_seed(config, subtensor, commits=commits)
+        assignment_result = get_validator_miner_assignment(
+            config, subtensor, commits=commits, metagraph=metagraph,
+        )
         assignment = assignment_result.assignment
         my_assignment_set = set(assignment.get(config.chain.hotkey_ss58, []))
 
