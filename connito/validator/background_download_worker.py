@@ -1,16 +1,19 @@
 """Step (1) of the round lifecycle: download miner HF checkpoints in the
 background, in incentive order, into the round's `downloaded_pool`.
 
-This worker is network-only. It is paused while:
-  - the foreground holds GPU/HF (`foreground_active` set), or
-  - the main loop is in the Merge phase (`merge_phase_active` set), or
+This worker is network-only — disk writes + HF reads — so it does not
+contend with foreground evaluation (which only reads from disk and runs
+on GPU). It is paused while:
+  - the main loop is in the Merge phase (`merge_phase_active` set), so
+    HF upload + allreduce can hold the available bandwidth, or
   - the download window has closed (`download_window_closed` set), which
     the main loop sets when it begins waiting for MinerCommit1 of the
     next round and clears at the next freeze.
 
-It does not gate on `eval_window_active`; download continues across the
-round's eval window (Submission → MinerCommit1(K+1)) so the eval worker
-has work queued when its window opens.
+It does not gate on the foreground pass: foreground reads from
+`miner_submission_path`, which this worker is responsible for filling,
+so the two MUST run concurrently or foreground would never discover any
+miner to evaluate.
 """
 
 from __future__ import annotations
@@ -42,7 +45,6 @@ class BackgroundDownloadWorker(threading.Thread):
         *,
         config,
         round_ref: RoundRef,
-        foreground_active: threading.Event,
         merge_phase_active: threading.Event,
         download_window_closed: threading.Event | None = None,
         stop_event: threading.Event | None = None,
@@ -51,7 +53,6 @@ class BackgroundDownloadWorker(threading.Thread):
         super().__init__(daemon=True, name="connito-bg-download")
         self.config = config
         self.round_ref = round_ref
-        self.foreground_active = foreground_active
         self.merge_phase_active = merge_phase_active
         self.download_window_closed = download_window_closed or threading.Event()
         self.stop_event = stop_event or threading.Event()
@@ -100,8 +101,7 @@ class BackgroundDownloadWorker(threading.Thread):
 
                 # Snapshot pause state for telemetry.
                 paused = (
-                    self.foreground_active.is_set()
-                    or self.merge_phase_active.is_set()
+                    self.merge_phase_active.is_set()
                     or self.download_window_closed.is_set()
                 )
                 try:
@@ -112,7 +112,6 @@ class BackgroundDownloadWorker(threading.Thread):
                     if idle_ticks % IDLE_LOG_EVERY == 0:
                         logger.info(
                             "bg-download: paused",
-                            foreground_active=self.foreground_active.is_set(),
                             merge_phase_active=self.merge_phase_active.is_set(),
                             download_window_closed=self.download_window_closed.is_set(),
                         )
@@ -123,13 +122,18 @@ class BackgroundDownloadWorker(threading.Thread):
                 # Pick the next UID to download.
                 target = self._next_target(round_obj)
                 if target is None:
-                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                    # Log only on the transition into idle; stay quiet until
+                    # new work arrives. idle_ticks resets to 0 on the next
+                    # successful download below, re-arming this log for the
+                    # next gap. Without this, an empty queue spammed
+                    # ~once-per-30s for the whole rest of the cycle.
+                    if idle_ticks == 0:
                         try:
                             stats = round_obj.stats()
                         except Exception:
                             stats = None
                         logger.info(
-                            "bg-download: no pending targets",
+                            "bg-download: no pending targets — going idle",
                             round_id=getattr(round_obj, "round_id", None),
                             round_stats=stats,
                         )
@@ -156,14 +160,12 @@ class BackgroundDownloadWorker(threading.Thread):
         # propagate without spinning.
         logger.info(
             "bg-download: deactivated — gates blocked, pausing downloads",
-            foreground_active=self.foreground_active.is_set(),
             merge_phase_active=self.merge_phase_active.is_set(),
             download_window_closed=self.download_window_closed.is_set(),
         )
         while not self.stop_event.is_set():
             if (
-                not self.foreground_active.is_set()
-                and not self.merge_phase_active.is_set()
+                not self.merge_phase_active.is_set()
                 and not self.download_window_closed.is_set()
             ):
                 logger.info("bg-download: active — gates cleared, resuming downloads")
@@ -172,9 +174,10 @@ class BackgroundDownloadWorker(threading.Thread):
 
     async def _download_one(self, round_obj, *, uid: int, hotkey: str) -> None:
         timeout = float(self.config.evaluation.per_miner_download_timeout_sec)
-        # background_uids and foreground_uids are disjoint, and there is a
-        # single download thread, so we don't need to claim the UID here.
-        # publish_download is a no-op if the UID has already been scored.
+        # We walk foreground_uids first then background_uids; the single
+        # download thread plus next_for_download's claimed/scored/failed
+        # filters keep us from racing with foreground eval. publish_download
+        # is a no-op if the UID has already been scored.
         subtensor = self._subtensor
         if subtensor is None:
             return

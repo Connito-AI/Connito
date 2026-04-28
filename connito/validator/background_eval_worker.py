@@ -46,6 +46,7 @@ class BackgroundEvalWorker(threading.Thread):
         merge_phase_active: threading.Event,
         eval_window_active: threading.Event,
         gpu_eval_lock: threading.Lock,
+        expert_group_assignment,
         stop_event: threading.Event | None = None,
         poll_interval_sec: float = 2.0,
     ) -> None:
@@ -59,6 +60,7 @@ class BackgroundEvalWorker(threading.Thread):
         self.merge_phase_active = merge_phase_active
         self.eval_window_active = eval_window_active
         self.gpu_eval_lock = gpu_eval_lock
+        self.expert_group_assignment = expert_group_assignment
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
         # Model is handed in by the main loop (see set_eval_base_model)
@@ -272,6 +274,32 @@ class BackgroundEvalWorker(threading.Thread):
 
         timeout = float(self.config.evaluation.per_miner_eval_timeout_sec)
         baseline = self._loaded_baseline_loss if self._loaded_baseline_loss is not None else 100.0
+
+        # Verify the on-disk submission against the chain commit (signed
+        # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
+        # GPU eval. Off-spec submissions are dropped — same outcome as
+        # the foreground path.
+        from connito.shared.telemetry import inc_error
+        from connito.validator.evaluator import validate_miner_submission
+
+        fail_reason = await asyncio.to_thread(
+            validate_miner_submission,
+            round_obj=round_obj,
+            uid=uid,
+            model_path=path,
+            expert_group_assignment=self.expert_group_assignment,
+        )
+        if fail_reason is not None:
+            logger.warning(
+                "bg-eval: submission failed validation — marking failed",
+                uid=uid, hotkey=hotkey[:6],
+                round_id=round_obj.round_id,
+                reason=fail_reason,
+            )
+            inc_error(component="bg_eval", kind="validation")
+            round_obj.mark_failed(uid)
+            self._record_metrics(round_obj, scored_inc=False)
+            return
 
         logger.info(
             "bg-eval: evaluating",

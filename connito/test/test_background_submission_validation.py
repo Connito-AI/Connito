@@ -134,7 +134,8 @@ def _freeze_round(
         assignment=assignment,
         miners_with_checkpoint=miners_with_checkpoint,
     )
-    with patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
+    with patch("connito.shared.chain.get_chain_commits", return_value=[]), \
+         patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
          patch("connito.shared.cycle.get_validator_miner_assignment", return_value=assignment_result):
         return Round.freeze(
             config=config,
@@ -237,32 +238,33 @@ class TestSnapshotIsolation:
 # ---------------------------------------------------------------------------
 
 class TestBackgroundQueue:
-    def test_next_for_download_walks_background_in_incentive_order(self) -> None:
+    def test_next_for_download_yields_foreground_first_then_background(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5, "hk_d": 0.3})
         # Only hk_b is mine; the rest belong to other validators (background).
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c", "hk_d"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Foreground = hk_b. Background = hk_c, hk_d, hk_a (incentive desc).
         order = [e.hotkey for e in rnd.next_for_download()]
-        assert order == ["hk_c", "hk_d", "hk_a"]
+        # Foreground (hk_b) first, then background in per-(validator, round)
+        # shuffled order (PR #55).
+        assert order[: len(rnd.foreground_uids)] == ["hk_b"]
+        assert set(order[len(rnd.foreground_uids):]) == {"hk_a", "hk_c", "hk_d"}
 
-    def test_foreground_claim_removes_from_background_queue(self) -> None:
+    def test_foreground_claim_removes_uid_from_download_queue(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
         # hk_b is mine; hk_a and hk_c are someone else's so they go background.
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Background candidates begin as [hk_c, hk_a].
-        assert [e.hotkey for e in rnd.next_for_download()] == ["hk_c", "hk_a"]
+        # Roster covers foreground (hk_b) + background (hk_a, hk_c).
+        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b", "hk_c"}
 
-        # If we claim hk_c via foreground (simulating spillover), it should
-        # disappear from the background queue.
+        # Claiming a UID via foreground removes it from the download queue.
         uid_c = next(e.uid for e in rnd.roster if e.hotkey == "hk_c")
         assert rnd.claim_for_foreground(uid_c) is True
-        assert [e.hotkey for e in rnd.next_for_download()] == ["hk_a"]
+        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b"}
 
     def test_publish_download_then_pop_round_trip(self, tmp_path: Path) -> None:
         config = _fake_validator_config()
@@ -483,6 +485,7 @@ class TestBackgroundEvalWorker:
             merge_phase_active=merge_active,
             eval_window_active=eval_window,
             gpu_eval_lock=gpu_lock,
+            expert_group_assignment={},
             stop_event=stop,
             poll_interval_sec=0.05,
         )

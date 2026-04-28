@@ -8,15 +8,19 @@ background workers (download + eval) all anchor on the same `Round`.
 
 from __future__ import annotations
 
+import random
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import TYPE_CHECKING, Iterable, NamedTuple
 
 import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+
+if TYPE_CHECKING:
+    from connito.shared.checkpoints import ChainCheckpoint
 
 logger = structlog.get_logger(__name__)
 
@@ -49,6 +53,10 @@ class Round:
     background_uids: tuple[int, ...]
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
+    # Per-uid `ChainCheckpoint` snapshot captured at freeze time so the eval
+    # path can run `validate(expert_group_assignment=...)` (signature, hash,
+    # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
+    uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = field(default_factory=dict)
 
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
@@ -78,13 +86,23 @@ class Round:
         incentive snapshot and the global_model state_dict (CPU clone)
         before Merge(K) can mutate either.
         """
+        from connito.shared.chain import get_chain_commits
         from connito.shared.cycle import (
             get_combined_validator_seed,
             get_validator_miner_assignment,
         )
 
-        seed = get_combined_validator_seed(config, subtensor)
-        assignment_result = get_validator_miner_assignment(config, subtensor)
+        # Fetch head-block chain commits ONCE and pass to both helpers; they
+        # would otherwise each issue a duplicate `get_all_commitments` +
+        # `metagraph()` pair against the archive endpoint, serialized through
+        # the global subtensor lock. Same for the metagraph already passed in
+        # by the caller — `get_validator_miner_assignment` reuses it instead
+        # of re-fetching head-block state.
+        commits = get_chain_commits(config, subtensor)
+        seed = get_combined_validator_seed(config, subtensor, commits=commits)
+        assignment_result = get_validator_miner_assignment(
+            config, subtensor, commits=commits, metagraph=metagraph,
+        )
         assignment = assignment_result.assignment
         my_assignment_set = set(assignment.get(config.chain.hotkey_ss58, []))
 
@@ -96,15 +114,32 @@ class Round:
         foreground: list[int] = []
         background: list[int] = []
         uid_to_hotkey: dict[int, str] = {}
+        uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = {}
+        chain_checkpoints_by_hotkey = getattr(
+            assignment_result, "chain_checkpoints_by_hotkey", {}
+        ) or {}
         for hk in assignment_result.miners_with_checkpoint:
             uid = hotkey_to_uid.get(hk)
             if uid is None:
                 logger.warning("Round.freeze: hotkey not in metagraph; skipping", hotkey=hk[:6])
                 continue
             uid_to_hotkey[uid] = hk
+            ckpt = chain_checkpoints_by_hotkey.get(hk)
+            if ckpt is not None:
+                uid_to_chain_checkpoint[uid] = ckpt
             (foreground if hk in my_assignment_set else background).append(uid)
 
         foreground_uids = tuple(foreground)
+
+        rid = int(round_id) if round_id is not None else int(subtensor.block)
+
+        # Shuffle background deterministically per (validator, round) so each
+        # validator hits HF in a different order — spreads download load
+        # across the subnet instead of every validator racing for the same
+        # top-incentive miners first. Stable within a round (workers see the
+        # same order across re-reads) but varies cycle-to-cycle so no miner
+        # is permanently stuck at the back of any one validator's queue.
+        random.Random(f"{config.chain.hotkey_ss58}:{rid}").shuffle(background)
         background_uids = tuple(background)
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
@@ -113,8 +148,6 @@ class Round:
         snapshot = {
             k: v.detach().clone().cpu() for k, v in global_model.state_dict().items()
         }
-
-        rid = int(round_id) if round_id is not None else int(subtensor.block)
 
         logger.info(
             "Round.freeze: roster locked",
@@ -133,6 +166,7 @@ class Round:
             background_uids=background_uids,
             uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
+            uid_to_chain_checkpoint=uid_to_chain_checkpoint,
         )
 
     # ---------------- Claim / score helpers ----------------
@@ -206,10 +240,18 @@ class Round:
         )
 
     def next_for_download(self) -> Iterable[RosterEntry]:
-        """Yield background_uids in incentive order that are not yet
-        downloaded, scored, or claimed. Re-checks state each iteration so
-        pause/resume stays correct."""
-        for uid in self.background_uids:
+        """Yield roster UIDs (foreground first, then background) in priority
+        order that are not yet downloaded, scored, or claimed. Re-checks state
+        each iteration so pause/resume stays correct.
+
+        Foreground UIDs are yielded first because they are this validator's
+        assignment slice — `gather_validation_job` (called by
+        `evaluate_foreground_round`) scans `miner_submission_path`, so until
+        bg-download writes a foreground miner's shard to disk, foreground eval
+        polls forever and finds nothing. Walking foreground first puts the
+        priority work where it's needed.
+        """
+        for uid in (*self.foreground_uids, *self.background_uids):
             with self._lock:
                 if (
                     uid in self.scored_uids
