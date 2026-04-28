@@ -224,7 +224,8 @@ class ModelCheckpoint(BaseModel):
 
             layer_id, expert_id = get_layer_expert_id(name)
             if layer_id is None or expert_id is None:
-                continue
+                self.expert_group_verified = False
+                return self.expert_group_verified
 
             routed_expert_key_count += 1
 
