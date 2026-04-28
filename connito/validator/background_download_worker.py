@@ -122,13 +122,18 @@ class BackgroundDownloadWorker(threading.Thread):
                 # Pick the next UID to download.
                 target = self._next_target(round_obj)
                 if target is None:
-                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                    # Log only on the transition into idle; stay quiet until
+                    # new work arrives. idle_ticks resets to 0 on the next
+                    # successful download below, re-arming this log for the
+                    # next gap. Without this, an empty queue spammed
+                    # ~once-per-30s for the whole rest of the cycle.
+                    if idle_ticks == 0:
                         try:
                             stats = round_obj.stats()
                         except Exception:
                             stats = None
                         logger.info(
-                            "bg-download: no pending targets",
+                            "bg-download: no pending targets — going idle",
                             round_id=getattr(round_obj, "round_id", None),
                             round_stats=stats,
                         )
