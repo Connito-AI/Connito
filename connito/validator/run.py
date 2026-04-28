@@ -767,8 +767,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
             # === Wait till commit phase to submit random seed ===
-            phase_response = wait_till(config, PhaseNames.miner_commit_1)
-            global_opt_step = phase_response.phase_start_block
+            phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
             logger.info("Commit new seed for next validation")
 
             # === (4) Close the (3) window and submit weights for the round
@@ -835,6 +834,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Non-blocking; ChainSubmitter serializes this with the
                 # commit_status that follows, so order is preserved.
                 chain_submitter.async_submit_fallback_weights()
+
+            phase_response = wait_till(config, PhaseNames.miner_commit_1)
+            global_opt_step = phase_response.phase_start_block
 
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
@@ -1169,7 +1171,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === Close download window, archive top-k, prune the rest ===
             # Wait until 20 blocks before the next MinerCommit1 so the cleanup
             # finishes inside the quiet window just before the new cycle begins.
-            wait_till(config, PhaseNames.miner_commit_1, block_offset=-20)
+            wait_till(config, PhaseNames.miner_commit_1, block_offset=-30)
             download_window_closed.set()
 
             if config.ckpt.archive_submissions:
