@@ -13,7 +13,14 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
-from connito.shared.telemetry import track_eval_latency, track_model_load_latency
+from connito.shared.telemetry import (
+    VALIDATOR_BASELINE_LOSS,
+    VALIDATOR_MINER_DELTA_LOSS,
+    VALIDATOR_MINER_EVAL_LATENCY_SECONDS,
+    inc_error,
+    track_eval_latency,
+    track_model_load_latency,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -224,6 +231,7 @@ async def evaluate_one_miner(
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
+    lane: str = "foreground",
 ) -> "MinerEvalJob | None":
     """Evaluate a single miner and record the score.
 
@@ -241,22 +249,23 @@ async def evaluate_one_miner(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        miner_model = await asyncio.to_thread(load_model_from_path, str(model_path), base_model, device)
+        with VALIDATOR_MINER_EVAL_LATENCY_SECONDS.labels(lane=lane).time():
+            miner_model = await asyncio.to_thread(load_model_from_path, str(model_path), base_model, device)
 
-        try:
-            metrics = await _evaluate_on_fresh_loader(
-                config=config,
-                tokenizer=tokenizer,
-                combinded_seed=combined_seed,
-                step=step,
-                model=miner_model,
-                device=device,
-                max_eval_batches=max_eval_batches,
-                rank=rank,
-            )
-        finally:
-            del miner_model
-            gc.collect()
+            try:
+                metrics = await _evaluate_on_fresh_loader(
+                    config=config,
+                    tokenizer=tokenizer,
+                    combinded_seed=combined_seed,
+                    step=step,
+                    model=miner_model,
+                    device=device,
+                    max_eval_batches=max_eval_batches,
+                    rank=rank,
+                )
+            finally:
+                del miner_model
+                gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -264,6 +273,12 @@ async def evaluate_one_miner(
         delta = max(0.0, baseline_loss - val_loss)
         score = delta ** 1.2
         score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=score, round_id=round_id)
+        if round_id is not None:
+            VALIDATOR_MINER_DELTA_LOSS.labels(
+                round_id=str(round_id),
+                miner_uid=str(int(uid)),
+                lane=lane,
+            ).set(delta)
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -277,12 +292,14 @@ async def evaluate_one_miner(
         return job
     except torch.cuda.OutOfMemoryError:
         logger.error("evaluate_one_miner: OOM", uid=int(uid))
+        inc_error(component=f"{lane}_eval", kind="oom")
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return None
     except Exception as e:
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
+        inc_error(component=f"{lane}_eval", kind="unknown")
         return None
 
 
@@ -356,6 +373,7 @@ async def evaluate_foreground_round(
         max_eval_batches=EVAL_MAX_BATCHES,
     )
     baseline_loss = float(baseline_metrics.get("val_loss", 100))
+    VALIDATOR_BASELINE_LOSS.labels(round_id=str(round_obj.round_id)).set(baseline_loss)
     del baseline_metrics
     gc.collect()
     if torch.cuda.is_available():
@@ -463,10 +481,12 @@ async def evaluate_foreground_round(
                     "foreground eval: per-miner timeout — marking failed",
                     uid=uid, hotkey=hotkey[:6],
                 )
+                inc_error(component="foreground_eval", kind="timeout")
                 round_obj.mark_failed(uid)
                 continue
             except Exception as e:
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
+                inc_error(component="foreground_eval", kind="unknown")
                 round_obj.mark_failed(uid)
                 continue
 

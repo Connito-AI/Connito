@@ -29,9 +29,11 @@ from connito.shared.app_logging import structlog
 from connito.shared.helper import parse_dynamic_filename
 from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.shared.telemetry import (
+    BG_DOWNLOAD_RESULT_TOTAL,
     VALIDATOR_BG_WORKER_PAUSED,
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
+    inc_error,
 )
 from connito.validator.evaluator import resolve_miner_hf_target
 from connito.validator.round import RoundRef
@@ -190,6 +192,7 @@ class BackgroundDownloadWorker(threading.Thread):
             )
             if target is None:
                 logger.debug("bg-download: no HF target for miner; skipping", uid=uid, hotkey=hotkey[:6])
+                BG_DOWNLOAD_RESULT_TOTAL.labels(result="no_hf_coords").inc()
                 round_obj.mark_failed(uid)
                 self._update_pending_metric(round_obj)
                 return
@@ -208,6 +211,7 @@ class BackgroundDownloadWorker(threading.Thread):
                     "bg-download: submission already on disk; reusing",
                     uid=uid, hotkey=hotkey[:6], path=str(existing),
                 )
+                BG_DOWNLOAD_RESULT_TOTAL.labels(result="reused").inc()
                 round_obj.publish_download(uid, existing)
                 self._update_pending_metric(round_obj)
                 return
@@ -233,17 +237,22 @@ class BackgroundDownloadWorker(threading.Thread):
                         filenames=[filename],
                         dest_dir=tmp_dir,
                         token_env_var=self.config.hf.token_env_var,
+                        kind="miner_submission",
                     ),
                     timeout=timeout,
                 )
                 (tmp_dir / filename).replace(dest)
             except asyncio.TimeoutError:
                 logger.warning("bg-download: timeout", uid=uid, hotkey=hotkey[:6], timeout_sec=timeout)
+                BG_DOWNLOAD_RESULT_TOTAL.labels(result="timeout").inc()
+                inc_error(component="bg_download", kind="timeout")
                 round_obj.mark_failed(uid)
                 self._record_failure_metric(round_obj)
                 return
             except Exception as e:
                 logger.warning("bg-download: failed", uid=uid, hotkey=hotkey[:6], error=str(e))
+                BG_DOWNLOAD_RESULT_TOTAL.labels(result="network_error").inc()
+                inc_error(component="bg_download", kind="network")
                 round_obj.mark_failed(uid)
                 self._record_failure_metric(round_obj)
                 return
@@ -256,6 +265,7 @@ class BackgroundDownloadWorker(threading.Thread):
                 size_bytes = dest.stat().st_size
             except OSError:
                 size_bytes = None
+            BG_DOWNLOAD_RESULT_TOTAL.labels(result="success").inc()
             logger.info(
                 "bg-download: success",
                 uid=uid, hotkey=hotkey[:6],
@@ -266,6 +276,8 @@ class BackgroundDownloadWorker(threading.Thread):
             )
         except Exception as e:
             logger.exception("bg-download: unexpected failure", uid=uid, error=str(e))
+            BG_DOWNLOAD_RESULT_TOTAL.labels(result="unknown").inc()
+            inc_error(component="bg_download", kind="unknown")
 
     def _existing_submission(self, submission_dir: Path, hotkey: str) -> Path | None:
         for path in submission_dir.glob("*.pt"):

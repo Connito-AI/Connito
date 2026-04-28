@@ -238,18 +238,17 @@ class TestSnapshotIsolation:
 # ---------------------------------------------------------------------------
 
 class TestBackgroundQueue:
-    def test_next_for_download_yields_foreground_first_then_background(self) -> None:
+    def test_next_for_download_yields_full_background_set(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5, "hk_d": 0.3})
         # Only hk_b is mine; the rest belong to other validators (background).
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c", "hk_d"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
+        # Order is shuffled per-(validator, round) to spread HF load — the
+        # contract here is set membership, not ordering. Foreground = hk_b.
         order = [e.hotkey for e in rnd.next_for_download()]
-        # Foreground (hk_b) first, then background in per-(validator, round)
-        # shuffled order (PR #55).
-        assert order[: len(rnd.foreground_uids)] == ["hk_b"]
-        assert set(order[len(rnd.foreground_uids):]) == {"hk_a", "hk_c", "hk_d"}
+        assert set(order) == {"hk_a", "hk_c", "hk_d"}
 
     def test_foreground_claim_removes_uid_from_download_queue(self) -> None:
         config = _fake_validator_config()
@@ -258,8 +257,8 @@ class TestBackgroundQueue:
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Roster covers foreground (hk_b) + background (hk_a, hk_c).
-        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b", "hk_c"}
+        # Background candidates start as {hk_a, hk_c} (shuffled order).
+        assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_c"}
 
         # Claiming a UID via foreground removes it from the download queue.
         uid_c = next(e.uid for e in rnd.roster if e.hotkey == "hk_c")

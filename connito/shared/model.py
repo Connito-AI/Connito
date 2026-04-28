@@ -310,6 +310,7 @@ def fetch_model_from_chain_validator(
                         filenames=filenames,
                         dest_dir=out_folder,
                         token_env_var=config.hf.token_env_var,
+                        kind="validator_checkpoint",
                     )
                 except Exception as e:
                     logger.warning(

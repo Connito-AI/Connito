@@ -128,6 +128,130 @@ ERRORS_TOTAL = Counter("validator_errors_total", "Errors counted by component an
 def inc_error(component: str, kind: str) -> None:
     ERRORS_TOTAL.labels(component=component, kind=kind).inc()
 
+# ==============================================================================
+# Validator health, per-phase timing, errors, foreground/background visibility,
+# baseline loss, expanded per-miner scoring, and HF transport metrics.
+# ==============================================================================
+
+# Health
+VALIDATOR_CYCLES_COMPLETED_TOTAL = Counter(
+    "validator_cycles_completed_total",
+    "Number of full validator cycles completed since process start",
+)
+VALIDATOR_LAST_CYCLE_TIMESTAMP = Gauge(
+    "validator_last_cycle_timestamp",
+    "Unix-seconds timestamp of the most recently completed validator cycle",
+)
+VALIDATOR_PARTICIPATED_IN_MERGE = Gauge(
+    "validator_participated_in_merge",
+    "1 if the validator contributed to the most recent allreduce, else 0",
+)
+VALIDATOR_INFO = Gauge(
+    "validator_info",
+    "Static label-only info gauge (always 1) describing this validator process",
+    ["version", "git_sha", "hotkey_ss58", "expert_group"],
+)
+
+# Per-phase timing
+VALIDATOR_PHASE_DURATION_SECONDS = Histogram(
+    "validator_phase_duration_seconds",
+    "Wall-clock duration of each validator phase block",
+    ["phase"],
+)
+
+# Errors
+VALIDATOR_ERRORS_TOTAL = Counter(
+    "validator_errors_total",
+    "Validator-side error count, partitioned by component and kind",
+    ["component", "kind"],
+)
+
+# Foreground / background lane visibility
+VALIDATOR_ROUND_ROSTER_SIZE = Gauge(
+    "validator_round_roster_size",
+    "Number of miners in each lane (foreground/background) for the round",
+    ["round_id", "lane"],
+)
+VALIDATOR_ROUND_MINER_LANE = Gauge(
+    "validator_round_miner_lane",
+    "1 while the (uid, lane) pair is part of the active round; cleared when round ends",
+    ["round_id", "miner_uid", "lane"],
+)
+
+# Baseline + per-miner eval visibility
+VALIDATOR_BASELINE_LOSS = Gauge(
+    "validator_baseline_loss",
+    "Baseline (un-merged) eval loss for the round, used as the reference for delta scoring",
+    ["round_id"],
+)
+VALIDATOR_MINER_DELTA_LOSS = Gauge(
+    "validator_miner_delta_loss",
+    "baseline_loss - val_loss for the miner this round (raw input to the score formula)",
+    ["round_id", "miner_uid", "lane"],
+)
+VALIDATOR_MINER_EVAL_LATENCY_SECONDS = Histogram(
+    "validator_miner_eval_latency_seconds",
+    "Per-miner evaluation latency, tagged by lane",
+    ["lane"],
+)
+
+# Per-miner scoring (extends VALIDATOR_MINER_SCORE which holds the latest score)
+VALIDATOR_MINER_SCORE_AVG = Gauge(
+    "validator_miner_score_avg",
+    "Rolling-average miner score actually used when computing chain weights",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_SCORE_POINTS = Gauge(
+    "validator_miner_score_points",
+    "Number of scoring points retained for this miner (capped at score_window)",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_CHAIN_WEIGHT = Gauge(
+    "validator_miner_chain_weight",
+    "Final normalized chain weight submitted for this miner in the most recent cycle",
+    ["miner_uid"],
+)
+
+# HF transport
+HF_TRANSFER_BYTES_TOTAL = Counter(
+    "hf_transfer_bytes_total",
+    "Bytes transferred via HuggingFace, partitioned by direction and kind",
+    ["direction", "kind"],
+)
+HF_TRANSFER_LATENCY_SECONDS = Histogram(
+    "hf_transfer_latency_seconds",
+    "Wall-clock latency of HuggingFace transfers",
+    ["direction", "kind"],
+)
+HF_TRANSFER_RESULT_TOTAL = Counter(
+    "hf_transfer_result_total",
+    "HuggingFace transfer outcomes",
+    ["direction", "kind", "result"],
+)
+
+# Background worker outcomes
+BG_DOWNLOAD_RESULT_TOTAL = Counter(
+    "bg_download_result_total",
+    "BackgroundDownloadWorker per-attempt outcomes",
+    ["result"],
+)
+BG_EVAL_RESULT_TOTAL = Counter(
+    "bg_eval_result_total",
+    "BackgroundEvalWorker per-attempt outcomes",
+    ["result"],
+)
+
+
+def inc_error(component: str, kind: str = "unknown") -> None:
+    """Bump the validator_errors_total counter with a standardized label set.
+
+    `component` ∈ {hf_upload, hf_download, foreground_eval, bg_download,
+    bg_eval, chain_commit, allreduce, peer_sync, weight_submit, eval_load}.
+    `kind` ∈ {timeout, oom, network, validation, unknown}. Use `unknown` when
+    the call site doesn't know more than "something raised."
+    """
+    VALIDATOR_ERRORS_TOTAL.labels(component=component, kind=kind).inc()
+
 
 # ==============================================================================
 # Decorators for Passive Tracing

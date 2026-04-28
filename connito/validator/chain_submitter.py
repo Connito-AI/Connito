@@ -31,6 +31,12 @@ from connito.shared.chain import (
     acommit_status,
     submit_weights_async,
 )
+from connito.shared.telemetry import (
+    CHAIN_WEIGHT_SET_FAILURE,
+    CHAIN_WEIGHT_SET_SUCCESS,
+    VALIDATOR_MINER_CHAIN_WEIGHT,
+    inc_error,
+)
 from connito.validator.round import Round
 
 logger = structlog.get_logger(__name__)
@@ -191,15 +197,27 @@ class ChainSubmitter:
                 "ChainSubmitter: submit_weights_async raised",
                 round_id=round_obj.round_id, error=str(e), exc_info=True,
             )
+            CHAIN_WEIGHT_SET_FAILURE.inc()
+            inc_error(component="weight_submit", kind="unknown")
             return False
 
         if success:
             round_obj.weights_submitted = True
+            CHAIN_WEIGHT_SET_SUCCESS.inc()
+            # Publish the per-uid weights actually submitted so dashboards can
+            # graph the consensus signal alongside the rolling-avg score.
+            for uid, weight in uid_weights.items():
+                try:
+                    VALIDATOR_MINER_CHAIN_WEIGHT.labels(miner_uid=str(uid)).set(float(weight))
+                except Exception:
+                    pass
             logger.info(
                 "ChainSubmitter: submission succeeded",
                 round_id=round_obj.round_id,
             )
         else:
+            CHAIN_WEIGHT_SET_FAILURE.inc()
+            inc_error(component="weight_submit", kind="network")
             logger.warning(
                 "ChainSubmitter: submission failed",
                 round_id=round_obj.round_id,

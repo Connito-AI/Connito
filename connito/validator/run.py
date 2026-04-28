@@ -162,11 +162,19 @@ from connito.validator.inter_validator_connection import (
     unpack_to_grads,
 )
 from connito.shared.telemetry import (
+    MODEL_PARAMETER_COUNT,
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
+    VALIDATOR_CYCLES_COMPLETED_TOTAL,
+    VALIDATOR_INFO,
+    VALIDATOR_LAST_CYCLE_TIMESTAMP,
+    VALIDATOR_PARTICIPATED_IN_MERGE,
+    VALIDATOR_PHASE_DURATION_SECONDS,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
-    SystemStatePoller
+    SystemStatePoller,
+    inc_error,
 )
+import time as _time
 from datetime import datetime
 
 configure_logging()
@@ -633,6 +641,35 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # peer validator before continuing.
     _participated_in_merge = True
 
+    # === Static "info" series so PromQL can filter the cluster by version. ===
+    try:
+        VALIDATOR_INFO.labels(
+            version=pkg_version or "unknown",
+            git_sha=os.environ.get("CONNITO_GIT_SHA", "unknown")[:12],
+            hotkey_ss58=config.chain.hotkey_ss58 or "unknown",
+            expert_group=str(config.task.exp.group_id),
+        ).set(1)
+        MODEL_PARAMETER_COUNT.set(sum(p.numel() for p in global_model.parameters()))
+    except Exception as _e:
+        logger.debug("validator_info / model_parameter_count metrics setup failed", error=str(_e))
+
+    # Tracks the most recently entered phase + when we entered it. Updated
+    # at every phase transition; observed by the next transition so we
+    # record the duration of the just-finished phase.
+    _phase_clock: dict[str, float | str | None] = {"phase": None, "t0": None}
+
+    def _mark_phase(new_phase: str | None) -> None:
+        now = _time.perf_counter()
+        prev = _phase_clock["phase"]
+        prev_t0 = _phase_clock["t0"]
+        if prev is not None and prev_t0 is not None:
+            try:
+                VALIDATOR_PHASE_DURATION_SECONDS.labels(phase=str(prev)).observe(now - float(prev_t0))
+            except Exception:
+                pass
+        _phase_clock["phase"] = new_phase
+        _phase_clock["t0"] = now
+
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
@@ -836,6 +873,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 chain_submitter.async_submit_fallback_weights()
 
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
+            _mark_phase("miner_commit_1")
             global_opt_step = phase_response.phase_start_block
 
             chain_submitter.async_commit(ValidatorChainCommit(
@@ -852,6 +890,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # picks up its background_uids, eval worker waits for
             # eval_window_active to open after Merge.
             phase_response = wait_till(config, PhaseNames.submission)
+            _mark_phase("submission")
 
             logger.info(
                 "(0) Submission phase entered — freezing round",
@@ -913,6 +952,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 pass
 
             phase_response = wait_till(config, PhaseNames.validate)
+            _mark_phase("validate")
 
             logger.info("(2) Foreground evaluation complete", evaluated=len(miner_jobs))
             if len(miner_jobs) == 0:
@@ -987,6 +1027,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
+            _mark_phase("merge")
 
             # Suspend both background workers for the entire Merge window —
             # they share GPU and DHT resources with sync_grad_across_validators
@@ -1064,6 +1105,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             finally:
                 merge_phase_active.clear()
 
+            # Snapshot the allreduce-participation outcome of this Merge phase
+            # so dashboards / alerts can flag "validator drifted out of consensus"
+            # the moment it happens, not next cycle.
+            try:
+                VALIDATOR_PARTICIPATED_IN_MERGE.set(1.0 if _participated_in_merge else 0.0)
+            except Exception:
+                pass
+
             # (3) Open the eval window for the round we just merged. The eval
             # worker uses round.model_snapshot_cpu (taken at freeze time) so
             # the post-Merge mutation of global_model does not affect it.
@@ -1083,6 +1132,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
+                _mark_phase("validator_commit_1")
                 logger.info("Commit new signed_model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(SignedModelHashChainCommit(
                     signed_model_hash=model_ckpt.signed_model_hash,
@@ -1128,6 +1178,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                                 f"global_ver={model_ckpt.global_ver} "
                                 f"expert_group={config.task.exp.group_id}"
                             ),
+                            kind="validator_checkpoint",
                         )
                     except Exception as e:
                         logger.error(
@@ -1149,6 +1200,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
 
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
+                _mark_phase("validator_commit_2")
                 logger.info("Commit model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(ValidatorChainCommit(
                     model_hash=model_ckpt.model_hash,
@@ -1238,6 +1290,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             metric_logger.log(metrics)
             cleanup(global_model)
 
+            # End-of-cycle health heartbeat. The counter feeds rate alerts;
+            # the timestamp drives "validator stuck" alerts via
+            # `time() - validator_last_cycle_timestamp > N`.
+            try:
+                VALIDATOR_CYCLES_COMPLETED_TOTAL.inc()
+                VALIDATOR_LAST_CYCLE_TIMESTAMP.set(_time.time())
+            except Exception:
+                pass
+
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
         # Stop the producer first so the eval worker drains its remaining
@@ -1253,6 +1314,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         raise
     except Exception:
         logger.error("Quit training", exc_info=True)
+        try:
+            inc_error(component="main_loop", kind="unknown")
+        except Exception:
+            pass
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()

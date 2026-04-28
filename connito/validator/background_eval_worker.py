@@ -22,10 +22,12 @@ import torch.nn as nn
 
 from connito.shared.app_logging import structlog
 from connito.shared.telemetry import (
+    BG_EVAL_RESULT_TOTAL,
     VALIDATOR_BG_WORKER_PAUSED,
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
     VALIDATOR_ROUND_MINERS_SCORED,
+    inc_error,
 )
 from connito.validator.evaluator import EVAL_MAX_BATCHES, evaluate_one_miner
 from connito.validator.round import RoundRef
@@ -332,6 +334,7 @@ class BackgroundEvalWorker(threading.Thread):
                     baseline_loss=baseline,
                     step=round_obj.round_id,
                     round_id=round_obj.round_id,
+                    lane="background",
                 )
             finally:
                 self.gpu_eval_lock.release()
@@ -340,9 +343,13 @@ class BackgroundEvalWorker(threading.Thread):
             evaluated = await asyncio.wait_for(_eval_with_lock(), timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning("bg-eval: timeout", uid=uid, hotkey=hotkey[:6], timeout_sec=timeout)
+            BG_EVAL_RESULT_TOTAL.labels(result="timeout").inc()
+            inc_error(component="bg_eval", kind="timeout")
             evaluated = None
         except Exception as e:
             logger.exception("bg-eval: failure", uid=uid, error=str(e))
+            BG_EVAL_RESULT_TOTAL.labels(result="eval_failed").inc()
+            inc_error(component="bg_eval", kind="unknown")
             evaluated = None
 
         if evaluated is None:
@@ -350,6 +357,7 @@ class BackgroundEvalWorker(threading.Thread):
             self._record_metrics(round_obj, scored_inc=False)
             return
 
+        BG_EVAL_RESULT_TOTAL.labels(result="success").inc()
         round_obj.mark_scored(uid)
         logger.info(
             "bg-eval: success",
