@@ -4,6 +4,7 @@ import ctypes
 import gc
 import math
 import os
+import secrets
 import threading
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
@@ -681,10 +682,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
 
     # === commit status === (non-blocking; queued on chain_submitter)
+    miner_seed_for_round = secrets.randbelow(2**31 - 1)
     chain_submitter.async_commit(ValidatorChainCommit(
         model_hash=None,
         global_ver=global_opt_step,
         expert_group=config.task.exp.group_id,
+        miner_seed=miner_seed_for_round,
     ))
 
     # === training ===
@@ -769,6 +772,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === Wait till commit phase to submit random seed ===
             phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
             logger.info("Commit new seed for next validation")
+            # Per-cycle eval seed. Without this, miner_seed is omitted from
+            # ValidatorChainCommit, parses back as None, and is folded to 0
+            # by get_validator_seed_from_commit — every validator emits 0,
+            # combined_seed_str = "0" * len(validators), and the sha256 is a
+            # constant string that miners can recompute from chain.
+            miner_seed_for_round = secrets.randbelow(2**31 - 1)
 
             # === (4) Close the (3) window and submit weights for the round
             # whose evaluation just ended. This used to live at the bottom of
@@ -842,6 +851,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 model_hash=current_model_hash,
                 global_ver=global_opt_step,
                 expert_group=config.task.exp.group_id,
+                miner_seed=miner_seed_for_round,
             ))
 
             check_phase_expired(lite_subtensor, phase_response)
@@ -1154,6 +1164,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     model_hash=model_ckpt.model_hash,
                     global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                     expert_group=config.task.exp.group_id,
+                    miner_seed=miner_seed_for_round,
                     hf_repo_id=hf_chain_repo_id if hf_revision else None,
                     hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
                 ))
