@@ -797,7 +797,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                uid_weights = score_aggregator.uid_score_pairs(how="avg")
+                uid_weights = score_aggregator.fresh_uid_score_pairs(
+                    current_round_id=pending_round.round_id,
+                    freshness_window=config.evaluation.weight_freshness_window,
+                    how="avg",
+                )
+                stale_dropped = (
+                    len(score_aggregator.uid_score_pairs(how="avg")) - len(uid_weights)
+                )
+                if stale_dropped > 0:
+                    logger.info(
+                        "Dropped stale miners from weight submission",
+                        round_id=pending_round.round_id,
+                        dropped=stale_dropped,
+                        freshness_window=config.evaluation.weight_freshness_window,
+                    )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)

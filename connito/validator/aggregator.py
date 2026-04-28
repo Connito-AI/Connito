@@ -247,6 +247,48 @@ class MinerScoreAggregator:
                     raise ValueError('how must be one of: "latest", "sum", "avg", "ema"')
             return out
 
+    def fresh_uid_score_pairs(
+        self,
+        *,
+        current_round_id: int,
+        freshness_window: int,
+        how: Literal["latest", "sum", "avg", "ema"] = "avg",
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[int, float]:
+        """Return {uid: score} restricted to miners scored within the last
+        `freshness_window` rounds (inclusive of `current_round_id`).
+
+        A miner whose newest tagged round_id is older than
+        `current_round_id - freshness_window` — or whose points carry no
+        round_id at all — is dropped. Callers feed the result to
+        `submit_weights_async`, where dropped uids end up with implicit
+        weight 0 instead of pulling stale scores forward.
+        """
+        if freshness_window < 0:
+            raise ValueError("freshness_window must be >= 0.")
+        cutoff_rid = current_round_id - freshness_window
+        with self._lock:
+            out: dict[int, float] = {}
+            for uid, state in self._miners.items():
+                latest_rid = max(
+                    (rid for _, _, rid in state.series.points if rid is not None),
+                    default=None,
+                )
+                if latest_rid is None or latest_rid < cutoff_rid:
+                    continue
+                if how == "latest":
+                    out[uid] = state.series.latest()
+                elif how == "sum":
+                    out[uid] = state.series.sum(start, end)
+                elif how == "avg":
+                    out[uid] = state.series.avg(start, end)
+                elif how == "ema":
+                    out[uid] = self.ema(uid, start=start, end=end)
+                else:
+                    raise ValueError('how must be one of: "latest", "sum", "avg", "ema"')
+            return out
+
     def is_in_top(
         self,
         uid: int,
