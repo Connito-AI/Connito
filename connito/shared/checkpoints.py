@@ -224,7 +224,22 @@ class ModelCheckpoint(BaseModel):
 
             layer_id, expert_id = get_layer_expert_id(name)
             if layer_id is None or expert_id is None:
-                continue
+                # Non-routed-expert tensors are not part of a miner submission's
+                # contract. Miners own only their assigned routed experts; the
+                # validator distributes everything else (embeddings, attention,
+                # shared experts, MoE gates, norms, lm_head) via
+                # model_shared.pt. A non-routed key in the submitted
+                # state_dict is therefore either malformed or an injection
+                # attempt — both must be rejected before load_state_dict
+                # overrides base-model weights at evaluation time.
+                logger.warning(
+                    "expert group verification failed: non-routed-expert tensor in submission",
+                    key=name,
+                    expert_group=self.expert_group,
+                    hotkey=self.hotkey,
+                )
+                self.expert_group_verified = False
+                return self.expert_group_verified
 
             routed_expert_key_count += 1
 
