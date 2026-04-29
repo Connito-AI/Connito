@@ -338,6 +338,7 @@ async def evaluate_foreground_round(
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
     score_path: str | os.PathLike | None = None,
+    completed_out: list[MinerEvalJob] | None = None,
 ) -> list[MinerEvalJob]:
     """Foreground (step 2): evaluate the round's top-N miners during
     Submission + Validate.
@@ -348,6 +349,14 @@ async def evaluate_foreground_round(
     itself. UIDs that exceed the per-miner budget or fail to land by
     `end_block` are left unclaimed so the `BackgroundEvalWorker` can pick
     them up in step 3.
+
+    If `completed_out` is provided, finished `MinerEvalJob`s are appended
+    to that list as they complete (in addition to being returned at the
+    end). Callers wrap this coroutine with `asyncio.wait_for` to enforce
+    a wall-clock cap; on cancellation the local return value is lost,
+    but `completed_out` retains every miner that finished scoring before
+    the deadline. `list.append` is atomic, so there is no partial-append
+    race during cancellation.
     """
     # Lazy imports — connito.shared.cycle imports this module, so a top-
     # level import would create a cycle.
@@ -372,7 +381,7 @@ async def evaluate_foreground_round(
         torch.cuda.empty_cache()
 
     foreground_set = set(round_obj.foreground_uids)
-    completed: list[MinerEvalJob] = []
+    completed: list[MinerEvalJob] = completed_out if completed_out is not None else []
 
     logger.info(
         "foreground eval: starting",

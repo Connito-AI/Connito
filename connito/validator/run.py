@@ -1008,22 +1008,56 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # bg-download runs concurrently here, filling
             # `miner_submission_path` with foreground UIDs first so this loop
             # has work to discover.
-            miner_jobs = asyncio.run(
-                evaluate_foreground_round(
-                    config=config,
-                    round_obj=new_round,
-                    subtensor=subtensor,
-                    step=global_opt_step,
-                    device=device,
-                    score_aggregator=score_aggregator,
-                    base_model=global_model,
-                    tokenizer=tokenizer,
-                    end_block=phase_response.phase_end_block,
-                    expert_group_assignment=expert_manager.expert_group_assignment,
-                    per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                    score_path=score_path,
-                )
+            #
+            # Hard wall-clock backstop on top of the cooperative deadline
+            # checks inside evaluate_foreground_round: derive a budget
+            # from the validate phase's end_block. If the inner path
+            # overshoots, asyncio.wait_for cancels the in-flight eval
+            # and the rest of this round's pipeline runs without it.
+            foreground_timeout_sec = max(
+                0.0,
+                (phase_response.phase_end_block - lite_subtensor.block)
+                * BITTENSOR_BLOCK_TIME_SECONDS,
             )
+
+            # Pre-allocated accumulator so partial scoring survives
+            # asyncio.wait_for cancellation. evaluate_foreground_round
+            # appends each MinerEvalJob to this list as it completes —
+            # if the wall-clock cap fires mid-round, anything already
+            # scored is still here for the merge step.
+            miner_jobs: list[MinerEvalJob] = []
+
+            async def _bounded_foreground_eval():
+                return await asyncio.wait_for(
+                    evaluate_foreground_round(
+                        config=config,
+                        round_obj=new_round,
+                        subtensor=subtensor,
+                        step=global_opt_step,
+                        device=device,
+                        score_aggregator=score_aggregator,
+                        base_model=global_model,
+                        tokenizer=tokenizer,
+                        end_block=phase_response.phase_end_block,
+                        expert_group_assignment=expert_manager.expert_group_assignment,
+                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
+                        score_path=score_path,
+                        completed_out=miner_jobs,
+                    ),
+                    timeout=foreground_timeout_sec,
+                )
+
+            try:
+                asyncio.run(_bounded_foreground_eval())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Foreground evaluation exceeded validate phase deadline; "
+                    "cancelling and continuing with partial scores",
+                    round_id=new_round.round_id,
+                    timeout_sec=round(foreground_timeout_sec, 2),
+                    end_block=phase_response.phase_end_block,
+                    completed_count=len(miner_jobs),
+                )
 
             # Hand bg-eval a copy of global_model the first time foreground
             # eval finishes — Merge hasn't run yet, so global_model still
