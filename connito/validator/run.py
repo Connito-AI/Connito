@@ -1021,6 +1021,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 * BITTENSOR_BLOCK_TIME_SECONDS,
             ) + 30.0
 
+            # Pre-allocated accumulator so partial scoring survives
+            # asyncio.wait_for cancellation. evaluate_foreground_round
+            # appends each MinerEvalJob to this list as it completes —
+            # if the wall-clock cap fires mid-round, anything already
+            # scored is still here for the merge step.
+            miner_jobs: list[MinerEvalJob] = []
+
             async def _bounded_foreground_eval():
                 return await asyncio.wait_for(
                     evaluate_foreground_round(
@@ -1036,21 +1043,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         expert_group_assignment=expert_manager.expert_group_assignment,
                         per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                         score_path=score_path,
+                        completed_out=miner_jobs,
                     ),
                     timeout=foreground_timeout_sec,
                 )
 
             try:
-                miner_jobs = asyncio.run(_bounded_foreground_eval())
+                asyncio.run(_bounded_foreground_eval())
             except asyncio.TimeoutError:
                 logger.warning(
                     "Foreground evaluation exceeded validate phase deadline; "
-                    "cancelling and continuing without remaining scores",
+                    "cancelling and continuing with partial scores",
                     round_id=new_round.round_id,
                     timeout_sec=round(foreground_timeout_sec, 2),
                     end_block=phase_response.phase_end_block,
+                    completed_count=len(miner_jobs),
                 )
-                miner_jobs = []
 
             # Hand bg-eval a copy of global_model the first time foreground
             # eval finishes — Merge hasn't run yet, so global_model still
