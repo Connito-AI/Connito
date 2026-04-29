@@ -276,7 +276,7 @@ def fetch_model_from_chain_validator(
     if should_download and chain_checkpoints:
         download_success = False
         retries = 0
-        max_retries = 3
+        max_retries = 2
         retry_delay_s = 10
 
         while (not download_success) and (retries < max_retries):
