@@ -6,6 +6,11 @@ import math
 import os
 import threading
 import time
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
@@ -802,6 +807,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     logger.info("ChainSubmitter ready")
 
+    # Hard wall-clock cap for sync_grad_across_validators. Python threads
+    # can't be cancelled, so on timeout we abandon the worker and skip the
+    # rest of this round's merge — the orphan keeps running until avg.step
+    # unwinds (cooperative deadline checks inside the function should make
+    # that quick). The next merge cycle refuses to start a fresh sync
+    # while a previous orphan is still alive, so the orphan can't race
+    # outer_optimizer.step or the next round's pack_grads for model.grad.
+    sync_grad_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="connito-sync-grad",
+    )
+    last_sync_grad_future: Future | None = None
+    last_sync_grad_started_at: float | None = None
+
     try:
         while True:
 
@@ -1045,34 +1063,78 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             try:
                 if grad_is_valid:
                     logger.info("Syncing gradient across validators")
-                    sync_grad_across_validators(
-                        config=config,
-                        group_averagers=group_averagers,
-                        group_grad_buff_meta=group_grad_buff_meta,
-                        model=global_model,
-                        deadline_monotonic=merge_deadline_monotonic,
-                    )
 
-                    # === global optimizer ===
-                    logger.info("Running global model optimization step")
+                    # Refuse to start a fresh sync while a previous one is
+                    # still alive — its thread may still be inside
+                    # unpack_to_grads writing model.grad. Letting a new
+                    # pack_grads run alongside would corrupt both.
+                    if (
+                        last_sync_grad_future is not None
+                        and not last_sync_grad_future.done()
+                    ):
+                        orphan_age = (
+                            round(time.monotonic() - last_sync_grad_started_at, 2)
+                            if last_sync_grad_started_at is not None
+                            else None
+                        )
+                        logger.warning(
+                            "Previous sync_grad_across_validators thread is still alive; "
+                            "skipping this round's gradient sync to avoid concurrent "
+                            "mutation of model.grad",
+                            previous_age_sec=orphan_age,
+                        )
+                        sync_grad_completed = False
+                    else:
+                        last_sync_grad_future = None
+                        last_sync_grad_started_at = time.monotonic()
+                        remaining = max(0.0, merge_deadline_monotonic - time.monotonic())
+                        future = sync_grad_executor.submit(
+                            sync_grad_across_validators,
+                            config=config,
+                            group_averagers=group_averagers,
+                            group_grad_buff_meta=group_grad_buff_meta,
+                            model=global_model,
+                            deadline_monotonic=merge_deadline_monotonic,
+                        )
+                        try:
+                            future.result(timeout=remaining)
+                            sync_grad_completed = True
+                        except FuturesTimeoutError:
+                            logger.warning(
+                                "sync_grad_across_validators exceeded merge deadline; "
+                                "abandoning thread and skipping outer optimizer step",
+                                timeout_sec=round(remaining, 2),
+                            )
+                            last_sync_grad_future = future
+                            sync_grad_completed = False
 
-                    org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
+                    if sync_grad_completed:
+                        # === global optimizer ===
+                        logger.info("Running global model optimization step")
 
-                    run_global_optimization(
-                        global_model=global_model,
-                        device=device,
-                        rank=rank,
-                        outer_optimizer=outer_optimizer,
-                        miner_jobs=miner_jobs,
-                        score_aggregator=score_aggregator,
-                    )
+                        org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
-                    logger.info(
-                        "Optimization step complete",
-                        org_model_hash=org_model_hash,
-                        new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                    )
-                    _participated_in_merge = True
+                        run_global_optimization(
+                            global_model=global_model,
+                            device=device,
+                            rank=rank,
+                            outer_optimizer=outer_optimizer,
+                            miner_jobs=miner_jobs,
+                            score_aggregator=score_aggregator,
+                        )
+
+                        logger.info(
+                            "Optimization step complete",
+                            org_model_hash=org_model_hash,
+                            new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
+                        )
+                        _participated_in_merge = True
+                    else:
+                        # Sync was orphaned or skipped: don't run the outer
+                        # optimizer (model.grad may be in an indeterminate
+                        # state) and trigger the peer-resync path next
+                        # cycle via _participated_in_merge=False.
+                        _participated_in_merge = False
                 else:
                     logger.info(
                         "Skipping gradient sync and optimizer — "
@@ -1299,6 +1361,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
+        # Don't wait on a stuck sync_grad worker — it may be blocked inside
+        # avg.step. cancel_futures only affects pending submissions, not
+        # the in-flight one, which keeps running until avg.step unwinds.
+        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()
         raise
@@ -1309,6 +1375,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
+        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()
 
