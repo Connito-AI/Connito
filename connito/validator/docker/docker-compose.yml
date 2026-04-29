@@ -102,9 +102,14 @@ services:
 
     command: ["--path", "/data/configs/validator.yaml"]
 
-    # Surface a basic liveness signal — telemetry server starts on 8200.
+    # Surface a liveness signal — both the Prometheus exporter (8200) and
+    # the state API (8300) must respond, so a wedged FastAPI thread also
+    # fails the probe (not just a dead Prometheus exporter). CMD-SHELL is
+    # required because && chains under a shell.
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8200/metrics"]
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://localhost:8200/metrics && curl -fsS http://localhost:8300/healthz"
       interval: 60s
       timeout: 10s
       retries: 5
