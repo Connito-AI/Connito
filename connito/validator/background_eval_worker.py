@@ -333,6 +333,7 @@ class BackgroundEvalWorker(threading.Thread):
                     baseline_loss=baseline,
                     step=round_obj.round_id,
                     round_id=round_obj.round_id,
+                    score_path=self.score_path,
                 )
             finally:
                 self.gpu_eval_lock.release()
@@ -357,12 +358,7 @@ class BackgroundEvalWorker(threading.Thread):
             round_id=round_obj.round_id,
             uid=uid, hotkey=hotkey[:6],
         )
-        # Persist the aggregator atomically after each scored miner so a
-        # crash mid-round does not lose work already done.
-        try:
-            self.score_aggregator.persist_atomic(self.score_path)
-        except Exception as e:
-            logger.warning("bg-eval: persist_atomic failed", error=str(e))
+        # Per-miner persistence happens inside evaluate_one_miner via score_path.
         self._record_metrics(round_obj, scored_inc=True)
 
     def _assert_lock_unheld_by_us(self) -> None:

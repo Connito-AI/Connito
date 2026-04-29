@@ -11,6 +11,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
@@ -89,6 +90,7 @@ from connito.shared.checkpoints import (
     build_local_checkpoint,
     delete_old_checkpoints,
     prune_miner_submission_files,
+    prune_submissions_outside_window,
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
@@ -703,6 +705,39 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     else:
         score_aggregator = MinerScoreAggregator(max_points=score_window)
 
+    # === restart replay: submit weights from loaded historic scores ===
+    # Recovers the on-chain weights immediately after a restart instead of
+    # waiting a full cycle for the end-of-step-3 submission. No-op when the
+    # aggregator is empty (fresh install or v0.1.24 wipe above).
+    _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
+    _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
+    if _replay_nonzero > 0:
+        @dataclass
+        class _ReplayRound:
+            round_id: int
+            weights_submitted: bool = False
+
+        _replay_round = _ReplayRound(round_id=int(global_opt_step))
+        logger.info(
+            "Restart replay: submitting weights from loaded historic scores",
+            uids=len(_replay_uid_weights),
+            nonzero_uids=_replay_nonzero,
+        )
+        try:
+            _replay_future = chain_submitter.async_submit_weight(_replay_round, _replay_uid_weights)
+            try:
+                _replay_future.result(timeout=120.0)
+                logger.info(
+                    "Restart replay: submission completed",
+                    weights_submitted=_replay_round.weights_submitted,
+                )
+            except FuturesTimeoutError:
+                logger.warning("Restart replay: submission did not complete within 120s; continuing")
+        except Exception as e:
+            logger.warning("Restart replay: submission scheduling failed", error=str(e))
+    else:
+        logger.info("Restart replay: skipped — no non-zero historic scores to submit")
+
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
         model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
@@ -932,7 +967,35 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 metagraph=metagraph,
                 global_model=global_model,
                 round_id=phase_response.phase_start_block,
+                submission_block_range=(
+                    phase_response.phase_start_block,
+                    phase_response.phase_end_block,
+                ),
             )
+            # Belt-and-suspenders: drop any leftover submission file whose
+            # block falls outside this round's window. The end-of-cycle
+            # prune is normally enough, but a validator restart that
+            # crashed mid-cycle (or any path that skips that prune) leaves
+            # stale .pt files behind — bg-download's _existing_submission
+            # would then short-circuit the fresh fetch and publish the
+            # stale path, which gather_validation_job silently rejects.
+            try:
+                deleted = prune_submissions_outside_window(
+                    folder_path=config.ckpt.miner_submission_path,
+                    submission_block_range=new_round.submission_block_range,
+                )
+                if deleted:
+                    logger.info(
+                        "Pruned out-of-window submissions at round freeze",
+                        deleted=len(deleted),
+                        round_id=new_round.round_id,
+                        submission_block_range=new_round.submission_block_range,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to prune out-of-window submissions at round freeze",
+                    error=str(exc),
+                )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
             try:
@@ -958,6 +1021,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     end_block=phase_response.phase_end_block,
                     expert_group_assignment=expert_manager.expert_group_assignment,
                     per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
+                    score_path=score_path,
                 )
             )
 

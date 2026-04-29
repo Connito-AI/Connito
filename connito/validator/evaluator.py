@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import gc
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -224,6 +225,7 @@ async def evaluate_one_miner(
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
+    score_path: str | os.PathLike | None = None,
 ) -> "MinerEvalJob | None":
     """Evaluate a single miner and record the score.
 
@@ -264,6 +266,11 @@ async def evaluate_one_miner(
         delta = max(0.0, baseline_loss - val_loss)
         score = delta ** 1.2
         score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=score, round_id=round_id)
+        if score_path is not None:
+            try:
+                score_aggregator.persist_atomic(score_path)
+            except Exception as e:
+                logger.warning("evaluate_one_miner: persist_atomic failed", uid=int(uid), error=str(e))
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -330,6 +337,7 @@ async def evaluate_foreground_round(
     expert_group_assignment,
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
+    score_path: str | os.PathLike | None = None,
 ) -> list[MinerEvalJob]:
     """Foreground (step 2): evaluate the round's top-N miners during
     Submission + Validate.
@@ -341,7 +349,9 @@ async def evaluate_foreground_round(
     `end_block` are left unclaimed so the `BackgroundEvalWorker` can pick
     them up in step 3.
     """
-    from connito.shared.cycle import gather_validation_job
+    # Lazy imports — connito.shared.cycle imports this module, so a top-
+    # level import would create a cycle.
+    from connito.shared.cycle import BITTENSOR_BLOCK_TIME_SECONDS, gather_validation_job
 
     # Baseline once against the round's input model (= live `base_model`,
     # which equals round.model_snapshot_cpu since the foreground runs
@@ -406,9 +416,19 @@ async def evaluate_foreground_round(
         )
         poll_idx += 1
         progressed = False
+        phase_deadline_crossed = False
         for uid in round_obj.foreground_uids:
             if uid not in by_uid:
                 continue
+            # Hard-stop before claiming if Validate has ended. Without
+            # this, the inner for-loop walks every foreground UID before
+            # the outer `subtensor.block > end_block` check fires, so a
+            # 5-miner round can spill ~5 × per_miner_eval_timeout_sec
+            # past end_block.
+            block_now = subtensor.block
+            if block_now > end_block:
+                phase_deadline_crossed = True
+                break
             if not round_obj.claim_for_foreground(uid):
                 continue
             job = by_uid[uid]
@@ -439,6 +459,17 @@ async def evaluate_foreground_round(
                 round_obj.mark_failed(uid)
                 continue
 
+            # Cap the per-miner eval at min(configured_timeout, time_to_end_block)
+            # so a long-running eval can't itself overrun the phase boundary.
+            sec_to_end_block = max(0.0, (end_block - block_now) * BITTENSOR_BLOCK_TIME_SECONDS)
+            effective_timeout: float | None = sec_to_end_block
+            if per_miner_eval_timeout_sec is not None:
+                effective_timeout = min(per_miner_eval_timeout_sec, sec_to_end_block)
+            if effective_timeout <= 0:
+                round_obj.release_claim(uid)
+                phase_deadline_crossed = True
+                break
+
             eval_coro = evaluate_one_miner(
                 config=config,
                 model_path=job.model_path,
@@ -452,16 +483,15 @@ async def evaluate_foreground_round(
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
+                score_path=score_path,
             )
             try:
-                if per_miner_eval_timeout_sec:
-                    evaluated = await asyncio.wait_for(eval_coro, timeout=per_miner_eval_timeout_sec)
-                else:
-                    evaluated = await eval_coro
+                evaluated = await asyncio.wait_for(eval_coro, timeout=effective_timeout)
             except asyncio.TimeoutError:
                 logger.warning(
                     "foreground eval: per-miner timeout — marking failed",
                     uid=uid, hotkey=hotkey[:6],
+                    timeout_sec=round(effective_timeout, 2),
                 )
                 round_obj.mark_failed(uid)
                 continue
@@ -481,7 +511,15 @@ async def evaluate_foreground_round(
         if scored_top_n >= len(foreground_set):
             break
 
-        if subtensor.block > end_block:
+        if phase_deadline_crossed or subtensor.block > end_block:
+            logger.info(
+                "foreground eval: validate phase ended — stopping",
+                round_id=round_obj.round_id,
+                end_block=end_block,
+                current_block=subtensor.block,
+                scored=scored_top_n,
+                foreground_total=len(foreground_set),
+            )
             break
         if not progressed:
             await asyncio.sleep(poll_interval_sec)

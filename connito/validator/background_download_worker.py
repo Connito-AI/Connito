@@ -201,8 +201,15 @@ class BackgroundDownloadWorker(threading.Thread):
             submission_dir.mkdir(parents=True, exist_ok=True)
 
             # Skip if a submission for this hotkey already exists locally
-            # (HTTP path or earlier hydration may have written it).
-            existing = self._existing_submission(submission_dir, hotkey)
+            # (e.g. validator restarted mid-round and the file is still on
+            # disk). The match is gated on block ∈ this round's submission
+            # window — without that filter, a leftover .pt from a previous
+            # cycle would short-circuit the fresh fetch and get published,
+            # but `gather_validation_job` would silently reject it for
+            # being out-of-window.
+            existing = self._existing_submission(
+                submission_dir, hotkey, round_obj.submission_block_range,
+            )
             if existing is not None:
                 logger.info(
                     "bg-download: submission already on disk; reusing",
@@ -267,13 +274,31 @@ class BackgroundDownloadWorker(threading.Thread):
         except Exception as e:
             logger.exception("bg-download: unexpected failure", uid=uid, error=str(e))
 
-    def _existing_submission(self, submission_dir: Path, hotkey: str) -> Path | None:
+    def _existing_submission(
+        self,
+        submission_dir: Path,
+        hotkey: str,
+        submission_block_range: tuple[int, int] | None,
+    ) -> Path | None:
+        """Return the on-disk submission for `hotkey` whose embedded block
+        falls inside `submission_block_range`. If the range is None
+        (legacy path / round without a window) fall back to hotkey-only
+        match — but new code always passes a range so this stays safe.
+        """
         for path in submission_dir.glob("*.pt"):
             if path.name.startswith(".tmp"):
                 continue
             meta = parse_dynamic_filename(path.name)
-            if meta and meta.get("hotkey") == hotkey:
-                return path
+            if not meta or meta.get("hotkey") != hotkey:
+                continue
+            if submission_block_range is not None:
+                block = meta.get("block")
+                if not isinstance(block, int):
+                    continue
+                start, end = submission_block_range
+                if not (start <= block <= end):
+                    continue
+            return path
         return None
 
     @staticmethod

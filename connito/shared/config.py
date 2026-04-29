@@ -241,7 +241,6 @@ class MoECfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
     })
-    my_expert_group_id: int = 1
     interleave: bool = True
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
