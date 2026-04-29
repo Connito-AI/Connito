@@ -698,7 +698,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         try:
             with open(score_path, "r") as f:
                 score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
-            logger.info("Loaded previous MinerScoreAggregator state from disk")
+            _loaded_latest = score_aggregator.uid_score_pairs(how="latest")
+            _loaded_avg = score_aggregator.uid_score_pairs(how="avg")
+            logger.info(
+                "Loaded previous MinerScoreAggregator state from disk",
+                uids=len(_loaded_latest),
+                latest_scores={int(u): float(s) for u, s in sorted(_loaded_latest.items())},
+                avg_scores={int(u): float(s) for u, s in sorted(_loaded_avg.items())},
+            )
         except Exception as e:
             logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
             score_aggregator = MinerScoreAggregator(max_points=score_window)
