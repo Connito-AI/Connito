@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import gc
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -224,6 +225,7 @@ async def evaluate_one_miner(
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
+    score_path: str | os.PathLike | None = None,
 ) -> "MinerEvalJob | None":
     """Evaluate a single miner and record the score.
 
@@ -264,6 +266,11 @@ async def evaluate_one_miner(
         delta = max(0.0, baseline_loss - val_loss)
         score = delta ** 1.2
         score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=score, round_id=round_id)
+        if score_path is not None:
+            try:
+                score_aggregator.persist_atomic(score_path)
+            except Exception as e:
+                logger.warning("evaluate_one_miner: persist_atomic failed", uid=int(uid), error=str(e))
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -330,6 +337,7 @@ async def evaluate_foreground_round(
     expert_group_assignment,
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
+    score_path: str | os.PathLike | None = None,
 ) -> list[MinerEvalJob]:
     """Foreground (step 2): evaluate the round's top-N miners during
     Submission + Validate.
@@ -452,6 +460,7 @@ async def evaluate_foreground_round(
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
+                score_path=score_path,
             )
             try:
                 if per_miner_eval_timeout_sec:
