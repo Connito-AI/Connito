@@ -241,6 +241,7 @@ async def evaluate_one_miner(
     baseline_loss: float,
     step: int,
     round_id: int | None = None,
+    round_obj=None,  # connito.validator.round.Round; optional for back-compat.
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
 ) -> "MinerEvalJob | None":
@@ -283,6 +284,13 @@ async def evaluate_one_miner(
         delta = max(0.0, baseline_loss - val_loss)
         score = delta ** 1.2
         score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=score, round_id=round_id)
+        if round_obj is not None:
+            # Stash for the /v1/state.json leaderboard. Best-effort; a stash
+            # failure must never block scoring.
+            try:
+                round_obj.record_val_loss(int(uid), val_loss)
+            except Exception as e:
+                logger.debug("evaluate_one_miner: record_val_loss failed", uid=int(uid), error=str(e))
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -389,6 +397,12 @@ async def evaluate_foreground_round(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # Stash for the /v1/state.json endpoint. Best-effort; logged but not raised.
+    try:
+        round_obj.set_baseline_loss(baseline_loss)
+    except Exception as e:
+        logger.debug("foreground eval: set_baseline_loss failed", error=str(e))
+
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = []
 
@@ -480,6 +494,7 @@ async def evaluate_foreground_round(
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
+                round_obj=round_obj,
             )
             try:
                 if per_miner_eval_timeout_sec:

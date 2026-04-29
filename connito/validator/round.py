@@ -65,6 +65,20 @@ class Round:
     failed_uids: set[int] = field(default_factory=set)
     weights_submitted: bool = False
 
+    # Per-round eval telemetry consumed by connito.validator.api. These are
+    # written by evaluate_foreground_round (baseline_loss, once) and
+    # evaluate_one_miner (val_loss_by_uid[uid], once per scored miner). Kept
+    # on the Round so the API endpoint can read everything from a single
+    # locked snapshot without reaching back into the eval pipeline.
+    baseline_loss: float | None = None
+    val_loss_by_uid: dict[int, float] = field(default_factory=dict)
+
+    # Subnet shape captured at freeze time — feeds the "Total miners on
+    # subnet" tile on the leaderboard frontend. Kept on the Round so the
+    # API doesn't have to issue a fresh metagraph RPC per request.
+    total_subnet_uids: int = 0  # every UID in the metagraph (validators + miners)
+    validator_count: int = 0    # whitelisted validators (== len(assignment))
+
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # ---------------- Construction ----------------
@@ -158,6 +172,12 @@ class Round:
             foreground_uids=list(foreground_uids),
         )
 
+        # Subnet shape snapshot. `metagraph.hotkeys` covers every UID
+        # (validators + miners); `assignment` is keyed by validator hotkey,
+        # so its length is the whitelisted validator count.
+        total_subnet_uids = len(metagraph.hotkeys)
+        validator_count = len(assignment)
+
         return cls(
             round_id=rid,
             seed=seed,
@@ -167,6 +187,8 @@ class Round:
             uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
+            total_subnet_uids=total_subnet_uids,
+            validator_count=validator_count,
         )
 
     # ---------------- Claim / score helpers ----------------
@@ -287,6 +309,19 @@ class Round:
                 if uid not in self.scored_uids
             ]
 
+    # ---------------- Eval telemetry stashes ----------------
+    def set_baseline_loss(self, loss: float) -> None:
+        """Record the round's baseline loss. Called once per round by
+        ``evaluate_foreground_round`` after the baseline pass completes."""
+        with self._lock:
+            self.baseline_loss = float(loss)
+
+    def record_val_loss(self, uid: int, val_loss: float) -> None:
+        """Record per-miner validation loss. Called by ``evaluate_one_miner``
+        for each successfully evaluated miner."""
+        with self._lock:
+            self.val_loss_by_uid[int(uid)] = float(val_loss)
+
     # ---------------- Stats ----------------
     def stats(self) -> dict[str, int]:
         roster_size = len(self.foreground_uids) + len(self.background_uids)
@@ -298,6 +333,32 @@ class Round:
                 "downloaded": len(self.downloaded_pool),
                 "claimed": len(self.claimed_uids),
                 "pending": roster_size - len(self.scored_uids) - len(self.failed_uids),
+            }
+
+    def snapshot(self) -> dict:
+        """Lock-guarded snapshot of every field the /v1/state.json endpoint
+        needs. One acquire/release covers the full read so the API never
+        races with the eval workers updating scored_uids / val_loss_by_uid.
+        """
+        roster_size = len(self.foreground_uids) + len(self.background_uids)
+        with self._lock:
+            return {
+                "round_id": self.round_id,
+                "baseline_loss": self.baseline_loss,
+                "foreground_uids": tuple(self.foreground_uids),
+                "uid_to_hotkey": dict(self.uid_to_hotkey),
+                "uid_to_chain_checkpoint": dict(self.uid_to_chain_checkpoint),
+                "val_loss_by_uid": dict(self.val_loss_by_uid),
+                "total_subnet_uids": self.total_subnet_uids,
+                "validator_count": self.validator_count,
+                "stats": {
+                    "roster": roster_size,
+                    "scored": len(self.scored_uids),
+                    "failed": len(self.failed_uids),
+                    "downloaded": len(self.downloaded_pool),
+                    "claimed": len(self.claimed_uids),
+                    "pending": roster_size - len(self.scored_uids) - len(self.failed_uids),
+                },
             }
 
 

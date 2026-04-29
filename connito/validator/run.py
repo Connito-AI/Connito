@@ -169,6 +169,8 @@ from connito.shared.telemetry import (
     SystemStatePoller,
     track_metagraph_sync_latency,
 )
+from connito.validator.api import StateAPIServer, build_app
+from connito.validator.baseline_history import BaselineLossHistory
 from datetime import datetime
 
 configure_logging()
@@ -668,6 +670,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     else:
         score_aggregator = MinerScoreAggregator(max_points=score_window)
 
+    # === set up baseline_loss history (for /v1/state.json trend tile) ===
+    # 24-round ring buffer matching the leaderboard mockup; persisted next
+    # to score_aggregator.json so the trend doesn't reset on restart.
+    baseline_history_path = config.ckpt.checkpoint_path / "baseline_loss_history.json"
+    if baseline_history_path.exists():
+        try:
+            with open(baseline_history_path, "r") as f:
+                baseline_loss_history = BaselineLossHistory.from_json(f.read(), max_points=24)
+            logger.info(
+                "Loaded previous BaselineLossHistory state from disk",
+                points=len(baseline_loss_history.snapshot()),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load baseline_loss_history.json, starting fresh: {e}")
+            baseline_loss_history = BaselineLossHistory(max_points=24)
+    else:
+        baseline_loss_history = BaselineLossHistory(max_points=24)
+
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
         model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
@@ -787,6 +807,25 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
 
     logger.info("ChainSubmitter ready")
+
+    # Start the /v1/state.json admin API on port 8300 + rank (mirrors the
+    # 8200 + rank Prometheus convention). Daemon thread; stopped explicitly
+    # in the shutdown paths below alongside the telemetry poller.
+    state_api = StateAPIServer(
+        app=build_app(
+            config=config,
+            round_ref=round_ref,
+            score_aggregator=score_aggregator,
+            phase_manager=PhaseManager(config, lite_subtensor),
+            lite_subtensor=lite_subtensor,
+            wallet=wallet,
+            validator_uid=validator_uid,
+            baseline_loss_history=baseline_loss_history,
+        ),
+        host="0.0.0.0",
+        port=8300 + rank,
+    )
+    state_api.start()
 
     try:
         while True:
@@ -930,6 +969,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                 )
             )
+
+            # Stamp this round's baseline_loss into the history ring buffer
+            # for the leaderboard's 24-round trend tile, then persist
+            # atomically (mirrors score_aggregator.persist_atomic). Best-
+            # effort: a persistence failure must never affect scoring.
+            if new_round.baseline_loss is not None:
+                try:
+                    baseline_loss_history.add(new_round.round_id, new_round.baseline_loss)
+                    baseline_loss_history.persist_atomic(baseline_history_path)
+                except Exception as e:
+                    logger.warning("Failed to update baseline_loss_history", error=str(e))
 
             # Hand bg-eval a copy of global_model the first time foreground
             # eval finishes — Merge hasn't run yet, so global_model still
@@ -1277,6 +1327,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
+        state_api.stop()
         cleanup(global_model)
         metric_logger.close()
         for _, a in group_averagers.items():
@@ -1287,6 +1338,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
+        state_api.stop()
         cleanup(global_model)
         metric_logger.close()
         for _, a in group_averagers.items():
