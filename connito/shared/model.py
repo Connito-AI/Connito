@@ -276,8 +276,8 @@ def fetch_model_from_chain_validator(
     if should_download and chain_checkpoints:
         download_success = False
         retries = 0
-        max_retries = 6
-        base_delay_s = 60  # exponential backoff: 1/2/4/8/16 min between the 6 attempts
+        max_retries = 2
+        retry_delay_s = 10
 
         while (not download_success) and (retries < max_retries):
             for chain_checkpoint in chain_checkpoints.checkpoints:
@@ -358,9 +358,8 @@ def fetch_model_from_chain_validator(
             if not download_success:
                 retries += 1
                 if retries < max_retries:
-                    delay = base_delay_s * (2 ** (retries - 1))
-                    logger.info("Retrying", delay=delay, retries=retries + 1, max_retries=max_retries)
-                    time.sleep(delay)
+                    logger.info("Retrying", delay=retry_delay_s, retries=retries + 1, max_retries=max_retries)
+                    time.sleep(retry_delay_s)
 
         if not download_success:
             logger.error(f"❌ All download attempts failed after {retries} retries.")
