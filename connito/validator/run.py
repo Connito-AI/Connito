@@ -1504,4 +1504,4 @@ if __name__ == "__main__":
     else:
         config = ValidatorConfig()
 
-    run(0, 1, config)
+    run(0, 1, config, pkg_version=pkg_version)
