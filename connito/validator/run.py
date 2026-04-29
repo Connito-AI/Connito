@@ -495,12 +495,21 @@ def sync_grad_across_validators(
                         attempt=attempt,
                     )
                     break
-                step_timeout = min(step_timeout, remaining)
+                # Reserve ~2s of slack: hivemind's `timeout=` governs
+                # matchmaking and is a soft hint — the allreduce that
+                # follows can run a bit past it before unwinding. Floor
+                # at 0.5s so a near-exhausted deadline still produces a
+                # syntactically valid call rather than zero.
+                step_timeout = min(step_timeout, max(remaining - 2.0, 0.5))
             try:
+                # allow_retries=False so hivemind's internal retry doesn't
+                # stack extra wall time inside one .step() call — our outer
+                # retry loop is the single source of retry budget, which
+                # makes the total time bounded and observable.
                 avg_step = avg.step(
                     gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
                     timeout=step_timeout,
-                    allow_retries=True,
+                    allow_retries=False,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
                 )
@@ -529,6 +538,18 @@ def sync_grad_across_validators(
             except Exception as e:
                 logger.warning(f"Averager - Unexpected error during avg.step (attempt {attempt}/{config.run.averager_step_max_retries}): {e}")
                 VALIDATOR_AVG_STEP_STATUS.labels(status="error").inc()
+                break
+
+            # Defensive: if avg.step ran past its (soft) timeout, the
+            # next attempt's top-of-loop check would catch the exhausted
+            # deadline — but make it explicit here so the retry path
+            # can't accidentally stack another full-budget step on top.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                logger.warning(
+                    "Aborting averager retries — deadline crossed during step",
+                    group=group_id,
+                    attempt=attempt,
+                )
                 break
 
         unpack_to_grads(group_grad_buff_meta[group_id], model)
