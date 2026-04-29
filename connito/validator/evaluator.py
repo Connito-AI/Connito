@@ -293,36 +293,6 @@ async def evaluate_one_miner(
         return None
 
 
-def resolve_miner_hf_target(
-    *,
-    config,
-    subtensor: bittensor.Subtensor,
-    hotkey: str,
-) -> tuple[str, str] | None:
-    """Resolve a miner's (hf_repo_id, hf_revision) from the chain commits.
-
-    Returns None when the miner has no chain commit, no HF coords, or
-    when fetching commits fails.
-    """
-    from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
-
-    try:
-        chain_checkpoints = build_chain_checkpoints_from_previous_phase(
-            config=config, subtensor=subtensor, for_role="miner",
-        )
-    except Exception as e:
-        logger.warning("resolve_miner_hf_target: failed to fetch chain checkpoints", error=str(e))
-        return None
-
-    for ckpt in chain_checkpoints.checkpoints:
-        if ckpt.hotkey != hotkey:
-            continue
-        if not (ckpt.hf_repo_id and ckpt.hf_revision):
-            return None
-        return ckpt.hf_repo_id, ckpt.hf_revision
-    return None
-
-
 async def evaluate_foreground_round(
     *,
     config,

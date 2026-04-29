@@ -33,7 +33,6 @@ from connito.shared.telemetry import (
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
 )
-from connito.validator.evaluator import resolve_miner_hf_target
 from connito.validator.round import RoundRef
 
 logger = structlog.get_logger(__name__)
@@ -178,23 +177,15 @@ class BackgroundDownloadWorker(threading.Thread):
         # download thread plus next_for_download's claimed/scored/failed
         # filters keep us from racing with foreground eval. publish_download
         # is a no-op if the UID has already been scored.
-        subtensor = self._subtensor
-        if subtensor is None:
-            return
         try:
-            target = await asyncio.to_thread(
-                resolve_miner_hf_target,
-                config=self.config,
-                subtensor=subtensor,
-                hotkey=hotkey,
-            )
-            if target is None:
+            ckpt = round_obj.uid_to_chain_checkpoint.get(uid)
+            if ckpt is None or not (ckpt.hf_repo_id and ckpt.hf_revision):
                 logger.debug("bg-download: no HF target for miner; skipping", uid=uid, hotkey=hotkey[:6])
                 round_obj.mark_failed(uid)
                 self._update_pending_metric(round_obj)
                 return
 
-            repo_id, revision = target
+            repo_id, revision = ckpt.hf_repo_id, ckpt.hf_revision
             expert_group_id = self.config.task.exp.group_id
             filename = f"model_expgroup_{expert_group_id}.pt"
             submission_dir = Path(self.config.ckpt.miner_submission_path)
