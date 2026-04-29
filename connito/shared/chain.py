@@ -12,6 +12,10 @@ try:
     from websockets.exceptions import ConnectionClosedError
 except Exception:  # pragma: no cover - optional dependency shape varies
     ConnectionClosedError = None
+try:
+    from async_substrate_interface.errors import SubstrateRequestException
+except Exception:  # pragma: no cover - optional dependency shape varies
+    SubstrateRequestException = None
 from pydantic import BaseModel, ConfigDict, Field
 
 from connito.shared.app_logging import structlog
@@ -37,6 +41,12 @@ _subtensor_lock = threading.Lock()
 # Retry policy for set_weights RPC calls
 _WEIGHT_SUBMIT_MAX_RETRIES: int = 2
 _WEIGHT_SUBMIT_BACKOFF_S: float = 2.0
+
+# Retry policy for chain read RPCs in get_chain_commits — covers transient
+# upstream-node failures (SubstrateRequestException "Internal error", WS drop,
+# timeout) that would otherwise crash the validator at Round.freeze.
+_CHAIN_READ_MAX_RETRIES: int = 5
+_CHAIN_READ_BACKOFF_S: float = 2.0
 
 
 
@@ -207,26 +217,62 @@ def get_chain_commits(
     block: int | None = None,
     signature_commit: bool = False,
 ) -> tuple[WorkerChainCommit, bittensor.Neuron]:
-    try:
-        all_commitments = subtensor.get_all_commitments(
-            netuid=config.chain.netuid, block=block,
-        )
-        metagraph = subtensor.metagraph(netuid=config.chain.netuid, block=block)
-        current_block = block if block is not None else subtensor.block
-    except Exception as err:
-        err_msg = str(err)
-        if block is not None and "State discarded" in err_msg:
-            logger.warning(
-                "Historical chain state unavailable on current node; retrying with latest head",
-                requested_block=block,
-                network=config.chain.network,
-                netuid=config.chain.netuid,
-                error=err_msg,
+    # Retry transient upstream-node errors (e.g. SubstrateRequestException
+    # "Internal error" from get_chain_head, WS disconnects, timeouts). Without
+    # this, a single bad RPC response at Round.freeze kills the validator.
+    # The "State discarded" branch is a one-shot fallback to head when the
+    # archive node has pruned the requested historical block — it's tracked
+    # separately so it doesn't burn retry budget.
+    max_retries = _CHAIN_READ_MAX_RETRIES
+    backoff_s = _CHAIN_READ_BACKOFF_S
+    fetch_block = block
+
+    for attempt in range(max_retries + 1):
+        try:
+            all_commitments = subtensor.get_all_commitments(
+                netuid=config.chain.netuid, block=fetch_block,
             )
-            all_commitments = subtensor.get_all_commitments(netuid=config.chain.netuid, block=None)
-            metagraph = subtensor.metagraph(netuid=config.chain.netuid, block=None)
-            current_block = subtensor.block
-        else:
+            metagraph = subtensor.metagraph(netuid=config.chain.netuid, block=fetch_block)
+            current_block = fetch_block if fetch_block is not None else subtensor.block
+            break
+        except Exception as err:
+            err_msg = str(err)
+
+            if fetch_block is not None and "State discarded" in err_msg:
+                logger.warning(
+                    "Historical chain state unavailable on current node; retrying with latest head",
+                    requested_block=fetch_block,
+                    network=config.chain.network,
+                    netuid=config.chain.netuid,
+                    error=err_msg,
+                )
+                fetch_block = None
+                continue
+
+            retryable = isinstance(err, TimeoutError)
+            if SubstrateRequestException is not None and isinstance(err, SubstrateRequestException):
+                retryable = True
+            if ConnectionClosedError is not None and isinstance(err, ConnectionClosedError):
+                retryable = True
+            if "Internal error" in err_msg or "keepalive ping timeout" in err_msg or "ConnectionClosedError" in err_msg:
+                retryable = True
+
+            if attempt < max_retries and retryable:
+                logger.warning(
+                    "get_chain_commits: chain RPC failed; retrying",
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    error=err_msg,
+                )
+                try:
+                    subtensor = bittensor.Subtensor(network=config.chain.network)
+                except Exception as refresh_exc:
+                    logger.warning(
+                        "Failed to refresh archive subtensor", error=str(refresh_exc),
+                    )
+                time.sleep(backoff_s * (attempt + 1))
+                continue
+
             raise
     max_weight_age = int(config.cycle.cycle_length)
 

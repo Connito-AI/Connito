@@ -53,6 +53,12 @@ class Round:
     background_uids: tuple[int, ...]
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
+    # On-chain Submission phase block range for this round. bg-download uses
+    # it to gate `_existing_submission` reuse — without this filter, a stale
+    # .pt left over from a previous cycle would short-circuit the fresh
+    # fetch and get published into downloaded_pool, but `gather_validation_job`
+    # would silently reject it because its block falls outside the window.
+    submission_block_range: tuple[int, int] | None = None
     # Per-uid `ChainCheckpoint` snapshot captured at freeze time so the eval
     # path can run `validate(expert_group_assignment=...)` (signature, hash,
     # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
@@ -91,6 +97,7 @@ class Round:
         metagraph,
         global_model: nn.Module,
         round_id: int | None = None,
+        submission_block_range: tuple[int, int] | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -186,6 +193,7 @@ class Round:
             background_uids=background_uids,
             uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
+            submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
             total_subnet_uids=total_subnet_uids,
             validator_count=validator_count,

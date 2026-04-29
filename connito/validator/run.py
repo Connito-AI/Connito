@@ -5,6 +5,13 @@ import gc
 import math
 import os
 import threading
+import time
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
@@ -83,6 +90,7 @@ from connito.shared.checkpoints import (
     build_local_checkpoint,
     delete_old_checkpoints,
     prune_miner_submission_files,
+    prune_submissions_outside_window,
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
@@ -92,6 +100,7 @@ from connito.shared.hf_distribute import (
     upload_checkpoint_to_hf,
 )
 from connito.shared.cycle import (
+    BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
     wait_till,
 )
@@ -458,12 +467,21 @@ def sync_grad_across_validators(
     group_averagers: dict[str | int, DecentralizedAverager],
     group_grad_buff_meta: dict[str | int, Any],
     model,
+    deadline_monotonic: float | None = None,
 ):
     for group_id, avg in group_averagers.items():
         # avg.total_size is the number of tensor *elements* in the grad buffer,
         # not the peer count. Skip only if the buffer is empty (should never happen).
         if avg.total_size <= 0:
             logger.debug("Skipping averager — grad buffer is empty", group=group_id, mode=avg.mode)
+            continue
+
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            logger.warning(
+                "Skipping averager — merge phase deadline exhausted",
+                group=group_id,
+                mode=avg.mode,
+            )
             continue
 
         pack_grads(group_grad_buff_meta[group_id], model)
@@ -486,14 +504,34 @@ def sync_grad_across_validators(
             min_group_size=getattr(avg, "min_group_size", None),
             client_mode=getattr(avg, "client_mode", None),
         )
-        
+
         avg_step = None
         for attempt in range(1, config.run.averager_step_max_retries + 1):
+            step_timeout = config.run.averager_step_timeout_sec
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "Aborting averager retries — merge phase deadline exhausted",
+                        group=group_id,
+                        attempt=attempt,
+                    )
+                    break
+                # Reserve ~2s of slack: hivemind's `timeout=` governs
+                # matchmaking and is a soft hint — the allreduce that
+                # follows can run a bit past it before unwinding. Floor
+                # at 0.5s so a near-exhausted deadline still produces a
+                # syntactically valid call rather than zero.
+                step_timeout = min(step_timeout, max(remaining - 2.0, 0.5))
             try:
+                # allow_retries=False so hivemind's internal retry doesn't
+                # stack extra wall time inside one .step() call — our outer
+                # retry loop is the single source of retry budget, which
+                # makes the total time bounded and observable.
                 avg_step = avg.step(
                     gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
-                    timeout=config.run.averager_step_timeout_sec,
-                    allow_retries=True,
+                    timeout=step_timeout,
+                    allow_retries=False,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
                 )
@@ -522,6 +560,18 @@ def sync_grad_across_validators(
             except Exception as e:
                 logger.warning(f"Averager - Unexpected error during avg.step (attempt {attempt}/{config.run.averager_step_max_retries}): {e}")
                 VALIDATOR_AVG_STEP_STATUS.labels(status="error").inc()
+                break
+
+            # Defensive: if avg.step ran past its (soft) timeout, the
+            # next attempt's top-of-loop check would catch the exhausted
+            # deadline — but make it explicit here so the retry path
+            # can't accidentally stack another full-budget step on top.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                logger.warning(
+                    "Aborting averager retries — deadline crossed during step",
+                    group=group_id,
+                    attempt=attempt,
+                )
                 break
 
         unpack_to_grads(group_grad_buff_meta[group_id], model)
@@ -651,19 +701,26 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.20":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.20
+    if pkg_version == "v0.1.29":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.1.29
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.20 fall through the `score_path.exists()` branch and
+        # restarts on v0.1.29 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.20", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.1.29", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
         try:
             with open(score_path, "r") as f:
                 score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
-            logger.info("Loaded previous MinerScoreAggregator state from disk")
+            _loaded_latest = score_aggregator.uid_score_pairs(how="latest")
+            _loaded_avg = score_aggregator.uid_score_pairs(how="avg")
+            logger.info(
+                "Loaded previous MinerScoreAggregator state from disk",
+                uids=len(_loaded_latest),
+                latest_scores={int(u): float(s) for u, s in sorted(_loaded_latest.items())},
+                avg_scores={int(u): float(s) for u, s in sorted(_loaded_avg.items())},
+            )
         except Exception as e:
             logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
             score_aggregator = MinerScoreAggregator(max_points=score_window)
@@ -687,6 +744,39 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             baseline_loss_history = BaselineLossHistory(max_points=24)
     else:
         baseline_loss_history = BaselineLossHistory(max_points=24)
+
+    # === restart replay: submit weights from loaded historic scores ===
+    # Recovers the on-chain weights immediately after a restart instead of
+    # waiting a full cycle for the end-of-step-3 submission. No-op when the
+    # aggregator is empty (fresh install or v0.1.29 wipe above).
+    _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
+    _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
+    if _replay_nonzero > 0:
+        @dataclass
+        class _ReplayRound:
+            round_id: int
+            weights_submitted: bool = False
+
+        _replay_round = _ReplayRound(round_id=int(global_opt_step))
+        logger.info(
+            "Restart replay: submitting weights from loaded historic scores",
+            uids=len(_replay_uid_weights),
+            nonzero_uids=_replay_nonzero,
+        )
+        try:
+            _replay_future = chain_submitter.async_submit_weight(_replay_round, _replay_uid_weights)
+            try:
+                _replay_future.result(timeout=120.0)
+                logger.info(
+                    "Restart replay: submission completed",
+                    weights_submitted=_replay_round.weights_submitted,
+                )
+            except FuturesTimeoutError:
+                logger.warning("Restart replay: submission did not complete within 120s; continuing")
+        except Exception as e:
+            logger.warning("Restart replay: submission scheduling failed", error=str(e))
+    else:
+        logger.info("Restart replay: skipped — no non-zero historic scores to submit")
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
@@ -827,6 +917,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     )
     state_api.start()
 
+    # Hard wall-clock cap for sync_grad_across_validators. Python threads
+    # can't be cancelled, so on timeout we abandon the worker and skip the
+    # rest of this round's merge — the orphan keeps running until avg.step
+    # unwinds (cooperative deadline checks inside the function should make
+    # that quick). The next merge cycle refuses to start a fresh sync
+    # while a previous orphan is still alive, so the orphan can't race
+    # outer_optimizer.step or the next round's pack_grads for model.grad.
+    sync_grad_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="connito-sync-grad",
+    )
+    last_sync_grad_future: Future | None = None
+    last_sync_grad_started_at: float | None = None
+
     try:
         while True:
             # Liveness signal: alert on rate(validator_main_loop_heartbeat_total[5m]) == 0
@@ -941,7 +1044,35 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 metagraph=metagraph,
                 global_model=global_model,
                 round_id=phase_response.phase_start_block,
+                submission_block_range=(
+                    phase_response.phase_start_block,
+                    phase_response.phase_end_block,
+                ),
             )
+            # Belt-and-suspenders: drop any leftover submission file whose
+            # block falls outside this round's window. The end-of-cycle
+            # prune is normally enough, but a validator restart that
+            # crashed mid-cycle (or any path that skips that prune) leaves
+            # stale .pt files behind — bg-download's _existing_submission
+            # would then short-circuit the fresh fetch and publish the
+            # stale path, which gather_validation_job silently rejects.
+            try:
+                deleted = prune_submissions_outside_window(
+                    folder_path=config.ckpt.miner_submission_path,
+                    submission_block_range=new_round.submission_block_range,
+                )
+                if deleted:
+                    logger.info(
+                        "Pruned out-of-window submissions at round freeze",
+                        deleted=len(deleted),
+                        round_id=new_round.round_id,
+                        submission_block_range=new_round.submission_block_range,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to prune out-of-window submissions at round freeze",
+                    error=str(exc),
+                )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
             try:
@@ -954,26 +1085,64 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # bg-download runs concurrently here, filling
             # `miner_submission_path` with foreground UIDs first so this loop
             # has work to discover.
-            miner_jobs = asyncio.run(
-                evaluate_foreground_round(
-                    config=config,
-                    round_obj=new_round,
-                    subtensor=subtensor,
-                    step=global_opt_step,
-                    device=device,
-                    score_aggregator=score_aggregator,
-                    base_model=global_model,
-                    tokenizer=tokenizer,
-                    end_block=phase_response.phase_end_block,
-                    expert_group_assignment=expert_manager.expert_group_assignment,
-                    per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                )
+            #
+            # Hard wall-clock backstop on top of the cooperative deadline
+            # checks inside evaluate_foreground_round: derive a budget
+            # from the validate phase's end_block. If the inner path
+            # overshoots, asyncio.wait_for cancels the in-flight eval
+            # and the rest of this round's pipeline runs without it.
+            foreground_timeout_sec = max(
+                0.0,
+                (phase_response.phase_end_block - lite_subtensor.block)
+                * BITTENSOR_BLOCK_TIME_SECONDS,
             )
+
+            # Pre-allocated accumulator so partial scoring survives
+            # asyncio.wait_for cancellation. evaluate_foreground_round
+            # appends each MinerEvalJob to this list as it completes —
+            # if the wall-clock cap fires mid-round, anything already
+            # scored is still here for the merge step.
+            miner_jobs: list[MinerEvalJob] = []
+
+            async def _bounded_foreground_eval():
+                return await asyncio.wait_for(
+                    evaluate_foreground_round(
+                        config=config,
+                        round_obj=new_round,
+                        subtensor=subtensor,
+                        step=global_opt_step,
+                        device=device,
+                        score_aggregator=score_aggregator,
+                        base_model=global_model,
+                        tokenizer=tokenizer,
+                        end_block=phase_response.phase_end_block,
+                        expert_group_assignment=expert_manager.expert_group_assignment,
+                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
+                        score_path=score_path,
+                        completed_out=miner_jobs,
+                    ),
+                    timeout=foreground_timeout_sec,
+                )
+
+            try:
+                asyncio.run(_bounded_foreground_eval())
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Foreground evaluation exceeded validate phase deadline; "
+                    "cancelling and continuing with partial scores",
+                    round_id=new_round.round_id,
+                    timeout_sec=round(foreground_timeout_sec, 2),
+                    end_block=phase_response.phase_end_block,
+                    completed_count=len(miner_jobs),
+                )
 
             # Stamp this round's baseline_loss into the history ring buffer
             # for the leaderboard's 24-round trend tile, then persist
-            # atomically (mirrors score_aggregator.persist_atomic). Best-
-            # effort: a persistence failure must never affect scoring.
+            # atomically (mirrors score_aggregator.persist_atomic). Runs
+            # whether the bounded eval completed normally or hit the wall-
+            # clock cap — baseline_loss is set early in evaluate_foreground_
+            # round, so it's already on `new_round` by either exit path.
+            # Best-effort: a persistence failure must never affect scoring.
             if new_round.baseline_loss is not None:
                 try:
                     baseline_loss_history.add(new_round.round_id, new_round.baseline_loss)
@@ -1069,6 +1238,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
 
+            # Bound the merge work to the on-chain Merge window: convert the
+            # remaining blocks to a wall-clock deadline so sync_grad can clamp
+            # its timeouts and bail rather than spilling into ValidatorCommit1.
+            merge_deadline_monotonic = time.monotonic() + max(
+                0, phase_response.blocks_remaining_in_phase
+            ) * BITTENSOR_BLOCK_TIME_SECONDS
+
             # Suspend both background workers for the entire Merge window —
             # they share GPU and DHT resources with sync_grad_across_validators
             # and run_global_optimization.
@@ -1076,33 +1252,78 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             try:
                 if grad_is_valid:
                     logger.info("Syncing gradient across validators")
-                    sync_grad_across_validators(
-                        config=config,
-                        group_averagers=group_averagers,
-                        group_grad_buff_meta=group_grad_buff_meta,
-                        model=global_model,
-                    )
 
-                    # === global optimizer ===
-                    logger.info("Running global model optimization step")
+                    # Refuse to start a fresh sync while a previous one is
+                    # still alive — its thread may still be inside
+                    # unpack_to_grads writing model.grad. Letting a new
+                    # pack_grads run alongside would corrupt both.
+                    if (
+                        last_sync_grad_future is not None
+                        and not last_sync_grad_future.done()
+                    ):
+                        orphan_age = (
+                            round(time.monotonic() - last_sync_grad_started_at, 2)
+                            if last_sync_grad_started_at is not None
+                            else None
+                        )
+                        logger.warning(
+                            "Previous sync_grad_across_validators thread is still alive; "
+                            "skipping this round's gradient sync to avoid concurrent "
+                            "mutation of model.grad",
+                            previous_age_sec=orphan_age,
+                        )
+                        sync_grad_completed = False
+                    else:
+                        last_sync_grad_future = None
+                        last_sync_grad_started_at = time.monotonic()
+                        remaining = max(0.0, merge_deadline_monotonic - time.monotonic())
+                        future = sync_grad_executor.submit(
+                            sync_grad_across_validators,
+                            config=config,
+                            group_averagers=group_averagers,
+                            group_grad_buff_meta=group_grad_buff_meta,
+                            model=global_model,
+                            deadline_monotonic=merge_deadline_monotonic,
+                        )
+                        try:
+                            future.result(timeout=remaining)
+                            sync_grad_completed = True
+                        except FuturesTimeoutError:
+                            logger.warning(
+                                "sync_grad_across_validators exceeded merge deadline; "
+                                "abandoning thread and skipping outer optimizer step",
+                                timeout_sec=round(remaining, 2),
+                            )
+                            last_sync_grad_future = future
+                            sync_grad_completed = False
 
-                    org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
+                    if sync_grad_completed:
+                        # === global optimizer ===
+                        logger.info("Running global model optimization step")
 
-                    run_global_optimization(
-                        global_model=global_model,
-                        device=device,
-                        rank=rank,
-                        outer_optimizer=outer_optimizer,
-                        miner_jobs=miner_jobs,
-                        score_aggregator=score_aggregator,
-                    )
+                        org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
-                    logger.info(
-                        "Optimization step complete",
-                        org_model_hash=org_model_hash,
-                        new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                    )
-                    _participated_in_merge = True
+                        run_global_optimization(
+                            global_model=global_model,
+                            device=device,
+                            rank=rank,
+                            outer_optimizer=outer_optimizer,
+                            miner_jobs=miner_jobs,
+                            score_aggregator=score_aggregator,
+                        )
+
+                        logger.info(
+                            "Optimization step complete",
+                            org_model_hash=org_model_hash,
+                            new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
+                        )
+                        _participated_in_merge = True
+                    else:
+                        # Sync was orphaned or skipped: don't run the outer
+                        # optimizer (model.grad may be in an indeterminate
+                        # state) and trigger the peer-resync path next
+                        # cycle via _participated_in_merge=False.
+                        _participated_in_merge = False
                 else:
                     logger.info(
                         "Skipping gradient sync and optimizer — "
@@ -1330,6 +1551,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         state_api.stop()
         cleanup(global_model)
         metric_logger.close()
+        # Don't wait on a stuck sync_grad worker — it may be blocked inside
+        # avg.step. cancel_futures only affects pending submissions, not
+        # the in-flight one, which keeps running until avg.step unwinds.
+        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()
         raise
@@ -1341,6 +1566,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         state_api.stop()
         cleanup(global_model)
         metric_logger.close()
+        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()
 
@@ -1364,4 +1590,4 @@ if __name__ == "__main__":
     else:
         config = ValidatorConfig()
 
-    run(0, 1, config)
+    run(0, 1, config, pkg_version=pkg_version)
