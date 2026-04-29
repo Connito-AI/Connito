@@ -5,6 +5,7 @@ import gc
 import math
 import os
 import threading
+import time
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
@@ -92,6 +93,7 @@ from connito.shared.hf_distribute import (
     upload_checkpoint_to_hf,
 )
 from connito.shared.cycle import (
+    BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
     wait_till,
 )
@@ -443,12 +445,21 @@ def sync_grad_across_validators(
     group_averagers: dict[str | int, DecentralizedAverager],
     group_grad_buff_meta: dict[str | int, Any],
     model,
+    deadline_monotonic: float | None = None,
 ):
     for group_id, avg in group_averagers.items():
         # avg.total_size is the number of tensor *elements* in the grad buffer,
         # not the peer count. Skip only if the buffer is empty (should never happen).
         if avg.total_size <= 0:
             logger.debug("Skipping averager — grad buffer is empty", group=group_id, mode=avg.mode)
+            continue
+
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            logger.warning(
+                "Skipping averager — merge phase deadline exhausted",
+                group=group_id,
+                mode=avg.mode,
+            )
             continue
 
         pack_grads(group_grad_buff_meta[group_id], model)
@@ -471,13 +482,24 @@ def sync_grad_across_validators(
             min_group_size=getattr(avg, "min_group_size", None),
             client_mode=getattr(avg, "client_mode", None),
         )
-        
+
         avg_step = None
         for attempt in range(1, config.run.averager_step_max_retries + 1):
+            step_timeout = config.run.averager_step_timeout_sec
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "Aborting averager retries — merge phase deadline exhausted",
+                        group=group_id,
+                        attempt=attempt,
+                    )
+                    break
+                step_timeout = min(step_timeout, remaining)
             try:
                 avg_step = avg.step(
                     gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
-                    timeout=config.run.averager_step_timeout_sec,
+                    timeout=step_timeout,
                     allow_retries=True,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
@@ -988,6 +1010,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
 
+            # Bound the merge work to the on-chain Merge window: convert the
+            # remaining blocks to a wall-clock deadline so sync_grad can clamp
+            # its timeouts and bail rather than spilling into ValidatorCommit1.
+            merge_deadline_monotonic = time.monotonic() + max(
+                0, phase_response.blocks_remaining_in_phase
+            ) * BITTENSOR_BLOCK_TIME_SECONDS
+
             # Suspend both background workers for the entire Merge window —
             # they share GPU and DHT resources with sync_grad_across_validators
             # and run_global_optimization.
@@ -1000,6 +1029,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         group_averagers=group_averagers,
                         group_grad_buff_meta=group_grad_buff_meta,
                         model=global_model,
+                        deadline_monotonic=merge_deadline_monotonic,
                     )
 
                     # === global optimizer ===
