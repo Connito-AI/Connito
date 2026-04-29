@@ -89,6 +89,7 @@ from connito.shared.checkpoints import (
     build_local_checkpoint,
     delete_old_checkpoints,
     prune_miner_submission_files,
+    prune_submissions_outside_window,
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
@@ -932,7 +933,35 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 metagraph=metagraph,
                 global_model=global_model,
                 round_id=phase_response.phase_start_block,
+                submission_block_range=(
+                    phase_response.phase_start_block,
+                    phase_response.phase_end_block,
+                ),
             )
+            # Belt-and-suspenders: drop any leftover submission file whose
+            # block falls outside this round's window. The end-of-cycle
+            # prune is normally enough, but a validator restart that
+            # crashed mid-cycle (or any path that skips that prune) leaves
+            # stale .pt files behind — bg-download's _existing_submission
+            # would then short-circuit the fresh fetch and publish the
+            # stale path, which gather_validation_job silently rejects.
+            try:
+                deleted = prune_submissions_outside_window(
+                    folder_path=config.ckpt.miner_submission_path,
+                    submission_block_range=new_round.submission_block_range,
+                )
+                if deleted:
+                    logger.info(
+                        "Pruned out-of-window submissions at round freeze",
+                        deleted=len(deleted),
+                        round_id=new_round.round_id,
+                        submission_block_range=new_round.submission_block_range,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to prune out-of-window submissions at round freeze",
+                    error=str(exc),
+                )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
             try:
