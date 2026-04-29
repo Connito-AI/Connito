@@ -485,9 +485,16 @@ async def evaluate_foreground_round(
             round_obj.mark_scored(uid)
             completed.append(evaluated)
 
-        # Stop once every top-N UID is scored or the phase boundary hits.
-        scored_top_n = sum(1 for u in foreground_set if u in round_obj.scored_uids)
-        if scored_top_n >= len(foreground_set):
+        # Stop once every top-N UID is resolved (scored or failed) or the
+        # phase boundary hits. Without counting failed UIDs, a round whose
+        # foreground miners all hit a fast-fail path (validation reject,
+        # per-miner timeout) keeps polling until end_block even though
+        # claim_for_foreground refuses to re-claim them.
+        resolved = sum(
+            1 for u in foreground_set
+            if u in round_obj.scored_uids or u in round_obj.failed_uids
+        )
+        if resolved >= len(foreground_set):
             break
 
         if phase_deadline_crossed or subtensor.block > end_block:
@@ -496,7 +503,8 @@ async def evaluate_foreground_round(
                 round_id=round_obj.round_id,
                 end_block=end_block,
                 current_block=subtensor.block,
-                scored=scored_top_n,
+                scored=sum(1 for u in foreground_set if u in round_obj.scored_uids),
+                failed=sum(1 for u in foreground_set if u in round_obj.failed_uids),
                 foreground_total=len(foreground_set),
             )
             break
