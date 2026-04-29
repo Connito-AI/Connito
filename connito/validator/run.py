@@ -1010,16 +1010,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # has work to discover.
             #
             # Hard wall-clock backstop on top of the cooperative deadline
-            # checks inside evaluate_foreground_round: derive a budget from
-            # the validate phase's end_block + ~30s grace so the inner
-            # cooperative path fires first. If even that overshoots,
-            # asyncio.wait_for cancels the in-flight eval and the rest of
-            # this round's pipeline runs without it.
+            # checks inside evaluate_foreground_round: derive a budget
+            # from the validate phase's end_block. If the inner path
+            # overshoots, asyncio.wait_for cancels the in-flight eval
+            # and the rest of this round's pipeline runs without it.
             foreground_timeout_sec = max(
                 0.0,
                 (phase_response.phase_end_block - lite_subtensor.block)
                 * BITTENSOR_BLOCK_TIME_SECONDS,
-            ) + 30.0
+            )
 
             # Pre-allocated accumulator so partial scoring survives
             # asyncio.wait_for cancellation. evaluate_foreground_round
