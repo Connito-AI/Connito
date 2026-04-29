@@ -879,6 +879,47 @@ def delete_old_checkpoints_by_hotkey(
     )
 
 
+def prune_submissions_outside_window(
+    folder_path: Path,
+    submission_block_range: tuple[int, int] | None,
+) -> list[str]:
+    """Delete miner submission files whose embedded `block_N` falls outside
+    `[start, end]`. Distinct from `prune_miner_submission_files`, which is
+    age-based — this one is window-based and is meant to run at round
+    freeze so a stale .pt from a previous cycle can't masquerade as the
+    current round's submission and short-circuit `_existing_submission`.
+
+    No-op (returns []) if `submission_block_range` is None or the folder
+    does not exist.
+    """
+    if submission_block_range is None:
+        return []
+    if not folder_path.exists():
+        return []
+
+    start, end = submission_block_range
+    deleted_files: list[str] = []
+    for file_path in folder_path.glob("*.pt"):
+        if file_path.name.startswith(".tmp"):
+            continue
+        meta = parse_dynamic_filename(file_path.name)
+        block = meta.get("block")
+        if not isinstance(block, int):
+            continue
+        if start <= block <= end:
+            continue
+        try:
+            os.remove(file_path)
+            deleted_files.append(file_path.name)
+        except OSError as exc:
+            logger.warning(
+                "Failed to delete out-of-window submission file",
+                file=file_path.name,
+                error=str(exc),
+            )
+    return deleted_files
+
+
 def archive_top_miner_submissions(
     submission_dir: Path,
     archive_dir: Path,
