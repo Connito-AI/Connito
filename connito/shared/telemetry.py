@@ -3,8 +3,9 @@ import functools
 import threading
 import torch
 import time
-from typing import Callable, Any
+from typing import Callable, Any, Literal
 
+import psutil
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 from connito.shared.app_logging import structlog
@@ -47,9 +48,20 @@ class TelemetryManager:
 SUBNET_CURRENT_BLOCK = Gauge("subnet_current_block", "Current block on local subtensor")
 SUBNET_PHASE_INDEX = Gauge("subnet_current_phase_index", "Enum index of active phase")
 SUBNET_BLOCKS_REMAINING = Gauge("subnet_blocks_remaining_in_phase", "Blocks left before phase transition")
+SUBNET_VALIDATOR_VTRUST = Gauge("subnet_validator_vtrust", "Validator trust value for this validator's UID")
+SUBNET_VALIDATOR_CONSENSUS = Gauge("subnet_validator_consensus", "Consensus value for this validator's UID")
+SUBNET_UID_DEREGISTRATIONS_TOTAL = Counter(
+    "subnet_uid_deregistrations_total",
+    "UIDs that disappeared from the metagraph between consecutive polls",
+)
+
 GPU_VRAM_ALLOCATED_BYTES = Gauge("validator_vram_allocated_bytes", "VRAM allocated by operations", ["device"])
 GPU_VRAM_PEAK_ALLOCATED_BYTES = Gauge("validator_vram_peak_allocated_bytes", "Peak VRAM allocated by operations", ["device"])
 GPU_UTILIZATION_PERCENT = Gauge("system_gpu_utilization_percent", "GPU Utilization percent", ["device"])
+SYSTEM_CPU_UTILIZATION_PERCENT = Gauge(
+    "system_cpu_utilization_percent",
+    "Host CPU utilization percent (psutil aggregate, sampled by SystemStatePoller)",
+)
 DHT_PEER_COUNT = Gauge("validator_dht_peers_count", "Total peers tracked in the averager network")
 DATALOADER_QUEUE_DEPTH = Gauge("system_dataloader_queue_depth", "Data pipeline depth")
 MODEL_PARAMETER_COUNT = Gauge("system_model_parameter_count", "Total loaded parameter count")
@@ -61,6 +73,19 @@ VALIDATOR_SCORE_STD = Gauge("validator_score_std", "Spread of miner scores")
 VALIDATOR_AVG_STEP_STATUS = Counter("validator_avg_step_status", "Averager sync step stats", ["status"])
 VALIDATOR_EVAL_LOSS = Gauge("validator_eval_loss", "Evaluation loss", ["expert_group"])
 VALIDATOR_EVAL_BATCH_COUNT = Counter("validator_eval_batch_count", "Evaluation batch count")
+VALIDATOR_HEARTBEAT_TOTAL = Counter(
+    "validator_main_loop_heartbeat_total",
+    "Validator main loop iterations completed; alert on rate() going to zero",
+)
+VALIDATOR_METAGRAPH_LAST_SYNC_TS = Gauge(
+    "validator_metagraph_last_sync_timestamp",
+    "Unix timestamp of the most recent successful metagraph sync",
+)
+VALIDATOR_MINER_EVAL_FAILURES = Counter(
+    "validator_miner_eval_failures_total",
+    "Failures encountered while evaluating a miner submission, by reason",
+    ["miner_uid", "reason"],
+)
 
 # Per-round lifecycle (background submission validation)
 VALIDATOR_ROUND_LIFECYCLE_STEP = Gauge(
@@ -110,23 +135,47 @@ MINER_STEP_TIME_HOURS = Gauge("miner_step_time_hours", "Wall-clock time of the l
 MINER_TOTAL_TRAINING_TIME_HOURS = Gauge("miner_total_training_time_hours", "Total accumulated training time (hours)")
 MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of expert parameter values (health check)")
 
-# Histograms (Latency)
+# Histograms (Latency & Sizes)
 EVAL_LATENCY_SECONDS = Histogram("validator_eval_latency_seconds", "Latency of run_evaluation()")
 MODEL_LOAD_LATENCY_SECONDS = Histogram("validator_model_load_latency_seconds", "Latency of load_model_from_path()")
 CHAIN_COMMIT_LATENCY_SECONDS = Histogram("chain_commit_latency_seconds", "Time taken to commit to Bittensor")
 CHECKPOINT_SAVE_LATENCY_SECONDS = Histogram("miner_checkpoint_save_latency_seconds", "Time taken to save and submit checkpoint")
 CHECKPOINT_FETCH_LATENCY_SECONDS = Histogram("chain_checkpoint_fetch_duration_seconds", "How long downloading miner checkpoints takes")
 CHAIN_CYCLE_LATENCY_SECONDS = Histogram("chain_cycle_duration_seconds", "Time per full chain cycle")
+METAGRAPH_SYNC_LATENCY_SECONDS = Histogram(
+    "validator_metagraph_sync_latency_seconds",
+    "Latency of metagraph sync calls",
+)
+# Buckets cover ~1MB through ~10GB to fit miner checkpoint payloads. The
+# prometheus_client default buckets are tuned for seconds and would all fall
+# into the +Inf bucket here, making the histogram useless.
+CHECKPOINT_DOWNLOAD_BYTES = Histogram(
+    "validator_checkpoint_download_bytes",
+    "Size of miner checkpoint payloads downloaded by the validator (bytes)",
+    buckets=(1e6, 1e7, 5e7, 1e8, 5e8, 1e9, 5e9, 1e10, float("inf")),
+)
 
 # System & Errors
 RPC_ERRORS_TOTAL = Counter("chain_rpc_errors_total", "Bittensor RPC/timeout errors")
 CHAIN_WEIGHT_SET_SUCCESS = Counter("chain_weight_set_success", "Successful weight settings")
 CHAIN_WEIGHT_SET_FAILURE = Counter("chain_weight_set_failure", "Failed weight settings")
-ERRORS_TOTAL = Counter("validator_errors_total", "Errors counted by component and kind", ["component", "kind"])
+ERRORS_TOTAL = Counter("connito_errors_total", "Errors counted by component and kind", ["component", "kind"])
+
+
+EvalFailureReason = Literal["timeout", "corrupt", "oom", "checksum", "rpc", "unknown"]
+_EVAL_FAILURE_REASONS: frozenset[str] = frozenset(
+    {"timeout", "corrupt", "oom", "checksum", "rpc", "unknown"}
+)
 
 
 def inc_error(component: str, kind: str) -> None:
     ERRORS_TOTAL.labels(component=component, kind=kind).inc()
+
+
+def inc_eval_failure(miner_uid: int | str, reason: EvalFailureReason | str) -> None:
+    """Record a miner eval failure. Unknown reasons are coerced to 'unknown' to keep cardinality bounded."""
+    safe_reason = reason if reason in _EVAL_FAILURE_REASONS else "unknown"
+    VALIDATOR_MINER_EVAL_FAILURES.labels(miner_uid=str(miner_uid), reason=safe_reason).inc()
 
 
 # ==============================================================================
@@ -163,6 +212,18 @@ def track_chain_commit_latency():
         return wrapper
     return decorator
 
+def track_metagraph_sync_latency():
+    """Tracks latency of metagraph sync calls and stamps the last-sync timestamp on success."""
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            with METAGRAPH_SYNC_LATENCY_SECONDS.time():
+                result = func(*args, **kwargs)
+            VALIDATOR_METAGRAPH_LAST_SYNC_TS.set(time.time())
+            return result
+        return wrapper
+    return decorator
+
 def count_rpc_errors():
     """Counts unhandled exceptions/RPC dropouts silently while re-raising them"""
     def decorator(func: Callable) -> Callable:
@@ -185,20 +246,49 @@ def count_rpc_errors():
 class SystemStatePoller(threading.Thread):
     """
     A sidecar thread that sleeps natively and only wakes to sample
-    the bittensor chain phase, DHT sizes, and GPU variables without
+    the bittensor chain phase, DHT sizes, and GPU/CPU variables without
     blocking main worker threads.
+
+    Metagraph-derived metrics (vtrust, consensus, deregistration churn) are
+    expensive RPC calls and are throttled to once every
+    ``metagraph_poll_every_n_polls`` ticks (default: every 5th poll, ~once per
+    minute at the 12s default cadence).
     """
-    def __init__(self, subtensor=None, phase_manager=None, group_averagers=None, interval_sec: float = 12.0):
+    def __init__(
+        self,
+        subtensor=None,
+        phase_manager=None,
+        group_averagers=None,
+        netuid: int | None = None,
+        validator_uid: int | None = None,
+        interval_sec: float = 12.0,
+        metagraph_poll_every_n_polls: int = 5,
+    ):
         super().__init__(daemon=True)
         self.interval = interval_sec
         self.subtensor = subtensor
         self.phase_manager = phase_manager
         self.group_averagers = group_averagers
+        self.netuid = netuid
+        self.validator_uid = validator_uid
+        self.metagraph_poll_every_n_polls = max(1, int(metagraph_poll_every_n_polls))
         self._stop_event = threading.Event()
         # Dedicated subtensor for this thread to avoid websocket collisions
         # with the caller's subtensor. Created lazily on first poll.
         self._local_subtensor = None
-        
+        self._poll_count: int = 0
+        # Holds the prior tick's UID set so we can diff for deregistrations.
+        # Stays empty until the first metagraph sync runs successfully; we
+        # skip emitting the deregistration counter on that first tick.
+        self._prior_uids: set[int] = set()
+        # psutil.cpu_percent(interval=None) returns 0.0 on its very first call
+        # because it has no previous sample to diff against. Prime it here so
+        # the first real poll already has a usable baseline.
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
     def stop(self):
         self._stop_event.set()
 
@@ -208,6 +298,7 @@ class SystemStatePoller(threading.Thread):
                 self._poll()
             except Exception as e:
                 logger.debug(f"Telemetry sidecar hit an error: {e}")
+            self._poll_count += 1
             self._stop_event.wait(self.interval)
 
     def _poll(self):
@@ -247,3 +338,54 @@ class SystemStatePoller(threading.Thread):
                     GPU_VRAM_PEAK_ALLOCATED_BYTES.labels(device=str(dev_idx)).set(peak)
                 except Exception:
                     pass
+
+        # 4. Host CPU utilization (cheap; runs every tick)
+        try:
+            SYSTEM_CPU_UTILIZATION_PERCENT.set(psutil.cpu_percent(interval=None))
+        except Exception:
+            pass
+
+        # 5. Throttled metagraph fetch (vtrust / consensus / deregistration churn).
+        # Fetching the metagraph is a multi-second RPC, so we only do it every
+        # Nth poll. We also fire on the very first tick (poll_count == 0) so
+        # dashboards aren't blank at startup.
+        is_metagraph_tick = (
+            self._poll_count == 0
+            or self._poll_count % self.metagraph_poll_every_n_polls == 0
+        )
+        if is_metagraph_tick and self._local_subtensor is not None and self.netuid is not None:
+            self._poll_metagraph()
+
+    def _poll_metagraph(self) -> None:
+        try:
+            with METAGRAPH_SYNC_LATENCY_SECONDS.time():
+                metagraph = self._local_subtensor.metagraph(self.netuid)
+            VALIDATOR_METAGRAPH_LAST_SYNC_TS.set(time.time())
+        except Exception as e:
+            logger.debug(f"Failed to fetch metagraph in poller: {e}")
+            return
+
+        # Deregistration diff. Skip on the first successful sync — we have no
+        # prior set to diff against, so every UID would falsely look "new".
+        try:
+            current_uids: set[int] = {int(u) for u in metagraph.uids.tolist()}
+            if self._prior_uids:
+                deregistered = self._prior_uids - current_uids
+                if deregistered:
+                    SUBNET_UID_DEREGISTRATIONS_TOTAL.inc(len(deregistered))
+            self._prior_uids = current_uids
+        except Exception as e:
+            logger.debug(f"Failed to diff metagraph UIDs: {e}")
+
+        # Self vtrust / consensus (only meaningful for this validator's UID).
+        if self.validator_uid is None:
+            return
+        try:
+            uid = int(self.validator_uid)
+            if 0 <= uid < len(metagraph.uids):
+                vtrust = float(metagraph.validator_trust[uid].item())
+                consensus = float(metagraph.consensus[uid].item())
+                SUBNET_VALIDATOR_VTRUST.set(vtrust)
+                SUBNET_VALIDATOR_CONSENSUS.set(consensus)
+        except Exception as e:
+            logger.debug(f"Failed to read self vtrust/consensus: {e}")

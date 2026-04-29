@@ -13,9 +13,28 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
-from connito.shared.telemetry import track_eval_latency, track_model_load_latency
+from connito.shared.telemetry import (
+    EvalFailureReason,
+    inc_error,
+    inc_eval_failure,
+    track_eval_latency,
+    track_model_load_latency,
+)
 
 logger = structlog.get_logger(__name__)
+
+
+# Maps the short reason strings returned by `validate_miner_submission` onto
+# the closed `EvalFailureReason` enum used by the
+# `validator_miner_eval_failures_total` Counter. Keeping the mapping here (and
+# not in telemetry.py) so the validator-side semantics live with the eval code.
+_VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
+    "no_chain_commit": "unknown",
+    "signature": "corrupt",
+    "hash": "checksum",
+    "expert_group_or_nan": "corrupt",
+    "unknown": "unknown",
+}
 
 
 # -----------------------------------------------------------------------------
@@ -277,12 +296,21 @@ async def evaluate_one_miner(
         return job
     except torch.cuda.OutOfMemoryError:
         logger.error("evaluate_one_miner: OOM", uid=int(uid))
+        inc_eval_failure(int(uid), "oom")
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return None
+    except (ValueError, RuntimeError, EOFError) as e:
+        # ValueError: load_model_from_path's "Unsupported checkpoint format" /
+        # empty state_dict guard. RuntimeError / EOFError: torch.load rejecting
+        # truncated or malformed payloads. All three signal a corrupt download.
+        logger.exception("evaluate_one_miner: corrupt checkpoint", uid=int(uid), error=str(e))
+        inc_eval_failure(int(uid), "corrupt")
+        return None
     except Exception as e:
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
+        inc_eval_failure(int(uid), "unknown")
         return None
 
 
@@ -434,8 +462,8 @@ async def evaluate_foreground_round(
                     round_id=round_obj.round_id,
                     reason=fail_reason,
                 )
-                from connito.shared.telemetry import inc_error
                 inc_error(component="foreground_eval", kind="validation")
+                inc_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
                 round_obj.mark_failed(uid)
                 continue
 
@@ -463,10 +491,12 @@ async def evaluate_foreground_round(
                     "foreground eval: per-miner timeout — marking failed",
                     uid=uid, hotkey=hotkey[:6],
                 )
+                inc_eval_failure(int(uid), "timeout")
                 round_obj.mark_failed(uid)
                 continue
             except Exception as e:
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
+                inc_eval_failure(int(uid), "unknown")
                 round_obj.mark_failed(uid)
                 continue
 

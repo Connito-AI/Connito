@@ -31,6 +31,7 @@ from connito.shared.hf_distribute import (
     upload_checkpoint_to_hf,
 )
 from connito.shared.model import fetch_model_from_chain_validator
+from connito.shared.telemetry import inc_error
 from connito.sn_owner.cycle import PhaseNames
 
 # Short SHA prefix written to the chain. Matches the validator convention so
@@ -39,6 +40,28 @@ HF_CHAIN_REVISION_LENGTH = 7
 
 configure_logging()
 logger = structlog.get_logger(__name__)
+
+
+def _classify_upload_error(exc: BaseException) -> str:
+    """Map an upload exception to a small set of `inc_error` kind labels.
+
+    Keeps cardinality bounded; refine the buckets here as we learn what
+    actually surfaces in production logs. Returns one of:
+      - "timeout" — TimeoutError or any exception whose name/message mentions a timeout
+      - "rpc" — HF / requests / urllib HTTP transport failures
+      - "unknown" — anything else (config, filesystem, programmer error)
+    """
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "timeout" in name or "timed out" in msg or "timeout" in msg:
+        return "timeout"
+    if any(k in name for k in ("http", "connection", "request", "hub", "hf")):
+        return "rpc"
+    if any(k in msg for k in ("connection", "network", "503", "502", "504", "reset", "unreachable", "dns")):
+        return "rpc"
+    return "unknown"
 
 
 # --- Job definitions ---
@@ -231,6 +254,7 @@ def _upload_checkpoint_to_hf_safe(
             max_chain_repo_chars=CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
         )
     except Exception as e:
+        inc_error("checkpoint_upload", _classify_upload_error(e))
         logger.error(
             f"<{PhaseNames.miner_commit_1}> HF repo id resolution failed; miner will be missing for this round",
             error=str(e),
@@ -265,6 +289,7 @@ def _upload_checkpoint_to_hf_safe(
             allow_patterns=[f"model_expgroup_{config.task.exp.group_id}.pt"],
         )
     except Exception as e:
+        inc_error("checkpoint_upload", _classify_upload_error(e))
         logger.error(
             f"<{PhaseNames.miner_commit_1}> HF upload failed; miner will be missing for this round",
             upload_checkpoint_repo=hf_upload_repo_id,

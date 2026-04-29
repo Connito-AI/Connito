@@ -164,13 +164,26 @@ from connito.validator.inter_validator_connection import (
 from connito.shared.telemetry import (
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
+    VALIDATOR_HEARTBEAT_TOTAL,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
-    SystemStatePoller
+    SystemStatePoller,
+    track_metagraph_sync_latency,
 )
 from datetime import datetime
 
 configure_logging()
 logger = structlog.get_logger(__name__)
+
+
+@track_metagraph_sync_latency()
+def _sync_lite_metagraph(subtensor, netuid: int):
+    """Validator-side metagraph fetch via lite_subtensor.
+
+    Wrapped here (rather than at the call site) so the
+    ``track_metagraph_sync_latency`` decorator times every fetch and stamps
+    ``validator_metagraph_last_sync_timestamp`` on success.
+    """
+    return subtensor.metagraph(netuid=netuid)
 
 
 def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
@@ -670,12 +683,28 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
 
+    # Resolve this validator's UID so the poller can emit vtrust / consensus
+    # for our own slot. Failing this lookup keeps the metagraph block of the
+    # poller inert (validator_uid=None) rather than crashing startup.
+    validator_uid: int | None
+    try:
+        bootstrap_metagraph = _sync_lite_metagraph(lite_subtensor, config.chain.netuid)
+        validator_uid = bootstrap_metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+    except Exception as e:
+        logger.warning(
+            "Could not resolve validator UID for telemetry; metagraph metrics will be inert",
+            error=str(e),
+        )
+        validator_uid = None
+
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
         subtensor=lite_subtensor,
         phase_manager=PhaseManager(config, lite_subtensor),
         group_averagers=group_averagers,
-        interval_sec=12.0
+        netuid=config.chain.netuid,
+        validator_uid=validator_uid,
+        interval_sec=12.0,
     )
     poller.start()
 
@@ -761,6 +790,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     try:
         while True:
+            # Liveness signal: alert on rate(validator_main_loop_heartbeat_total[5m]) == 0
+            VALIDATOR_HEARTBEAT_TOTAL.inc()
 
             # for each step, we run 1 backward
             # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
@@ -817,7 +848,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # the round's weights on chain. If the round's submit fails, next
             # cycle's stale-weights check catches it (no race that cycle).
             max_weight_age = int(config.cycle.cycle_length)
-            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
+            metagraph = _sync_lite_metagraph(lite_subtensor, config.chain.netuid)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
             current_block = lite_subtensor.get_current_block()
