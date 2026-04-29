@@ -5,6 +5,12 @@ import gc
 import math
 import os
 import threading
+import time
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from dotenv import load_dotenv
 
@@ -92,6 +98,7 @@ from connito.shared.hf_distribute import (
     upload_checkpoint_to_hf,
 )
 from connito.shared.cycle import (
+    BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
     wait_till,
 )
@@ -443,12 +450,21 @@ def sync_grad_across_validators(
     group_averagers: dict[str | int, DecentralizedAverager],
     group_grad_buff_meta: dict[str | int, Any],
     model,
+    deadline_monotonic: float | None = None,
 ):
     for group_id, avg in group_averagers.items():
         # avg.total_size is the number of tensor *elements* in the grad buffer,
         # not the peer count. Skip only if the buffer is empty (should never happen).
         if avg.total_size <= 0:
             logger.debug("Skipping averager — grad buffer is empty", group=group_id, mode=avg.mode)
+            continue
+
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            logger.warning(
+                "Skipping averager — merge phase deadline exhausted",
+                group=group_id,
+                mode=avg.mode,
+            )
             continue
 
         pack_grads(group_grad_buff_meta[group_id], model)
@@ -471,14 +487,34 @@ def sync_grad_across_validators(
             min_group_size=getattr(avg, "min_group_size", None),
             client_mode=getattr(avg, "client_mode", None),
         )
-        
+
         avg_step = None
         for attempt in range(1, config.run.averager_step_max_retries + 1):
+            step_timeout = config.run.averager_step_timeout_sec
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "Aborting averager retries — merge phase deadline exhausted",
+                        group=group_id,
+                        attempt=attempt,
+                    )
+                    break
+                # Reserve ~2s of slack: hivemind's `timeout=` governs
+                # matchmaking and is a soft hint — the allreduce that
+                # follows can run a bit past it before unwinding. Floor
+                # at 0.5s so a near-exhausted deadline still produces a
+                # syntactically valid call rather than zero.
+                step_timeout = min(step_timeout, max(remaining - 2.0, 0.5))
             try:
+                # allow_retries=False so hivemind's internal retry doesn't
+                # stack extra wall time inside one .step() call — our outer
+                # retry loop is the single source of retry budget, which
+                # makes the total time bounded and observable.
                 avg_step = avg.step(
                     gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
-                    timeout=config.run.averager_step_timeout_sec,
-                    allow_retries=True,
+                    timeout=step_timeout,
+                    allow_retries=False,
                     wait=True,
                     # scheduled_time=scheduled_time.timestamp()
                 )
@@ -507,6 +543,18 @@ def sync_grad_across_validators(
             except Exception as e:
                 logger.warning(f"Averager - Unexpected error during avg.step (attempt {attempt}/{config.run.averager_step_max_retries}): {e}")
                 VALIDATOR_AVG_STEP_STATUS.labels(status="error").inc()
+                break
+
+            # Defensive: if avg.step ran past its (soft) timeout, the
+            # next attempt's top-of-loop check would catch the exhausted
+            # deadline — but make it explicit here so the retry path
+            # can't accidentally stack another full-budget step on top.
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                logger.warning(
+                    "Aborting averager retries — deadline crossed during step",
+                    group=group_id,
+                    attempt=attempt,
+                )
                 break
 
         unpack_to_grads(group_grad_buff_meta[group_id], model)
@@ -636,12 +684,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.23":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.23
+    if pkg_version == "v0.1.24":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.1.24
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.23 fall through the `score_path.exists()` branch and
+        # restarts on v0.1.24 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.23", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.1.24", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
@@ -758,6 +806,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
 
     logger.info("ChainSubmitter ready")
+
+    # Hard wall-clock cap for sync_grad_across_validators. Python threads
+    # can't be cancelled, so on timeout we abandon the worker and skip the
+    # rest of this round's merge — the orphan keeps running until avg.step
+    # unwinds (cooperative deadline checks inside the function should make
+    # that quick). The next merge cycle refuses to start a fresh sync
+    # while a previous orphan is still alive, so the orphan can't race
+    # outer_optimizer.step or the next round's pack_grads for model.grad.
+    sync_grad_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="connito-sync-grad",
+    )
+    last_sync_grad_future: Future | None = None
+    last_sync_grad_started_at: float | None = None
 
     try:
         while True:
@@ -988,6 +1049,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
 
+            # Bound the merge work to the on-chain Merge window: convert the
+            # remaining blocks to a wall-clock deadline so sync_grad can clamp
+            # its timeouts and bail rather than spilling into ValidatorCommit1.
+            merge_deadline_monotonic = time.monotonic() + max(
+                0, phase_response.blocks_remaining_in_phase
+            ) * BITTENSOR_BLOCK_TIME_SECONDS
+
             # Suspend both background workers for the entire Merge window —
             # they share GPU and DHT resources with sync_grad_across_validators
             # and run_global_optimization.
@@ -995,33 +1063,78 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             try:
                 if grad_is_valid:
                     logger.info("Syncing gradient across validators")
-                    sync_grad_across_validators(
-                        config=config,
-                        group_averagers=group_averagers,
-                        group_grad_buff_meta=group_grad_buff_meta,
-                        model=global_model,
-                    )
 
-                    # === global optimizer ===
-                    logger.info("Running global model optimization step")
+                    # Refuse to start a fresh sync while a previous one is
+                    # still alive — its thread may still be inside
+                    # unpack_to_grads writing model.grad. Letting a new
+                    # pack_grads run alongside would corrupt both.
+                    if (
+                        last_sync_grad_future is not None
+                        and not last_sync_grad_future.done()
+                    ):
+                        orphan_age = (
+                            round(time.monotonic() - last_sync_grad_started_at, 2)
+                            if last_sync_grad_started_at is not None
+                            else None
+                        )
+                        logger.warning(
+                            "Previous sync_grad_across_validators thread is still alive; "
+                            "skipping this round's gradient sync to avoid concurrent "
+                            "mutation of model.grad",
+                            previous_age_sec=orphan_age,
+                        )
+                        sync_grad_completed = False
+                    else:
+                        last_sync_grad_future = None
+                        last_sync_grad_started_at = time.monotonic()
+                        remaining = max(0.0, merge_deadline_monotonic - time.monotonic())
+                        future = sync_grad_executor.submit(
+                            sync_grad_across_validators,
+                            config=config,
+                            group_averagers=group_averagers,
+                            group_grad_buff_meta=group_grad_buff_meta,
+                            model=global_model,
+                            deadline_monotonic=merge_deadline_monotonic,
+                        )
+                        try:
+                            future.result(timeout=remaining)
+                            sync_grad_completed = True
+                        except FuturesTimeoutError:
+                            logger.warning(
+                                "sync_grad_across_validators exceeded merge deadline; "
+                                "abandoning thread and skipping outer optimizer step",
+                                timeout_sec=round(remaining, 2),
+                            )
+                            last_sync_grad_future = future
+                            sync_grad_completed = False
 
-                    org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
+                    if sync_grad_completed:
+                        # === global optimizer ===
+                        logger.info("Running global model optimization step")
 
-                    run_global_optimization(
-                        global_model=global_model,
-                        device=device,
-                        rank=rank,
-                        outer_optimizer=outer_optimizer,
-                        miner_jobs=miner_jobs,
-                        score_aggregator=score_aggregator,
-                    )
+                        org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
 
-                    logger.info(
-                        "Optimization step complete",
-                        org_model_hash=org_model_hash,
-                        new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                    )
-                    _participated_in_merge = True
+                        run_global_optimization(
+                            global_model=global_model,
+                            device=device,
+                            rank=rank,
+                            outer_optimizer=outer_optimizer,
+                            miner_jobs=miner_jobs,
+                            score_aggregator=score_aggregator,
+                        )
+
+                        logger.info(
+                            "Optimization step complete",
+                            org_model_hash=org_model_hash,
+                            new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
+                        )
+                        _participated_in_merge = True
+                    else:
+                        # Sync was orphaned or skipped: don't run the outer
+                        # optimizer (model.grad may be in an indeterminate
+                        # state) and trigger the peer-resync path next
+                        # cycle via _participated_in_merge=False.
+                        _participated_in_merge = False
                 else:
                     logger.info(
                         "Skipping gradient sync and optimizer — "
@@ -1248,6 +1361,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
+        # Don't wait on a stuck sync_grad worker — it may be blocked inside
+        # avg.step. cancel_futures only affects pending submissions, not
+        # the in-flight one, which keeps running until avg.step unwinds.
+        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()
         raise
@@ -1258,6 +1375,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
+        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()
 
