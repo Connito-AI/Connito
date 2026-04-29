@@ -809,6 +809,12 @@ class EvalCfg(BaseConfig):
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
+    # Drop miners from weight submission whose newest score is older than
+    # `weight_freshness_window` rounds. Prevents stale rolling-window scores
+    # from pulling weight after a miner stops being evaluated (deregistered,
+    # rolled out of this validator's roster, or simply not in the foreground
+    # top-N for several cycles in a row).
+    weight_freshness_window: int = 2
 
 
 class ValidatorConfig(WorkerConfig):
