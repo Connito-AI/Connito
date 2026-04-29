@@ -1,0 +1,8 @@
+# Connito Telemetry Gateway — runtime dependencies.
+# Pinned versions match the parent project where overlap exists.
+
+fastapi==0.110.1
+uvicorn[standard]==0.30.0
+httpx==0.27.2
+pydantic==2.7.1
+pydantic-settings==2.2.1
