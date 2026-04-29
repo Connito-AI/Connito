@@ -686,12 +686,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.24":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.24
+    if pkg_version == "v0.1.29":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.1.29
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.24 fall through the `score_path.exists()` branch and
+        # restarts on v0.1.29 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.24", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.1.29", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
@@ -715,7 +715,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === restart replay: submit weights from loaded historic scores ===
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
-    # aggregator is empty (fresh install or v0.1.24 wipe above).
+    # aggregator is empty (fresh install or v0.1.29 wipe above).
     _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
     _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
     if _replay_nonzero > 0:
