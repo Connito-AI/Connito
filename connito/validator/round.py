@@ -145,20 +145,17 @@ class Round:
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
-        # Freeze-time penalty: every miner in *any* validator's assignment
-        # (foreground here, plus everyone else's assignment that lands in
-        # our background) that did not publish a valid chain commit gets
-        # score=0 under this round_id. Doing it here — synchronously, on
-        # the main thread — keeps the worker threads out of the aggregator
-        # and catches miners with no commit at all (those never appear in
-        # `miners_with_checkpoint` and so would be invisible to the
-        # bg-download path).
+        # Freeze-time penalty: every neuron in the metagraph that is not
+        # in `assignment_result.miners_with_checkpoint` with a valid chain
+        # commit gets score=0 under this round_id. Doing it here —
+        # synchronously, on the main thread — keeps the worker threads
+        # out of the aggregator and catches miners with no commit at all
+        # (those never appear in `miners_with_checkpoint` and so would
+        # be invisible to the bg-download path).
         if score_aggregator is not None:
-            all_assigned: set[str] = set()
-            for miner_hks in assignment.values():
-                all_assigned.update(miner_hks)
-            invalid_assigned = all_assigned - assigned_with_valid_ckpt
-            for hk in invalid_assigned:
+            for hk in metagraph.hotkeys:
+                if hk in assigned_with_valid_ckpt:
+                    continue
                 uid = hotkey_to_uid.get(hk)
                 if uid is None:
                     continue
