@@ -1054,8 +1054,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     timeout=foreground_timeout_sec,
                 )
 
+            # Use a private event loop instead of asyncio.run so a timed-out
+            # evaluate_one_miner cannot stall this thread on cleanup:
+            # asyncio.to_thread cancellation only detaches the awaiter; the
+            # underlying default-executor thread keeps running. asyncio.run
+            # would then block in shutdown_default_executor(wait=True) waiting
+            # on that orphan, freezing the main loop indefinitely (we hit
+            # exactly this — round 8081470 sat ~27 min after
+            # "foreground eval: complete"). loop.close() calls
+            # executor.shutdown(wait=False), so the orphan thread is left to
+            # die with the process and we proceed to the validate phase.
+            foreground_loop = asyncio.new_event_loop()
             try:
-                asyncio.run(_bounded_foreground_eval())
+                foreground_loop.run_until_complete(_bounded_foreground_eval())
             except asyncio.TimeoutError:
                 logger.warning(
                     "Foreground evaluation exceeded validate phase deadline; "
@@ -1065,6 +1076,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     end_block=phase_response.phase_end_block,
                     completed_count=len(miner_jobs),
                 )
+            finally:
+                foreground_loop.close()
 
             # Hand bg-eval a copy of global_model the first time foreground
             # eval finishes — Merge hasn't run yet, so global_model still
