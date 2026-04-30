@@ -176,6 +176,7 @@ from connito.shared.telemetry import (
     VALIDATOR_HEARTBEAT_TOTAL,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
     SystemStatePoller,
+    set_validator_identity,
     track_metagraph_sync_latency,
 )
 from connito.validator.api import StateAPIServer, build_app
@@ -807,6 +808,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
         validator_uid = None
 
+    # Stamp identity onto the connito_validator info metric so every Prom scrape
+    # carries which validator emitted it, and stash git_version for the
+    # /v1/state.json meta block. _get_build_version() reads CONNITO_GIT_VERSION
+    # / CONNITO_GIT_SHA env vars (baked into the Docker image) with a git-cli
+    # fallback in source checkouts.
+    git_version, git_sha = _get_build_version()
+    try:
+        set_validator_identity(
+            hotkey=wallet.hotkey.ss58_address,
+            uid=validator_uid,
+            version=git_version,
+            netuid=int(config.chain.netuid),
+        )
+    except Exception as e:
+        logger.warning("Failed to stamp connito_validator_info; continuing", error=str(e))
+
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
         subtensor=lite_subtensor,
@@ -911,6 +928,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             wallet=wallet,
             validator_uid=validator_uid,
             baseline_loss_history=baseline_loss_history,
+            git_version=git_version,
         ),
         host="0.0.0.0",
         port=8300 + rank,

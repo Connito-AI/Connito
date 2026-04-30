@@ -6,7 +6,7 @@ import time
 from typing import Callable, Any, Literal
 
 import psutil
-from prometheus_client import start_http_server, Counter, Gauge, Histogram
+from prometheus_client import start_http_server, Counter, Gauge, Histogram, Info
 
 from connito.shared.app_logging import structlog
 logger = structlog.get_logger(__name__)
@@ -43,6 +43,31 @@ class TelemetryManager:
 # ==============================================================================
 # Metric Definitions
 # ==============================================================================
+
+# Identity — stamps every scrape with which validator emitted these metrics.
+# Set once at startup via set_validator_identity(); central Prometheus joins
+# this with measurement metrics via PromQL `* on(instance) group_left(...)`.
+CONNITO_VALIDATOR_INFO = Info(
+    "connito_validator",
+    "Identity of the validator emitting these metrics (one labelset per process)",
+)
+
+
+def set_validator_identity(*, hotkey: str, uid: int | None, version: str, netuid: int) -> None:
+    """Stamp the validator's identity onto the ``connito_validator_info``
+    metric. Call once at validator startup, immediately after ``validator_uid``
+    resolution. Safe to re-call (e.g. on UID change after a deregister/re-
+    register cycle) — ``Info.info()`` replaces the labelset atomically.
+    """
+    CONNITO_VALIDATOR_INFO.info({
+        "hotkey": str(hotkey),
+        # uid==None when the bootstrap metagraph fetch failed; emit as -1 so
+        # downstream queries can still match without crashing on null.
+        "uid": str(uid if uid is not None else -1),
+        "version": str(version),
+        "netuid": str(netuid),
+    })
+
 
 # Infrastructure / Cycle (Gauges & Histograms)
 SUBNET_CURRENT_BLOCK = Gauge("subnet_current_block", "Current block on local subtensor")

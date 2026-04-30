@@ -20,6 +20,7 @@ every whitelisted validator's ``/v1/state.json``.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import uvicorn
@@ -44,6 +45,7 @@ def build_app(
     wallet,
     validator_uid: int | None,
     baseline_loss_history=None, # connito.validator.baseline_history.BaselineLossHistory
+    git_version: str | None = None,  # build tag, surfaced in /v1/state.json meta
 ) -> FastAPI:
     """Build a FastAPI app with the /v1/state.json endpoint.
 
@@ -66,6 +68,7 @@ def build_app(
     app.state.wallet = wallet
     app.state.validator_uid = validator_uid
     app.state.baseline_loss_history = baseline_loss_history
+    app.state.git_version = git_version
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -82,13 +85,30 @@ def build_app(
 # Snapshot composition — each section is best-effort and isolated
 # ============================================================================
 
+PAYLOAD_VERSION = "1.0"
+
+
 def _build_state_snapshot(s) -> dict[str, Any]:
     return {
+        # Envelope metadata first — lets multi-validator aggregators detect
+        # schema-skew between validators on different builds before parsing
+        # the rest of the payload.
+        "meta": _build_meta_section(s),
         "validator": _build_validator_section(s),
         "subnet": _build_subnet_section(s),
         "phase": _build_phase_section(s),
         "round": _build_round_section(s),
         "leaderboard": _build_leaderboard_section(s),
+    }
+
+
+def _build_meta_section(s) -> dict[str, Any]:
+    """Aggregator-facing payload metadata. Bump ``payload_version`` on any
+    breaking schema change so downstream consumers can fail fast."""
+    return {
+        "payload_version": PAYLOAD_VERSION,
+        "connito_version": getattr(s, "git_version", None),
+        "snapshot_ts": time.time(),
     }
 
 
