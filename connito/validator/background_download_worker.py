@@ -180,14 +180,7 @@ class BackgroundDownloadWorker(threading.Thread):
         try:
             ckpt = round_obj.uid_to_chain_checkpoint.get(uid)
             if ckpt is None or not (ckpt.hf_repo_id and ckpt.hf_revision):
-                # Defensive: Round.freeze already penalizes miners without
-                # a valid chain commit and excludes them from the queue, so
-                # this branch should not normally fire. mark_failed only —
-                # the score=0 (if warranted) was recorded at freeze time.
-                logger.debug(
-                    "bg-download: no HF target despite freeze-time filter; skipping",
-                    uid=uid, hotkey=hotkey[:6],
-                )
+                logger.debug("bg-download: no HF target for miner; skipping", uid=uid, hotkey=hotkey[:6])                
                 round_obj.mark_failed(uid)
                 self._update_pending_metric(round_obj)
                 return
