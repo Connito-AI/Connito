@@ -716,9 +716,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
     # aggregator is empty (fresh install or v0.1.29 wipe above).
-    # Plain average over the score_window — the aggregator caps each
-    # miner's history at max_points=score_window (see MinerScoreAggregator
-    # construction above), so `how="avg"` is exactly mean-over-last-N.
     _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
     _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
     if _replay_nonzero > 0:
@@ -903,11 +900,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                # Plain average over the score_window. The aggregator's
-                # MinerSeries caps each miner's points at
-                # max_points=score_window (see config.evaluation.score_window,
-                # default 8), so `how="avg"` is exactly mean-over-last-N
-                # and never includes records older than the window.
                 uid_weights = score_aggregator.uid_score_pairs(how="avg")
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
