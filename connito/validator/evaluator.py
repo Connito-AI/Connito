@@ -427,14 +427,21 @@ async def evaluate_foreground_round(
                 expert_group_assignment=expert_group_assignment,
             )
             if fail_reason is not None:
+                # Invalid checkpoint (no chain commit / signature / hash /
+                # expert_group / NaN-Inf): penalize with score=0. Operational
+                # failures below (timeout / OOM / unexpected exception) do
+                # NOT score=0 — those are not the miner's fault.
                 logger.warning(
-                    "foreground eval: submission failed validation — marking failed",
+                    "foreground eval: submission failed validation — penalizing with score=0",
                     uid=uid, hotkey=hotkey[:6],
                     round_id=round_obj.round_id,
                     reason=fail_reason,
                 )
                 from connito.shared.telemetry import inc_error
                 inc_error(component="foreground_eval", kind="validation")
+                score_aggregator.add_score(
+                    uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+                )
                 round_obj.mark_failed(uid)
                 continue
 
