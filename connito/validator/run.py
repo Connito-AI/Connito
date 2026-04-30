@@ -699,12 +699,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             with open(score_path, "r") as f:
                 score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
             _loaded_latest = score_aggregator.uid_score_pairs(how="latest")
-            _loaded_ema = score_aggregator.uid_score_pairs(how="ema")
+            _loaded_avg = score_aggregator.uid_score_pairs(how="avg")
             logger.info(
                 "Loaded previous MinerScoreAggregator state from disk",
                 uids=len(_loaded_latest),
                 latest_scores={int(u): float(s) for u, s in sorted(_loaded_latest.items())},
-                ema_scores={int(u): float(s) for u, s in sorted(_loaded_ema.items())},
+                avg_scores={int(u): float(s) for u, s in sorted(_loaded_avg.items())},
             )
         except Exception as e:
             logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
@@ -716,8 +716,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
     # aggregator is empty (fresh install or v0.1.29 wipe above).
-    # Use EMA to match the steady-state weight-submission path below.
-    _replay_uid_weights = score_aggregator.uid_score_pairs(how="ema")
+    # Plain average over the score_window — the aggregator caps each
+    # miner's history at max_points=score_window (see MinerScoreAggregator
+    # construction above), so `how="avg"` is exactly mean-over-last-N.
+    _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
     _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
     if _replay_nonzero > 0:
         @dataclass
@@ -901,12 +903,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                # EMA over the score_window (last N=score_window records per
-                # miner) — recent rounds dominate, but older rounds aren't
-                # discarded outright. Plain "avg" gave equal weight to every
-                # record in the window, blunting recovery for miners whose
-                # most recent submissions improved.
-                uid_weights = score_aggregator.uid_score_pairs(how="ema")
+                # Plain average over the score_window. The aggregator's
+                # MinerSeries caps each miner's points at
+                # max_points=score_window (see config.evaluation.score_window,
+                # default 8), so `how="avg"` is exactly mean-over-last-N
+                # and never includes records older than the window.
+                uid_weights = score_aggregator.uid_score_pairs(how="avg")
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
