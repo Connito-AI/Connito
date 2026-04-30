@@ -170,22 +170,23 @@ class Round:
                     uid=uid, hotkey=hk[:6], round_id=rid,
                 )
 
-        # Order foreground/background so the staler a miner is (i.e. the
-        # longer ago this validator last produced a score for them), the
-        # earlier they appear. A miner with no prior score is treated as
-        # infinitely stale and goes first. This keeps every assigned miner
-        # being refreshed even when the per-round eval budget runs out
-        # before the queue drains, and naturally spreads load across
-        # validators since `last_evaluated` is per-validator state.
+        foreground_uids = tuple(foreground)
+
+        # Order *background* by staleness — longest-since-last-evaluated
+        # first, never-evaluated UIDs treated as infinitely stale. This
+        # ensures the long tail of the roster eventually rotates through
+        # bg-eval instead of always favoring the same incentive-ranked
+        # head. Foreground stays in incentive order; that's the priority
+        # set by design and the per-round eval budget covers it. Each
+        # validator has different `last_evaluated` so background also
+        # spreads naturally across the subnet without an explicit shuffle.
         EPOCH = datetime.min.replace(tzinfo=timezone.utc)
         last_eval_map = last_evaluated or {}
 
         def _staleness_key(uid: int) -> datetime:
             return last_eval_map.get(uid, EPOCH)
 
-        foreground.sort(key=_staleness_key)
         background.sort(key=_staleness_key)
-        foreground_uids = tuple(foreground)
         background_uids = tuple(background)
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
