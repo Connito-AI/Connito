@@ -180,7 +180,7 @@ class BackgroundDownloadWorker(threading.Thread):
         try:
             ckpt = round_obj.uid_to_chain_checkpoint.get(uid)
             if ckpt is None or not (ckpt.hf_repo_id and ckpt.hf_revision):
-                logger.debug("bg-download: no HF target for miner; skipping", uid=uid, hotkey=hotkey[:6])
+                logger.debug("bg-download: no HF target for miner; skipping", uid=uid, hotkey=hotkey[:6])                
                 round_obj.mark_failed(uid)
                 self._update_pending_metric(round_obj)
                 return

@@ -8,9 +8,9 @@ background workers (download + eval) all anchor on the same `Round`.
 
 from __future__ import annotations
 
-import random
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, NamedTuple
 
@@ -21,6 +21,7 @@ from connito.shared.app_logging import structlog
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
+    from connito.validator.aggregator import MinerScoreAggregator
 
 logger = structlog.get_logger(__name__)
 
@@ -84,6 +85,8 @@ class Round:
         global_model: nn.Module,
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
+        last_evaluated: dict[int, datetime] | None = None,
+        score_aggregator: "MinerScoreAggregator | None" = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -125,6 +128,7 @@ class Round:
         chain_checkpoints_by_hotkey = getattr(
             assignment_result, "chain_checkpoints_by_hotkey", {}
         ) or {}
+        assigned_with_valid_ckpt: set[str] = set()
         for hk in assignment_result.miners_with_checkpoint:
             uid = hotkey_to_uid.get(hk)
             if uid is None:
@@ -134,19 +138,52 @@ class Round:
             ckpt = chain_checkpoints_by_hotkey.get(hk)
             if ckpt is not None:
                 uid_to_chain_checkpoint[uid] = ckpt
-            (foreground if hk in my_assignment_set else background).append(uid)
+            if ckpt is not None and ckpt.hf_repo_id and ckpt.hf_revision:
+                assigned_with_valid_ckpt.add(hk)
 
-        foreground_uids = tuple(foreground)
+            (foreground if hk in my_assignment_set else background).append(uid)
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
-        # Shuffle background deterministically per (validator, round) so each
-        # validator hits HF in a different order — spreads download load
-        # across the subnet instead of every validator racing for the same
-        # top-incentive miners first. Stable within a round (workers see the
-        # same order across re-reads) but varies cycle-to-cycle so no miner
-        # is permanently stuck at the back of any one validator's queue.
-        random.Random(f"{config.chain.hotkey_ss58}:{rid}").shuffle(background)
+        # Freeze-time penalty: every neuron in the metagraph that is not
+        # in `assignment_result.miners_with_checkpoint` with a valid chain
+        # commit gets score=0 under this round_id. Doing it here —
+        # synchronously, on the main thread — keeps the worker threads
+        # out of the aggregator and catches miners with no commit at all
+        # (those never appear in `miners_with_checkpoint` and so would
+        # be invisible to the bg-download path).
+        if score_aggregator is not None:
+            for hk in metagraph.hotkeys:
+                if hk in assigned_with_valid_ckpt:
+                    continue
+                uid = hotkey_to_uid.get(hk)
+                if uid is None:
+                    continue
+                score_aggregator.add_score(
+                    uid=uid, hotkey=hk, score=0.0, round_id=rid,
+                )
+                logger.info(
+                    "Round.freeze: invalid chain checkpoint — penalizing with score=0",
+                    uid=uid, hotkey=hk[:6], round_id=rid,
+                )
+
+        foreground_uids = tuple(foreground)
+
+        # Order *background* by staleness — longest-since-last-evaluated
+        # first, never-evaluated UIDs treated as infinitely stale. This
+        # ensures the long tail of the roster eventually rotates through
+        # bg-eval instead of always favoring the same incentive-ranked
+        # head. Foreground stays in incentive order; that's the priority
+        # set by design and the per-round eval budget covers it. Each
+        # validator has different `last_evaluated` so background also
+        # spreads naturally across the subnet without an explicit shuffle.
+        EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+        last_eval_map = last_evaluated or {}
+
+        def _staleness_key(uid: int) -> datetime:
+            return last_eval_map.get(uid, EPOCH)
+
+        background.sort(key=_staleness_key)
         background_uids = tuple(background)
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
@@ -233,9 +270,9 @@ class Round:
     @property
     def assigned_uids(self) -> tuple[int, ...]:
         """Alias for `foreground_uids` — the validator's assignment slice.
-        Kept under a separate name so callers (e.g. the missed-submission
-        penalty pass) can express *intent* without coupling to the fact
-        that today every assigned miner is also evaluated in foreground.
+        Kept under a separate name so callers can express *intent* without
+        coupling to the fact that today every assigned miner is also
+        evaluated in foreground.
         """
         return self.foreground_uids
 
@@ -286,8 +323,10 @@ class Round:
 
     def unscored_roster_uids(self) -> list[RosterEntry]:
         """Assigned miners this validator did not score this round. Scoped
-        to `foreground_uids` so the penalty pass does not zero out miners
-        that belong to other validators' assignments."""
+        to `foreground_uids` so it never returns miners that belong to
+        other validators' assignments. No longer used for penalties (we
+        only score=0 for invalid checkpoints, recorded inline at the
+        validation site); kept for diagnostics and future use."""
         with self._lock:
             return [
                 RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
