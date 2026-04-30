@@ -25,7 +25,7 @@ class MinerSeries:
     """Holds a single miner's (timestamp, score, round_id) points, kept sorted by time."""
 
     points: list[tuple[datetime, float, int | None]] = field(default_factory=list)
-    max_points: int = 16
+    max_points: int = 8  # default mirrors config.evaluation.score_window
 
     def add(self, ts: datetime, score: float, round_id: int | None = None) -> None:
         if ts.tzinfo is None:
@@ -106,7 +106,7 @@ class MinerScoreAggregator:
     REQUIREMENT: if a uid's hotkey changes, that uid's score history resets.
     """
 
-    def __init__(self, max_points: int = 16):
+    def __init__(self, max_points: int = 8):
         self._miners: dict[int, MinerState] = {}  # uid -> MinerState
         self._lock = threading.RLock()
         self._max_points = max_points
@@ -329,7 +329,7 @@ class MinerScoreAggregator:
         return json.dumps({"schema_version": SCHEMA_VERSION, "miners": miners_payload})
 
     @classmethod
-    def from_json(cls, data: str, max_points: int = 16) -> MinerScoreAggregator:
+    def from_json(cls, data: str, max_points: int = 8) -> MinerScoreAggregator:
         raw = json.loads(data)
         # v2 has a top-level envelope; v1 was a bare {uid: {...}} mapping.
         if isinstance(raw, dict) and "miners" in raw and "schema_version" in raw:
