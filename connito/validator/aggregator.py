@@ -68,12 +68,26 @@ class MinerSeries:
     def latest(self) -> float:
         return float(self.points[-1][1]) if self.points else 0.0
 
-    def sum(self, start: datetime | None = None, end: datetime | None = None) -> float:
+    def _window(
+        self, start: datetime | None, end: datetime | None,
+    ) -> list[tuple[datetime, float, int | None]]:
+        """Return the points used by every aggregation, hard-capped to
+        the last ``max_points`` entries. ``add()`` already trims storage,
+        so this is mostly belt-and-suspenders for callers that pass a
+        wide ``start``/``end`` (e.g. the entire run history) — we still
+        only ever look at the most recent ``score_window`` records.
+        """
         pts = self.slice(start, end) if (start or end) else self.points
+        if len(pts) > self.max_points:
+            pts = pts[-self.max_points:]
+        return pts
+
+    def sum(self, start: datetime | None = None, end: datetime | None = None) -> float:
+        pts = self._window(start, end)
         return float(sum(v for _, v, _ in pts))
 
     def avg(self, start: datetime | None = None, end: datetime | None = None) -> float:
-        pts = self.slice(start, end) if (start or end) else self.points
+        pts = self._window(start, end)
         return float(sum(v for _, v, _ in pts) / len(pts)) if pts else 0.0
 
 
@@ -211,6 +225,10 @@ class MinerScoreAggregator:
         if not (0 < alpha <= 1):
             raise ValueError("alpha must be in (0, 1].")
         pts = self.get_history(uid, start, end)
+        # Mirror MinerSeries._window: cap to the last score_window entries
+        # so ema never folds in records older than what avg/sum see.
+        if len(pts) > self._max_points:
+            pts = pts[-self._max_points:]
         if not pts:
             return 0.0
         ema_val = pts[0][1]
