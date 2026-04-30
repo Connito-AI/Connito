@@ -21,6 +21,7 @@ from connito.shared.app_logging import structlog
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
+    from connito.validator.aggregator import MinerScoreAggregator
 
 logger = structlog.get_logger(__name__)
 
@@ -85,6 +86,7 @@ class Round:
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
+        score_aggregator: "MinerScoreAggregator | None" = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -126,6 +128,7 @@ class Round:
         chain_checkpoints_by_hotkey = getattr(
             assignment_result, "chain_checkpoints_by_hotkey", {}
         ) or {}
+        my_assignment_with_valid_ckpt: set[str] = set()
         for hk in assignment_result.miners_with_checkpoint:
             uid = hotkey_to_uid.get(hk)
             if uid is None:
@@ -133,11 +136,44 @@ class Round:
                 continue
             uid_to_hotkey[uid] = hk
             ckpt = chain_checkpoints_by_hotkey.get(hk)
+            has_valid_ckpt = (
+                ckpt is not None and bool(ckpt.hf_repo_id) and bool(ckpt.hf_revision)
+            )
             if ckpt is not None:
                 uid_to_chain_checkpoint[uid] = ckpt
-            (foreground if hk in my_assignment_set else background).append(uid)
+            if hk in my_assignment_set:
+                if has_valid_ckpt:
+                    my_assignment_with_valid_ckpt.add(hk)
+                    foreground.append(uid)
+                # If hk is in my_assignment but the ckpt is invalid, drop it
+                # from the round entirely — the freeze-time penalty pass
+                # below records the score=0 directly. Including it in the
+                # queue would just waste a bg-download slot.
+            else:
+                background.append(uid)
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
+
+        # Freeze-time penalty: every miner in *my* assignment that did not
+        # publish a valid chain commit (no commit at all, or commit missing
+        # hf_repo_id / hf_revision) gets score=0 under this round_id. Doing
+        # it here — synchronously, on the main thread — keeps the worker
+        # threads out of the aggregator and catches miners with no commit
+        # at all (those never appear in `miners_with_checkpoint` and so
+        # would be invisible to the bg-download path).
+        if score_aggregator is not None:
+            invalid_assigned = my_assignment_set - my_assignment_with_valid_ckpt
+            for hk in invalid_assigned:
+                uid = hotkey_to_uid.get(hk)
+                if uid is None:
+                    continue
+                score_aggregator.add_score(
+                    uid=uid, hotkey=hk, score=0.0, round_id=rid,
+                )
+                logger.info(
+                    "Round.freeze: invalid chain checkpoint — penalizing with score=0",
+                    uid=uid, hotkey=hk[:6], round_id=rid,
+                )
 
         # Order foreground/background so the staler a miner is (i.e. the
         # longer ago this validator last produced a score for them), the

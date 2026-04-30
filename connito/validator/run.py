@@ -821,7 +821,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             config=config,
             round_ref=round_ref,
             merge_phase_active=merge_phase_active,
-            score_aggregator=score_aggregator,
             download_window_closed=download_window_closed,
         )
         # bg-eval idles until the main loop hands it a copy of
@@ -973,6 +972,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     phase_response.phase_end_block,
                 ),
                 last_evaluated=score_aggregator.last_evaluated_per_uid(),
+                score_aggregator=score_aggregator,
             )
             # Belt-and-suspenders: drop any leftover submission file whose
             # block falls outside this round's window. The end-of-cycle
