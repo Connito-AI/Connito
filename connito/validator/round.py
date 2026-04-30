@@ -136,21 +136,16 @@ class Round:
                 continue
             uid_to_hotkey[uid] = hk
             ckpt = chain_checkpoints_by_hotkey.get(hk)
-            has_valid_ckpt = (
-                ckpt is not None and bool(ckpt.hf_repo_id) and bool(ckpt.hf_revision)
-            )
             if ckpt is not None:
                 uid_to_chain_checkpoint[uid] = ckpt
-            if hk in my_assignment_set:
-                if has_valid_ckpt:
-                    my_assignment_with_valid_ckpt.add(hk)
-                    foreground.append(uid)
-                # If hk is in my_assignment but the ckpt is invalid, drop it
-                # from the round entirely — the freeze-time penalty pass
-                # below records the score=0 directly. Including it in the
-                # queue would just waste a bg-download slot.
-            else:
-                background.append(uid)
+            if (
+                hk in my_assignment_set
+                and ckpt is not None
+                and ckpt.hf_repo_id
+                and ckpt.hf_revision
+            ):
+                my_assignment_with_valid_ckpt.add(hk)
+            (foreground if hk in my_assignment_set else background).append(uid)
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
