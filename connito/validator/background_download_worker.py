@@ -45,6 +45,7 @@ class BackgroundDownloadWorker(threading.Thread):
         config,
         round_ref: RoundRef,
         merge_phase_active: threading.Event,
+        score_aggregator,
         download_window_closed: threading.Event | None = None,
         stop_event: threading.Event | None = None,
         poll_interval_sec: float = 6.0,
@@ -53,6 +54,7 @@ class BackgroundDownloadWorker(threading.Thread):
         self.config = config
         self.round_ref = round_ref
         self.merge_phase_active = merge_phase_active
+        self.score_aggregator = score_aggregator
         self.download_window_closed = download_window_closed or threading.Event()
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
@@ -180,7 +182,17 @@ class BackgroundDownloadWorker(threading.Thread):
         try:
             ckpt = round_obj.uid_to_chain_checkpoint.get(uid)
             if ckpt is None or not (ckpt.hf_repo_id and ckpt.hf_revision):
-                logger.debug("bg-download: no HF target for miner; skipping", uid=uid, hotkey=hotkey[:6])
+                # Invalid checkpoint at the chain level: penalize with
+                # score=0. Operational failures (timeouts, network errors)
+                # later in this method do NOT score=0 — those are not the
+                # miner's fault.
+                logger.info(
+                    "bg-download: no chain checkpoint — penalizing with score=0",
+                    uid=uid, hotkey=hotkey[:6],
+                )
+                self.score_aggregator.add_score(
+                    uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+                )
                 round_obj.mark_failed(uid)
                 self._update_pending_metric(round_obj)
                 return

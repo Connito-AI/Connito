@@ -8,9 +8,9 @@ background workers (download + eval) all anchor on the same `Round`.
 
 from __future__ import annotations
 
-import random
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, NamedTuple
 
@@ -84,6 +84,7 @@ class Round:
         global_model: nn.Module,
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
+        last_evaluated: dict[int, datetime] | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -136,17 +137,24 @@ class Round:
                 uid_to_chain_checkpoint[uid] = ckpt
             (foreground if hk in my_assignment_set else background).append(uid)
 
-        foreground_uids = tuple(foreground)
-
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
-        # Shuffle background deterministically per (validator, round) so each
-        # validator hits HF in a different order — spreads download load
-        # across the subnet instead of every validator racing for the same
-        # top-incentive miners first. Stable within a round (workers see the
-        # same order across re-reads) but varies cycle-to-cycle so no miner
-        # is permanently stuck at the back of any one validator's queue.
-        random.Random(f"{config.chain.hotkey_ss58}:{rid}").shuffle(background)
+        # Order foreground/background so the staler a miner is (i.e. the
+        # longer ago this validator last produced a score for them), the
+        # earlier they appear. A miner with no prior score is treated as
+        # infinitely stale and goes first. This keeps every assigned miner
+        # being refreshed even when the per-round eval budget runs out
+        # before the queue drains, and naturally spreads load across
+        # validators since `last_evaluated` is per-validator state.
+        EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+        last_eval_map = last_evaluated or {}
+
+        def _staleness_key(uid: int) -> datetime:
+            return last_eval_map.get(uid, EPOCH)
+
+        foreground.sort(key=_staleness_key)
+        background.sort(key=_staleness_key)
+        foreground_uids = tuple(foreground)
         background_uids = tuple(background)
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
@@ -233,9 +241,9 @@ class Round:
     @property
     def assigned_uids(self) -> tuple[int, ...]:
         """Alias for `foreground_uids` — the validator's assignment slice.
-        Kept under a separate name so callers (e.g. the missed-submission
-        penalty pass) can express *intent* without coupling to the fact
-        that today every assigned miner is also evaluated in foreground.
+        Kept under a separate name so callers can express *intent* without
+        coupling to the fact that today every assigned miner is also
+        evaluated in foreground.
         """
         return self.foreground_uids
 
@@ -286,8 +294,10 @@ class Round:
 
     def unscored_roster_uids(self) -> list[RosterEntry]:
         """Assigned miners this validator did not score this round. Scoped
-        to `foreground_uids` so the penalty pass does not zero out miners
-        that belong to other validators' assignments."""
+        to `foreground_uids` so it never returns miners that belong to
+        other validators' assignments. No longer used for penalties (we
+        only score=0 for invalid checkpoints, recorded inline at the
+        validation site); kept for diagnostics and future use."""
         with self._lock:
             return [
                 RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])

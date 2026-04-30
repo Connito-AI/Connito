@@ -286,6 +286,19 @@ class MinerScoreAggregator:
         cutoff_score = sorted_scores[cutoff - 1]
         return scores[uid] >= cutoff_score
 
+    def last_evaluated_per_uid(self) -> dict[int, datetime]:
+        """Return ``{uid: most_recent_timestamp}`` for every miner with at
+        least one recorded score. Used by ``Round.freeze`` to prioritize
+        the validation queue: miners that were last evaluated longer ago
+        come first so every miner gets refreshed.
+        """
+        with self._lock:
+            return {
+                uid: state.series.points[-1][0]
+                for uid, state in self._miners.items()
+                if state.series.points
+            }
+
     # ---------- Maintenance ----------
     def prune_older_than(self, older_than: timedelta, now: datetime | None = None) -> None:
         if now is None:
