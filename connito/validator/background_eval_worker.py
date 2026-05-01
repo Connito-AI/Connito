@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -27,7 +28,11 @@ from connito.shared.telemetry import (
     VALIDATOR_ROUND_MINERS_PENDING,
     VALIDATOR_ROUND_MINERS_SCORED,
 )
-from connito.validator.evaluator import EVAL_MAX_BATCHES, evaluate_one_miner
+from connito.validator.evaluator import (
+    EVAL_MAX_BATCHES,
+    cleanup_non_top_submissions,
+    evaluate_one_miner,
+)
 from connito.validator.round import RoundRef
 
 logger = structlog.get_logger(__name__)
@@ -300,6 +305,7 @@ class BackgroundEvalWorker(threading.Thread):
             self.score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=0, round_id=round_obj.round_id)
             round_obj.mark_failed(uid)
             self._record_metrics(round_obj, scored_inc=False)
+            self._prune_non_top(round_obj)
             return
 
         logger.info(
@@ -351,16 +357,19 @@ class BackgroundEvalWorker(threading.Thread):
         if evaluated is None:
             round_obj.mark_failed(uid)
             self._record_metrics(round_obj, scored_inc=False)
+            self._prune_non_top(round_obj)
             return
 
-        round_obj.mark_scored(uid)
+        round_obj.mark_scored(uid, evaluated.score)
         logger.info(
             "bg-eval: success",
             round_id=round_obj.round_id,
             uid=uid, hotkey=hotkey[:6],
+            score=round(evaluated.score, 6),
         )
         # Per-miner persistence happens inside evaluate_one_miner via score_path.
         self._record_metrics(round_obj, scored_inc=True)
+        self._prune_non_top(round_obj)
 
     def _assert_lock_unheld_by_us(self) -> None:
         # Best-effort invariant check. `Lock.locked()` is true if anyone
@@ -377,6 +386,33 @@ class BackgroundEvalWorker(threading.Thread):
             "bg-eval: gpu_eval_lock appears held at iteration boundary; "
             "this is the lock-yielding invariant — investigate."
         )
+
+    def _prune_non_top(self, round_obj) -> None:
+        """Drop on-disk submission files for miners that have been
+        processed this round but are not in the top-`top_k_miners_to_reward`
+        by *this round's* score (read from `round.scores`, not the global
+        aggregator). Files for miners that have not yet been evaluated
+        are explicitly retained — see `cleanup_non_top_submissions`.
+        Keeps the merge-time top-1 set (top_k_miners_to_merge=1 ⊆
+        top_k_miners_to_reward=3) and the archive-time top set, while
+        reclaiming disk for everyone else.
+        """
+        try:
+            deleted = cleanup_non_top_submissions(
+                round_obj=round_obj,
+                submission_dir=Path(self.config.ckpt.miner_submission_path),
+                top_k=int(self.config.evaluation.top_k_miners_to_reward),
+            )
+        except Exception as e:
+            logger.warning("bg-eval: post-eval submission cleanup failed", error=str(e))
+            return
+        if deleted:
+            logger.info(
+                "bg-eval: pruned non-top miner submissions",
+                round_id=round_obj.round_id,
+                deleted=len(deleted),
+                files=deleted,
+            )
 
     @staticmethod
     def _record_metrics(round_obj, *, scored_inc: bool) -> None:
