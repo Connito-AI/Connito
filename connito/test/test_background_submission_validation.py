@@ -722,24 +722,24 @@ class TestFinalizeRoundScores:
             return []
         return [v for _, v, rid in state.series.points if rid == round_id]
 
-    def test_top_three_get_three_two_one(self) -> None:
+    def test_top_three_get_geometric_rank_scores(self) -> None:
         from connito.validator.evaluator import finalize_round_scores
 
         rnd = self._round_with_five_miners()
         # mark_scored stores delta**1.2; pick distinct values so ranking
         # is unambiguous.
         rnd.mark_scored(rnd.roster[0].uid, score=0.10)  # rank 4
-        rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # rank 1 → 3.0
-        rnd.mark_scored(rnd.roster[2].uid, score=0.30)  # rank 2 → 2.0
+        rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # rank 1 → 2.25
+        rnd.mark_scored(rnd.roster[2].uid, score=0.30)  # rank 2 → 1.5
         rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 3 → 1.0
         rnd.mark_scored(rnd.roster[4].uid, score=0.05)  # rank 5
 
         agg = MinerScoreAggregator(max_points=8)
         finalize_round_scores(round_obj=rnd, score_aggregator=agg)
 
-        # Rank 1 → 3.0, rank 2 → 2.0, rank 3 → 1.0, rest → 0.0.
-        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [3.0]
-        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [2.0]
+        # Rank 1 → 2.25, rank 2 → 1.5, rank 3 → 1.0, rest → 0.0.
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [1.5]
         assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.0]
         assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [0.0]
@@ -755,8 +755,8 @@ class TestFinalizeRoundScores:
         # values below.
         rnd.mark_scored(rnd.roster[0].uid, score=0.50)  # tied → 0
         rnd.mark_scored(rnd.roster[1].uid, score=0.50)  # tied → 0
-        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # rank 1 → 3.0
-        rnd.mark_scored(rnd.roster[3].uid, score=0.30)  # rank 2 → 2.0
+        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # rank 1 → 2.25
+        rnd.mark_scored(rnd.roster[3].uid, score=0.30)  # rank 2 → 1.5
         rnd.mark_scored(rnd.roster[4].uid, score=0.20)  # rank 3 → 1.0
 
         agg = MinerScoreAggregator(max_points=8)
@@ -764,8 +764,8 @@ class TestFinalizeRoundScores:
 
         assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
-        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [3.0]
-        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.5]
         assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [1.0]
 
     def test_three_way_tie_all_get_zero(self) -> None:
@@ -777,7 +777,7 @@ class TestFinalizeRoundScores:
         rnd.mark_scored(rnd.roster[0].uid, score=0.40)  # tied
         rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # tied
         rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # tied
-        rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 1 → 3.0
+        rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 1 → 2.25
 
         agg = MinerScoreAggregator(max_points=8)
         finalize_round_scores(round_obj=rnd, score_aggregator=agg)
@@ -786,13 +786,13 @@ class TestFinalizeRoundScores:
             assert self._scores_for_uid(
                 agg, rnd.roster[tied_idx].uid, rnd.round_id,
             ) == [0.0]
-        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.25]
 
     def test_zero_delta_excluded_from_top_three(self) -> None:
-        # If only one miner has delta > 0, only that miner gets 3.0.
-        # The other "scored but delta==0" miners receive 0.0 — they did not
-        # actually improve over baseline so they should not collect reward
-        # weight just for showing up.
+        # If only one miner has delta > 0, only that miner gets the
+        # rank-1 reward (2.25). The other "scored but delta==0" miners
+        # receive 0.0 — they did not actually improve over baseline so
+        # they should not collect reward weight just for showing up.
         from connito.validator.evaluator import finalize_round_scores
 
         rnd = self._round_with_five_miners()
@@ -804,7 +804,7 @@ class TestFinalizeRoundScores:
         agg = MinerScoreAggregator(max_points=8)
         finalize_round_scores(round_obj=rnd, score_aggregator=agg)
 
-        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [2.25]
         for entry in (rnd.roster[0], rnd.roster[2], rnd.roster[3]):
             assert self._scores_for_uid(agg, entry.uid, rnd.round_id) == [0.0]
 
@@ -819,7 +819,7 @@ class TestFinalizeRoundScores:
         agg = MinerScoreAggregator(max_points=8)
         finalize_round_scores(round_obj=rnd, score_aggregator=agg)
 
-        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [2.25]
         assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [0.0]
 
@@ -917,8 +917,8 @@ class TestFinalizeRoundScores:
                       score=42.0, round_id=rnd.round_id)
         finalize_round_scores(round_obj=rnd, score_aggregator=agg)
 
-        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [3.0]
-        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [2.0]
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [1.5]
 
     def test_persists_score_path_when_provided(self, tmp_path: Path) -> None:
         from connito.validator.evaluator import finalize_round_scores
@@ -939,4 +939,4 @@ class TestFinalizeRoundScores:
         )
         assert TestFinalizeRoundScores._scores_for_uid(
             restored, rnd.roster[0].uid, rnd.round_id,
-        ) == [3.0]
+        ) == [2.25]

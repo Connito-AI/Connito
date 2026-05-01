@@ -105,13 +105,18 @@ def cleanup_non_top_submissions(
     return deleted
 
 
-# Rank → score mapping used by `finalize_round_scores`. Top-1 in the
-# round's delta ranking gets 3.0, runner-up 2.0, third 1.0; everyone else
-# (and every failed/missing miner) gets 0.0. Hard-coded rather than
-# parameterized off `top_k_miners_to_reward` (which governs disk
-# retention, not reward weight) because the values 3/2/1 are part of the
+# Rank → score mapping used by `finalize_round_scores`. Geometric
+# progression with ratio 1.5: top-1 in the round's delta ranking gets
+# 2.25, runner-up 1.5, third 1.0; everyone else (and every failed /
+# missing miner) gets 0.0. The geometric spacing concentrates more
+# reward weight at the top — `top1 / top3 = 2.25` vs. the previous
+# arithmetic mapping's `3 / 1 = 3` — while keeping the second-place
+# miner closer to first than to third (`top2 / top1 = 0.667` vs.
+# `top3 / top2 = 0.667`, equal ratios across tiers). Hard-coded rather
+# than parameterized off `top_k_miners_to_reward` (which governs disk
+# retention, not reward weight) because these values are part of the
 # scoring contract — see PR #93.
-_RANK_TO_SCORE: tuple[float, ...] = (3.0, 2.0, 1.0)
+_RANK_TO_SCORE: tuple[float, ...] = (2.25, 1.5, 1.0)
 
 
 def finalize_round_scores(
@@ -128,9 +133,9 @@ def finalize_round_scores(
     intermediate eval-time scores do not stack with the rank-based ones,
     then re-adds:
 
-      - Top-1 by `round.scores` (delta desc): score 3.
-      - Top-2: score 2.
-      - Top-3: score 1.
+      - Top-1 by `round.scores` (delta desc): score 2.25.
+      - Top-2: score 1.5.
+      - Top-3: score 1.0.
       - Other scored UIDs (incl. delta=0): score 0.
       - Any UIDs whose `round.scores` value exactly equals another
         scored miner's: score 0 — a tied val_loss is evidence of a
