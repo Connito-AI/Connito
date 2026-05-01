@@ -404,9 +404,22 @@ async def aggregate_miner_gradient_change(
     # Keeping all top-k miner models resident on CPU simultaneously was the
     # single largest transient RAM spike in the cycle.
     for job in top_jobs:
-        miner_model = await asyncio.to_thread(
-            load_model_from_path, job.model_path, global_model, device
-        )
+        # The file at job.model_path can disappear between foreground eval
+        # and merge — bg-eval / foreground's post-eval cleanup keeps only
+        # the top miners' submissions on disk. Treat a load failure as
+        # "skip this miner" instead of letting it kill the whole merge.
+        try:
+            miner_model = await asyncio.to_thread(
+                load_model_from_path, job.model_path, global_model, device
+            )
+        except (FileNotFoundError, OSError, ValueError) as e:
+            logger.warning(
+                "Skipping miner in merge — checkpoint file unavailable",
+                uid=job.uid,
+                model_path=str(job.model_path),
+                error=str(e),
+            )
+            continue
         try:
             pre_grad_sum = sum_model_gradients(global_model)
             populate_global_grads_from_local(global_model, miner_model, weight=weight)
