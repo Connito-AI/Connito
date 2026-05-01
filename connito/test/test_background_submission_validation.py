@@ -114,8 +114,18 @@ def _freeze_round(
     seed: str = "deadbeef",
     round_id: int = 100,
     global_model: nn.Module | None = None,
+    chain_checkpoints_by_hotkey: dict[str, "object"] | None = None,
+    last_evaluated: dict[int, datetime] | None = None,
+    prior_avg_scores: dict[int, float] | None = None,
 ) -> Round:
-    """Build a Round bypassing the chain helpers."""
+    """Build a Round bypassing the chain helpers.
+
+    `chain_checkpoints_by_hotkey` pairs each hotkey with a stub object
+    exposing `hf_repo_id` / `hf_revision`. Hotkeys absent from the map
+    end up in `freeze_zero_uids`. Default = empty (all miners are
+    treated as freeze-zero), which mirrors how the test suite has
+    historically run.
+    """
     if global_model is None:
         global_model = _make_model()
     subtensor = _fake_subtensor(metagraph, block=round_id)
@@ -133,6 +143,7 @@ def _freeze_round(
     assignment_result = SimpleNamespace(
         assignment=assignment,
         miners_with_checkpoint=miners_with_checkpoint,
+        chain_checkpoints_by_hotkey=chain_checkpoints_by_hotkey or {},
     )
     with patch("connito.shared.chain.get_chain_commits", return_value=[]), \
          patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
@@ -143,7 +154,21 @@ def _freeze_round(
             metagraph=metagraph,
             global_model=global_model,
             round_id=round_id,
+            last_evaluated=last_evaluated,
+            prior_avg_scores=prior_avg_scores,
         )
+
+
+def _valid_chain_checkpoints(hotkeys: list[str]) -> dict[str, "object"]:
+    """Stub `ChainCheckpoint`-shaped objects with `hf_repo_id` and
+    `hf_revision` set so `Round.freeze` keeps these hotkeys *out* of
+    `freeze_zero_uids`. Use when a test needs miners to be treated as
+    "had a valid commit at freeze time".
+    """
+    return {
+        hk: SimpleNamespace(hf_repo_id=f"repo/{hk}", hf_revision="rev123")
+        for hk in hotkeys
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +230,101 @@ class TestRoundFreeze:
         assert rnd.foreground_uids == (uid_a,)
         assert rnd.background_uids == (uid_b,)
         assert rnd.assigned_uids == (uid_a,)
+
+
+# ---------------------------------------------------------------------------
+# Background queue prepend: top-N prior-avg-scored miners come first so
+# `bg-download` / `bg-eval` re-check the current leaders before falling
+# through to the staleness rotation.
+# ---------------------------------------------------------------------------
+
+class TestBackgroundPriorScorePrepend:
+    def test_top_five_prior_scored_come_first(self) -> None:
+        # Eight background miners; five of them have positive prior-avg
+        # scores. The top-5 by prior avg should lead the queue (in score-
+        # desc order), then the rest by staleness.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({
+            f"hk_{i}": 0.5 - 0.01 * i for i in range(8)
+        })
+        # No miner is mine — push everyone to background.
+        assignment = {"other_validator": [f"hk_{i}" for i in range(8)]}
+        prior = {
+            0: 0.10, 1: 2.50, 2: 1.00, 3: 0.00, 4: 0.50,
+            5: 1.50, 6: 0.00, 7: 3.00,
+        }
+        # Stagger last_evaluated so the tail order is observable.
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        last_eval = {i: ts.replace(minute=i) for i in range(8)}
+
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores=prior, last_evaluated=last_eval,
+        )
+
+        # uid 7 (3.00), uid 1 (2.50), uid 5 (1.50), uid 2 (1.00), uid 4 (0.50).
+        assert rnd.background_uids[:5] == (7, 1, 5, 2, 4)
+        # Tail: uids 0, 3, 6 — sorted by staleness (minute asc).
+        assert rnd.background_uids[5:] == (0, 3, 6)
+
+    def test_prepend_capped_by_class_constant(self) -> None:
+        # Even with seven positively-scored miners, only the top
+        # `BG_TOP_SCORED_PREPEND_COUNT` come first. The rest fall back
+        # into the staleness-sorted tail.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({f"hk_{i}": 0.5 - 0.01 * i for i in range(7)})
+        assignment = {"other_validator": [f"hk_{i}" for i in range(7)]}
+        # All seven have positive scores, descending.
+        prior = {i: 1.0 + (7 - i) for i in range(7)}
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        last_eval = {i: ts.replace(minute=i) for i in range(7)}
+
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores=prior, last_evaluated=last_eval,
+        )
+
+        assert Round.BG_TOP_SCORED_PREPEND_COUNT == 5
+        # uid 0 (8.0), uid 1 (7.0), uid 2 (6.0), uid 3 (5.0), uid 4 (4.0).
+        assert rnd.background_uids[:5] == (0, 1, 2, 3, 4)
+        # Remaining two (uids 5, 6) fall through to the staleness tail.
+        assert rnd.background_uids[5:] == (5, 6)
+
+    def test_zero_prior_score_excluded_from_prepend(self) -> None:
+        # Miners with prior avg <= 0 are NOT prepended — they fall into
+        # the staleness tail. This means a brand-new validator (empty
+        # aggregator) sees no prepend at all and the queue is identical
+        # to the staleness-sorted version.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({f"hk_{i}": 0.5 - 0.01 * i for i in range(4)})
+        assignment = {"other_validator": [f"hk_{i}" for i in range(4)]}
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        last_eval = {0: ts.replace(minute=3), 1: ts, 2: ts.replace(minute=1), 3: ts.replace(minute=2)}
+
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores={i: 0.0 for i in range(4)},  # all zeros
+            last_evaluated=last_eval,
+        )
+
+        # Pure staleness order: uid 1 (oldest), then 2, 3, 0.
+        assert rnd.background_uids == (1, 2, 3, 0)
+
+    def test_foreground_unaffected_by_prepend(self) -> None:
+        # Foreground stays in incentive order. Prior avg scores must not
+        # leak into the foreground ordering.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
+        assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
+        # Make hk_a the highest-scored historically — it must still
+        # come *after* hk_b in foreground because foreground uses
+        # incentive order.
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores={0: 99.0, 1: 0.0, 2: 0.0},
+        )
+        # Incentive desc: hk_b (uid 1), hk_c (uid 2), hk_a (uid 0).
+        assert rnd.foreground_uids == (1, 2, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +579,7 @@ class TestBackgroundEvalWorker:
     Heavy ops (evaluate_one_miner, dataloader, evaluate_model) are mocked.
     """
 
-    def _build_worker(self, *, round_ref: RoundRef, score_path: Path):
+    def _build_worker(self, *, round_ref: RoundRef):
         from connito.validator.background_eval_worker import BackgroundEvalWorker
 
         # Minimal config surface needed by the worker.
@@ -467,8 +587,6 @@ class TestBackgroundEvalWorker:
             evaluation=SimpleNamespace(per_miner_eval_timeout_sec=5),
             dataloader=SimpleNamespace(world_size=1),
         )
-
-        agg = MinerScoreAggregator(max_points=8)
 
         gpu_lock = threading.Lock()
         merge_active = threading.Event()
@@ -480,8 +598,6 @@ class TestBackgroundEvalWorker:
             round_ref=round_ref,
             device=torch.device("cpu"),
             tokenizer=MagicMock(),
-            score_aggregator=agg,
-            score_path=score_path,
             merge_phase_active=merge_active,
             eval_window_active=eval_window,
             gpu_eval_lock=gpu_lock,
@@ -490,7 +606,7 @@ class TestBackgroundEvalWorker:
             poll_interval_sec=0.05,
         )
         worker.set_eval_base_model(_make_model())
-        return worker, agg, gpu_lock, merge_active, eval_window, stop
+        return worker, gpu_lock, merge_active, eval_window, stop
 
     def test_lock_unheld_at_iteration_boundary(self, tmp_path: Path) -> None:
         config = _fake_validator_config()
@@ -500,8 +616,8 @@ class TestBackgroundEvalWorker:
 
         ref = RoundRef()
         ref.swap(new_current=rnd)
-        worker, _agg, gpu_lock, merge_active, eval_window, stop = self._build_worker(
-            round_ref=ref, score_path=tmp_path / "score.json",
+        worker, gpu_lock, merge_active, eval_window, stop = self._build_worker(
+            round_ref=ref,
         )
         # Ensure both gates start in the paused state so the worker idles
         # immediately and never enters the eval branch.
@@ -566,3 +682,261 @@ class TestDelayedSubmission:
         # This is just a flag-level test.
         if not rnd.weights_submitted:
             pytest.fail("weights_submitted should already be set")
+
+
+# ---------------------------------------------------------------------------
+# Rank-based scoring: finalize_round_scores writes 3/2/1/0 to the aggregator
+# using `round.scores` (delta**1.2) as the ranking signal.
+# ---------------------------------------------------------------------------
+
+class TestFinalizeRoundScores:
+    @staticmethod
+    def _round_with_five_miners(*, valid_checkpoints: bool = False) -> Round:
+        """Build a 5-miner round.
+
+        `valid_checkpoints=True` populates chain checkpoints for every
+        miner so they are NOT in `freeze_zero_uids` — required when the
+        test wants to verify "unreached" / "operational failure" paths,
+        which are only meaningful for miners that had a valid commit at
+        freeze time.
+        """
+        config = _fake_validator_config()
+        hotkeys = ["hk_a", "hk_b", "hk_c", "hk_d", "hk_e"]
+        metagraph = _make_metagraph({
+            "hk_a": 0.5, "hk_b": 0.4, "hk_c": 0.3, "hk_d": 0.2, "hk_e": 0.1,
+        })
+        assignment = {"vhk": hotkeys}
+        chain_ckpts = _valid_chain_checkpoints(hotkeys) if valid_checkpoints else None
+        return _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            round_id=500, chain_checkpoints_by_hotkey=chain_ckpts,
+        )
+
+    @staticmethod
+    def _scores_for_uid(agg: MinerScoreAggregator, uid: int, round_id: int) -> list[float]:
+        # Returns the list of score values this UID has under `round_id`.
+        # `[]` means either: aggregator has no record of the UID at all,
+        # or it has records but none tagged with this round.
+        state = agg._miners.get(uid)
+        if state is None:
+            return []
+        return [v for _, v, rid in state.series.points if rid == round_id]
+
+    def test_top_three_get_geometric_rank_scores(self) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        # mark_scored stores delta**1.2; pick distinct values so ranking
+        # is unambiguous.
+        rnd.mark_scored(rnd.roster[0].uid, score=0.10)  # rank 4
+        rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # rank 1 → 2.25
+        rnd.mark_scored(rnd.roster[2].uid, score=0.30)  # rank 2 → 1.5
+        rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 3 → 1.0
+        rnd.mark_scored(rnd.roster[4].uid, score=0.05)  # rank 5
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        # Rank 1 → 2.25, rank 2 → 1.5, rank 3 → 1.0, rest → 0.0.
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [1.5]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.0]
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [0.0]
+
+    def test_tied_scores_get_zero_and_skip_rank_slot(self) -> None:
+        # A tied val_loss between two miners is evidence of a duplicated
+        # submission, not legitimate parallel improvement. Both tied
+        # miners receive score 0; the next non-tied miner becomes rank 1.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        # Two miners tied at the highest score, then three distinct
+        # values below.
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)  # tied → 0
+        rnd.mark_scored(rnd.roster[1].uid, score=0.50)  # tied → 0
+        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # rank 1 → 2.25
+        rnd.mark_scored(rnd.roster[3].uid, score=0.30)  # rank 2 → 1.5
+        rnd.mark_scored(rnd.roster[4].uid, score=0.20)  # rank 3 → 1.0
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.5]
+        assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [1.0]
+
+    def test_three_way_tie_all_get_zero(self) -> None:
+        # All three would have placed top-3 by score; instead all three
+        # get 0 because they share the same val_loss.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.40)  # tied
+        rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # tied
+        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # tied
+        rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 1 → 2.25
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        for tied_idx in (0, 1, 2):
+            assert self._scores_for_uid(
+                agg, rnd.roster[tied_idx].uid, rnd.round_id,
+            ) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.25]
+
+    def test_zero_delta_excluded_from_top_three(self) -> None:
+        # If only one miner has delta > 0, only that miner gets the
+        # rank-1 reward (2.25). The other "scored but delta==0" miners
+        # receive 0.0 — they did not actually improve over baseline so
+        # they should not collect reward weight just for showing up.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.0)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.5)
+        rnd.mark_scored(rnd.roster[2].uid, score=0.0)
+        rnd.mark_scored(rnd.roster[3].uid, score=0.0)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [2.25]
+        for entry in (rnd.roster[0], rnd.roster[2], rnd.roster[3]):
+            assert self._scores_for_uid(agg, entry.uid, rnd.round_id) == [0.0]
+
+    def test_validation_failed_uids_get_zero(self) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_validation_failed(rnd.roster[1].uid)
+        rnd.mark_validation_failed(rnd.roster[2].uid)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [0.0]
+
+    def test_operational_failure_preserves_prior_ema(self) -> None:
+        # `mark_failed` (without `mark_validation_failed`) marks the UID
+        # as failed for operational reasons — download timeout, eval
+        # timeout, OOM, unexpected exception. Finalize must NOT write a
+        # score=0 for these so the miner's prior EMA is preserved.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners(valid_checkpoints=True)
+        op_uid = rnd.roster[1].uid
+        op_hotkey = rnd.roster[1].hotkey
+
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_failed(op_uid)  # operational failure (timeout etc.)
+
+        agg = MinerScoreAggregator(max_points=8)
+        # Preload a positive history for the operational-fail UID so we
+        # can prove finalize did not overwrite it with a 0.
+        prior_ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        agg.add_score(
+            uid=op_uid, hotkey=op_hotkey, score=1.5, ts=prior_ts, round_id=42,
+        )
+
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        # No new entry under THIS round's id for the operational-fail UID.
+        assert self._scores_for_uid(agg, op_uid, rnd.round_id) == []
+        # Prior history untouched.
+        all_pts = agg._miners[op_uid].series.points
+        assert any(p[1] == 1.5 and p[2] == 42 for p in all_pts)
+
+    def test_unreached_miners_get_no_entry(self) -> None:
+        # Miners we never reached — submission never landed on disk, or
+        # bg-eval ran out of time before claiming them — are absent from
+        # `scored_uids`, `validation_failed_uids`, and `freeze_zero_uids`
+        # (because they had a valid checkpoint at freeze). They must
+        # receive no aggregator entry so their prior EMA is preserved.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners(valid_checkpoints=True)
+        unreached_uid = rnd.roster[2].uid
+
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.30)
+        # roster[2] is intentionally not touched.
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, unreached_uid, rnd.round_id) == []
+
+    def test_freeze_zero_uids_get_zero_at_finalize(self) -> None:
+        # Miners absent from `miners_with_checkpoint` at freeze time end up
+        # in `freeze_zero_uids` and should still receive a 0.0 entry from
+        # finalize.
+        from connito.validator.evaluator import finalize_round_scores
+
+        config = _fake_validator_config()
+        metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4, "hk_c": 0.3})
+        assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
+        # hk_b has no checkpoint this round.
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            miners_with_checkpoint=["hk_a", "hk_c"],
+            round_id=600,
+        )
+        uid_b = metagraph.hotkeys.index("hk_b")
+        assert uid_b in rnd.freeze_zero_uids
+
+        rnd.mark_scored(metagraph.hotkeys.index("hk_a"), score=0.20)
+        rnd.mark_scored(metagraph.hotkeys.index("hk_c"), score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, uid_b, rnd.round_id) == [0.0]
+
+    def test_drop_round_clears_stale_entries_before_rank_writes(self) -> None:
+        # Defensive: if the aggregator already holds entries tagged with
+        # this round_id (e.g. from a partial run that crashed and was
+        # restored from disk), finalize must drop them before writing the
+        # rank-based entries — otherwise the avg would mix stale signal
+        # with rank.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.40)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        # Pre-load a stale partial entry tagged with this round_id.
+        agg.add_score(uid=rnd.roster[0].uid, hotkey=rnd.roster[0].hotkey,
+                      score=42.0, round_id=rnd.round_id)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [1.5]
+
+    def test_persists_score_path_when_provided(self, tmp_path: Path) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.40)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        score_path = tmp_path / "score_aggregator.json"
+        finalize_round_scores(
+            round_obj=rnd, score_aggregator=agg, score_path=score_path,
+        )
+
+        assert score_path.exists()
+        restored = MinerScoreAggregator.from_json(
+            score_path.read_text(encoding="utf-8"), max_points=8,
+        )
+        assert TestFinalizeRoundScores._scores_for_uid(
+            restored, rnd.roster[0].uid, rnd.round_id,
+        ) == [2.25]
