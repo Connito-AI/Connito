@@ -27,6 +27,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 
 from connito.shared.app_logging import structlog
+from connito.shared.telemetry import SUBNET_CURRENT_BLOCK
 
 logger = structlog.get_logger(__name__)
 
@@ -164,13 +165,51 @@ def _actor_for_phase(name: str) -> str:
     return "Unknown"
 
 
+def _compute_upcoming_phases(phase_manager, head_block: int) -> list[tuple[str, int, int]]:
+    """Local mirror of ``PhaseManager.blocks_until_next_phase`` that uses a
+    caller-supplied ``head_block`` instead of ``self.subtensor.block``.
+
+    The original calls into the shared ``lite_subtensor``'s websocket — fine
+    on the main thread but a race against this validator's main loop when
+    invoked from the API request thread (caused a fatal
+    ``websockets.ConcurrencyError`` in production). This pure-computation
+    variant uses only static phase config + the cached head_block so the API
+    thread never touches the shared websocket.
+
+    Returns ``[(name, start_block, end_block), ...]`` for every phase in the
+    cycle, in declaration order.
+    """
+    cycle_len = phase_manager.cycle_length
+    cycle_block_index = head_block % cycle_len
+    cycle_start_block = head_block - cycle_block_index
+
+    out: list[tuple[str, int, int]] = []
+    start = 0
+    for phase in phase_manager.phases:
+        phase_start = start
+        if phase_start >= cycle_block_index:
+            start_block = cycle_start_block + phase_start
+        else:
+            start_block = cycle_start_block + cycle_len + phase_start
+        end_block = start_block + phase["length"] - 1
+        out.append((phase["name"], start_block, end_block))
+        start += phase["length"]
+    return out
+
+
 def _build_phase_section(s) -> dict[str, Any]:
+    # Read the cached head block from the Prometheus gauge that
+    # SystemStatePoller refreshes every ~12s. Avoids a concurrent websocket
+    # `recv()` against the shared lite_subtensor (the main loop's reads of
+    # `lite_subtensor.block` raced this previously and crashed the validator
+    # with `websockets.ConcurrencyError`).
     head_block: int | None = None
     try:
-        if s.lite_subtensor is not None:
-            head_block = int(s.lite_subtensor.get_current_block())
+        cached = SUBNET_CURRENT_BLOCK._value.get()
+        if cached:
+            head_block = int(cached)
     except Exception as e:
-        logger.debug("api: failed to read head block", error=str(e))
+        logger.debug("api: failed to read cached head block", error=str(e))
 
     if head_block is None or s.phase_manager is None:
         return {
@@ -181,6 +220,9 @@ def _build_phase_section(s) -> dict[str, Any]:
         }
 
     try:
+        # `get_phase(block)` is safe — pass the explicit block and PhaseManager
+        # uses it directly without re-fetching from chain. (SystemStatePoller
+        # already calls it the same way from a background thread.)
         pr = s.phase_manager.get_phase(head_block)
     except Exception as e:
         logger.debug("api: failed to resolve current phase", error=str(e))
@@ -193,13 +235,11 @@ def _build_phase_section(s) -> dict[str, Any]:
 
     upcoming: list[dict[str, Any]] = []
     try:
-        # blocks_until_next_phase returns each phase's next occurrence
-        # (this cycle if still ahead, otherwise next cycle). We want the
-        # phases AFTER the current one, sorted by start_block, capped at 3.
-        next_phases = s.phase_manager.blocks_until_next_phase()
+        # Local pure-computation; no websocket touch (see _compute_upcoming_phases).
+        all_phases = _compute_upcoming_phases(s.phase_manager, head_block)
         candidates = [
             (name, start_block)
-            for name, (start_block, _end_block, _bu) in next_phases.items()
+            for (name, start_block, _end_block) in all_phases
             if start_block > pr.phase_start_block
         ]
         candidates.sort(key=lambda x: x[1])
