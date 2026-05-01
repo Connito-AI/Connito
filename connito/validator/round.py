@@ -94,6 +94,8 @@ class Round:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # ---------------- Construction ----------------
+    BG_TOP_SCORED_PREPEND_COUNT: int = 5
+
     @classmethod
     def freeze(
         cls,
@@ -105,6 +107,7 @@ class Round:
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
+        prior_avg_scores: dict[int, float] | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -187,22 +190,51 @@ class Round:
 
         foreground_uids = tuple(foreground)
 
-        # Order *background* by staleness — longest-since-last-evaluated
-        # first, never-evaluated UIDs treated as infinitely stale. This
-        # ensures the long tail of the roster eventually rotates through
-        # bg-eval instead of always favoring the same incentive-ranked
-        # head. Foreground stays in incentive order; that's the priority
-        # set by design and the per-round eval budget covers it. Each
-        # validator has different `last_evaluated` so background also
-        # spreads naturally across the subnet without an explicit shuffle.
+        # Order *background* in two segments:
+        #   (a) top-N background miners by their prior-round avg score
+        #       (`prior_avg_scores`, the same metric that determines the
+        #       weight submission). Re-evaluating the current leaders
+        #       first protects the top of the leaderboard against a stale
+        #       EMA — without this, a strong miner that hasn't been
+        #       picked recently could keep its lead even after submitting
+        #       a worse checkpoint, because staleness alone defers their
+        #       re-eval. We cap the prepended segment at
+        #       `BG_TOP_SCORED_PREPEND_COUNT` so it cannot crowd out the
+        #       staleness rotation.
+        #   (b) everyone else, sorted by staleness — longest-since-last-
+        #       evaluated first, never-evaluated UIDs treated as
+        #       infinitely stale. This rotates the long tail through
+        #       bg-eval instead of always favoring the same incentive-
+        #       ranked head. Each validator has different `last_evaluated`
+        #       so the tail spreads naturally across the subnet.
+        # Foreground stays in incentive order; that's the priority set
+        # by design and the per-round eval budget covers it.
         EPOCH = datetime.min.replace(tzinfo=timezone.utc)
         last_eval_map = last_evaluated or {}
+        prior_scores = prior_avg_scores or {}
 
         def _staleness_key(uid: int) -> datetime:
             return last_eval_map.get(uid, EPOCH)
 
-        background.sort(key=_staleness_key)
-        background_uids = tuple(background)
+        bg_set = set(background)
+        # Top-N background miners by prior-round avg score. Tiebreak
+        # on uid asc so the order is deterministic across validators.
+        scored_bg = sorted(
+            (
+                (uid, prior_scores.get(uid, 0.0))
+                for uid in bg_set
+                if prior_scores.get(uid, 0.0) > 0.0
+            ),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        prepend_uids = [uid for uid, _ in scored_bg[: cls.BG_TOP_SCORED_PREPEND_COUNT]]
+        prepend_set = set(prepend_uids)
+
+        tail = sorted(
+            (uid for uid in background if uid not in prepend_set),
+            key=_staleness_key,
+        )
+        background_uids = tuple([*prepend_uids, *tail])
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
         # move to CPU so subsequent in-place mutations of global_model

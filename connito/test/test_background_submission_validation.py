@@ -115,6 +115,8 @@ def _freeze_round(
     round_id: int = 100,
     global_model: nn.Module | None = None,
     chain_checkpoints_by_hotkey: dict[str, "object"] | None = None,
+    last_evaluated: dict[int, datetime] | None = None,
+    prior_avg_scores: dict[int, float] | None = None,
 ) -> Round:
     """Build a Round bypassing the chain helpers.
 
@@ -152,6 +154,8 @@ def _freeze_round(
             metagraph=metagraph,
             global_model=global_model,
             round_id=round_id,
+            last_evaluated=last_evaluated,
+            prior_avg_scores=prior_avg_scores,
         )
 
 
@@ -226,6 +230,101 @@ class TestRoundFreeze:
         assert rnd.foreground_uids == (uid_a,)
         assert rnd.background_uids == (uid_b,)
         assert rnd.assigned_uids == (uid_a,)
+
+
+# ---------------------------------------------------------------------------
+# Background queue prepend: top-N prior-avg-scored miners come first so
+# `bg-download` / `bg-eval` re-check the current leaders before falling
+# through to the staleness rotation.
+# ---------------------------------------------------------------------------
+
+class TestBackgroundPriorScorePrepend:
+    def test_top_five_prior_scored_come_first(self) -> None:
+        # Eight background miners; five of them have positive prior-avg
+        # scores. The top-5 by prior avg should lead the queue (in score-
+        # desc order), then the rest by staleness.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({
+            f"hk_{i}": 0.5 - 0.01 * i for i in range(8)
+        })
+        # No miner is mine — push everyone to background.
+        assignment = {"other_validator": [f"hk_{i}" for i in range(8)]}
+        prior = {
+            0: 0.10, 1: 2.50, 2: 1.00, 3: 0.00, 4: 0.50,
+            5: 1.50, 6: 0.00, 7: 3.00,
+        }
+        # Stagger last_evaluated so the tail order is observable.
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        last_eval = {i: ts.replace(minute=i) for i in range(8)}
+
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores=prior, last_evaluated=last_eval,
+        )
+
+        # uid 7 (3.00), uid 1 (2.50), uid 5 (1.50), uid 2 (1.00), uid 4 (0.50).
+        assert rnd.background_uids[:5] == (7, 1, 5, 2, 4)
+        # Tail: uids 0, 3, 6 — sorted by staleness (minute asc).
+        assert rnd.background_uids[5:] == (0, 3, 6)
+
+    def test_prepend_capped_by_class_constant(self) -> None:
+        # Even with seven positively-scored miners, only the top
+        # `BG_TOP_SCORED_PREPEND_COUNT` come first. The rest fall back
+        # into the staleness-sorted tail.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({f"hk_{i}": 0.5 - 0.01 * i for i in range(7)})
+        assignment = {"other_validator": [f"hk_{i}" for i in range(7)]}
+        # All seven have positive scores, descending.
+        prior = {i: 1.0 + (7 - i) for i in range(7)}
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        last_eval = {i: ts.replace(minute=i) for i in range(7)}
+
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores=prior, last_evaluated=last_eval,
+        )
+
+        assert Round.BG_TOP_SCORED_PREPEND_COUNT == 5
+        # uid 0 (8.0), uid 1 (7.0), uid 2 (6.0), uid 3 (5.0), uid 4 (4.0).
+        assert rnd.background_uids[:5] == (0, 1, 2, 3, 4)
+        # Remaining two (uids 5, 6) fall through to the staleness tail.
+        assert rnd.background_uids[5:] == (5, 6)
+
+    def test_zero_prior_score_excluded_from_prepend(self) -> None:
+        # Miners with prior avg <= 0 are NOT prepended — they fall into
+        # the staleness tail. This means a brand-new validator (empty
+        # aggregator) sees no prepend at all and the queue is identical
+        # to the staleness-sorted version.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({f"hk_{i}": 0.5 - 0.01 * i for i in range(4)})
+        assignment = {"other_validator": [f"hk_{i}" for i in range(4)]}
+        ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        last_eval = {0: ts.replace(minute=3), 1: ts, 2: ts.replace(minute=1), 3: ts.replace(minute=2)}
+
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores={i: 0.0 for i in range(4)},  # all zeros
+            last_evaluated=last_eval,
+        )
+
+        # Pure staleness order: uid 1 (oldest), then 2, 3, 0.
+        assert rnd.background_uids == (1, 2, 3, 0)
+
+    def test_foreground_unaffected_by_prepend(self) -> None:
+        # Foreground stays in incentive order. Prior avg scores must not
+        # leak into the foreground ordering.
+        config = _fake_validator_config(my_hotkey="vhk")
+        metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
+        assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
+        # Make hk_a the highest-scored historically — it must still
+        # come *after* hk_b in foreground because foreground uses
+        # incentive order.
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            prior_avg_scores={0: 99.0, 1: 0.0, 2: 0.0},
+        )
+        # Incentive desc: hk_b (uid 1), hk_c (uid 2), hk_a (uid 0).
+        assert rnd.foreground_uids == (1, 2, 0)
 
 
 # ---------------------------------------------------------------------------

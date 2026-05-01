@@ -1006,6 +1006,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     phase_response.phase_end_block,
                 ),
                 last_evaluated=score_aggregator.last_evaluated_per_uid(),
+                # Re-eval the current leaders first inside background so
+                # a stale EMA can't keep a regressed miner on top.
+                prior_avg_scores=score_aggregator.uid_score_pairs(how="avg"),
             )
             # Belt-and-suspenders: drop any leftover submission file whose
             # block falls outside this round's window. The end-of-cycle
