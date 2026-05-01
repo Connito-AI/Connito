@@ -37,6 +37,15 @@ from connito.validator.round import RoundRef
 
 logger = structlog.get_logger(__name__)
 
+# Maximum number of UIDs that may sit in `Round.downloaded_pool` waiting
+# for bg-eval to pick them up before bg-download stops fetching new
+# checkpoints. Without this cap, bg-download will happily pull every
+# miner's shard onto disk even when bg-eval is many minutes behind, which
+# wastes HF bandwidth and (more importantly) inflates the on-disk backlog
+# the cycle-tail prune has to tear down. Re-checked every poll so the cap
+# self-clears once eval drains the queue.
+DOWNLOAD_PENDING_EVAL_CAP = 10
+
 
 class BackgroundDownloadWorker(threading.Thread):
     def __init__(
@@ -116,6 +125,23 @@ class BackgroundDownloadWorker(threading.Thread):
                         )
                     idle_ticks += 1
                     await self._wait_clear()
+                    continue
+
+                # Backpressure on bg-eval: stop pulling more checkpoints
+                # while bg-eval already has DOWNLOAD_PENDING_EVAL_CAP+ UIDs
+                # queued. Counted under Round's lock so a concurrent
+                # publish/pop can't skew the read.
+                pending_eval = round_obj.downloaded_pending_eval_count()
+                if pending_eval > DOWNLOAD_PENDING_EVAL_CAP:
+                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                        logger.info(
+                            "bg-download: pausing — eval backlog above cap",
+                            pending_eval=pending_eval,
+                            cap=DOWNLOAD_PENDING_EVAL_CAP,
+                            round_id=getattr(round_obj, "round_id", None),
+                        )
+                    idle_ticks += 1
+                    await asyncio.sleep(self.poll_interval_sec)
                     continue
 
                 # Pick the next UID to download.

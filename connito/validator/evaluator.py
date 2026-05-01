@@ -14,9 +14,101 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
+from connito.shared.helper import parse_dynamic_filename
 from connito.shared.telemetry import track_eval_latency, track_model_load_latency
 
 logger = structlog.get_logger(__name__)
+
+
+def cleanup_non_top_submissions(
+    *,
+    round_obj,  # connito.validator.round.Round
+    score_aggregator,  # connito.validator.aggregator.MinerScoreAggregator
+    submission_dir: Path,
+    top_k: int,
+) -> list[str]:
+    """Delete miner submission files for UIDs that have been processed
+    this round but are not in the top-`top_k` by latest score among the
+    round's scored UIDs. Files for UIDs not yet processed are kept so
+    the eval workers can still find them.
+
+    `top_k` should match (or exceed) ``top_k_miners_to_reward`` so the
+    top miners archived/rewarded at the cycle tail are still on disk.
+    Failed UIDs always have their file removed since their score is 0
+    and they cannot be in any top-N.
+    """
+    submission_dir = Path(submission_dir)
+    if not submission_dir.exists():
+        return []
+
+    scored, failed = round_obj.processed_uids_snapshot()
+    if not scored and not failed:
+        return []
+
+    if scored:
+        top_uids = {
+            uid for uid in scored
+            if score_aggregator.is_in_top(
+                uid=uid, cutoff=top_k, how="latest", among=scored,
+            )
+        }
+    else:
+        top_uids = set()
+
+    delete_uids = failed | (scored - top_uids)
+    hotkeys_to_delete = {
+        round_obj.uid_to_hotkey[uid]
+        for uid in delete_uids
+        if uid in round_obj.uid_to_hotkey
+    }
+    if not hotkeys_to_delete:
+        return []
+
+    deleted: list[str] = []
+    for file_path in submission_dir.glob("*.pt"):
+        if file_path.name.startswith(".tmp"):
+            continue
+        meta = parse_dynamic_filename(file_path.name)
+        if not meta:
+            continue
+        if meta.get("hotkey") in hotkeys_to_delete:
+            try:
+                file_path.unlink(missing_ok=True)
+                deleted.append(file_path.name)
+            except Exception as e:
+                logger.warning(
+                    "cleanup_non_top_submissions: failed to delete file",
+                    file=file_path.name, error=str(e),
+                )
+    return deleted
+
+
+def _prune_non_top_after_eval(
+    *,
+    config,
+    round_obj,
+    score_aggregator,
+) -> None:
+    """Wrapper around `cleanup_non_top_submissions` that swallows errors
+    so a cleanup failure can never abort eval flow.
+    """
+    try:
+        deleted = cleanup_non_top_submissions(
+            round_obj=round_obj,
+            score_aggregator=score_aggregator,
+            submission_dir=Path(config.ckpt.miner_submission_path),
+            top_k=int(config.evaluation.top_k_miners_to_reward),
+        )
+    except Exception as e:
+        logger.warning("foreground eval: post-eval cleanup failed", error=str(e))
+        return
+    if deleted:
+        logger.info(
+            "foreground eval: pruned non-top miner submissions",
+            round_id=round_obj.round_id,
+            deleted=len(deleted),
+            files=deleted,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -443,6 +535,11 @@ async def evaluate_foreground_round(
                     uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
                 )
                 round_obj.mark_failed(uid)
+                _prune_non_top_after_eval(
+                    config=config,
+                    round_obj=round_obj,
+                    score_aggregator=score_aggregator,
+                )
                 continue
 
             # Cap the per-miner eval at min(configured_timeout, time_to_end_block)
@@ -480,17 +577,37 @@ async def evaluate_foreground_round(
                     timeout_sec=round(effective_timeout, 2),
                 )
                 round_obj.mark_failed(uid)
+                _prune_non_top_after_eval(
+                    config=config,
+                    round_obj=round_obj,
+                    score_aggregator=score_aggregator,
+                )
                 continue
             except Exception as e:
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
                 round_obj.mark_failed(uid)
+                _prune_non_top_after_eval(
+                    config=config,
+                    round_obj=round_obj,
+                    score_aggregator=score_aggregator,
+                )
                 continue
 
             if evaluated is None:
                 round_obj.mark_failed(uid)
+                _prune_non_top_after_eval(
+                    config=config,
+                    round_obj=round_obj,
+                    score_aggregator=score_aggregator,
+                )
                 continue
             round_obj.mark_scored(uid)
             completed.append(evaluated)
+            _prune_non_top_after_eval(
+                config=config,
+                round_obj=round_obj,
+                score_aggregator=score_aggregator,
+            )
 
         # Stop once every top-N UID is scored or the phase boundary hits.
         scored_top_n = sum(1 for u in foreground_set if u in round_obj.scored_uids)

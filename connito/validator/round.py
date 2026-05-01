@@ -266,6 +266,27 @@ class Round:
         with self._lock:
             return uid in self.downloaded_pool
 
+    def downloaded_pending_eval_count(self) -> int:
+        """Number of UIDs whose checkpoint has been downloaded but is not
+        yet picked up by an eval worker (claimed/scored/failed). Used by
+        bg-download to backpressure: when this rises above the configured
+        cap, downloads pause until bg-eval has drained the queue.
+        """
+        with self._lock:
+            return sum(
+                1 for uid in self.downloaded_pool
+                if uid not in self.scored_uids
+                and uid not in self.claimed_uids
+                and uid not in self.failed_uids
+            )
+
+    def processed_uids_snapshot(self) -> tuple[set[int], set[int]]:
+        """Lock-protected snapshot of (scored_uids, failed_uids) for callers
+        that need a consistent view across both sets in the same instant.
+        """
+        with self._lock:
+            return set(self.scored_uids), set(self.failed_uids)
+
     # ---------------- Iteration helpers ----------------
     @property
     def assigned_uids(self) -> tuple[int, ...]:
