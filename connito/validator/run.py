@@ -970,20 +970,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             pending_round: Round | None = round_ref.current
             scheduled_round_weights = False
             if pending_round is not None and not pending_round.weights_submitted:
-                # Missed-submission penalty pass against the frozen roster.
-                for entry in pending_round.unscored_roster_uids():
-                    score_aggregator.add_score(
-                        uid=entry.uid,
-                        hotkey=entry.hotkey,
-                        score=0.0,
-                        round_id=pending_round.round_id,
-                    )
-                    logger.info(
-                        "Penalizing missing submission",
-                        uid=entry.uid, hotkey=entry.hotkey[:6], score=0.0,
-                        round_id=pending_round.round_id,
-                    )
-
+                # No blanket score=0 for unscored UIDs. Score=0 is reserved
+                # for *invalid checkpoints* (no chain commit, hash/sig/expert-
+                # group/NaN failure) and is recorded inline at the validation
+                # site (foreground eval, bg-eval, bg-download). Miners we
+                # simply ran out of time to evaluate keep their existing EMA;
+                # they get re-prioritized as "stalest" in the next round.
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
@@ -1053,8 +1045,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             cleanup(global_model)
 
-            # (0) Lock and prioritize: build the round roster (incentive-ranked,
-            # restricted to this validator's assignment), capture the seed, and
+            # (0) Lock and prioritize: build the round roster (stalest miners
+            # first within both foreground and background — see Round.freeze),
+            # restricted to this validator's assignment, capture the seed, and
             # snapshot global_model.state_dict() to CPU before Merge can mutate it.
             new_round = Round.freeze(
                 config=config,
@@ -1066,6 +1059,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     phase_response.phase_start_block,
                     phase_response.phase_end_block,
                 ),
+                last_evaluated=score_aggregator.last_evaluated_per_uid(),
+                score_aggregator=score_aggregator,
             )
             # Belt-and-suspenders: drop any leftover submission file whose
             # block falls outside this round's window. The end-of-cycle
@@ -1142,8 +1137,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     timeout=foreground_timeout_sec,
                 )
 
+            # Use a private event loop instead of asyncio.run so a timed-out
+            # evaluate_one_miner cannot stall this thread on cleanup:
+            # asyncio.to_thread cancellation only detaches the awaiter; the
+            # underlying default-executor thread keeps running. asyncio.run
+            # would then block in shutdown_default_executor(wait=True) waiting
+            # on that orphan, freezing the main loop indefinitely (we hit
+            # exactly this — round 8081470 sat ~27 min after
+            # "foreground eval: complete"). loop.close() calls
+            # executor.shutdown(wait=False), so the orphan thread is left to
+            # die with the process and we proceed to the validate phase.
+            foreground_loop = asyncio.new_event_loop()
             try:
-                asyncio.run(_bounded_foreground_eval())
+                foreground_loop.run_until_complete(_bounded_foreground_eval())
             except asyncio.TimeoutError:
                 logger.warning(
                     "Foreground evaluation exceeded validate phase deadline; "
@@ -1153,6 +1159,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     end_block=phase_response.phase_end_block,
                     completed_count=len(miner_jobs),
                 )
+            finally:
+                foreground_loop.close()
 
             # Stamp this round's baseline_loss into the history ring buffer
             # for the leaderboard's 24-round trend tile, then persist
