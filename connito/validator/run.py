@@ -686,12 +686,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.29":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.29
+    if pkg_version == "v0.1.30":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.1.30
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.29 fall through the `score_path.exists()` branch and
+        # restarts on v0.1.30 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.29", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.1.30", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(max_points=score_window)
     elif score_path.exists():
@@ -715,7 +715,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === restart replay: submit weights from loaded historic scores ===
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
-    # aggregator is empty (fresh install or v0.1.29 wipe above).
+    # aggregator is empty (fresh install or v0.1.30 wipe above).
     _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
     _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
     if _replay_nonzero > 0:
@@ -870,15 +870,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
             # === Wait till commit phase to submit random seed ===
-            phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
+            phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             logger.info("Commit new seed for next validation")
 
-            # === (4) Close the (3) window and submit weights for the round
-            # whose evaluation just ended. This used to live at the bottom of
-            # the cycle (after ValidatorCommit2); it now happens here, at end
-            # of Train(K+1) = start of MinerCommit1(K+1), so the weights
+            # === (4) Submit weights for the round whose evaluation just
+            # ended. This used to live at the bottom of the cycle (after
+            # ValidatorCommit2); it now happens here, at end of
+            # Train(K+1) = start of MinerCommit1(K+1), so the weights
             # reflect both (2) foreground and (3) background scores.
-            eval_window_active.clear()
+            # The (3) window itself is closed below — *after* MinerCommit1
+            # actually begins — so bg-eval can keep scoring up to that
+            # boundary and the archive/prune of round-K's submission files
+            # cannot race in-flight bg-eval reads.
             pending_round: Round | None = round_ref.current
             scheduled_round_weights = False
             if pending_round is not None and not pending_round.weights_submitted:
@@ -933,11 +936,45 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
 
+            # Close the (3) bg-eval window and clean up round-K's submission
+            # files now that MinerCommit1(K+1) has begun. bg-eval is gated on
+            # eval_window_active, so clearing it before archive/prune prevents
+            # the worker from loading files that are about to be moved/deleted
+            # (which previously surfaced as a flood of "empty model_state_dict"
+            # / hash-mismatch failures for miners that had already been scored
+            # cleanly earlier in the window).
+            eval_window_active.clear()
+
+
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
                 global_ver=global_opt_step,
                 expert_group=config.task.exp.group_id,
             ))
+
+            if config.ckpt.archive_submissions:
+                logger.info("Archiving top miner submissions")
+                archive_top_miner_submissions(
+                    submission_dir=config.ckpt.miner_submission_path,
+                    archive_dir=config.ckpt.miner_submission_archive_path,
+                    score_aggregator=score_aggregator,
+                    top_k=config.evaluation.top_k_miners_to_reward,
+                    max_archive=config.ckpt.miner_submission_archive_max_files,
+                )
+
+            deleted = prune_miner_submission_files(
+                config.ckpt.miner_submission_path,
+                current_block=lite_subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=0,
+            )
+            logger.info(
+                "Pruned aged miner submissions after cycle",
+                deleted=len(deleted),
+                current_block=lite_subtensor.block,
+                cycle_length=config.cycle.cycle_length,
+                max_age_cycles=0,
+            )
 
             check_phase_expired(lite_subtensor, phase_response)
 
@@ -1394,39 +1431,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # so it can incorporate the (3) background scores collected from
             # end-of-Validate(K) through end-of-Train(K+1).
 
-            # === Close download window, archive top-k, prune the rest ===
-            # Wait until 20 blocks before the next MinerCommit1 so the cleanup
-            # finishes inside the quiet window just before the new cycle begins.
-            wait_till(config, PhaseNames.miner_commit_1, block_offset=-30)
+            # === Close download window before next-cycle MinerCommit1 ===
+            # Wait until 30 blocks before the next MinerCommit1 so bg-download
+            # stops pulling round-K submissions inside the quiet window just
+            # before the new cycle begins. The archive + prune of those files
+            # has been moved to right after MinerCommit1 begins (above), so
+            # bg-eval can keep scoring round-K's miners through this window
+            # without racing the cleanup.
+            wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             download_window_closed.set()
 
-            if config.ckpt.archive_submissions:
-                logger.info("Archiving top miner submissions")
-                archive_top_miner_submissions(
-                    submission_dir=config.ckpt.miner_submission_path,
-                    archive_dir=config.ckpt.miner_submission_archive_path,
-                    score_aggregator=score_aggregator,
-                    top_k=config.evaluation.top_k_miners_to_reward,
-                    max_archive=config.ckpt.miner_submission_archive_max_files,
-                )
-
-            deleted = prune_miner_submission_files(
-                config.ckpt.miner_submission_path,
-                current_block=lite_subtensor.block,
-                cycle_length=config.cycle.cycle_length,
-                max_age_cycles=0,
-            )
-            logger.info(
-                "Pruned aged miner submissions after cycle",
-                deleted=len(deleted),
-                current_block=lite_subtensor.block,
-                cycle_length=config.cycle.cycle_length,
-                max_age_cycles=0,
-            )
-
             # === Re-sync from peer if we were excluded last cycle ===
-            # Done in the same quiet pre-MinerCommit1 window as the cleanup
-            # above so the sync settles before the new cycle begins.
+            # Done in the same quiet pre-MinerCommit1 window as the
+            # download-window close above so the sync settles before the
+            # new cycle begins.
             if not _participated_in_merge:
                 logger.info(
                     "Re-syncing model from peer validator (was excluded from allreduce last cycle)"
