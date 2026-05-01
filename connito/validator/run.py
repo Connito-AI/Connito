@@ -122,6 +122,7 @@ from connito.validator.chain_submitter import ChainSubmitter
 from connito.validator.evaluator import (
     MinerEvalJob,
     evaluate_foreground_round,
+    finalize_round_scores,
     load_model_from_path,
 )
 from connito.validator.round import Round, RoundRef
@@ -373,30 +374,22 @@ async def aggregate_miner_gradient_change(
     rank: int,
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
-    score_aggregator: MinerScoreAggregator,
 ) -> list[str]:
     # global_model is expected to already live on `device` (GPU).
-    this_round_uids = {job.uid for job in miner_jobs}
-
-    # Drop zero-score miners before ranking so they can never be merged, even
-    # when fewer than top_k miners have a positive score this round. Use the
-    # latest (this-round) score, not the rolling avg, so a single bad round
-    # is enough to exclude a miner regardless of their history.
-    latest_scores = score_aggregator.uid_score_pairs(how="latest")
-    scored_jobs = [job for job in miner_jobs if latest_scores.get(job.uid, 0.0) > 0]
+    # `MinerEvalJob.score` is the per-round delta-based signal
+    # (`(baseline_loss - val_loss) ** 1.2`) returned by `evaluate_one_miner`.
+    # The aggregator is no longer fed during eval — `finalize_round_scores`
+    # writes rank-based scores to it at end of round — so merge ranking
+    # reads `job.score` directly. Drop zero-score miners first (a single
+    # bad eval excludes them regardless of history), then keep the top
+    # `top_k_miners_to_merge` by this-round score.
+    scored_jobs = [job for job in miner_jobs if job.score > 0]
     skipped_zero_uids = [job.uid for job in miner_jobs if job not in scored_jobs]
     if skipped_zero_uids:
         logger.info("Excluding zero-score miners from merge", uids=skipped_zero_uids)
 
-    top_jobs = [
-        job for job in scored_jobs
-        if score_aggregator.is_in_top(
-            uid=job.uid,
-            cutoff=config.evaluation.top_k_miners_to_merge,
-            how="avg",
-            among=this_round_uids,
-        )
-    ]
+    scored_jobs.sort(key=lambda j: (-j.score, j.uid))
+    top_jobs = scored_jobs[: int(config.evaluation.top_k_miners_to_merge)]
     weight = 1 / max(1, len(top_jobs))
     merged_uids: list[str] = []
 
@@ -592,7 +585,6 @@ def run_global_optimization(
     rank: int,
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
-    score_aggregator: MinerScoreAggregator,
 ):
     # global_model and outer_optimizer state are expected to already live on `device` (GPU).
     old_shared_name, old_shared_sum = get_weight_sum(global_model, shared=True)
@@ -843,8 +835,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             round_ref=round_ref,
             device=device,
             tokenizer=tokenizer,
-            score_aggregator=score_aggregator,
-            score_path=score_path,
             merge_phase_active=merge_phase_active,
             eval_window_active=eval_window_active,
             gpu_eval_lock=gpu_eval_lock,
@@ -886,24 +876,29 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             logger.info("Commit new seed for next validation")
 
-            # === (4) Submit weights for the round whose evaluation just
-            # ended. This used to live at the bottom of the cycle (after
-            # ValidatorCommit2); it now happens here, at end of
-            # Train(K+1) = start of MinerCommit1(K+1), so the weights
-            # reflect both (2) foreground and (3) background scores.
-            # The (3) window itself is closed below — *after* MinerCommit1
-            # actually begins — so bg-eval can keep scoring up to that
-            # boundary and the archive/prune of round-K's submission files
-            # cannot race in-flight bg-eval reads.
+            # === (4) Finalize round-K scoring and submit weights.
+            #
+            # Close the (3) bg-eval window FIRST so no in-flight eval can
+            # add a new entry to `round.scores` after `finalize_round_scores`
+            # has snapshotted it. The archive/prune step that lives lower
+            # in this block also runs while the window is closed — same
+            # invariant we used to rely on, just hoisted up.
+            #
+            # `finalize_round_scores` is the sole writer to the global
+            # aggregator for this round_id: it computes ranks from the
+            # delta-based per-round signal in `round.scores`, drops any
+            # stale aggregator points tagged with this round_id, and
+            # writes 3/2/1 for the top-3 (with delta>0), 0 for everyone
+            # else (incl. failed evals and freeze-time invalid checkpoints).
+            eval_window_active.clear()
             pending_round: Round | None = round_ref.current
             scheduled_round_weights = False
             if pending_round is not None and not pending_round.weights_submitted:
-                # No blanket score=0 for unscored UIDs. Score=0 is reserved
-                # for *invalid checkpoints* (no chain commit, hash/sig/expert-
-                # group/NaN failure) and is recorded inline at the validation
-                # site (foreground eval, bg-eval, bg-download). Miners we
-                # simply ran out of time to evaluate keep their existing EMA;
-                # they get re-prioritized as "stalest" in the next round.
+                finalize_round_scores(
+                    round_obj=pending_round,
+                    score_aggregator=score_aggregator,
+                    score_path=score_path,
+                )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
@@ -913,11 +908,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
                 scheduled_round_weights = True
-
-                try:
-                    score_aggregator.persist_atomic(score_path)
-                except Exception as e:
-                    logger.warning("Failed to persist score_aggregator after submit_weights", error=str(e))
 
             # Submit fallback weights if last_update is stale (past max_weight_age)
             # AND we did not just schedule a fresh round-weight submission. The
@@ -949,16 +939,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
 
-            # Close the (3) bg-eval window and clean up round-K's submission
-            # files now that MinerCommit1(K+1) has begun. bg-eval is gated on
-            # eval_window_active, so clearing it before archive/prune prevents
-            # the worker from loading files that are about to be moved/deleted
-            # (which previously surfaced as a flood of "empty model_state_dict"
-            # / hash-mismatch failures for miners that had already been scored
-            # cleanly earlier in the window).
-            eval_window_active.clear()
-
-
+            # The (3) eval window was closed at the top of this block before
+            # `finalize_round_scores`. Archive/prune below runs with bg-eval
+            # gated, preserving the file-race protection that used to live
+            # at this point in the loop.
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
                 global_ver=global_opt_step,
@@ -1022,7 +1006,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     phase_response.phase_end_block,
                 ),
                 last_evaluated=score_aggregator.last_evaluated_per_uid(),
-                score_aggregator=score_aggregator,
             )
             # Belt-and-suspenders: drop any leftover submission file whose
             # block falls outside this round's window. The end-of-cycle
@@ -1087,13 +1070,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         subtensor=subtensor,
                         step=global_opt_step,
                         device=device,
-                        score_aggregator=score_aggregator,
                         base_model=global_model,
                         tokenizer=tokenizer,
                         end_block=phase_response.phase_end_block,
                         expert_group_assignment=expert_manager.expert_group_assignment,
                         per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                        score_path=score_path,
                         completed_out=miner_jobs,
                     ),
                     timeout=foreground_timeout_sec,
@@ -1173,7 +1154,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     rank=rank,
                     outer_optimizer=outer_optimizer,
                     miner_jobs=miner_jobs,
-                    score_aggregator=score_aggregator,
                 )
             )
 
@@ -1283,7 +1263,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             rank=rank,
                             outer_optimizer=outer_optimizer,
                             miner_jobs=miner_jobs,
-                            score_aggregator=score_aggregator,
                         )
 
                         logger.info(

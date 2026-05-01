@@ -21,7 +21,6 @@ from connito.shared.app_logging import structlog
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
-    from connito.validator.aggregator import MinerScoreAggregator
 
 logger = structlog.get_logger(__name__)
 
@@ -76,6 +75,13 @@ class Round:
     scores: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
+    # UIDs penalized at freeze time for missing/invalid chain checkpoints.
+    # `finalize_round_scores` stamps each one with score=0 in the global
+    # aggregator at end of round; the hotkey map is captured here because
+    # those UIDs may not appear in `uid_to_hotkey` (which only covers
+    # roster miners with a valid checkpoint).
+    freeze_zero_uids: set[int] = field(default_factory=set)
+    freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -92,7 +98,6 @@ class Round:
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
-        score_aggregator: "MinerScoreAggregator | None" = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -151,27 +156,27 @@ class Round:
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
-        # Freeze-time penalty: every neuron in the metagraph that is not
-        # in `assignment_result.miners_with_checkpoint` with a valid chain
-        # commit gets score=0 under this round_id. Doing it here —
-        # synchronously, on the main thread — keeps the worker threads
-        # out of the aggregator and catches miners with no commit at all
-        # (those never appear in `miners_with_checkpoint` and so would
-        # be invisible to the bg-download path).
-        if score_aggregator is not None:
-            for hk in metagraph.hotkeys:
-                if hk in assigned_with_valid_ckpt:
-                    continue
-                uid = hotkey_to_uid.get(hk)
-                if uid is None:
-                    continue
-                score_aggregator.add_score(
-                    uid=uid, hotkey=hk, score=0.0, round_id=rid,
-                )
-                logger.info(
-                    "Round.freeze: invalid chain checkpoint — penalizing with score=0",
-                    uid=uid, hotkey=hk[:6], round_id=rid,
-                )
+        # Freeze-time penalty: every metagraph neuron that lacks a valid
+        # chain checkpoint this round is recorded here so
+        # `finalize_round_scores` can stamp it with score=0 in the
+        # aggregator at end of round. Catching it on the main thread
+        # also covers miners with no commit at all — those never appear
+        # in `miners_with_checkpoint` and would otherwise be invisible
+        # to the eval workers entirely.
+        freeze_zero_uids: set[int] = set()
+        freeze_zero_hotkeys: dict[int, str] = {}
+        for hk in metagraph.hotkeys:
+            if hk in assigned_with_valid_ckpt:
+                continue
+            uid = hotkey_to_uid.get(hk)
+            if uid is None:
+                continue
+            freeze_zero_uids.add(uid)
+            freeze_zero_hotkeys[uid] = hk
+            logger.info(
+                "Round.freeze: invalid chain checkpoint — will record score=0 at finalize",
+                uid=uid, hotkey=hk[:6], round_id=rid,
+            )
 
         foreground_uids = tuple(foreground)
 
@@ -218,6 +223,8 @@ class Round:
             model_snapshot_cpu=snapshot,
             submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
+            freeze_zero_uids=freeze_zero_uids,
+            freeze_zero_hotkeys=freeze_zero_hotkeys,
         )
 
     # ---------------- Claim / score helpers ----------------

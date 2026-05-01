@@ -459,7 +459,7 @@ class TestBackgroundEvalWorker:
     Heavy ops (evaluate_one_miner, dataloader, evaluate_model) are mocked.
     """
 
-    def _build_worker(self, *, round_ref: RoundRef, score_path: Path):
+    def _build_worker(self, *, round_ref: RoundRef):
         from connito.validator.background_eval_worker import BackgroundEvalWorker
 
         # Minimal config surface needed by the worker.
@@ -467,8 +467,6 @@ class TestBackgroundEvalWorker:
             evaluation=SimpleNamespace(per_miner_eval_timeout_sec=5),
             dataloader=SimpleNamespace(world_size=1),
         )
-
-        agg = MinerScoreAggregator(max_points=8)
 
         gpu_lock = threading.Lock()
         merge_active = threading.Event()
@@ -480,8 +478,6 @@ class TestBackgroundEvalWorker:
             round_ref=round_ref,
             device=torch.device("cpu"),
             tokenizer=MagicMock(),
-            score_aggregator=agg,
-            score_path=score_path,
             merge_phase_active=merge_active,
             eval_window_active=eval_window,
             gpu_eval_lock=gpu_lock,
@@ -490,7 +486,7 @@ class TestBackgroundEvalWorker:
             poll_interval_sec=0.05,
         )
         worker.set_eval_base_model(_make_model())
-        return worker, agg, gpu_lock, merge_active, eval_window, stop
+        return worker, gpu_lock, merge_active, eval_window, stop
 
     def test_lock_unheld_at_iteration_boundary(self, tmp_path: Path) -> None:
         config = _fake_validator_config()
@@ -500,8 +496,8 @@ class TestBackgroundEvalWorker:
 
         ref = RoundRef()
         ref.swap(new_current=rnd)
-        worker, _agg, gpu_lock, merge_active, eval_window, stop = self._build_worker(
-            round_ref=ref, score_path=tmp_path / "score.json",
+        worker, gpu_lock, merge_active, eval_window, stop = self._build_worker(
+            round_ref=ref,
         )
         # Ensure both gates start in the paused state so the worker idles
         # immediately and never enters the eval branch.
@@ -566,3 +562,150 @@ class TestDelayedSubmission:
         # This is just a flag-level test.
         if not rnd.weights_submitted:
             pytest.fail("weights_submitted should already be set")
+
+
+# ---------------------------------------------------------------------------
+# Rank-based scoring: finalize_round_scores writes 3/2/1/0 to the aggregator
+# using `round.scores` (delta**1.2) as the ranking signal.
+# ---------------------------------------------------------------------------
+
+class TestFinalizeRoundScores:
+    @staticmethod
+    def _round_with_five_miners() -> Round:
+        config = _fake_validator_config()
+        metagraph = _make_metagraph({
+            "hk_a": 0.5, "hk_b": 0.4, "hk_c": 0.3, "hk_d": 0.2, "hk_e": 0.1,
+        })
+        assignment = {"vhk": ["hk_a", "hk_b", "hk_c", "hk_d", "hk_e"]}
+        return _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment, round_id=500,
+        )
+
+    @staticmethod
+    def _scores_for_uid(agg: MinerScoreAggregator, uid: int, round_id: int) -> list[float]:
+        return [v for _, v, rid in agg._miners[uid].series.points if rid == round_id]
+
+    def test_top_three_get_three_two_one(self) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        # mark_scored stores delta**1.2; pick distinct values so ranking
+        # is unambiguous.
+        rnd.mark_scored(rnd.roster[0].uid, score=0.10)  # rank 4
+        rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # rank 1 → 3.0
+        rnd.mark_scored(rnd.roster[2].uid, score=0.30)  # rank 2 → 2.0
+        rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 3 → 1.0
+        rnd.mark_scored(rnd.roster[4].uid, score=0.05)  # rank 5
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        # Rank 1 → 3.0, rank 2 → 2.0, rank 3 → 1.0, rest → 0.0.
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [2.0]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.0]
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [0.0]
+
+    def test_zero_delta_excluded_from_top_three(self) -> None:
+        # If only one miner has delta > 0, only that miner gets 3.0.
+        # The other "scored but delta==0" miners receive 0.0 — they did not
+        # actually improve over baseline so they should not collect reward
+        # weight just for showing up.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.0)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.5)
+        rnd.mark_scored(rnd.roster[2].uid, score=0.0)
+        rnd.mark_scored(rnd.roster[3].uid, score=0.0)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [3.0]
+        for entry in (rnd.roster[0], rnd.roster[2], rnd.roster[3]):
+            assert self._scores_for_uid(agg, entry.uid, rnd.round_id) == [0.0]
+
+    def test_failed_uids_get_zero(self) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_failed(rnd.roster[1].uid)
+        rnd.mark_failed(rnd.roster[2].uid)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [0.0]
+
+    def test_freeze_zero_uids_get_zero_at_finalize(self) -> None:
+        # Miners absent from `miners_with_checkpoint` at freeze time end up
+        # in `freeze_zero_uids` and should still receive a 0.0 entry from
+        # finalize.
+        from connito.validator.evaluator import finalize_round_scores
+
+        config = _fake_validator_config()
+        metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4, "hk_c": 0.3})
+        assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
+        # hk_b has no checkpoint this round.
+        rnd = _freeze_round(
+            config=config, metagraph=metagraph, assignment=assignment,
+            miners_with_checkpoint=["hk_a", "hk_c"],
+            round_id=600,
+        )
+        uid_b = metagraph.hotkeys.index("hk_b")
+        assert uid_b in rnd.freeze_zero_uids
+
+        rnd.mark_scored(metagraph.hotkeys.index("hk_a"), score=0.20)
+        rnd.mark_scored(metagraph.hotkeys.index("hk_c"), score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, uid_b, rnd.round_id) == [0.0]
+
+    def test_drop_round_clears_stale_entries_before_rank_writes(self) -> None:
+        # Defensive: if the aggregator already holds entries tagged with
+        # this round_id (e.g. from a partial run that crashed and was
+        # restored from disk), finalize must drop them before writing the
+        # rank-based entries — otherwise the avg would mix stale signal
+        # with rank.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.40)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        # Pre-load a stale partial entry tagged with this round_id.
+        agg.add_score(uid=rnd.roster[0].uid, hotkey=rnd.roster[0].hotkey,
+                      score=42.0, round_id=rnd.round_id)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [2.0]
+
+    def test_persists_score_path_when_provided(self, tmp_path: Path) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.40)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        score_path = tmp_path / "score_aggregator.json"
+        finalize_round_scores(
+            round_obj=rnd, score_aggregator=agg, score_path=score_path,
+        )
+
+        assert score_path.exists()
+        restored = MinerScoreAggregator.from_json(
+            score_path.read_text(encoding="utf-8"), max_points=8,
+        )
+        assert TestFinalizeRoundScores._scores_for_uid(
+            restored, rnd.roster[0].uid, rnd.round_id,
+        ) == [3.0]

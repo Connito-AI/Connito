@@ -46,8 +46,6 @@ class BackgroundEvalWorker(threading.Thread):
         round_ref: RoundRef,
         device: torch.device,
         tokenizer,
-        score_aggregator,
-        score_path,
         merge_phase_active: threading.Event,
         eval_window_active: threading.Event,
         gpu_eval_lock: threading.Lock,
@@ -60,8 +58,6 @@ class BackgroundEvalWorker(threading.Thread):
         self.round_ref = round_ref
         self.device = device
         self.tokenizer = tokenizer
-        self.score_aggregator = score_aggregator
-        self.score_path = score_path
         self.merge_phase_active = merge_phase_active
         self.eval_window_active = eval_window_active
         self.gpu_eval_lock = gpu_eval_lock
@@ -302,7 +298,8 @@ class BackgroundEvalWorker(threading.Thread):
                 reason=fail_reason,
             )
             inc_error(component="bg_eval", kind="validation")
-            self.score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=0, round_id=round_obj.round_id)
+            # No aggregator push here — `finalize_round_scores` records
+            # score=0 for every `failed_uids` entry at end of round.
             round_obj.mark_failed(uid)
             self._record_metrics(round_obj, scored_inc=False)
             self._prune_non_top(round_obj)
@@ -335,11 +332,9 @@ class BackgroundEvalWorker(threading.Thread):
                     tokenizer=self.tokenizer,
                     combined_seed=round_obj.seed,
                     device=self.device,
-                    score_aggregator=self.score_aggregator,
                     baseline_loss=baseline,
                     step=round_obj.round_id,
                     round_id=round_obj.round_id,
-                    score_path=self.score_path,
                 )
             finally:
                 self.gpu_eval_lock.release()
@@ -366,7 +361,6 @@ class BackgroundEvalWorker(threading.Thread):
             uid=uid, hotkey=hotkey[:6],
             score=round(evaluated.score, 6),
         )
-        # Per-miner persistence happens inside evaluate_one_miner via score_path.
         self._record_metrics(round_obj, scored_inc=True)
         self._prune_non_top(round_obj)
 
