@@ -359,11 +359,12 @@ class BackgroundEvalWorker(threading.Thread):
             self._prune_non_top(round_obj)
             return
 
-        round_obj.mark_scored(uid)
+        round_obj.mark_scored(uid, evaluated.score)
         logger.info(
             "bg-eval: success",
             round_id=round_obj.round_id,
             uid=uid, hotkey=hotkey[:6],
+            score=round(evaluated.score, 6),
         )
         # Per-miner persistence happens inside evaluate_one_miner via score_path.
         self._record_metrics(round_obj, scored_inc=True)
@@ -388,14 +389,16 @@ class BackgroundEvalWorker(threading.Thread):
     def _prune_non_top(self, round_obj) -> None:
         """Drop on-disk submission files for miners that have been
         processed this round but are not in the top-`top_k_miners_to_reward`
-        by latest score among scored UIDs. Keeps the merge-time top-1 set
-        (top_k_miners_to_merge=1 ⊆ top_k_miners_to_reward=3) and the
-        archive-time top set, while reclaiming disk for everyone else.
+        by *this round's* score (read from `round.scores`, not the global
+        aggregator). Files for miners that have not yet been evaluated
+        are explicitly retained — see `cleanup_non_top_submissions`.
+        Keeps the merge-time top-1 set (top_k_miners_to_merge=1 ⊆
+        top_k_miners_to_reward=3) and the archive-time top set, while
+        reclaiming disk for everyone else.
         """
         try:
             deleted = cleanup_non_top_submissions(
                 round_obj=round_obj,
-                score_aggregator=self.score_aggregator,
                 submission_dir=Path(self.config.ckpt.miner_submission_path),
                 top_k=int(self.config.evaluation.top_k_miners_to_reward),
             )

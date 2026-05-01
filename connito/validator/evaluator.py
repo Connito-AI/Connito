@@ -23,43 +23,60 @@ logger = structlog.get_logger(__name__)
 def cleanup_non_top_submissions(
     *,
     round_obj,  # connito.validator.round.Round
-    score_aggregator,  # connito.validator.aggregator.MinerScoreAggregator
     submission_dir: Path,
     top_k: int,
 ) -> list[str]:
-    """Delete miner submission files for UIDs that have been processed
-    this round but are not in the top-`top_k` by latest score among the
-    round's scored UIDs. Files for UIDs not yet processed are kept so
-    the eval workers can still find them.
+    """Delete miner submission files for UIDs that have been *processed*
+    this round but are not in the top-`top_k` by *this round's* score.
 
-    `top_k` should match (or exceed) ``top_k_miners_to_reward`` so the
-    top miners archived/rewarded at the cycle tail are still on disk.
-    Failed UIDs always have their file removed since their score is 0
-    and they cannot be in any top-N.
+    Ranking uses `Round.top_scored_uids_this_round`, which reads only
+    `round.scores` (populated by `mark_scored`) — the global
+    `MinerScoreAggregator` is intentionally not consulted here, so a
+    miner's history from prior rounds cannot pull them into the keep
+    set this round and the cleanup decision is fully owned by the round
+    object.
+
+    A file is deleted iff its hotkey resolves to a UID that:
+      - is in `round.failed_uids` (validation/timeout/exception, score=0
+        — never top), or
+      - is in `round.scored_uids` AND is not in the per-round top-k.
+
+    Files for UIDs that have *not* yet been processed are explicitly
+    skipped — this is the safety guarantee the eval workers rely on:
+    bg-download has already written the shard to disk, but no eval has
+    happened, so the file MUST stay until the worker can read it.
+    Files belonging to hotkeys outside the round's roster (stale from a
+    previous cycle, etc.) are also skipped here; the cycle-tail prune
+    catches those.
     """
     submission_dir = Path(submission_dir)
     if not submission_dir.exists():
         return []
 
     scored, failed = round_obj.processed_uids_snapshot()
-    if not scored and not failed:
+    processed = scored | failed
+    if not processed:
         return []
 
-    if scored:
-        top_uids = {
-            uid for uid in scored
-            if score_aggregator.is_in_top(
-                uid=uid, cutoff=top_k, how="latest", among=scored,
-            )
-        }
-    else:
-        top_uids = set()
-
+    top_uids = round_obj.top_scored_uids_this_round(top_k)
     delete_uids = failed | (scored - top_uids)
+    if not delete_uids:
+        return []
+
+    # Map UID → hotkey for the deletion target set, and collect the
+    # hotkeys of every roster UID that has *not* been processed yet so
+    # we can refuse to touch their files even by accident (defense in
+    # depth: a hotkey clash would already be impossible, but the explicit
+    # filter makes the invariant readable at the deletion site).
     hotkeys_to_delete = {
         round_obj.uid_to_hotkey[uid]
         for uid in delete_uids
         if uid in round_obj.uid_to_hotkey
+    }
+    unprocessed_hotkeys = {
+        hotkey
+        for uid, hotkey in round_obj.uid_to_hotkey.items()
+        if uid not in processed
     }
     if not hotkeys_to_delete:
         return []
@@ -71,7 +88,12 @@ def cleanup_non_top_submissions(
         meta = parse_dynamic_filename(file_path.name)
         if not meta:
             continue
-        if meta.get("hotkey") in hotkeys_to_delete:
+        hotkey = meta.get("hotkey")
+        if hotkey in unprocessed_hotkeys:
+            # Explicit safety: never delete a file for a miner whose
+            # checkpoint has not been evaluated yet.
+            continue
+        if hotkey in hotkeys_to_delete:
             try:
                 file_path.unlink(missing_ok=True)
                 deleted.append(file_path.name)
@@ -87,7 +109,6 @@ def _prune_non_top_after_eval(
     *,
     config,
     round_obj,
-    score_aggregator,
 ) -> None:
     """Wrapper around `cleanup_non_top_submissions` that swallows errors
     so a cleanup failure can never abort eval flow.
@@ -95,7 +116,6 @@ def _prune_non_top_after_eval(
     try:
         deleted = cleanup_non_top_submissions(
             round_obj=round_obj,
-            score_aggregator=score_aggregator,
             submission_dir=Path(config.ckpt.miner_submission_path),
             top_k=int(config.evaluation.top_k_miners_to_reward),
         )
@@ -177,6 +197,7 @@ class MinerEvalJob:
     hotkey: str
     model_path: str
     step: int
+    score: float = 0.0
 
 
 # -------------------------- Pipeline Config -----------------------------------
@@ -329,7 +350,6 @@ async def evaluate_one_miner(
     Returns a `MinerEvalJob` on success (so the caller can later use
     `model_path` for gradient aggregation), or None on failure.
     """
-    job = MinerEvalJob(uid=int(uid), hotkey=hotkey, model_path=str(model_path), step=int(step))
     try:
         gc.collect()
         if torch.cuda.is_available():
@@ -373,7 +393,13 @@ async def evaluate_one_miner(
             score=round(score, 6),
             round_id=round_id,
         )
-        return job
+        return MinerEvalJob(
+            uid=int(uid),
+            hotkey=hotkey,
+            model_path=str(model_path),
+            step=int(step),
+            score=float(score),
+        )
     except torch.cuda.OutOfMemoryError:
         logger.error("evaluate_one_miner: OOM", uid=int(uid))
         gc.collect()
@@ -538,7 +564,6 @@ async def evaluate_foreground_round(
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
-                    score_aggregator=score_aggregator,
                 )
                 continue
 
@@ -580,7 +605,6 @@ async def evaluate_foreground_round(
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
-                    score_aggregator=score_aggregator,
                 )
                 continue
             except Exception as e:
@@ -589,7 +613,6 @@ async def evaluate_foreground_round(
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
-                    score_aggregator=score_aggregator,
                 )
                 continue
 
@@ -598,15 +621,13 @@ async def evaluate_foreground_round(
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
-                    score_aggregator=score_aggregator,
                 )
                 continue
-            round_obj.mark_scored(uid)
+            round_obj.mark_scored(uid, evaluated.score)
             completed.append(evaluated)
             _prune_non_top_after_eval(
                 config=config,
                 round_obj=round_obj,
-                score_aggregator=score_aggregator,
             )
 
         # Stop once every top-N UID is scored or the phase boundary hits.

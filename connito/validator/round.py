@@ -68,6 +68,12 @@ class Round:
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
     scored_uids: set[int] = field(default_factory=set)
+    # Per-uid score recorded by `mark_scored`. Scoped to *this round*
+    # only — kept here so cleanup ranking does not have to read the
+    # global `MinerScoreAggregator` (which mixes in scores from prior
+    # rounds and would let history pull a non-top-this-round miner into
+    # the keep set).
+    scores: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
     weights_submitted: bool = False
@@ -241,10 +247,36 @@ class Round:
         with self._lock:
             self.claimed_uids.discard(uid)
 
-    def mark_scored(self, uid: int) -> None:
+    def mark_scored(self, uid: int, score: float = 0.0) -> None:
+        """Record a successful evaluation. `score` is this-round's score
+        (e.g. ``delta ** 1.2`` from `evaluate_one_miner`); it is stored
+        in `self.scores` so per-round ranking — used by post-eval
+        submission cleanup — never has to consult the global aggregator.
+        """
         with self._lock:
             self.scored_uids.add(uid)
+            self.scores[uid] = float(score)
             self.claimed_uids.discard(uid)
+
+    def top_scored_uids_this_round(self, top_k: int) -> set[int]:
+        """Top-`top_k` UIDs by *this round's* score. Returns every scored
+        UID when fewer than `top_k` have been scored. Ties are broken
+        arbitrarily by UID (stable-sort fallback) — the caller only needs
+        a set, not a ranking.
+        """
+        if top_k <= 0:
+            return set()
+        with self._lock:
+            if not self.scores:
+                return set()
+            if len(self.scores) <= top_k:
+                return set(self.scores.keys())
+            ranked = sorted(
+                self.scores.items(),
+                key=lambda kv: (kv[1], -kv[0]),  # score desc, uid asc as tiebreak
+                reverse=True,
+            )
+            return {uid for uid, _ in ranked[:top_k]}
 
     def mark_failed(self, uid: int) -> None:
         with self._lock:
