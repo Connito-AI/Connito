@@ -114,8 +114,16 @@ def _freeze_round(
     seed: str = "deadbeef",
     round_id: int = 100,
     global_model: nn.Module | None = None,
+    chain_checkpoints_by_hotkey: dict[str, "object"] | None = None,
 ) -> Round:
-    """Build a Round bypassing the chain helpers."""
+    """Build a Round bypassing the chain helpers.
+
+    `chain_checkpoints_by_hotkey` pairs each hotkey with a stub object
+    exposing `hf_repo_id` / `hf_revision`. Hotkeys absent from the map
+    end up in `freeze_zero_uids`. Default = empty (all miners are
+    treated as freeze-zero), which mirrors how the test suite has
+    historically run.
+    """
     if global_model is None:
         global_model = _make_model()
     subtensor = _fake_subtensor(metagraph, block=round_id)
@@ -133,6 +141,7 @@ def _freeze_round(
     assignment_result = SimpleNamespace(
         assignment=assignment,
         miners_with_checkpoint=miners_with_checkpoint,
+        chain_checkpoints_by_hotkey=chain_checkpoints_by_hotkey or {},
     )
     with patch("connito.shared.chain.get_chain_commits", return_value=[]), \
          patch("connito.shared.cycle.get_combined_validator_seed", return_value=seed), \
@@ -144,6 +153,18 @@ def _freeze_round(
             global_model=global_model,
             round_id=round_id,
         )
+
+
+def _valid_chain_checkpoints(hotkeys: list[str]) -> dict[str, "object"]:
+    """Stub `ChainCheckpoint`-shaped objects with `hf_repo_id` and
+    `hf_revision` set so `Round.freeze` keeps these hotkeys *out* of
+    `freeze_zero_uids`. Use when a test needs miners to be treated as
+    "had a valid commit at freeze time".
+    """
+    return {
+        hk: SimpleNamespace(hf_repo_id=f"repo/{hk}", hf_revision="rev123")
+        for hk in hotkeys
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -571,19 +592,36 @@ class TestDelayedSubmission:
 
 class TestFinalizeRoundScores:
     @staticmethod
-    def _round_with_five_miners() -> Round:
+    def _round_with_five_miners(*, valid_checkpoints: bool = False) -> Round:
+        """Build a 5-miner round.
+
+        `valid_checkpoints=True` populates chain checkpoints for every
+        miner so they are NOT in `freeze_zero_uids` — required when the
+        test wants to verify "unreached" / "operational failure" paths,
+        which are only meaningful for miners that had a valid commit at
+        freeze time.
+        """
         config = _fake_validator_config()
+        hotkeys = ["hk_a", "hk_b", "hk_c", "hk_d", "hk_e"]
         metagraph = _make_metagraph({
             "hk_a": 0.5, "hk_b": 0.4, "hk_c": 0.3, "hk_d": 0.2, "hk_e": 0.1,
         })
-        assignment = {"vhk": ["hk_a", "hk_b", "hk_c", "hk_d", "hk_e"]}
+        assignment = {"vhk": hotkeys}
+        chain_ckpts = _valid_chain_checkpoints(hotkeys) if valid_checkpoints else None
         return _freeze_round(
-            config=config, metagraph=metagraph, assignment=assignment, round_id=500,
+            config=config, metagraph=metagraph, assignment=assignment,
+            round_id=500, chain_checkpoints_by_hotkey=chain_ckpts,
         )
 
     @staticmethod
     def _scores_for_uid(agg: MinerScoreAggregator, uid: int, round_id: int) -> list[float]:
-        return [v for _, v, rid in agg._miners[uid].series.points if rid == round_id]
+        # Returns the list of score values this UID has under `round_id`.
+        # `[]` means either: aggregator has no record of the UID at all,
+        # or it has records but none tagged with this round.
+        state = agg._miners.get(uid)
+        if state is None:
+            return []
+        return [v for _, v, rid in state.series.points if rid == round_id]
 
     def test_top_three_get_three_two_one(self) -> None:
         from connito.validator.evaluator import finalize_round_scores
@@ -627,13 +665,13 @@ class TestFinalizeRoundScores:
         for entry in (rnd.roster[0], rnd.roster[2], rnd.roster[3]):
             assert self._scores_for_uid(agg, entry.uid, rnd.round_id) == [0.0]
 
-    def test_failed_uids_get_zero(self) -> None:
+    def test_validation_failed_uids_get_zero(self) -> None:
         from connito.validator.evaluator import finalize_round_scores
 
         rnd = self._round_with_five_miners()
         rnd.mark_scored(rnd.roster[0].uid, score=0.50)
-        rnd.mark_failed(rnd.roster[1].uid)
-        rnd.mark_failed(rnd.roster[2].uid)
+        rnd.mark_validation_failed(rnd.roster[1].uid)
+        rnd.mark_validation_failed(rnd.roster[2].uid)
 
         agg = MinerScoreAggregator(max_points=8)
         finalize_round_scores(round_obj=rnd, score_aggregator=agg)
@@ -641,6 +679,56 @@ class TestFinalizeRoundScores:
         assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [3.0]
         assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [0.0]
+
+    def test_operational_failure_preserves_prior_ema(self) -> None:
+        # `mark_failed` (without `mark_validation_failed`) marks the UID
+        # as failed for operational reasons — download timeout, eval
+        # timeout, OOM, unexpected exception. Finalize must NOT write a
+        # score=0 for these so the miner's prior EMA is preserved.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners(valid_checkpoints=True)
+        op_uid = rnd.roster[1].uid
+        op_hotkey = rnd.roster[1].hotkey
+
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_failed(op_uid)  # operational failure (timeout etc.)
+
+        agg = MinerScoreAggregator(max_points=8)
+        # Preload a positive history for the operational-fail UID so we
+        # can prove finalize did not overwrite it with a 0.
+        prior_ts = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        agg.add_score(
+            uid=op_uid, hotkey=op_hotkey, score=1.5, ts=prior_ts, round_id=42,
+        )
+
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        # No new entry under THIS round's id for the operational-fail UID.
+        assert self._scores_for_uid(agg, op_uid, rnd.round_id) == []
+        # Prior history untouched.
+        all_pts = agg._miners[op_uid].series.points
+        assert any(p[1] == 1.5 and p[2] == 42 for p in all_pts)
+
+    def test_unreached_miners_get_no_entry(self) -> None:
+        # Miners we never reached — submission never landed on disk, or
+        # bg-eval ran out of time before claiming them — are absent from
+        # `scored_uids`, `validation_failed_uids`, and `freeze_zero_uids`
+        # (because they had a valid checkpoint at freeze). They must
+        # receive no aggregator entry so their prior EMA is preserved.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners(valid_checkpoints=True)
+        unreached_uid = rnd.roster[2].uid
+
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.30)
+        # roster[2] is intentionally not touched.
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, unreached_uid, rnd.round_id) == []
 
     def test_freeze_zero_uids_get_zero_at_finalize(self) -> None:
         # Miners absent from `miners_with_checkpoint` at freeze time end up

@@ -292,15 +292,17 @@ class BackgroundEvalWorker(threading.Thread):
         )
         if fail_reason is not None:
             logger.warning(
-                "bg-eval: submission failed validation — marking failed",
+                "bg-eval: submission failed validation — marking validation-failed",
                 uid=uid, hotkey=hotkey[:6],
                 round_id=round_obj.round_id,
                 reason=fail_reason,
             )
             inc_error(component="bg_eval", kind="validation")
-            # No aggregator push here — `finalize_round_scores` records
-            # score=0 for every `failed_uids` entry at end of round.
-            round_obj.mark_failed(uid)
+            # `mark_validation_failed` puts this UID into both
+            # `failed_uids` (claim-blocking) and `validation_failed_uids`
+            # so finalize writes score=0 for it. Operational failures
+            # below use plain `mark_failed` and leave the EMA alone.
+            round_obj.mark_validation_failed(uid)
             self._record_metrics(round_obj, scored_inc=False)
             self._prune_non_top(round_obj)
             return

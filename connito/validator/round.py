@@ -75,11 +75,18 @@ class Round:
     scores: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
-    # UIDs penalized at freeze time for missing/invalid chain checkpoints.
-    # `finalize_round_scores` stamps each one with score=0 in the global
-    # aggregator at end of round; the hotkey map is captured here because
-    # those UIDs may not appear in `uid_to_hotkey` (which only covers
-    # roster miners with a valid checkpoint).
+    # UIDs the miner is at fault for: explicit validation failures
+    # (hash/signature/expert_group/NaN-Inf/no_chain_commit) or freeze-time
+    # invalid checkpoints. These get score=0 in the aggregator at finalize.
+    # `failed_uids ⊃ validation_failed_uids` — operational failures
+    # (timeout/OOM/exception/download failure) are in `failed_uids` only
+    # and intentionally receive *no* aggregator entry, so the miner keeps
+    # its prior EMA. The validator's lack of compute/bandwidth must not
+    # dock a miner's reward.
+    validation_failed_uids: set[int] = field(default_factory=set)
+    # Freeze-time invalid-checkpoint penalties. Hotkey map is captured
+    # alongside because these UIDs may not appear in `uid_to_hotkey`
+    # (which only covers roster miners with a valid checkpoint).
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
@@ -286,8 +293,24 @@ class Round:
             return {uid for uid, _ in ranked[:top_k]}
 
     def mark_failed(self, uid: int) -> None:
+        """Mark a UID as failed for operational reasons (download timeout,
+        eval timeout, OOM, unexpected exception). Lands in `failed_uids`
+        only; finalize will *not* write a score=0 for it — the miner's
+        prior EMA is preserved.
+        """
         with self._lock:
             self.failed_uids.add(uid)
+            self.claimed_uids.discard(uid)
+
+    def mark_validation_failed(self, uid: int) -> None:
+        """Mark a UID as failed because its on-disk submission is off-spec
+        (hash/signature/expert_group/NaN-Inf mismatch detected by
+        `validate_miner_submission`). Lands in both `failed_uids` and
+        `validation_failed_uids`; finalize records score=0 for it.
+        """
+        with self._lock:
+            self.failed_uids.add(uid)
+            self.validation_failed_uids.add(uid)
             self.claimed_uids.discard(uid)
 
     def publish_download(self, uid: int, path: Path) -> bool:

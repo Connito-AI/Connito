@@ -125,15 +125,26 @@ def finalize_round_scores(
     recorded by `mark_scored`).
 
     Drops every aggregator point tagged with `round.round_id` first so
-    intermediate eval-time scores (and freeze-time zeros) do not stack
-    with the rank-based ones, then re-adds:
+    intermediate eval-time scores do not stack with the rank-based ones,
+    then re-adds:
 
       - Top-1 by `round.scores` (delta desc, uid asc tiebreak): score 3.
       - Top-2: score 2.
       - Top-3: score 1.
       - Other scored UIDs (incl. delta=0): score 0.
-      - `failed_uids` (validation/timeout/exception this round): score 0.
+      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf): score 0.
       - `freeze_zero_uids` (no/invalid chain commit at freeze): score 0.
+
+    Operational failures (download timeout, eval timeout, OOM, unexpected
+    exception) live in `failed_uids` but NOT in `validation_failed_uids`,
+    so finalize deliberately writes nothing for them — their prior EMA
+    is preserved. The validator's lack of compute / bandwidth must not
+    dock a miner's reward.
+
+    Likewise, miners we never reached (submission never landed, or
+    bg-eval ran out of time before claiming) are absent from every set
+    and receive no entry. They keep their prior EMA and the next
+    round's stalest-first prioritization gives them another shot.
 
     Miners whose `round.scores` value is 0.0 are explicitly excluded
     from the top-3 ranking so a "best of a bad bunch" miner cannot
@@ -144,11 +155,12 @@ def finalize_round_scores(
     """
     # Snapshot all sets under the round's lock so the worker threads
     # cannot race a mark_scored / mark_failed against the read.
-    scored, failed = round_obj.processed_uids_snapshot()
+    scored, _failed = round_obj.processed_uids_snapshot()
     # `round.scores` is mutated under the same lock; copy it explicitly
     # rather than alias.
     with round_obj._lock:  # noqa: SLF001 — same module family
         round_scores = dict(round_obj.scores)
+        validation_failed = set(round_obj.validation_failed_uids)
     freeze_zero = set(round_obj.freeze_zero_uids)
     freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
 
@@ -185,8 +197,8 @@ def finalize_round_scores(
         )
         written[uid] = 0.0
 
-    # Validation / timeout / exception this round.
-    for uid in failed:
+    # Explicit validation failures — submission was off-spec.
+    for uid in validation_failed:
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -195,11 +207,10 @@ def finalize_round_scores(
         )
         written[uid] = 0.0
 
-    # Freeze-time invalid-checkpoint penalties — re-add after drop_round
-    # wiped them. Skip any UID that ended up in scored/failed (cannot
-    # happen today, but keep the override explicit if the freeze logic
-    # ever shifts).
-    for uid in freeze_zero - scored - failed:
+    # Freeze-time invalid-checkpoint penalties. Skip any UID that ended
+    # up in scored/validation_failed (cannot happen today, but keep the
+    # override explicit if the freeze logic ever shifts).
+    for uid in freeze_zero - scored - validation_failed:
         hotkey = freeze_hotkeys.get(uid) or round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -222,8 +233,8 @@ def finalize_round_scores(
         round_id=round_obj.round_id,
         top3={int(u): _RANK_TO_SCORE[r] for r, (u, _) in enumerate(positive[:3])},
         scored_count=len(scored),
-        failed_count=len(failed),
-        freeze_zero_count=len(freeze_zero - scored - failed),
+        validation_failed_count=len(validation_failed),
+        freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )
     return written
 
@@ -670,12 +681,12 @@ async def evaluate_foreground_round(
             )
             if fail_reason is not None:
                 # Invalid checkpoint (no chain commit / signature / hash /
-                # expert_group / NaN-Inf): mark failed; `finalize_round_scores`
-                # will record score=0 against this UID at end of round.
+                # expert_group / NaN-Inf): mark validation-failed so
+                # `finalize_round_scores` records score=0 at end of round.
                 # Operational failures below (timeout / OOM / unexpected
-                # exception) ALSO mark_failed and end up at 0 — not because
-                # the miner was malicious but because we have no eval result
-                # to rank them against this round.
+                # exception) use plain `mark_failed`, which leaves the
+                # miner's prior EMA untouched — those failures are not
+                # the miner's fault.
                 logger.warning(
                     "foreground eval: submission failed validation — will record score=0 at finalize",
                     uid=uid, hotkey=hotkey[:6],
@@ -684,7 +695,7 @@ async def evaluate_foreground_round(
                 )
                 from connito.shared.telemetry import inc_error
                 inc_error(component="foreground_eval", kind="validation")
-                round_obj.mark_failed(uid)
+                round_obj.mark_validation_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
