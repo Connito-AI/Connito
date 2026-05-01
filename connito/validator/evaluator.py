@@ -128,10 +128,14 @@ def finalize_round_scores(
     intermediate eval-time scores do not stack with the rank-based ones,
     then re-adds:
 
-      - Top-1 by `round.scores` (delta desc, uid asc tiebreak): score 3.
+      - Top-1 by `round.scores` (delta desc): score 3.
       - Top-2: score 2.
       - Top-3: score 1.
       - Other scored UIDs (incl. delta=0): score 0.
+      - Any UIDs whose `round.scores` value exactly equals another
+        scored miner's: score 0 — a tied val_loss is evidence of a
+        duplicated submission, so both sides are penalized regardless
+        of where they would have ranked.
       - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf): score 0.
       - `freeze_zero_uids` (no/invalid chain commit at freeze): score 0.
 
@@ -172,11 +176,23 @@ def finalize_round_scores(
         (uid, score) for uid, score in round_scores.items()
         if uid in scored and score > 0.0
     ]
-    positive.sort(key=lambda kv: (-kv[1], kv[0]))
+    # Group by exact score value: any miner whose val_loss matches
+    # another miner's gets 0 regardless of where they would have ranked.
+    # `score = (baseline_loss - val_loss) ** 1.2` with float64 math —
+    # exact equality between two miners is overwhelmingly evidence of a
+    # duplicated submission, not legitimate parallel improvement, so
+    # penalize both sides. Unique-score miners are then ranked normally
+    # and slot into the 3/2/1 mapping by position.
+    score_counts: dict[float, int] = {}
+    for _, s in positive:
+        score_counts[s] = score_counts.get(s, 0) + 1
+    tied_uids = {uid for uid, s in positive if score_counts[s] > 1}
+    unique_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
+    unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
 
     written: dict[int, float] = {}
     top_uids: set[int] = set()
-    for rank, (uid, _) in enumerate(positive):
+    for rank, (uid, _) in enumerate(unique_positive):
         rank_score = _RANK_TO_SCORE[rank] if rank < len(_RANK_TO_SCORE) else 0.0
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
@@ -185,6 +201,17 @@ def finalize_round_scores(
             uid=uid, hotkey=hotkey, score=rank_score, round_id=round_obj.round_id,
         )
         written[uid] = rank_score
+        top_uids.add(uid)
+
+    # Tied positive-delta miners — explicit 0 entry per uid.
+    for uid in tied_uids:
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            continue
+        score_aggregator.add_score(
+            uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+        )
+        written[uid] = 0.0
         top_uids.add(uid)
 
     # Remaining scored UIDs (delta == 0 or beyond top-3): score 0.
@@ -231,8 +258,12 @@ def finalize_round_scores(
     logger.info(
         "finalize_round_scores: round scored by rank",
         round_id=round_obj.round_id,
-        top3={int(u): _RANK_TO_SCORE[r] for r, (u, _) in enumerate(positive[:3])},
+        top3={
+            int(u): _RANK_TO_SCORE[r]
+            for r, (u, _) in enumerate(unique_positive[:3])
+        },
         scored_count=len(scored),
+        tied_count=len(tied_uids),
         validation_failed_count=len(validation_failed),
         freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )

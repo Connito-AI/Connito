@@ -645,6 +645,50 @@ class TestFinalizeRoundScores:
         assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [0.0]
 
+    def test_tied_scores_get_zero_and_skip_rank_slot(self) -> None:
+        # A tied val_loss between two miners is evidence of a duplicated
+        # submission, not legitimate parallel improvement. Both tied
+        # miners receive score 0; the next non-tied miner becomes rank 1.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        # Two miners tied at the highest score, then three distinct
+        # values below.
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)  # tied → 0
+        rnd.mark_scored(rnd.roster[1].uid, score=0.50)  # tied → 0
+        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # rank 1 → 3.0
+        rnd.mark_scored(rnd.roster[3].uid, score=0.30)  # rank 2 → 2.0
+        rnd.mark_scored(rnd.roster[4].uid, score=0.20)  # rank 3 → 1.0
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [3.0]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.0]
+        assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [1.0]
+
+    def test_three_way_tie_all_get_zero(self) -> None:
+        # All three would have placed top-3 by score; instead all three
+        # get 0 because they share the same val_loss.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.40)  # tied
+        rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # tied
+        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # tied
+        rnd.mark_scored(rnd.roster[3].uid, score=0.20)  # rank 1 → 3.0
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        for tied_idx in (0, 1, 2):
+            assert self._scores_for_uid(
+                agg, rnd.roster[tied_idx].uid, rnd.round_id,
+            ) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [3.0]
+
     def test_zero_delta_excluded_from_top_three(self) -> None:
         # If only one miner has delta > 0, only that miner gets 3.0.
         # The other "scored but delta==0" miners receive 0.0 — they did not
