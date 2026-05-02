@@ -22,10 +22,33 @@ def _utc_now() -> datetime:
 
 @dataclass
 class MinerSeries:
-    """Holds a single miner's (timestamp, score, round_id) points, kept sorted by time."""
+    """Holds a single miner's (timestamp, score, round_id) points, kept sorted by time.
+
+    Two caps:
+    - ``max_points``: rolling window for ``avg`` / ``sum`` / ``ema``. This
+      is the metric that drives weight submission, so changing it changes
+      *what* the validator rewards.
+    - ``max_history_points``: on-disk retention. Defaults to ``max_points``
+      when omitted. Set higher than ``max_points`` to keep extra
+      historical points for diagnostics without changing scoring.
+    """
 
     points: list[tuple[datetime, float, int | None]] = field(default_factory=list)
     max_points: int = 8  # default mirrors config.evaluation.score_window
+    # On-disk retention. ``None`` falls back to ``max_points`` so behavior
+    # is unchanged unless the caller opts in to a larger history.
+    max_history_points: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_history_points is not None and self.max_history_points < self.max_points:
+            raise ValueError(
+                f"max_history_points ({self.max_history_points}) must be >= "
+                f"max_points ({self.max_points}); the rolling window cannot exceed retention."
+            )
+
+    @property
+    def _retention_cap(self) -> int:
+        return self.max_history_points if self.max_history_points is not None else self.max_points
 
     def add(self, ts: datetime, score: float, round_id: int | None = None) -> None:
         if ts.tzinfo is None:
@@ -36,9 +59,13 @@ class MinerSeries:
         else:
             self.points.insert(i, (ts, score, round_id))
 
-        # Keep only the last max_points phases per miner to compute rolling average
-        if len(self.points) > self.max_points:
-            self.points = self.points[-self.max_points:]
+        # Trim to on-disk retention. The rolling-avg cap (max_points) is
+        # applied later inside _window/ema, not here, so increasing
+        # max_history_points beyond max_points keeps extra points around
+        # without changing the metric `submit_weights` consumes.
+        cap = self._retention_cap
+        if len(self.points) > cap:
+            self.points = self.points[-cap:]
 
     def slice(self, start: datetime | None, end: datetime | None) -> list[tuple[datetime, float, int | None]]:
         if start and start.tzinfo is None:
@@ -106,10 +133,13 @@ class MinerScoreAggregator:
     REQUIREMENT: if a uid's hotkey changes, that uid's score history resets.
     """
 
-    def __init__(self, max_points: int = 8):
+    def __init__(self, max_points: int = 8, max_history_points: int | None = None):
         self._miners: dict[int, MinerState] = {}  # uid -> MinerState
         self._lock = threading.RLock()
         self._max_points = max_points
+        # On-disk retention. None -> match max_points (no behavior change).
+        # Validated by MinerSeries.__post_init__ when each series is built.
+        self._max_history_points = max_history_points
 
     # ---------- Recording ----------
     def add_score(
@@ -138,7 +168,14 @@ class MinerScoreAggregator:
         with self._lock:
             state = self._miners.get(uid)
             if state is None:
-                state = MinerState(uid=uid, hotkey=hotkey, series=MinerSeries(max_points=self._max_points))
+                state = MinerState(
+                    uid=uid,
+                    hotkey=hotkey,
+                    series=MinerSeries(
+                        max_points=self._max_points,
+                        max_history_points=self._max_history_points,
+                    ),
+                )
                 self._miners[uid] = state
             elif state.hotkey != hotkey:
                 # Hotkey changed -> reset scores for this uid
@@ -174,7 +211,14 @@ class MinerScoreAggregator:
             state = self._miners.get(uid)
             if state is None:
                 # create empty series for new uid
-                self._miners[uid] = MinerState(uid=uid, hotkey=new_hotkey, series=MinerSeries(max_points=self._max_points))
+                self._miners[uid] = MinerState(
+                    uid=uid,
+                    hotkey=new_hotkey,
+                    series=MinerSeries(
+                        max_points=self._max_points,
+                        max_history_points=self._max_history_points,
+                    ),
+                )
             else:
                 if state.hotkey != new_hotkey:
                     state.hotkey = new_hotkey
@@ -342,7 +386,12 @@ class MinerScoreAggregator:
         return json.dumps({"schema_version": SCHEMA_VERSION, "miners": miners_payload})
 
     @classmethod
-    def from_json(cls, data: str, max_points: int = 8) -> MinerScoreAggregator:
+    def from_json(
+        cls,
+        data: str,
+        max_points: int = 8,
+        max_history_points: int | None = None,
+    ) -> MinerScoreAggregator:
         raw = json.loads(data)
         # v2 has a top-level envelope; v1 was a bare {uid: {...}} mapping.
         if isinstance(raw, dict) and "miners" in raw and "schema_version" in raw:
@@ -350,13 +399,20 @@ class MinerScoreAggregator:
         else:
             miners = raw  # legacy v1
 
-        agg = cls(max_points=max_points)
+        agg = cls(max_points=max_points, max_history_points=max_history_points)
         with agg._lock:
             for uid_str, body in miners.items():
                 uid = int(uid_str)
                 hotkey = body.get("hotkey", "")
                 pts = body.get("points", [])
-                state = MinerState(uid=uid, hotkey=hotkey, series=MinerSeries(max_points=max_points))
+                state = MinerState(
+                    uid=uid,
+                    hotkey=hotkey,
+                    series=MinerSeries(
+                        max_points=max_points,
+                        max_history_points=max_history_points,
+                    ),
+                )
                 for entry in pts:
                     # v2 entries are [ts, score, round_id]; v1 are [ts, score].
                     if len(entry) == 3:

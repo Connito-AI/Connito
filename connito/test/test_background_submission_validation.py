@@ -69,7 +69,7 @@ _install_stub_if_unavailable(
     },
 )
 
-from connito.validator.aggregator import MinerScoreAggregator  # noqa: E402
+from connito.validator.aggregator import MinerScoreAggregator, MinerSeries  # noqa: E402
 from connito.validator.round import Round, RosterEntry, RoundRef  # noqa: E402
 
 
@@ -510,6 +510,81 @@ class TestAggregatorSchema:
         # No leftover .tmp files in the directory.
         leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
         assert leftovers == []
+
+    def test_history_window_decoupled_from_avg_window(self) -> None:
+        # max_history_points=20 keeps 20 points on disk; max_points=8 means
+        # avg/sum/ema only consider the last 8. Scoring is unchanged from
+        # the default (8/8) configuration.
+        agg = MinerScoreAggregator(max_points=8, max_history_points=20)
+        ts0 = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+        for i in range(15):
+            agg.add_score(
+                uid=1, hotkey="hk1", score=float(i),
+                ts=ts0.replace(minute=i), round_id=100 + i,
+            )
+
+        pts = agg._miners[1].series.points
+        # Retention: all 15 points kept (15 < 20).
+        assert len(pts) == 15
+        assert [p[1] for p in pts] == [float(i) for i in range(15)]
+
+        # avg/sum/ema still operate over the last 8 points only.
+        last_8 = list(range(7, 15))
+        assert agg.avg_over(1) == pytest.approx(sum(last_8) / 8)
+        assert agg.sum_over(1) == pytest.approx(float(sum(last_8)))
+
+    def test_history_window_trims_at_retention_cap(self) -> None:
+        # Push past the retention cap and confirm trimming kicks in.
+        agg = MinerScoreAggregator(max_points=8, max_history_points=10)
+        ts0 = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+        for i in range(25):
+            agg.add_score(
+                uid=1, hotkey="hk1", score=float(i),
+                ts=ts0.replace(minute=i), round_id=100 + i,
+            )
+        pts = agg._miners[1].series.points
+        assert len(pts) == 10  # capped at retention
+        assert [p[1] for p in pts] == [float(i) for i in range(15, 25)]
+
+        # avg still uses the last 8 of the retained 10.
+        assert agg.avg_over(1) == pytest.approx(sum(range(17, 25)) / 8)
+
+    def test_history_window_default_matches_max_points(self) -> None:
+        # No max_history_points -> existing behavior: trim to max_points.
+        agg = MinerScoreAggregator(max_points=4)
+        ts0 = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+        for i in range(10):
+            agg.add_score(
+                uid=1, hotkey="hk1", score=float(i),
+                ts=ts0.replace(minute=i),
+            )
+        pts = agg._miners[1].series.points
+        assert len(pts) == 4
+        assert [p[1] for p in pts] == [6.0, 7.0, 8.0, 9.0]
+
+    def test_history_window_persists_extra_points_to_json(self) -> None:
+        # Extra retained points must round-trip through to_json/from_json.
+        agg = MinerScoreAggregator(max_points=4, max_history_points=12)
+        ts0 = datetime(2026, 4, 27, 12, 0, tzinfo=timezone.utc)
+        for i in range(10):
+            agg.add_score(
+                uid=1, hotkey="hk1", score=float(i),
+                ts=ts0.replace(minute=i), round_id=100 + i,
+            )
+        encoded = agg.to_json()
+        restored = MinerScoreAggregator.from_json(
+            encoded, max_points=4, max_history_points=12,
+        )
+        # All 10 points preserved (< 12 cap).
+        assert len(restored._miners[1].series.points) == 10
+        # Avg still over last 4 only.
+        assert restored.avg_over(1) == pytest.approx(sum(range(6, 10)) / 4)
+
+    def test_history_window_smaller_than_max_points_rejected(self) -> None:
+        # Retention must be >= avg window or the avg cannot find enough
+        # points. Constructor should fail fast.
+        with pytest.raises(ValueError, match="max_history_points"):
+            MinerSeries(max_points=8, max_history_points=4)
 
     def test_concurrent_add_and_persist_does_not_corrupt(self, tmp_path: Path) -> None:
         agg = MinerScoreAggregator(max_points=64)
