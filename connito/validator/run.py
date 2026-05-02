@@ -690,11 +690,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
-    # On-disk retention per miner. 0 → match score_window (existing
-    # behavior). Larger values keep extra historical points around for
-    # diagnostics while avg/sum/ema still cap at score_window, so the
-    # weight-submission metric is unchanged.
-    score_history_window: int | None = config.evaluation.score_history_window or None
+    # On-disk retention per miner — kept independent of score_window so
+    # avg/sum/ema (the metric driving weight submission) still cap reads
+    # at score_window. Larger here means more historical points are
+    # retained on disk for diagnostics without changing scoring.
+    # Hard-coded for now; promote to a config field once we settle on a
+    # default that won't change cross-validator behavior.
+    score_history_window: int = 80
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
     if pkg_version == "v0.1.31":
         # One-time wipe: drop any prior aggregator state on disk so the v0.1.31
