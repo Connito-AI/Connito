@@ -1538,7 +1538,19 @@ if __name__ == "__main__":
 
     pkg_version, git_sha = _get_build_version()
     print(f"Connito validator — version={pkg_version}  git_sha={git_sha[:12]}", flush=True)
-    logger.info("Validator starting", version=pkg_version, git_sha=git_sha[:12])
+    # PID 1's process name. Inside a container with `init: true` this is
+    # `docker-init` (tini); without it, CPython itself runs as PID 1 and
+    # this logs `python` — handy for confirming the docker-compose
+    # `init: true` change actually took effect after a recreate.
+    try:
+        with open("/proc/1/comm") as _pid1:
+            pid1_comm = _pid1.read().strip()
+    except OSError:
+        pid1_comm = "unknown"
+    logger.info(
+        "Validator starting",
+        version=pkg_version, git_sha=git_sha[:12], pid1=pid1_comm,
+    )
 
     if getattr(args, "test", False):
         from connito.shared.cycle import set_test_mode
