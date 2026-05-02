@@ -690,6 +690,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
+    # On-disk retention per miner. 0 → match score_window (existing
+    # behavior). Larger values keep extra historical points around for
+    # diagnostics while avg/sum/ema still cap at score_window, so the
+    # weight-submission metric is unchanged.
+    score_history_window: int | None = config.evaluation.score_history_window or None
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
     if pkg_version == "v0.1.31":
         # One-time wipe: drop any prior aggregator state on disk so the v0.1.31
@@ -698,11 +703,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         # load whatever this version has persisted.
         logger.info("Clearing historic score_aggregator for v0.1.31", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
-        score_aggregator = MinerScoreAggregator(max_points=score_window)
+        score_aggregator = MinerScoreAggregator(
+            max_points=score_window,
+            max_history_points=score_history_window,
+        )
     elif score_path.exists():
         try:
             with open(score_path, "r") as f:
-                score_aggregator = MinerScoreAggregator.from_json(f.read(), max_points=score_window)
+                score_aggregator = MinerScoreAggregator.from_json(
+                    f.read(),
+                    max_points=score_window,
+                    max_history_points=score_history_window,
+                )
             _loaded_latest = score_aggregator.uid_score_pairs(how="latest")
             _loaded_avg = score_aggregator.uid_score_pairs(how="avg")
             logger.info(
@@ -713,9 +725,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             )
         except Exception as e:
             logger.warning(f"Failed to load score_aggregator.json, starting fresh: {e}")
-            score_aggregator = MinerScoreAggregator(max_points=score_window)
+            score_aggregator = MinerScoreAggregator(
+                max_points=score_window,
+                max_history_points=score_history_window,
+            )
     else:
-        score_aggregator = MinerScoreAggregator(max_points=score_window)
+        score_aggregator = MinerScoreAggregator(
+            max_points=score_window,
+            max_history_points=score_history_window,
+        )
 
     # === restart replay: submit weights from loaded historic scores ===
     # Recovers the on-chain weights immediately after a restart instead of

@@ -804,7 +804,14 @@ class EvalCfg(BaseConfig):
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
-    score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
+    score_window: int = 8            # rolling window used by avg/sum/ema (the metric that drives weight submission)
+    # On-disk history retention per miner in score_aggregator.json. The
+    # rolling-avg / sum / ema metrics still cap reads at `score_window`
+    # so scoring and weight submission are unchanged regardless of this
+    # value. Set higher than `score_window` to keep more historical
+    # points around for diagnostics, dashboards, and post-hoc analysis.
+    # 0 = match `score_window` (default; existing behavior).
+    score_history_window: int = 0
     foreground_top_n: PositiveInt = 5
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
