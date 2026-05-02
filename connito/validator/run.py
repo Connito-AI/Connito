@@ -918,7 +918,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # the round's weights on chain. If the round's submit fails, next
             # cycle's stale-weights check catches it (no race that cycle).
             max_weight_age = int(config.cycle.cycle_length)
-            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid)
+            # `lite=False` so `metagraph.weights` is populated for
+            # `Round.freeze`'s chain-weight prepend (segment (a)). The
+            # heavier payload is fetched once per cycle and reused for
+            # the fallback-weights check below as well as `Round.freeze`.
+            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
             current_block = lite_subtensor.get_current_block()
