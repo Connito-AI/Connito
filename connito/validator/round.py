@@ -8,6 +8,7 @@ background workers (download + eval) all anchor on the same `Round`.
 
 from __future__ import annotations
 
+import random
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -190,51 +191,131 @@ class Round:
 
         foreground_uids = tuple(foreground)
 
-        # Order *background* in two segments:
-        #   (a) top-N background miners by their prior-round avg score
+        # Order *background* in three segments. Earlier segments take
+        # priority and are de-duplicated against later ones via `placed`,
+        # which starts as the foreground set so foreground UIDs cannot
+        # leak into any background segment:
+        #   (a) UIDs receiving non-zero weight from a qualified validator
+        #       (i.e. one whose hotkey is a key in
+        #       `assignment_result.assignment`). Ranked by stake-weighted
+        #       total weight across qualified validators, descending.
+        #       Lets chain consensus pull a previously unseen miner ahead
+        #       of this validator's own EMA leaders.
+        #   (b) top-N background miners by their prior-round avg score
         #       (`prior_avg_scores`, the same metric that determines the
-        #       weight submission). Re-evaluating the current leaders
-        #       first protects the top of the leaderboard against a stale
-        #       EMA — without this, a strong miner that hasn't been
-        #       picked recently could keep its lead even after submitting
-        #       a worse checkpoint, because staleness alone defers their
-        #       re-eval. We cap the prepended segment at
-        #       `BG_TOP_SCORED_PREPEND_COUNT` so it cannot crowd out the
-        #       staleness rotation.
-        #   (b) everyone else, sorted by staleness — longest-since-last-
+        #       weight submission), excluding anyone already in (a).
+        #       Re-evaluating the current local leaders first protects
+        #       the top of the leaderboard against a stale EMA — without
+        #       this, a strong miner that hasn't been picked recently
+        #       could keep its lead even after submitting a worse
+        #       checkpoint. Capped at `BG_TOP_SCORED_PREPEND_COUNT` so
+        #       it cannot crowd out the staleness rotation.
+        #   (c) everyone else, sorted by staleness — longest-since-last-
         #       evaluated first, never-evaluated UIDs treated as
-        #       infinitely stale. This rotates the long tail through
-        #       bg-eval instead of always favoring the same incentive-
-        #       ranked head. Each validator has different `last_evaluated`
-        #       so the tail spreads naturally across the subnet.
+        #       infinitely stale. Rotates the long tail through bg-eval
+        #       instead of always favoring the same incentive-ranked
+        #       head. Each validator has different `last_evaluated` so
+        #       the tail spreads naturally across the subnet.
+        # All three segments break ties randomly (no UID-asc fallback)
+        # so a low-numbered UID has no systematic head start.
         # Foreground stays in incentive order; that's the priority set
         # by design and the per-round eval budget covers it.
         EPOCH = datetime.min.replace(tzinfo=timezone.utc)
         last_eval_map = last_evaluated or {}
         prior_scores = prior_avg_scores or {}
 
-        def _staleness_key(uid: int) -> datetime:
-            return last_eval_map.get(uid, EPOCH)
-
         bg_set = set(background)
-        # Top-N background miners by prior-round avg score. Tiebreak
-        # on uid asc so the order is deterministic across validators.
-        scored_bg = sorted(
+        placed: set[int] = set(foreground)
+
+        # (a) Chain-weight prepend — UIDs other qualified validators are
+        # already rewarding. Requires `metagraph.weights` to be populated;
+        # the caller must fetch the metagraph with `lite=False`.
+        weight_prepend_uids: list[int] = []
+        weights_attr = getattr(metagraph, "weights", None)
+        if weights_attr is not None:
+            try:
+                W = weights_attr if isinstance(weights_attr, torch.Tensor) \
+                    else torch.as_tensor(weights_attr)
+            except Exception:
+                W = None
+            if W is None or W.ndim != 2 or W.shape[0] == 0:
+                logger.debug(
+                    "Round.freeze: metagraph.weights empty or malformed — "
+                    "skipping chain-weight prepend",
+                    shape=getattr(weights_attr, "shape", None),
+                )
+                W = None
+            if W is not None:
+                stake_attr = getattr(metagraph, "S", None)
+                S = None
+                if stake_attr is not None:
+                    try:
+                        S = stake_attr if isinstance(stake_attr, torch.Tensor) \
+                            else torch.as_tensor(stake_attr)
+                    except Exception:
+                        S = None
+
+                consensus: dict[int, float] = {}
+                n_rows, n_cols = int(W.shape[0]), int(W.shape[1])
+                for v_hk in assignment.keys():
+                    v_uid = hotkey_to_uid.get(v_hk)
+                    if v_uid is None or v_uid >= n_rows:
+                        continue
+                    row = W[v_uid]
+                    stake = (
+                        float(S[v_uid].item())
+                        if (S is not None and v_uid < int(S.shape[0]))
+                        else 1.0
+                    )
+                    # Iterate only over non-zero entries (matrix is sparse
+                    # in practice — most validators reward a small subset).
+                    nonzero_idx = torch.nonzero(row, as_tuple=True)[0].tolist()
+                    for m_uid in nonzero_idx:
+                        if m_uid in bg_set and m_uid not in placed:
+                            w = float(row[m_uid].item())
+                            consensus[m_uid] = consensus.get(m_uid, 0.0) + stake * w
+
+                weight_prepend_uids = [
+                    uid for uid, _ in sorted(
+                        consensus.items(),
+                        key=lambda kv: (-kv[1], random.random()),
+                    )
+                ]
+                placed.update(weight_prepend_uids)
+        else:
+            logger.debug(
+                "Round.freeze: metagraph has no `weights` attribute — "
+                "skipping chain-weight prepend (metagraph likely fetched with lite=True)",
+            )
+
+        # (b) Top-N by prior-round avg score, excluding anyone already
+        # placed (foreground or (a)). Random tiebreak.
+        scored_candidates = sorted(
             (
                 (uid, prior_scores.get(uid, 0.0))
                 for uid in bg_set
-                if prior_scores.get(uid, 0.0) > 0.0
+                if prior_scores.get(uid, 0.0) > 0.0 and uid not in placed
             ),
-            key=lambda kv: (-kv[1], kv[0]),
+            key=lambda kv: (-kv[1], random.random()),
         )
-        prepend_uids = [uid for uid, _ in scored_bg[: cls.BG_TOP_SCORED_PREPEND_COUNT]]
-        prepend_set = set(prepend_uids)
+        score_prepend_uids = [
+            uid for uid, _ in scored_candidates[: cls.BG_TOP_SCORED_PREPEND_COUNT]
+        ]
+        placed.update(score_prepend_uids)
 
-        tail = sorted(
-            (uid for uid in background if uid not in prepend_set),
-            key=_staleness_key,
+        # (c) Staleness tail — every remaining UID, oldest evaluation
+        # first. Random tiebreak on equal staleness (e.g. all
+        # never-evaluated UIDs share the EPOCH key).
+        stale_tail = sorted(
+            (uid for uid in background if uid not in placed),
+            key=lambda uid: (last_eval_map.get(uid, EPOCH), random.random()),
         )
-        background_uids = tuple([*prepend_uids, *tail])
+
+        background_uids = tuple([
+            *weight_prepend_uids,
+            *score_prepend_uids,
+            *stale_tail,
+        ])
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
         # move to CPU so subsequent in-place mutations of global_model
@@ -249,6 +330,9 @@ class Round:
             roster_size=len(uid_to_hotkey),
             foreground_size=len(foreground_uids),
             background_size=len(background_uids),
+            bg_chain_weight_prepend=len(weight_prepend_uids),
+            bg_score_prepend=len(score_prepend_uids),
+            bg_staleness_tail=len(stale_tail),
             foreground_uids=list(foreground_uids),
         )
 
