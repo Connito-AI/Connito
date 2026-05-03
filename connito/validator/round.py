@@ -184,9 +184,12 @@ class Round:
                 continue
             freeze_zero_uids.add(uid)
             freeze_zero_hotkeys[uid] = hk
+        if freeze_zero_uids:
             logger.info(
-                "Round.freeze: invalid chain checkpoint — will record score=0 at finalize",
-                uid=uid, hotkey=hk[:6], round_id=rid,
+                "Round.freeze: invalid chain checkpoints — will record score=0 at finalize",
+                round_id=rid,
+                count=len(freeze_zero_uids),
+                uids=sorted(freeze_zero_uids),
             )
 
         foreground_uids = tuple(foreground)
@@ -330,10 +333,30 @@ class Round:
             roster_size=len(uid_to_hotkey),
             foreground_size=len(foreground_uids),
             background_size=len(background_uids),
-            bg_chain_weight_prepend=len(weight_prepend_uids),
-            bg_score_prepend=len(score_prepend_uids),
-            bg_staleness_tail=len(stale_tail),
-            foreground_uids=list(foreground_uids),
+        )
+        logger.info(
+            "Round.freeze: foreground",
+            round_id=rid,
+            count=len(foreground_uids),
+            uids=list(foreground_uids),
+        )
+        logger.info(
+            "Round.freeze: bg chain-weight prepend",
+            round_id=rid,
+            count=len(weight_prepend_uids),
+            uids=list(weight_prepend_uids),
+        )
+        logger.info(
+            "Round.freeze: bg score prepend",
+            round_id=rid,
+            count=len(score_prepend_uids),
+            uids=list(score_prepend_uids),
+        )
+        logger.info(
+            "Round.freeze: bg staleness tail",
+            round_id=rid,
+            count=len(stale_tail),
+            uids=list(stale_tail),
         )
 
         return cls(
