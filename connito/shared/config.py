@@ -812,9 +812,11 @@ class EvalCfg(BaseConfig):
     # Round-group construction scheme. When true, Round.freeze() partitions
     # the roster into validation Groups A (3) / B (10) / C (17) with
     # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1
-    # (97%) / Group 2 (3%). Default off during rollout. Spec:
-    # _specs/round-group-construction-scheme.md.
-    enable_round_group_construction: bool = False
+    # (97%) / Group 2 (3%). Default ON; set False to opt back into the
+    # legacy foreground/background construction (kept as a rollback path
+    # until the new scheme is validated on mainnet for several cohorts).
+    # Spec: _specs/round-group-construction-scheme.md.
+    enable_round_group_construction: bool = True
     cohort_state_filename: str = "cohort_state.json"
     cohort_window_cycles: int = 8                # 8-cycle hold per spec
     weight_group_1_size: int = 3
