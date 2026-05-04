@@ -826,7 +826,8 @@ class EvalCfg(BaseConfig):
     validation_group_a_size: int = 3
     validation_group_ab_total: int = 13          # |A| + |B| invariant
     validation_group_c_size: int = 17
-    group_a_min_consensus: int = 3               # ≥ 3 qualified validators
+    group_a_min_consensus: int = 1               # ≥ 1 qualified validator
+    group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
 
 
 class ValidatorConfig(WorkerConfig):

@@ -47,7 +47,8 @@ def _config(*, flag: bool, my_hotkey: str = "vme") -> SimpleNamespace:
             validation_group_a_size=3,
             validation_group_ab_total=13,
             validation_group_c_size=17,
-            group_a_min_consensus=3,
+            group_a_min_consensus=1,
+            group_a_min_weight_per_validator=0.03,
             cohort_state_filename="cohort_state.json",
         ),
     )

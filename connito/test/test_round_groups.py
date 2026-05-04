@@ -47,7 +47,8 @@ def _cfg(**overrides) -> SimpleNamespace:
         validation_group_a_size=3,
         validation_group_ab_total=13,
         validation_group_c_size=17,
-        group_a_min_consensus=3,
+        group_a_min_consensus=1,
+        group_a_min_weight_per_validator=0.03,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -90,9 +91,6 @@ def test_cohort_epoch_for_truncates_to_window():
 
 def test_read_chain_set_top_k_tallies_validator_count_and_total_weight():
     # 3 validators (uids 0,1,2), 5 miners (uids 0..4).
-    # Validator 0 puts weight on miners {2:0.5, 3:0.3}
-    # Validator 1 puts weight on miners {2:0.4, 4:0.2}
-    # Validator 2 puts weight on miners {3:0.6, 4:0.1}
     weights = [
         [0.0, 0.0, 0.5, 0.3, 0.0],
         [0.0, 0.0, 0.4, 0.0, 0.2],
@@ -102,9 +100,10 @@ def test_read_chain_set_top_k_tallies_validator_count_and_total_weight():
     tally = read_chain_set_top_k(
         metagraph, k=2, qualified_validator_uids=[0, 1, 2]
     )
-    assert tally[2] == (2, pytest.approx(0.9))    # v0 + v1
-    assert tally[3] == (2, pytest.approx(0.9))    # v0 + v2
-    assert tally[4] == (2, pytest.approx(0.3))    # v1 + v2
+    # Tally is (count, total_weight, max_weight_from_one_validator)
+    assert tally[2][0] == 2 and tally[2][1] == pytest.approx(0.9) and tally[2][2] == pytest.approx(0.5)
+    assert tally[3][0] == 2 and tally[3][1] == pytest.approx(0.9) and tally[3][2] == pytest.approx(0.6)
+    assert tally[4][0] == 2 and tally[4][1] == pytest.approx(0.3) and tally[4][2] == pytest.approx(0.2)
 
 
 def test_read_chain_set_top_k_respects_top_k_per_validator():
@@ -139,36 +138,65 @@ def test_read_chain_set_top_k_empty_when_metagraph_lacks_weights():
 # ---------------------------------------------------------------------------
 
 
-def test_compute_group_a_returns_consensus_uids():
+def test_compute_group_a_returns_uids_passing_both_gates():
+    """min_consensus=1 + min_weight_per_validator=0.03; rank by total weight."""
     chain_top1 = {
-        10: (3, 1.5),
-        11: (4, 2.0),
-        12: (2, 1.0),    # below min_consensus
-        13: (3, 1.2),
+        10: (3, 1.5, 0.6),
+        11: (4, 2.0, 0.7),
+        12: (2, 0.04, 0.02),    # max_w 0.02 below 3% floor → excluded
+        13: (3, 1.2, 0.5),
     }
-    g_a = compute_group_a(chain_top1, min_consensus=3, max_size=3)
+    g_a = compute_group_a(
+        chain_top1, min_consensus=1, min_weight_per_validator=0.03, max_size=3
+    )
     assert set(g_a) == {11, 10, 13}
-    assert g_a[0] == 11   # highest validator-count first
+    assert g_a[0] == 11   # highest total weight first
 
 
-def test_compute_group_a_under_fills_when_consensus_short():
-    chain_top1 = {10: (3, 1.0), 11: (2, 0.5), 12: (1, 0.1)}
-    g_a = compute_group_a(chain_top1, min_consensus=3, max_size=3)
-    assert g_a == (10,)   # only one passes the bar
+def test_compute_group_a_excludes_miners_below_weight_floor():
+    """Miner with high count but no validator emitting > 3% is excluded."""
+    chain_top1 = {
+        10: (5, 0.10, 0.02),    # 5 validators, all tiny — fails 3% gate
+        11: (1, 0.05, 0.05),    # only 1 validator but emits 5% — passes
+    }
+    g_a = compute_group_a(
+        chain_top1, min_consensus=1, min_weight_per_validator=0.03, max_size=3
+    )
+    assert g_a == (11,)
 
 
-def test_compute_group_a_empty_when_no_consensus():
-    chain_top1 = {10: (1, 0.9), 11: (2, 0.5)}
-    assert compute_group_a(chain_top1, min_consensus=3, max_size=3) == ()
+def test_compute_group_a_min_consensus_can_be_raised():
+    """The count floor is still tunable (legacy 3-validator behavior)."""
+    chain_top1 = {
+        10: (1, 0.9, 0.9),       # only 1 validator — fails count floor of 3
+        11: (3, 1.2, 0.5),       # passes both gates
+    }
+    g_a = compute_group_a(
+        chain_top1, min_consensus=3, min_weight_per_validator=0.03, max_size=3
+    )
+    assert g_a == (11,)
+
+
+def test_compute_group_a_empty_when_no_one_passes_both_gates():
+    chain_top1 = {
+        10: (1, 0.02, 0.02),     # fails weight gate
+        11: (0, 0.0, 0.0),       # empty
+    }
+    g_a = compute_group_a(
+        chain_top1, min_consensus=1, min_weight_per_validator=0.03, max_size=3
+    )
+    assert g_a == ()
 
 
 def test_compute_group_a_tie_break_by_total_weight_then_uid():
     chain_top1 = {
-        10: (3, 1.0),
-        11: (3, 2.0),    # higher total weight wins
-        12: (3, 1.0),    # same count+weight as 10 → uid asc
+        10: (3, 1.0, 0.4),
+        11: (3, 2.0, 0.7),    # higher total weight wins
+        12: (3, 1.0, 0.4),    # same total as 10 → uid asc
     }
-    g_a = compute_group_a(chain_top1, min_consensus=3, max_size=3)
+    g_a = compute_group_a(
+        chain_top1, min_consensus=3, min_weight_per_validator=0.03, max_size=3
+    )
     assert g_a == (11, 10, 12)
 
 
@@ -178,7 +206,7 @@ def test_compute_group_a_tie_break_by_total_weight_then_uid():
 
 
 def test_compute_group_b_grows_when_group_a_underfills():
-    chain_top2 = {uid: (5, 1.0) for uid in range(20, 40)}
+    chain_top2 = {uid: (5, 1.0, 0.2) for uid in range(20, 40)}
     # A=2 → B should be 11 to keep |A|+|B|=13
     g_b = compute_group_b(chain_top2, group_a=(1, 2), ab_total=13)
     assert len(g_b) == 11
@@ -193,7 +221,7 @@ def test_compute_group_b_grows_when_group_a_underfills():
 
 
 def test_compute_group_b_excludes_group_a_uids():
-    chain_top2 = {uid: (5, 1.0) for uid in range(10)}
+    chain_top2 = {uid: (5, 1.0, 0.2) for uid in range(10)}
     g_b = compute_group_b(chain_top2, group_a=(1, 2, 3), ab_total=13)
     assert 1 not in g_b and 2 not in g_b and 3 not in g_b
 
@@ -205,10 +233,10 @@ def test_compute_group_b_ranks_by_total_weight_then_count_then_uid():
     only when totals are equal.
     """
     chain_top2 = {
-        20: (4, 1.0),
-        21: (5, 0.5),    # higher count, but lowest weight → ranks last
-        22: (4, 2.0),    # highest weight → ranks first
-        23: (4, 1.0),    # same total as 20 → tiebreak uid asc → 20 first
+        20: (4, 1.0, 0.25),
+        21: (5, 0.5, 0.10),   # higher count, but lowest total → ranks last
+        22: (4, 2.0, 0.50),   # highest total → ranks first
+        23: (4, 1.0, 0.25),   # same total as 20 → tiebreak uid asc → 20 first
     }
     g_b = compute_group_b(chain_top2, group_a=(), ab_total=4)
     assert g_b == (22, 20, 23, 21)
