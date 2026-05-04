@@ -45,7 +45,11 @@ from connito.shared.chain import (
     serve_axon,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
-from connito.shared.helper import h256_int, parse_dynamic_filename
+from connito.shared.helper import (
+    MINER_CHECKPOINT_SUFFIXES,
+    h256_int,
+    parse_dynamic_filename,
+)
 from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.validator.evaluator import MinerEvalJob
 
@@ -749,7 +753,8 @@ def get_init_peer_id(config: WorkerConfig) -> str | None:
 
 def load_submission_files(folder: str = "miner_submission"):
     """
-    Scans a folder for .pt files and returns:
+    Scans a folder for miner-checkpoint files (.safetensors or .pt) and
+    returns:
         { filename: {parsed key/values} }
     """
     folder_path = Path(folder)
@@ -757,7 +762,11 @@ def load_submission_files(folder: str = "miner_submission"):
         raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
 
     files_dict = {}
-    for file_name in folder_path.glob("*.pt"):
+    candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in folder_path.glob(f"*{suffix}")
+    ]
+    for file_name in candidates:
         if file_name.name.startswith("._tmp"):
             continue
         meta = parse_dynamic_filename(file_name.name)

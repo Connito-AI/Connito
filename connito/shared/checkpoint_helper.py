@@ -16,7 +16,11 @@ from connito.shared.expert_manager import (
     ExpertManager,
     get_layer_expert_id,
 )
-from connito.shared.helper import get_model_hash
+from connito.shared.helper import (
+    MINER_CHECKPOINT_SUFFIXES,
+    get_model_hash,
+    load_state_dict_from_path,
+)
 
 logger = structlog.getLogger(__name__)
 
@@ -595,10 +599,13 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
 
     full_state_dict = {}
     checkpoint_path = Path(checkpoint_path)
-    if checkpoint_path.is_file() and checkpoint_path.suffix == ".pt":
-        with checkpoint_path.open("rb") as fh:
-            full_state_dict = torch.load(fh, map_location=torch.device("cpu"))["model_state_dict"]
-            logger.debug("loaded checkpoint file", path=fh)
+    if checkpoint_path.is_file() and checkpoint_path.suffix in MINER_CHECKPOINT_SUFFIXES:
+        # Miner submission — could be `.safetensors` (preferred) or `.pt`.
+        # `load_state_dict_from_path` dispatches by suffix and gates `.pt`
+        # with `weights_only=True` so a malicious miner cannot execute code
+        # via a crafted `__reduce__` payload.
+        full_state_dict = load_state_dict_from_path(checkpoint_path)
+        logger.debug("loaded checkpoint file", path=checkpoint_path)
 
     else:
         model_files = get_model_files(checkpoint_path)
