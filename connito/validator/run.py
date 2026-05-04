@@ -13,6 +13,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -116,6 +117,7 @@ from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
+from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter
@@ -924,6 +926,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     round_id=pending_round.round_id,
                 )
                 uid_weights = score_aggregator.uid_score_pairs(how="avg")
+                # Round-group construction scheme: when this round was
+                # frozen with a non-empty weight Group 1, override the
+                # legacy avg-pair emission with the spec's 97% / 3%
+                # split. Group 1 (3 miners) is split equally; Group 2
+                # (≤15 miners) is split in proportion to local score.
+                # ChainSubmitter normalizes to 1.0 before sending.
+                if pending_round.weight_group_1:
+                    from connito.validator import round_groups as _rg
+                    uid_weights = _rg.compute_uid_weights(
+                        weight_group_1=pending_round.weight_group_1,
+                        weight_group_2=pending_round.weight_group_2,
+                        local_scores=uid_weights,
+                        group_1_share=config.evaluation.weight_group_1_share,
+                        group_2_share=config.evaluation.weight_group_2_share,
+                    )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
@@ -1015,6 +1032,33 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             cleanup(global_model)
 
+            # Round-group construction scheme (gated by
+            # config.evaluation.enable_round_group_construction). When the
+            # flag is on, load the held cohort state so Round.freeze can
+            # advance it at the cohort boundary or reuse it within one.
+            # Spec: _specs/round-group-construction-scheme.md.
+            cohort_state_path = None
+            current_cohort_state = None
+            if config.evaluation.enable_round_group_construction:
+                cohort_state_path = (
+                    Path(config.ckpt.checkpoint_path) / config.evaluation.cohort_state_filename
+                )
+                _task = getattr(config, "task", None)
+                _exp = getattr(_task, "exp", None) if _task is not None else None
+                expected_expert_group = str(_exp.group_id) if _exp is not None else ""
+                try:
+                    current_cohort_state = cohort_state_module.load(
+                        cohort_state_path,
+                        expected_expert_group=expected_expert_group,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load cohort_state.json — starting fresh cohort",
+                        error=str(e),
+                        path=str(cohort_state_path),
+                    )
+                    current_cohort_state = None
+
             # (0) Lock and prioritize: build the round roster (stalest miners
             # first within both foreground and background — see Round.freeze),
             # restricted to this validator's assignment, capture the seed, and
@@ -1033,7 +1077,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Re-eval the current leaders first inside background so
                 # a stale EMA can't keep a regressed miner on top.
                 prior_avg_scores=score_aggregator.uid_score_pairs(how="avg"),
+                cycle_index=phase_response.cycle_index,
+                cycle_length=phase_response.cycle_length,
+                cohort_state=current_cohort_state,
+                score_aggregator=score_aggregator,
             )
+
+            # Persist the (possibly newly advanced) cohort state to disk
+            # BEFORE round_ref.swap so a crash between freeze and swap can
+            # replay deterministically (the next process picks up the same
+            # cohort epoch and groups).
+            if config.evaluation.enable_round_group_construction and new_round.cohort_state is not None:
+                try:
+                    cohort_state_module.persist_atomic(
+                        cohort_state_path, new_round.cohort_state
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to persist cohort_state.json",
+                        error=str(e),
+                        path=str(cohort_state_path),
+                    )
             # Belt-and-suspenders: drop any leftover submission file whose
             # block falls outside this round's window. The end-of-cycle
             # prune is normally enough, but a validator restart that

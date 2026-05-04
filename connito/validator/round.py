@@ -22,6 +22,8 @@ from connito.shared.app_logging import structlog
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
+    from connito.validator.aggregator import MinerScoreAggregator
+    from connito.validator.cohort_state import CohortState
 
 logger = structlog.get_logger(__name__)
 
@@ -92,6 +94,22 @@ class Round:
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
 
+    # Round-group construction scheme (gated by
+    # `config.evaluation.enable_round_group_construction`). All default
+    # to `()` / 0 so the legacy code path leaves them empty and downstream
+    # consumers can branch on `bool(weight_group_1)` without a separate
+    # feature-flag check. Wired in PR 3.
+    weight_group_1: tuple[int, ...] = ()
+    weight_group_2: tuple[int, ...] = ()
+    validation_group_a: tuple[int, ...] = ()
+    validation_group_b: tuple[int, ...] = ()
+    validation_group_c: tuple[int, ...] = ()
+    cohort_epoch: int = 0
+    # Transient — the (possibly newly advanced) cohort state for this
+    # round. The caller in run.py reads this off and persists it after
+    # `Round.freeze` returns. `None` when the feature flag is off.
+    cohort_state: "CohortState | None" = field(default=None, repr=False, compare=False)
+
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # ---------------- Construction ----------------
@@ -109,6 +127,10 @@ class Round:
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
         prior_avg_scores: dict[int, float] | None = None,
+        cycle_index: int | None = None,
+        cycle_length: int | None = None,
+        cohort_state: "CohortState | None" = None,
+        score_aggregator: "MinerScoreAggregator | None" = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -359,6 +381,104 @@ class Round:
             uids=list(stale_tail),
         )
 
+        # Round-group construction overlay (spec:
+        # _specs/round-group-construction-scheme.md). When enabled, the
+        # cohort advances at every 8th cycle, and the validation roster
+        # for this round is replaced by Group A + B + C in that order.
+        # The legacy foreground/background just-computed above is the
+        # fallback path used by every test fixture and validator that has
+        # not opted into the new scheme yet.
+        new_cohort_state: "CohortState | None" = None
+        new_weight_group_1: tuple[int, ...] = ()
+        new_weight_group_2: tuple[int, ...] = ()
+        new_validation_a: tuple[int, ...] = ()
+        new_validation_b: tuple[int, ...] = ()
+        new_validation_c: tuple[int, ...] = ()
+        new_cohort_epoch = 0
+        flag_enabled = bool(getattr(
+            getattr(config, "evaluation", None),
+            "enable_round_group_construction",
+            False,
+        ))
+        if flag_enabled:
+            from connito.validator import round_groups
+
+            effective_cycle_length = cycle_length
+            effective_cycle_index = cycle_index
+            if effective_cycle_index is None and effective_cycle_length:
+                effective_cycle_index = rid // int(effective_cycle_length)
+            if effective_cycle_index is None or not effective_cycle_length:
+                logger.warning(
+                    "Round.freeze: round-group flag on but cycle_index/cycle_length missing; "
+                    "falling back to legacy foreground/background construction",
+                    round_id=rid,
+                )
+            else:
+                expert_group = str(getattr(getattr(config, "task", None), "exp", None).group_id) \
+                    if getattr(getattr(config, "task", None), "exp", None) is not None else ""
+                qualified_validator_uids = [
+                    hotkey_to_uid[hk]
+                    for hk in assignment.keys()
+                    if hk in hotkey_to_uid
+                ]
+                eligible_miner_uids = {
+                    hotkey_to_uid[hk]
+                    for hk in assignment_result.miners_with_checkpoint
+                    if hk in hotkey_to_uid
+                }
+                new_cohort_state = round_groups.maybe_advance_cohort(
+                    cycle_index=int(effective_cycle_index),
+                    round_id=rid,
+                    cycle_length=int(effective_cycle_length),
+                    current_state=cohort_state,
+                    score_aggregator=score_aggregator,
+                    metagraph=metagraph,
+                    qualified_validator_uids=qualified_validator_uids,
+                    eligible_miner_uids=eligible_miner_uids,
+                    assignment=assignment,
+                    my_hotkey=config.chain.hotkey_ss58,
+                    hotkey_to_uid=hotkey_to_uid,
+                    expert_group=expert_group,
+                    cfg=config.evaluation,
+                )
+
+                new_weight_group_1 = new_cohort_state.weight_group_1
+                new_weight_group_2 = new_cohort_state.weight_group_2
+                new_validation_a = new_cohort_state.validation_group_a
+                new_validation_b = new_cohort_state.validation_group_b
+                new_validation_c = new_cohort_state.validation_group_c
+                new_cohort_epoch = new_cohort_state.cohort_epoch
+
+                # Override legacy foreground/background with the cohort
+                # validation roster. Group A first (consensus tier),
+                # then Group B (consolidate), then Group C (assignment).
+                # background_uids is empty because the 30-miner budget
+                # is fully covered by A + B + C.
+                foreground_uids = round_groups.split_validation_uids_into_foreground(
+                    new_cohort_state
+                )
+                background_uids = ()
+
+                # Make sure every UID in the new foreground has a
+                # hotkey entry — Group A and B may include UIDs that
+                # are not in this validator's assignment slice and
+                # therefore may not have been added by the loop above.
+                for uid in foreground_uids:
+                    if uid in uid_to_hotkey:
+                        continue
+                    if 0 <= uid < len(metagraph.hotkeys):
+                        uid_to_hotkey[uid] = metagraph.hotkeys[uid]
+
+                logger.info(
+                    "Round.freeze: round-group overlay applied",
+                    round_id=rid,
+                    cohort_epoch=new_cohort_epoch,
+                    cycle_index=int(effective_cycle_index),
+                    foreground_size=len(foreground_uids),
+                    weight_group_1=list(new_weight_group_1),
+                    weight_group_2_size=len(new_weight_group_2),
+                )
+
         return cls(
             round_id=rid,
             seed=seed,
@@ -371,6 +491,13 @@ class Round:
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
             freeze_zero_uids=freeze_zero_uids,
             freeze_zero_hotkeys=freeze_zero_hotkeys,
+            weight_group_1=new_weight_group_1,
+            weight_group_2=new_weight_group_2,
+            validation_group_a=new_validation_a,
+            validation_group_b=new_validation_b,
+            validation_group_c=new_validation_c,
+            cohort_epoch=new_cohort_epoch,
+            cohort_state=new_cohort_state,
         )
 
     # ---------------- Claim / score helpers ----------------
