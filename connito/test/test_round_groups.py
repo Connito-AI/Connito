@@ -22,10 +22,12 @@ from connito.validator.round_groups import (
     compute_group_a,
     compute_group_b,
     compute_group_c,
+    compute_stake_weighted_total,
     compute_uid_weights,
     is_cohort_boundary,
     maybe_advance_cohort,
     read_chain_set_top_k,
+    split_validation_uids,
 )
 
 
@@ -589,3 +591,130 @@ def test_compute_uid_weights_handles_empty_groups():
         weight_group_2=(),
         local_scores={},
     ) == {}
+
+
+# ---------------------------------------------------------------------------
+# split_validation_uids — foreground/background priority partition
+# ---------------------------------------------------------------------------
+
+
+def _state_with_groups(group_a, group_b, group_c) -> CohortState:
+    return CohortState(
+        cohort_epoch=0,
+        expert_group="g1",
+        validation_group_a=tuple(group_a),
+        validation_group_b=tuple(group_b),
+        validation_group_c=tuple(group_c),
+    )
+
+
+def test_split_validation_uids_foreground_is_ab_intersect_assignment():
+    """Foreground = (A ∪ B) ∩ my_assignment; Group C never enters foreground."""
+    state = _state_with_groups(
+        group_a=(1, 2, 3),
+        group_b=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
+        group_c=(20, 21, 22, 23, 24),
+    )
+    # validator vme assigned uids {2, 5, 7, 21}: 2 in A, 5/7 in B, 21 in C.
+    metagraph = SimpleNamespace(
+        weights=torch.zeros((1, 30)),
+        S=torch.ones(1),
+    )
+    fg, bg = split_validation_uids(
+        state,
+        metagraph=metagraph,
+        qualified_validator_uids=[],
+        my_assignment_uids={2, 5, 7, 21},
+    )
+    assert set(fg) == {2, 5, 7}        # 21 is in C, not in foreground
+    assert 21 in set(bg)               # 21 lands in background
+    # |fg| + |bg| = full roster (no UID is dropped).
+    assert len(fg) + len(bg) == len(state.validation_group_a) + len(
+        state.validation_group_b
+    ) + len(state.validation_group_c)
+
+
+def test_split_validation_uids_foreground_sorted_by_stake_weight_desc():
+    """Higher stake-weighted total weight ranks first in foreground."""
+    state = _state_with_groups(
+        group_a=(1, 2, 3), group_b=(4,), group_c=()
+    )
+    # 2 validators with stakes 5.0 and 10.0; both vote on miners 1, 2.
+    weights = [
+        [0.0, 0.5, 0.2, 0.0, 0.0],  # validator 0
+        [0.0, 0.1, 0.9, 0.0, 0.0],  # validator 1
+    ]
+    metagraph = SimpleNamespace(
+        weights=torch.tensor(weights),
+        S=torch.tensor([5.0, 10.0]),
+    )
+    # Stake-weighted: m1 = 5*0.5 + 10*0.1 = 3.5; m2 = 5*0.2 + 10*0.9 = 10.0
+    # → m2 ranks before m1.
+    fg, _bg = split_validation_uids(
+        state,
+        metagraph=metagraph,
+        qualified_validator_uids=[0, 1],
+        my_assignment_uids={1, 2},
+    )
+    assert fg == (2, 1)
+
+
+def test_split_validation_uids_empty_foreground_when_no_overlap():
+    """If none of A∪B is in this validator's assignment, foreground is empty
+    and background is the full roster.
+    """
+    state = _state_with_groups(
+        group_a=(1, 2, 3), group_b=(4, 5), group_c=(20, 21)
+    )
+    metagraph = SimpleNamespace(weights=torch.zeros((1, 30)), S=torch.ones(1))
+    fg, bg = split_validation_uids(
+        state,
+        metagraph=metagraph,
+        qualified_validator_uids=[],
+        my_assignment_uids={20, 21},   # only Group C
+    )
+    assert fg == ()
+    assert set(bg) == {1, 2, 3, 4, 5, 20, 21}
+
+
+def test_split_validation_uids_background_preserves_a_then_b_then_c_order():
+    state = _state_with_groups(
+        group_a=(10, 11, 12), group_b=(20, 21), group_c=(30, 31)
+    )
+    metagraph = SimpleNamespace(weights=torch.zeros((1, 50)), S=torch.ones(1))
+    fg, bg = split_validation_uids(
+        state,
+        metagraph=metagraph,
+        qualified_validator_uids=[],
+        my_assignment_uids={11},   # only one foreground UID
+    )
+    assert fg == (11,)
+    # Background should be the remaining roster in A→B→C order.
+    assert bg == (10, 12, 20, 21, 30, 31)
+
+
+def test_compute_stake_weighted_total_sums_stake_times_weight():
+    weights = [
+        [0.0, 0.5, 0.2],
+        [0.0, 0.1, 0.9],
+    ]
+    metagraph = SimpleNamespace(
+        weights=torch.tensor(weights),
+        S=torch.tensor([4.0, 2.0]),
+    )
+    out = compute_stake_weighted_total(
+        metagraph,
+        target_uids={1, 2},
+        qualified_validator_uids=[0, 1],
+    )
+    # m1 = 4*0.5 + 2*0.1 = 2.2 ; m2 = 4*0.2 + 2*0.9 = 2.6
+    assert out[1] == pytest.approx(2.2)
+    assert out[2] == pytest.approx(2.6)
+
+
+def test_compute_stake_weighted_total_zero_when_no_weights_attr():
+    metagraph = SimpleNamespace()
+    out = compute_stake_weighted_total(
+        metagraph, target_uids={1, 2, 3}, qualified_validator_uids=[0, 1]
+    )
+    assert out == {1: 0.0, 2: 0.0, 3: 0.0}

@@ -499,14 +499,121 @@ def maybe_advance_cohort(
     return new_state
 
 
+def compute_stake_weighted_total(
+    metagraph,
+    *,
+    target_uids: set[int],
+    qualified_validator_uids: list[int],
+) -> dict[int, float]:
+    """Per-miner sum of `stake[v] * weight[v][m]` across qualified
+    validators, restricted to `target_uids`.
+
+    Used to rank foreground priority within Groups A ∪ B: this validator
+    spends its strict-timeout eval budget on the miners other validators
+    are *most* heavily rewarding (stake-weighted), so its scoring lines
+    up with the chain's consensus signal.
+    """
+    if not target_uids:
+        return {}
+
+    weights_attr = getattr(metagraph, "weights", None)
+    if weights_attr is None:
+        return {uid: 0.0 for uid in target_uids}
+
+    try:
+        W = weights_attr if isinstance(weights_attr, torch.Tensor) \
+            else torch.as_tensor(weights_attr)
+    except Exception:
+        return {uid: 0.0 for uid in target_uids}
+
+    if W.ndim != 2 or W.shape[0] == 0:
+        return {uid: 0.0 for uid in target_uids}
+
+    stake_attr = getattr(metagraph, "S", None)
+    S = None
+    if stake_attr is not None:
+        try:
+            S = stake_attr if isinstance(stake_attr, torch.Tensor) \
+                else torch.as_tensor(stake_attr)
+        except Exception:
+            S = None
+
+    out: dict[int, float] = {uid: 0.0 for uid in target_uids}
+    n_rows = int(W.shape[0])
+    for v_uid in qualified_validator_uids:
+        if v_uid < 0 or v_uid >= n_rows:
+            continue
+        row = W[v_uid]
+        stake = (
+            float(S[v_uid].item())
+            if (S is not None and v_uid < int(S.shape[0]))
+            else 1.0
+        )
+        nonzero_idx = torch.nonzero(row, as_tuple=True)[0].tolist()
+        for m_uid in nonzero_idx:
+            if m_uid in target_uids:
+                out[m_uid] += stake * float(row[m_uid].item())
+    return out
+
+
+def split_validation_uids(
+    state: "CohortState",
+    *,
+    metagraph,
+    qualified_validator_uids: list[int],
+    my_assignment_uids: set[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Partition the cohort's 30-miner validation roster into foreground
+    and background per the priority rule:
+
+    * **Foreground** = `(Group A ∪ Group B) ∩ my_assignment_uids`, sorted
+      by stake-weighted total weight desc (UID asc on ties). The strict
+      eval-budget tier for miners this validator is both (a) responsible
+      for via `validator_miner_assignment` and (b) in the chain-consensus
+      Groups A/B.
+    * **Background** = `(A ∪ B ∪ C) \\ foreground`, preserving
+      A→B→C order. Picks up: A/B miners outside this validator's
+      assignment, plus all of Group C (which by construction lives in
+      this validator's slice but ranks below the consensus tier).
+
+    `Round.freeze()` calls this when the feature flag is on. The total
+    `foreground + background` roster is exactly the 30 miners spread
+    across A/B/C — no UID is dropped, just re-prioritized.
+    """
+    ab_uids = list(state.validation_group_a) + list(state.validation_group_b)
+    ab_in_assignment = [uid for uid in ab_uids if uid in my_assignment_uids]
+
+    stake_weights = compute_stake_weighted_total(
+        metagraph,
+        target_uids=set(ab_in_assignment),
+        qualified_validator_uids=qualified_validator_uids,
+    )
+    ab_in_assignment.sort(key=lambda u: (-stake_weights.get(u, 0.0), u))
+    foreground = tuple(ab_in_assignment)
+
+    fg_set = set(foreground)
+    full_roster = (
+        *state.validation_group_a,
+        *state.validation_group_b,
+        *state.validation_group_c,
+    )
+    seen: set[int] = set()
+    background_list: list[int] = []
+    for uid in full_roster:
+        if uid in fg_set or uid in seen:
+            continue
+        seen.add(uid)
+        background_list.append(uid)
+    background = tuple(background_list)
+
+    return foreground, background
+
+
 def split_validation_uids_into_foreground(
     state: "CohortState",
 ) -> tuple[int, ...]:
-    """Foreground evaluation order: Group A → Group B → Group C.
-
-    `Round.freeze()` overrides `foreground_uids` with this when the
-    feature flag is on; `background_uids` becomes empty since the
-    30-miner budget is fully covered.
+    """Deprecated: kept for any caller that still wants the flat A→B→C
+    ordering. New callers should use `split_validation_uids`.
     """
     return tuple([*state.validation_group_a, *state.validation_group_b, *state.validation_group_c])
 

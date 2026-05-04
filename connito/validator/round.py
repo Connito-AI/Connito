@@ -358,20 +358,30 @@ class Round:
                 new_cohort_epoch = new_cohort_state.cohort_epoch
 
                 # Override legacy foreground/background with the cohort
-                # validation roster. Group A first (consensus tier),
-                # then Group B (consolidate), then Group C (assignment).
-                # background_uids is empty because the 30-miner budget
-                # is fully covered by A + B + C.
-                foreground_uids = round_groups.split_validation_uids_into_foreground(
-                    new_cohort_state
+                # validation roster:
+                #   foreground = (A ∪ B) ∩ my assignment, sorted by
+                #     stake-weighted total weight desc — strict-timeout
+                #     tier for consensus miners we're also assigned to.
+                #   background = (A ∪ B ∪ C) \\ foreground, preserving
+                #     A→B→C order — every other miner in the 30-roster
+                #     (A/B miners outside our assignment, plus all of C).
+                my_assignment_uids = {
+                    hotkey_to_uid[hk]
+                    for hk in assignment.get(config.chain.hotkey_ss58, [])
+                    if hk in hotkey_to_uid
+                }
+                foreground_uids, background_uids = round_groups.split_validation_uids(
+                    new_cohort_state,
+                    metagraph=metagraph,
+                    qualified_validator_uids=qualified_validator_uids,
+                    my_assignment_uids=my_assignment_uids,
                 )
-                background_uids = ()
 
-                # Make sure every UID in the new foreground has a
-                # hotkey entry — Group A and B may include UIDs that
-                # are not in this validator's assignment slice and
-                # therefore may not have been added by the loop above.
-                for uid in foreground_uids:
+                # Make sure every UID in the new roster has a hotkey
+                # entry — Group A and B may include UIDs outside this
+                # validator's assignment slice that the earlier loop
+                # didn't see. Cover both foreground and background.
+                for uid in (*foreground_uids, *background_uids):
                     if uid in uid_to_hotkey:
                         continue
                     if 0 <= uid < len(metagraph.hotkeys):

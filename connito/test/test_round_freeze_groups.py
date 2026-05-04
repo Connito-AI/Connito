@@ -225,9 +225,21 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
     assert set(r.validation_group_a) == {5, 6, 7}
     # |A| + |B| invariant.
     assert len(r.validation_group_a) + len(r.validation_group_b) == 13
-    # Foreground is A then B then C.
-    assert r.foreground_uids[: len(r.validation_group_a)] == r.validation_group_a
-    assert r.background_uids == ()
+    # Foreground = (A ∪ B) ∩ vme's assignment slice (m25..m34, uids 25-34).
+    # Group A {5,6,7} is outside vme's slice; Group B includes chain-set
+    # uids 21..30, of which {25..30} land in vme's assignment.
+    ab_set = set(r.validation_group_a) | set(r.validation_group_b)
+    assignment_uids = set(range(25, 35))
+    expected_fg = ab_set & assignment_uids
+    assert set(r.foreground_uids) == expected_fg
+    # Background = (A ∪ B ∪ C) \ foreground; Group C is entirely in bg.
+    assert set(r.background_uids) == (
+        set(r.validation_group_a) | set(r.validation_group_b) | set(r.validation_group_c)
+    ) - set(r.foreground_uids)
+    # Total roster size = 30.
+    assert len(r.foreground_uids) + len(r.background_uids) == (
+        len(r.validation_group_a) + len(r.validation_group_b) + len(r.validation_group_c)
+    )
     # Cold start → empty weight ballots.
     assert r.weight_group_1 == ()
     assert r.weight_group_2 == ()
