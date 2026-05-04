@@ -198,15 +198,20 @@ def test_compute_group_b_excludes_group_a_uids():
     assert 1 not in g_b and 2 not in g_b and 3 not in g_b
 
 
-def test_compute_group_b_ranks_by_validator_count_then_weight_then_uid():
+def test_compute_group_b_ranks_by_total_weight_then_count_then_uid():
+    """Sort: total_weight desc → validator_count desc → uid asc.
+
+    Total weight is the primary signal; validator count is a tiebreaker
+    only when totals are equal.
+    """
     chain_top2 = {
         20: (4, 1.0),
-        21: (5, 0.5),    # higher count beats higher weight
-        22: (4, 2.0),    # same count as 20 but higher weight
-        23: (4, 1.0),    # same as 20 → tiebreak uid asc → 20 wins
+        21: (5, 0.5),    # higher count, but lowest weight → ranks last
+        22: (4, 2.0),    # highest weight → ranks first
+        23: (4, 1.0),    # same total as 20 → tiebreak uid asc → 20 first
     }
     g_b = compute_group_b(chain_top2, group_a=(), ab_total=4)
-    assert g_b == (21, 22, 20, 23)
+    assert g_b == (22, 20, 23, 21)
 
 
 # ---------------------------------------------------------------------------

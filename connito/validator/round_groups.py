@@ -87,15 +87,13 @@ def read_chain_set_top_k(
     by emitted weight, then tally `(count, total_weight)` per miner uid.
 
     Returns `{miner_uid: (validator_count, total_weight_received)}`. Sort
-    by `(validator_count, total_weight)` descending to get the chain-set
-    Group `k` ranking.
+    by `(total_weight, validator_count)` descending to get the chain-set
+    Group `k` ranking — total weight received is the primary signal,
+    validator count is a secondary tiebreaker.
 
-    Used twice per cohort boundary: `k=1` for chain-set Group 1 (consensus
+    Used twice per cohort boundary: `k=3` for chain-set Group 1 (consensus
     candidates for validation Group A) and `k=15` for chain-set Group 2
-    (candidates for validation Group B). The legacy weight-prepend code at
-    `round.py:233-287` is a near-duplicate of this — it's kept until the
-    feature flag flips so existing tests stay green; PR 5 collapses both
-    to one caller.
+    (candidates for validation Group B).
     """
     weights_attr = getattr(metagraph, "weights", None)
     if weights_attr is None:
@@ -158,14 +156,15 @@ def compute_group_a(
 
     May under-fill — that's the Group A consensus-failure case (spec edge
     case). The freed slots are absorbed by Group B via `compute_group_b`.
-    Tiebreak: higher total weight, then lower UID (deterministic).
+    Sort: total weight desc → validator count desc → lower UID. Total
+    weight is the primary ranking signal once the consensus floor is met.
     """
     eligible = [
         (uid, count, total)
         for uid, (count, total) in chain_set_top1.items()
         if count >= min_consensus
     ]
-    eligible.sort(key=lambda x: (-x[1], -x[2], x[0]))
+    eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
     return tuple(uid for uid, _, _ in eligible[:max_size])
 
 
@@ -176,8 +175,8 @@ def compute_group_b(
     ab_total: int = 13,
     exclude: set[int] | None = None,
 ) -> tuple[int, ...]:
-    """Top miners from chain-set Group 2 by validator-count (NOT
-    stake-weighted), with weight-received as tiebreaker.
+    """Top miners from chain-set Group 2 by total weight received (NOT
+    stake-weighted), with validator-count as tiebreaker.
 
     Size = `ab_total - len(group_a)` so the `|A|+|B|=ab_total` invariant
     holds even when Group A under-fills.
@@ -191,7 +190,7 @@ def compute_group_b(
         for uid, (count, total) in chain_set_top2.items()
         if uid not in blocklist
     ]
-    eligible.sort(key=lambda x: (-x[1], -x[2], x[0]))
+    eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
     return tuple(uid for uid, _, _ in eligible[:target_size])
 
 
