@@ -199,20 +199,32 @@ def compute_group_c(
     assignment: dict[str, list[str]],
     my_hotkey: str,
     hotkey_to_uid: dict[str, int],
-    exclude: set[int],
+    restrict_to: set[int] | None = None,
+    exclude: set[int] | None = None,
     max_size: int = 17,
 ) -> tuple[int, ...]:
     """Per-validator Group C drawn from `validator_miner_assignment`.
 
-    Excludes UIDs already in Groups A and B so a miner cannot occupy two
-    validation slots in the same cohort. Distinct across validators by
-    construction (each validator has a different `my_hotkey` slice).
+    `restrict_to` (when given) keeps only UIDs that appear in that set —
+    the round-group scheme uses `restrict_to = group_a ∪ group_b` so
+    Group C is the slice of this validator's assignment that overlaps
+    with the chain-consensus tier. `exclude` (when given) drops listed
+    UIDs after the restrict step.
+
+    Distinct across validators by construction: each `my_hotkey` has a
+    different `assignment` slice, so `assignment[my_hotkey] ∩ A∪B`
+    differs across validators even when A and B are identical.
     """
     my_slice = assignment.get(my_hotkey, [])
+    excl = exclude or set()
     out: list[int] = []
     for hk in my_slice:
         uid = hotkey_to_uid.get(hk)
-        if uid is None or uid in exclude:
+        if uid is None:
+            continue
+        if uid in excl:
+            continue
+        if restrict_to is not None and uid not in restrict_to:
             continue
         out.append(uid)
         if len(out) >= max_size:
@@ -345,12 +357,19 @@ def build_cohort_groups(
         group_a=group_a,
         ab_total=cfg.validation_group_ab_total,
     )
-    placed = set(group_a) | set(group_b)
+    ab_set = set(group_a) | set(group_b)
+    # Group C is this validator's assignment slice OUTSIDE A∪B — the
+    # exploration tier, distinct across validators. The full validation
+    # roster is therefore A ∪ B ∪ C (up to 30 miners). Foreground/
+    # background priority is layered on top of this in
+    # `split_validation_uids`: foreground = (A∪B) ∩ my_assignment, the
+    # rest (A∪B miners outside my assignment, plus all of Group C) is
+    # background.
     group_c = compute_group_c(
         assignment=assignment,
         my_hotkey=my_hotkey,
         hotkey_to_uid=hotkey_to_uid,
-        exclude=placed,
+        exclude=ab_set,
         max_size=cfg.validation_group_c_size,
     )
 
