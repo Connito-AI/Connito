@@ -233,20 +233,33 @@ class ElectionBallots:
     weight_group_2: tuple[int, ...]
 
 
-def _rank_by_score_then_min_then_uid(
+def _rank_by_mean_then_min_excluding_ties(
     candidates: dict[int, tuple[float, float]],
     take: int,
 ) -> tuple[int, ...]:
-    """Tie-break: mean score desc → min cycle score desc → uid asc.
+    """Sort by mean desc → min cycle score desc, then drop any candidate
+    whose `(mean, min)` matches another candidate's.
 
-    Spec item 20: penalize a single great cycle among bad ones, then
-    fall back to lower UID for full determinism.
+    The lower-UID fallback from an earlier draft was removed: picking by
+    UID would give a systematic advantage that has nothing to do with
+    miner performance. Tied candidates instead miss the ballot, so the
+    ballot may under-fill (return < `take`). Determinism is preserved —
+    every validator with identical inputs excludes the same UIDs.
+
+    Cold-start consequence: if every candidate has `(0.0, 0.0)`, all of
+    them tie and the ballot is empty. This is the desired behavior; the
+    next cohort election will run on real scores.
     """
-    ranked = sorted(
-        candidates.items(),
-        key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]),
-    )
-    return tuple(uid for uid, _ in ranked[:take])
+    score_counts: dict[tuple[float, float], int] = {}
+    for score in candidates.values():
+        score_counts[score] = score_counts.get(score, 0) + 1
+    unique = [
+        (uid, score)
+        for uid, score in candidates.items()
+        if score_counts[score] == 1
+    ]
+    unique.sort(key=lambda kv: (-kv[1][0], -kv[1][1]))
+    return tuple(uid for uid, _ in unique[:take])
 
 
 def compute_election_ballots(
@@ -271,14 +284,14 @@ def compute_election_ballots(
     bc_pool = set(prev_validation_b) | set(prev_validation_c)
 
     ab_scores = {uid: scores_over_window.get(uid, (0.0, 0.0)) for uid in ab_pool}
-    g1 = _rank_by_score_then_min_then_uid(ab_scores, group_1_size)
+    g1 = _rank_by_mean_then_min_excluding_ties(ab_scores, group_1_size)
 
     bc_remaining = {
         uid: scores_over_window.get(uid, (0.0, 0.0))
         for uid in bc_pool
         if uid not in g1
     }
-    g2 = _rank_by_score_then_min_then_uid(bc_remaining, group_2_size)
+    g2 = _rank_by_mean_then_min_excluding_ties(bc_remaining, group_2_size)
 
     return ElectionBallots(weight_group_1=g1, weight_group_2=g2)
 

@@ -306,18 +306,20 @@ def test_flag_on_election_at_boundary_promotes_top_scorers():
 
     aggregator = MinerScoreAggregator(max_points=64, max_history_points=64)
     # Round_id 0..700 step 100 → cycles 0..7 with cycle_length=100.
-    high_scorers = [0, 1, 2]
-    low_scorers = [3, 4, 5, 6, 7]
+    # High scorers get distinct scores so the ballot's exclude-ties rule
+    # doesn't drop them (uid-tiebreak was removed deliberately).
+    high_scores = {0: 1.0, 1: 0.9, 2: 0.8}
+    low_scores = {uid: 0.1 + uid * 0.01 for uid in (3, 4, 5, 6, 7)}
     for cycle in range(8):
         rid = cycle * 100
         ts = datetime(2026, 1, 1, tzinfo=timezone.utc).replace(microsecond=cycle)
-        for uid in high_scorers:
+        for uid, score in high_scores.items():
             aggregator.add_score(
-                uid=uid, hotkey=f"m{uid}", score=1.0, ts=ts, round_id=rid
+                uid=uid, hotkey=f"m{uid}", score=score, ts=ts, round_id=rid
             )
-        for uid in low_scorers:
+        for uid, score in low_scores.items():
             aggregator.add_score(
-                uid=uid, hotkey=f"m{uid}", score=0.1, ts=ts, round_id=rid
+                uid=uid, hotkey=f"m{uid}", score=score, ts=ts, round_id=rid
             )
 
     r = _freeze(

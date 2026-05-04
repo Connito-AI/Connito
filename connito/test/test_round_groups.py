@@ -300,12 +300,14 @@ def test_compute_election_ballots_top2_of_bc_excludes_g1_winners():
     assert ballots.weight_group_2 == (5, 4)   # next-best in (B∪C)\G1 by mean
 
 
-def test_election_tie_break_by_min_then_uid():
-    # Equal mean but different min — higher min wins.
+def test_election_tie_break_uses_min_and_excludes_full_ties():
+    """Mean ties → fall through to min; (mean, min) ties → exclude both
+    rather than picking by UID. Ballot may under-fill.
+    """
     scores = {
         10: (0.5, 0.4),
         11: (0.5, 0.2),
-        12: (0.5, 0.4),   # same mean and min as 10 → lower uid wins
+        12: (0.5, 0.4),   # same (mean, min) as 10 → both excluded
     }
     ballots = compute_election_ballots(
         prev_validation_a=(10, 11, 12),
@@ -315,11 +317,14 @@ def test_election_tie_break_by_min_then_uid():
         group_1_size=2,
         group_2_size=0,
     )
-    assert ballots.weight_group_1 == (10, 12)
+    assert ballots.weight_group_1 == (11,)
 
 
-def test_election_zero_scored_uids_get_deterministic_ordering():
-    """Cold start equivalent: nobody has been scored, ranking falls back to uid."""
+def test_election_all_tied_yields_empty_ballot():
+    """Cold start equivalent: every candidate has the same (mean, min);
+    no winner can be picked without an arbitrary tiebreaker, so the
+    ballot is empty.
+    """
     scores = {1: (0.0, 0.0), 2: (0.0, 0.0), 3: (0.0, 0.0)}
     ballots = compute_election_ballots(
         prev_validation_a=(1, 2, 3),
@@ -329,7 +334,7 @@ def test_election_zero_scored_uids_get_deterministic_ordering():
         group_1_size=2,
         group_2_size=0,
     )
-    assert ballots.weight_group_1 == (1, 2)
+    assert ballots.weight_group_1 == ()
 
 
 # ---------------------------------------------------------------------------
