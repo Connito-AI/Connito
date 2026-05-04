@@ -54,7 +54,8 @@ class CohortState:
     weight_group_2: tuple[int, ...] = ()         # this validator's local ballot
     validation_group_a: tuple[int, ...] = ()     # chain-set top-3 (cross-validator)
     validation_group_b: tuple[int, ...] = ()     # chain-set top-N (cross-validator)
-    validation_group_c: tuple[int, ...] = ()     # per-validator assignment slice
+    validation_group_c: tuple[int, ...] = ()     # per-validator partition of (all \ A∪B)
+    foreground_uids: tuple[int, ...] = ()        # per-validator partition of A∪B
     last_election_round_id: int | None = None
     highest_seen_cycle_index: int = 0
     schema_version: int = SCHEMA_VERSION
@@ -68,6 +69,7 @@ class CohortState:
             "validation_group_a",
             "validation_group_b",
             "validation_group_c",
+            "foreground_uids",
         ):
             payload[key] = list(getattr(self, key))
         return json.dumps(payload)
@@ -90,6 +92,7 @@ class CohortState:
             validation_group_a=tuple(int(u) for u in raw.get("validation_group_a", [])),
             validation_group_b=tuple(int(u) for u in raw.get("validation_group_b", [])),
             validation_group_c=tuple(int(u) for u in raw.get("validation_group_c", [])),
+            foreground_uids=tuple(int(u) for u in raw.get("foreground_uids", [])),
             last_election_round_id=int(last_rid) if last_rid is not None else None,
             highest_seen_cycle_index=int(raw.get("highest_seen_cycle_index", 0)),
             schema_version=version,

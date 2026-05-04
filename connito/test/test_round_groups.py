@@ -19,15 +19,15 @@ from connito.validator.round_groups import (
     build_cohort_groups,
     cohort_epoch_for,
     compute_election_ballots,
+    compute_foreground_partition,
     compute_group_a,
     compute_group_b,
     compute_group_c,
-    compute_stake_weighted_total,
     compute_uid_weights,
     is_cohort_boundary,
     maybe_advance_cohort,
     read_chain_set_top_k,
-    split_validation_uids,
+    split_foreground_background,
 )
 
 
@@ -214,43 +214,116 @@ def test_compute_group_b_ranks_by_validator_count_then_weight_then_uid():
 # ---------------------------------------------------------------------------
 
 
-def test_compute_group_c_returns_my_assignment_slice_minus_excluded():
-    assignment = {
-        "v1": ["m1", "m2", "m3", "m4", "m5"],
-        "v2": ["m6", "m7", "m8"],
-    }
+def test_compute_group_c_excludes_ab_uids():
+    """Group C is partitioned over miners NOT in A∪B (the exploration tier)."""
+    validator_seeds = {"v1": 1, "v2": 2}
+    all_miner_hotkeys = [f"m{i}" for i in range(1, 9)]
     hotkey_to_uid = {f"m{i}": i for i in range(1, 9)}
     g_c = compute_group_c(
-        assignment=assignment,
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids={1, 2},   # uids 1 and 2 are in A∪B
         my_hotkey="v1",
         hotkey_to_uid=hotkey_to_uid,
-        exclude={1, 2},   # uids 1 and 2 are in Group A or B
         max_size=17,
     )
-    assert g_c == (3, 4, 5)
+    assert 1 not in g_c and 2 not in g_c
+    # Whatever validator gets, must be from {3..8}
+    assert set(g_c) <= {3, 4, 5, 6, 7, 8}
 
 
 def test_compute_group_c_distinct_across_validators():
-    assignment = {
-        "v1": ["m1", "m2", "m3"],
-        "v2": ["m4", "m5", "m6"],
-    }
+    validator_seeds = {"v1": 1, "v2": 2}
+    all_miner_hotkeys = [f"m{i}" for i in range(1, 7)]
     hotkey_to_uid = {f"m{i}": i for i in range(1, 7)}
-    c1 = compute_group_c(assignment=assignment, my_hotkey="v1",
-                         hotkey_to_uid=hotkey_to_uid, exclude=set())
-    c2 = compute_group_c(assignment=assignment, my_hotkey="v2",
-                         hotkey_to_uid=hotkey_to_uid, exclude=set())
+    c1 = compute_group_c(
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids=set(),
+        my_hotkey="v1",
+        hotkey_to_uid=hotkey_to_uid,
+    )
+    c2 = compute_group_c(
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids=set(),
+        my_hotkey="v2",
+        hotkey_to_uid=hotkey_to_uid,
+    )
+    # Each miner is assigned to exactly one validator → c1 ∩ c2 == ∅.
     assert set(c1).isdisjoint(set(c2))
+    # Together they cover the full pool.
+    assert set(c1) | set(c2) == {1, 2, 3, 4, 5, 6}
 
 
 def test_compute_group_c_caps_at_max_size():
-    assignment = {"v1": [f"m{i}" for i in range(50)]}
-    hotkey_to_uid = {f"m{i}": i for i in range(50)}
+    """Each validator's slice is capped at `max_size` when enough validators
+    exist to absorb the overflow.
+    """
+    # 4 validators, 100 miners, cap=17 each → at most 4*17=68 miners assigned
+    # and each validator's slice capped at 17.
+    validator_seeds = {f"v{i}": i for i in range(4)}
+    all_miner_hotkeys = [f"m{i}" for i in range(100)]
+    hotkey_to_uid = {f"m{i}": i for i in range(100)}
     g_c = compute_group_c(
-        assignment=assignment, my_hotkey="v1",
-        hotkey_to_uid=hotkey_to_uid, exclude=set(), max_size=17,
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids=set(),
+        my_hotkey="v1",
+        hotkey_to_uid=hotkey_to_uid,
+        max_size=17,
     )
-    assert len(g_c) == 17
+    assert len(g_c) <= 17
+
+
+def test_compute_foreground_partition_is_subset_of_ab():
+    """Foreground only contains UIDs from A∪B."""
+    validator_seeds = {"v1": 1, "v2": 2}
+    all_miner_hotkeys = [f"m{i}" for i in range(1, 11)]
+    hotkey_to_uid = {f"m{i}": i for i in range(1, 11)}
+    fg = compute_foreground_partition(
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids={3, 4, 5},   # Group A∪B
+        my_hotkey="v1",
+        hotkey_to_uid=hotkey_to_uid,
+    )
+    assert set(fg) <= {3, 4, 5}
+
+
+def test_compute_foreground_partition_distinct_across_validators_covers_ab():
+    """Every A∪B miner ends up in exactly one validator's foreground."""
+    validator_seeds = {"v1": 1, "v2": 2, "v3": 3}
+    all_miner_hotkeys = [f"m{i}" for i in range(1, 14)]
+    hotkey_to_uid = {f"m{i}": i for i in range(1, 14)}
+    ab_uids = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}   # 13 miners
+    fg1 = compute_foreground_partition(
+        validator_seeds=validator_seeds, all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids=ab_uids, my_hotkey="v1", hotkey_to_uid=hotkey_to_uid,
+    )
+    fg2 = compute_foreground_partition(
+        validator_seeds=validator_seeds, all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids=ab_uids, my_hotkey="v2", hotkey_to_uid=hotkey_to_uid,
+    )
+    fg3 = compute_foreground_partition(
+        validator_seeds=validator_seeds, all_miner_hotkeys=all_miner_hotkeys,
+        ab_uids=ab_uids, my_hotkey="v3", hotkey_to_uid=hotkey_to_uid,
+    )
+    assert set(fg1).isdisjoint(set(fg2))
+    assert set(fg1).isdisjoint(set(fg3))
+    assert set(fg2).isdisjoint(set(fg3))
+    assert set(fg1) | set(fg2) | set(fg3) == ab_uids
+
+
+def test_compute_foreground_partition_empty_when_no_ab():
+    fg = compute_foreground_partition(
+        validator_seeds={"v1": 1},
+        all_miner_hotkeys=[f"m{i}" for i in range(5)],
+        ab_uids=set(),
+        my_hotkey="v1",
+        hotkey_to_uid={f"m{i}": i for i in range(5)},
+    )
+    assert fg == ()
 
 
 # ---------------------------------------------------------------------------
@@ -345,10 +418,9 @@ def test_election_all_tied_yields_empty_ballot():
 
 
 def test_build_cohort_groups_invariants():
-    # 4 qualified validators, 30 miners, full participation in top-1 and top-15.
+    # 4 qualified validators, 30 miners, full participation in top-3 and top-15.
     n_miners = 30
     weights = []
-    # Each validator votes the same top-3 to weight Group 1, and the next 15 to Group 2.
     base_row = [0.0] * n_miners
     for i in range(3):
         base_row[i] = 0.9 - i * 0.1
@@ -360,14 +432,8 @@ def test_build_cohort_groups_invariants():
         weights=torch.tensor(weights),
         hotkeys=[f"m{i}" for i in range(n_miners)],
     )
-    assignment = {
-        "v0": ["m0", "m1", "m2", "m3"],
-        "v1": ["m4", "m5", "m6"],
-        "v2": ["m7", "m8"],
-        "v3": [
-            f"m{i}" for i in range(20, 30)
-        ],
-    }
+    validator_seeds = {f"v{i}": i for i in range(4)}
+    all_miner_hotkeys = [f"m{i}" for i in range(n_miners)]
     hotkey_to_uid = {f"m{i}": i for i in range(n_miners)}
     cfg = _cfg()
 
@@ -375,7 +441,8 @@ def test_build_cohort_groups_invariants():
         metagraph=metagraph,
         qualified_validator_uids=[0, 1, 2, 3],
         eligible_miner_uids=set(range(n_miners)),
-        assignment=assignment,
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
         my_hotkey="v3",
         hotkey_to_uid=hotkey_to_uid,
         election_ballots=ElectionBallots(weight_group_1=(0, 1, 2), weight_group_2=()),
@@ -385,9 +452,11 @@ def test_build_cohort_groups_invariants():
     assert len(groups.validation.group_a) == 3
     # |A| + |B| invariant.
     assert len(groups.validation.group_a) + len(groups.validation.group_b) == 13
-    # Group C drawn from this validator's slice, excluding A and B.
-    assert set(groups.validation.group_c).isdisjoint(set(groups.validation.group_a))
-    assert set(groups.validation.group_c).isdisjoint(set(groups.validation.group_b))
+    # Group C drawn from non-A∪B pool.
+    ab_set = set(groups.validation.group_a) | set(groups.validation.group_b)
+    assert set(groups.validation.group_c).isdisjoint(ab_set)
+    # Foreground is a subset of A∪B (per-validator partition).
+    assert set(groups.foreground_uids) <= ab_set
 
 
 def test_build_cohort_groups_consensus_failure_grows_b():
@@ -399,11 +468,8 @@ def test_build_cohort_groups_consensus_failure_grows_b():
     weights = []
     for v in range(4):
         row = [0.0] * n_miners
-        # 3 high-weight votes, distinct per validator (no overlap → no consensus)
         for j, m in enumerate(range(v * 3, v * 3 + 3)):
             row[m] = 0.9 - j * 0.01
-        # 10 low-weight shared votes so chain-set Group 2 (top-15) has
-        # candidates that DO have consensus and can fill Group B.
         for m in range(16, 26):
             row[m] = 0.05
         weights.append(row)
@@ -411,15 +477,16 @@ def test_build_cohort_groups_consensus_failure_grows_b():
         weights=torch.tensor(weights),
         hotkeys=[f"m{i}" for i in range(n_miners)],
     )
-    assignment = {f"v{i}": [] for i in range(4)}
-    assignment["v3"] = [f"m{i}" for i in range(20, 30)]
+    validator_seeds = {f"v{i}": i for i in range(4)}
+    all_miner_hotkeys = [f"m{i}" for i in range(n_miners)]
     cfg = _cfg(group_a_min_consensus=3)
 
     groups = build_cohort_groups(
         metagraph=metagraph,
         qualified_validator_uids=[0, 1, 2, 3],
         eligible_miner_uids=set(range(n_miners)),
-        assignment=assignment,
+        validator_seeds=validator_seeds,
+        all_miner_hotkeys=all_miner_hotkeys,
         my_hotkey="v3",
         hotkey_to_uid={f"m{i}": i for i in range(n_miners)},
         election_ballots=ElectionBallots(weight_group_1=(), weight_group_2=()),
@@ -460,7 +527,8 @@ def test_maybe_advance_cohort_holds_within_window():
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
         eligible_miner_uids=set(),
-        assignment={},
+        validator_seeds={},
+        all_miner_hotkeys=[],
         my_hotkey="vme",
         hotkey_to_uid={},
         expert_group="g1",
@@ -487,7 +555,8 @@ def test_maybe_advance_cohort_advances_at_boundary():
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
         eligible_miner_uids=set(),
-        assignment={"vme": []},
+        validator_seeds={"vme": 0},
+        all_miner_hotkeys=[],
         my_hotkey="vme",
         hotkey_to_uid={},
         expert_group="g1",
@@ -507,7 +576,8 @@ def test_maybe_advance_cohort_cold_start_returns_empty_ballots():
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
         eligible_miner_uids=set(),
-        assignment={"vme": []},
+        validator_seeds={"vme": 0},
+        all_miner_hotkeys=[],
         my_hotkey="vme",
         hotkey_to_uid={},
         expert_group="g1",
@@ -533,7 +603,8 @@ def test_maybe_advance_cohort_clamps_rollback():
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
         eligible_miner_uids=set(),
-        assignment={},
+        validator_seeds={},
+        all_miner_hotkeys=[],
         my_hotkey="vme",
         hotkey_to_uid={},
         expert_group="g1",
@@ -594,127 +665,65 @@ def test_compute_uid_weights_handles_empty_groups():
 
 
 # ---------------------------------------------------------------------------
-# split_validation_uids — foreground/background priority partition
+# split_foreground_background — per-cohort fg/bg partition
 # ---------------------------------------------------------------------------
 
 
-def _state_with_groups(group_a, group_b, group_c) -> CohortState:
+def _state_with_groups(
+    group_a, group_b, group_c, foreground=()
+) -> CohortState:
     return CohortState(
         cohort_epoch=0,
         expert_group="g1",
         validation_group_a=tuple(group_a),
         validation_group_b=tuple(group_b),
         validation_group_c=tuple(group_c),
+        foreground_uids=tuple(foreground),
     )
 
 
-def test_split_validation_uids_foreground_is_ab_intersect_assignment():
-    """Foreground = (A ∪ B) ∩ my_assignment; Group C never enters foreground."""
+def test_split_foreground_background_uses_persisted_foreground():
     state = _state_with_groups(
         group_a=(1, 2, 3),
         group_b=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
-        group_c=(20, 21, 22, 23, 24),
+        group_c=(20, 21, 22),
+        foreground=(2, 5),    # this validator's slice of A∪B
     )
-    # validator vme assigned uids {2, 5, 7, 21}: 2 in A, 5/7 in B, 21 in C.
-    metagraph = SimpleNamespace(
-        weights=torch.zeros((1, 30)),
-        S=torch.ones(1),
-    )
-    fg, bg = split_validation_uids(
-        state,
-        metagraph=metagraph,
-        qualified_validator_uids=[],
-        my_assignment_uids={2, 5, 7, 21},
-    )
-    assert set(fg) == {2, 5, 7}        # 21 is in C, not in foreground
-    assert 21 in set(bg)               # 21 lands in background
-    # |fg| + |bg| = full roster (no UID is dropped).
-    assert len(fg) + len(bg) == len(state.validation_group_a) + len(
-        state.validation_group_b
-    ) + len(state.validation_group_c)
+    fg, bg = split_foreground_background(state)
+    assert fg == (2, 5)
+    # Background = (A ∪ B ∪ C) \ foreground, A→B→C order
+    assert bg == (1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 20, 21, 22)
+    assert len(fg) + len(bg) == 16   # full roster preserved
 
 
-def test_split_validation_uids_foreground_sorted_by_stake_weight_desc():
-    """Higher stake-weighted total weight ranks first in foreground."""
+def test_split_foreground_background_empty_foreground_keeps_full_roster_in_bg():
     state = _state_with_groups(
-        group_a=(1, 2, 3), group_b=(4,), group_c=()
+        group_a=(1, 2, 3), group_b=(4, 5), group_c=(20, 21),
+        foreground=(),
     )
-    # 2 validators with stakes 5.0 and 10.0; both vote on miners 1, 2.
-    weights = [
-        [0.0, 0.5, 0.2, 0.0, 0.0],  # validator 0
-        [0.0, 0.1, 0.9, 0.0, 0.0],  # validator 1
-    ]
-    metagraph = SimpleNamespace(
-        weights=torch.tensor(weights),
-        S=torch.tensor([5.0, 10.0]),
-    )
-    # Stake-weighted: m1 = 5*0.5 + 10*0.1 = 3.5; m2 = 5*0.2 + 10*0.9 = 10.0
-    # → m2 ranks before m1.
-    fg, _bg = split_validation_uids(
-        state,
-        metagraph=metagraph,
-        qualified_validator_uids=[0, 1],
-        my_assignment_uids={1, 2},
-    )
-    assert fg == (2, 1)
-
-
-def test_split_validation_uids_empty_foreground_when_no_overlap():
-    """If none of A∪B is in this validator's assignment, foreground is empty
-    and background is the full roster.
-    """
-    state = _state_with_groups(
-        group_a=(1, 2, 3), group_b=(4, 5), group_c=(20, 21)
-    )
-    metagraph = SimpleNamespace(weights=torch.zeros((1, 30)), S=torch.ones(1))
-    fg, bg = split_validation_uids(
-        state,
-        metagraph=metagraph,
-        qualified_validator_uids=[],
-        my_assignment_uids={20, 21},   # only Group C
-    )
+    fg, bg = split_foreground_background(state)
     assert fg == ()
-    assert set(bg) == {1, 2, 3, 4, 5, 20, 21}
+    assert bg == (1, 2, 3, 4, 5, 20, 21)
 
 
-def test_split_validation_uids_background_preserves_a_then_b_then_c_order():
+def test_split_foreground_background_preserves_a_then_b_then_c_order_in_bg():
     state = _state_with_groups(
-        group_a=(10, 11, 12), group_b=(20, 21), group_c=(30, 31)
+        group_a=(10, 11, 12), group_b=(20, 21), group_c=(30, 31),
+        foreground=(11,),
     )
-    metagraph = SimpleNamespace(weights=torch.zeros((1, 50)), S=torch.ones(1))
-    fg, bg = split_validation_uids(
-        state,
-        metagraph=metagraph,
-        qualified_validator_uids=[],
-        my_assignment_uids={11},   # only one foreground UID
-    )
+    fg, bg = split_foreground_background(state)
     assert fg == (11,)
-    # Background should be the remaining roster in A→B→C order.
     assert bg == (10, 12, 20, 21, 30, 31)
 
 
-def test_compute_stake_weighted_total_sums_stake_times_weight():
-    weights = [
-        [0.0, 0.5, 0.2],
-        [0.0, 0.1, 0.9],
-    ]
-    metagraph = SimpleNamespace(
-        weights=torch.tensor(weights),
-        S=torch.tensor([4.0, 2.0]),
+def test_split_foreground_background_dedupes_overlap():
+    """Defensive: if Group C accidentally contains an A∪B UID
+    (shouldn't happen by construction), the fg/bg partition still
+    de-duplicates.
+    """
+    state = _state_with_groups(
+        group_a=(1,), group_b=(2,), group_c=(2, 3),   # 2 erroneously dup
+        foreground=(),
     )
-    out = compute_stake_weighted_total(
-        metagraph,
-        target_uids={1, 2},
-        qualified_validator_uids=[0, 1],
-    )
-    # m1 = 4*0.5 + 2*0.1 = 2.2 ; m2 = 4*0.2 + 2*0.9 = 2.6
-    assert out[1] == pytest.approx(2.2)
-    assert out[2] == pytest.approx(2.6)
-
-
-def test_compute_stake_weighted_total_zero_when_no_weights_attr():
-    metagraph = SimpleNamespace()
-    out = compute_stake_weighted_total(
-        metagraph, target_uids={1, 2, 3}, qualified_validator_uids=[0, 1]
-    )
-    assert out == {1: 0.0, 2: 0.0, 3: 0.0}
+    _fg, bg = split_foreground_background(state)
+    assert bg == (1, 2, 3)   # 2 not duplicated

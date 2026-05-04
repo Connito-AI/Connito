@@ -225,18 +225,16 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
     assert set(r.validation_group_a) == {5, 6, 7}
     # |A| + |B| invariant.
     assert len(r.validation_group_a) + len(r.validation_group_b) == 13
-    # Foreground = (A ∪ B) ∩ vme's assignment slice (m25..m34, uids 25-34).
-    # Group A {5,6,7} is outside vme's slice; Group B includes chain-set
-    # uids 21..30, of which {25..30} land in vme's assignment.
+    # Foreground is a subset of A∪B (per-validator partition of A∪B).
     ab_set = set(r.validation_group_a) | set(r.validation_group_b)
-    assignment_uids = set(range(25, 35))
-    expected_fg = ab_set & assignment_uids
-    assert set(r.foreground_uids) == expected_fg
-    # Background = (A ∪ B ∪ C) \ foreground; Group C is entirely in bg.
+    assert set(r.foreground_uids) <= ab_set
+    # Group C is disjoint from A∪B (per-validator partition of all \ A∪B).
+    assert set(r.validation_group_c).isdisjoint(ab_set)
+    # Background = (A ∪ B ∪ C) \ foreground.
     assert set(r.background_uids) == (
         set(r.validation_group_a) | set(r.validation_group_b) | set(r.validation_group_c)
     ) - set(r.foreground_uids)
-    # Total roster size = 30.
+    # |fg| + |bg| = full roster, no UID dropped.
     assert len(r.foreground_uids) + len(r.background_uids) == (
         len(r.validation_group_a) + len(r.validation_group_b) + len(r.validation_group_c)
     )

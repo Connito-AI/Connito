@@ -144,6 +144,7 @@ class Round:
         from connito.shared.cycle import (
             get_combined_validator_seed,
             get_validator_miner_assignment,
+            get_validator_seed_from_commit,
         )
 
         # Fetch head-block chain commits ONCE and pass to both helpers; they
@@ -334,6 +335,9 @@ class Round:
                     for hk in assignment_result.miners_with_checkpoint
                     if hk in hotkey_to_uid
                 }
+                # Validator seeds for the seeded `assign_miners_to_validators`
+                # partitions used to construct Group C and Foreground.
+                validator_seeds = get_validator_seed_from_commit(config, commits)
                 new_cohort_state = round_groups.maybe_advance_cohort(
                     cycle_index=int(effective_cycle_index),
                     round_id=rid,
@@ -343,7 +347,8 @@ class Round:
                     metagraph=metagraph,
                     qualified_validator_uids=qualified_validator_uids,
                     eligible_miner_uids=eligible_miner_uids,
-                    assignment=assignment,
+                    validator_seeds=validator_seeds,
+                    all_miner_hotkeys=list(assignment_result.miners_with_checkpoint),
                     my_hotkey=config.chain.hotkey_ss58,
                     hotkey_to_uid=hotkey_to_uid,
                     expert_group=expert_group,
@@ -359,22 +364,14 @@ class Round:
 
                 # Override legacy foreground/background with the cohort
                 # validation roster:
-                #   foreground = (A ∪ B) ∩ my assignment, sorted by
-                #     stake-weighted total weight desc — strict-timeout
-                #     tier for consensus miners we're also assigned to.
+                #   foreground = `cohort_state.foreground_uids` — this
+                #     validator's per-validator seeded partition of A∪B,
+                #     computed at the cohort boundary.
                 #   background = (A ∪ B ∪ C) \\ foreground, preserving
-                #     A→B→C order — every other miner in the 30-roster
-                #     (A/B miners outside our assignment, plus all of C).
-                my_assignment_uids = {
-                    hotkey_to_uid[hk]
-                    for hk in assignment.get(config.chain.hotkey_ss58, [])
-                    if hk in hotkey_to_uid
-                }
-                foreground_uids, background_uids = round_groups.split_validation_uids(
-                    new_cohort_state,
-                    metagraph=metagraph,
-                    qualified_validator_uids=qualified_validator_uids,
-                    my_assignment_uids=my_assignment_uids,
+                #     A → B → C order. Catches A/B miners outside our
+                #     foreground slice plus all of Group C.
+                foreground_uids, background_uids = round_groups.split_foreground_background(
+                    new_cohort_state
                 )
 
                 # Make sure every UID in the new roster has a hotkey
