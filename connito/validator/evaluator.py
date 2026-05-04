@@ -124,6 +124,176 @@ def cleanup_non_top_submissions(
     return deleted
 
 
+# Rank → score mapping used by `finalize_round_scores`. Geometric
+# progression with ratio 1.5: top-1 in the round's delta ranking gets
+# 2.25, runner-up 1.5, third 1.0; everyone else (and every failed /
+# missing miner) gets 0.0. The geometric spacing concentrates more
+# reward weight at the top — `top1 / top3 = 2.25` vs. the previous
+# arithmetic mapping's `3 / 1 = 3` — while keeping the second-place
+# miner closer to first than to third (`top2 / top1 = 0.667` vs.
+# `top3 / top2 = 0.667`, equal ratios across tiers). Hard-coded rather
+# than parameterized off `top_k_miners_to_reward` (which governs disk
+# retention, not reward weight) because these values are part of the
+# scoring contract — see PR #93.
+_RANK_TO_SCORE: tuple[float, ...] = (2.25, 1.5, 1.0)
+
+
+def finalize_round_scores(
+    *,
+    round_obj,  # connito.validator.round.Round
+    score_aggregator,
+    score_path=None,
+) -> dict[int, float]:
+    """Replace this round's per-miner aggregator entries with rank-based
+    scores derived from `round.scores` (the delta-based per-round signal
+    recorded by `mark_scored`).
+
+    Drops every aggregator point tagged with `round.round_id` first so
+    intermediate eval-time scores do not stack with the rank-based ones,
+    then re-adds:
+
+      - Top-1 by `round.scores` (delta desc): score 2.25.
+      - Top-2: score 1.5.
+      - Top-3: score 1.0.
+      - Other scored UIDs (incl. delta=0): score 0.
+      - Any UIDs whose `round.scores` value exactly equals another
+        scored miner's: score 0 — a tied val_loss is evidence of a
+        duplicated submission, so both sides are penalized regardless
+        of where they would have ranked.
+      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf): score 0.
+      - `freeze_zero_uids` (no/invalid chain commit at freeze): score 0.
+
+    Operational failures (download timeout, eval timeout, OOM, unexpected
+    exception) live in `failed_uids` but NOT in `validation_failed_uids`,
+    so finalize deliberately writes nothing for them — their prior EMA
+    is preserved. The validator's lack of compute / bandwidth must not
+    dock a miner's reward.
+
+    Likewise, miners we never reached (submission never landed, or
+    bg-eval ran out of time before claiming) are absent from every set
+    and receive no entry. They keep their prior EMA and the next
+    round's stalest-first prioritization gives them another shot.
+
+    Miners whose `round.scores` value is 0.0 are explicitly excluded
+    from the top-3 ranking so a "best of a bad bunch" miner cannot
+    collect reward weight without actually improving over baseline.
+
+    Returns ``{uid: rank_score}`` for the UIDs the function wrote, for
+    logging.
+    """
+    # Snapshot all sets under the round's lock so the worker threads
+    # cannot race a mark_scored / mark_failed against the read.
+    scored, _failed = round_obj.processed_uids_snapshot()
+    # `round.scores` is mutated under the same lock; copy it explicitly
+    # rather than alias.
+    with round_obj._lock:  # noqa: SLF001 — same module family
+        round_scores = dict(round_obj.scores)
+        validation_failed = set(round_obj.validation_failed_uids)
+    freeze_zero = set(round_obj.freeze_zero_uids)
+    freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
+
+    score_aggregator.drop_round(round_obj.round_id)
+
+    # Rank only positive-delta miners — see the docstring's "best of a
+    # bad bunch" clause.
+    positive = [
+        (uid, score) for uid, score in round_scores.items()
+        if uid in scored and score > 0.0
+    ]
+    # Group by exact score value: any miner whose val_loss matches
+    # another miner's gets 0 regardless of where they would have ranked.
+    # `score = (baseline_loss - val_loss) ** 1.2` with float64 math —
+    # exact equality between two miners is overwhelmingly evidence of a
+    # duplicated submission, not legitimate parallel improvement, so
+    # penalize both sides. Unique-score miners are then ranked normally
+    # and slot into the 3/2/1 mapping by position.
+    score_counts: dict[float, int] = {}
+    for _, s in positive:
+        score_counts[s] = score_counts.get(s, 0) + 1
+    tied_uids = {uid for uid, s in positive if score_counts[s] > 1}
+    unique_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
+    unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
+
+    written: dict[int, float] = {}
+    top_uids: set[int] = set()
+    for rank, (uid, _) in enumerate(unique_positive):
+        rank_score = _RANK_TO_SCORE[rank] if rank < len(_RANK_TO_SCORE) else 0.0
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            continue
+        score_aggregator.add_score(
+            uid=uid, hotkey=hotkey, score=rank_score, round_id=round_obj.round_id,
+        )
+        written[uid] = rank_score
+        top_uids.add(uid)
+
+    # Tied positive-delta miners — explicit 0 entry per uid.
+    for uid in tied_uids:
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            continue
+        score_aggregator.add_score(
+            uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+        )
+        written[uid] = 0.0
+        top_uids.add(uid)
+
+    # Remaining scored UIDs (delta == 0 or beyond top-3): score 0.
+    for uid in scored - top_uids:
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            continue
+        score_aggregator.add_score(
+            uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+        )
+        written[uid] = 0.0
+
+    # Explicit validation failures — submission was off-spec.
+    for uid in validation_failed:
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            continue
+        score_aggregator.add_score(
+            uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+        )
+        written[uid] = 0.0
+
+    # Freeze-time invalid-checkpoint penalties. Skip any UID that ended
+    # up in scored/validation_failed (cannot happen today, but keep the
+    # override explicit if the freeze logic ever shifts).
+    for uid in freeze_zero - scored - validation_failed:
+        hotkey = freeze_hotkeys.get(uid) or round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            continue
+        score_aggregator.add_score(
+            uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
+        )
+        written[uid] = 0.0
+
+    if score_path is not None:
+        try:
+            score_aggregator.persist_atomic(score_path)
+        except Exception as e:
+            logger.warning(
+                "finalize_round_scores: persist_atomic failed",
+                round_id=round_obj.round_id, error=str(e),
+            )
+
+    logger.info(
+        "finalize_round_scores: round scored by rank",
+        round_id=round_obj.round_id,
+        top3={
+            int(u): _RANK_TO_SCORE[r]
+            for r, (u, _) in enumerate(unique_positive[:3])
+        },
+        scored_count=len(scored),
+        tied_count=len(tied_uids),
+        validation_failed_count=len(validation_failed),
+        freeze_zero_count=len(freeze_zero - scored - validation_failed),
+    )
+    return written
+
+
 def _prune_non_top_after_eval(
     *,
     config,
@@ -351,21 +521,25 @@ async def evaluate_one_miner(
     tokenizer,
     combined_seed: str,
     device: torch.device,
-    score_aggregator,
     baseline_loss: float,
     step: int,
     round_id: int | None = None,
     round_obj=None,  # connito.validator.round.Round; optional for back-compat.
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
-    score_path: str | os.PathLike | None = None,
 ) -> "MinerEvalJob | None":
-    """Evaluate a single miner and record the score.
+    """Evaluate a single miner and return the per-round delta-based score.
 
     Shared between foreground (`evaluate_foreground_round`) and the
     `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
     is responsible for not mutating it across calls so successive miners
     see an identical baseline.
+
+    The returned `MinerEvalJob.score` is the raw `(baseline_loss - val_loss)
+    ** 1.2` signal; the caller stores it in `round.scores` via
+    `mark_scored`. The actual reward score sent to the chain is rank-based
+    and written by `finalize_round_scores` at end of round — this function
+    does not touch the global `MinerScoreAggregator`.
 
     Returns a `MinerEvalJob` on success (so the caller can later use
     `model_path` for gradient aggregation), or None on failure.
@@ -396,20 +570,19 @@ async def evaluate_one_miner(
 
         val_loss = float(metrics.get("val_loss", 100))
         delta = max(0.0, baseline_loss - val_loss)
+        # `score` is the per-round delta-based signal stored on
+        # `MinerEvalJob` and recorded in `round.scores` by the caller via
+        # `mark_scored`. The aggregator is intentionally NOT updated here
+        # — `finalize_round_scores` is the sole writer for this round's
+        # aggregator entries (see PR #93 introducing rank-based scoring).
         score = delta ** 1.2
-        score_aggregator.add_score(uid=int(uid), hotkey=hotkey, score=score, round_id=round_id)
         if round_obj is not None:
-            # Stash for the /v1/state.json leaderboard. Best-effort; a stash
-            # failure must never block scoring.
+            # Stash val_loss for the /v1/state.json leaderboard. Best-effort;
+            # a stash failure must never block scoring.
             try:
                 round_obj.record_val_loss(int(uid), val_loss)
             except Exception as e:
                 logger.debug("evaluate_one_miner: record_val_loss failed", uid=int(uid), error=str(e))
-        if score_path is not None:
-            try:
-                score_aggregator.persist_atomic(score_path)
-            except Exception as e:
-                logger.warning("evaluate_one_miner: persist_atomic failed", uid=int(uid), error=str(e))
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -454,14 +627,12 @@ async def evaluate_foreground_round(
     subtensor: bittensor.Subtensor,
     step: int,
     device: torch.device,
-    score_aggregator,
     base_model: nn.Module,
     tokenizer,
     end_block: int,
     expert_group_assignment,
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
-    score_path: str | os.PathLike | None = None,
     completed_out: list[MinerEvalJob] | None = None,
 ) -> list[MinerEvalJob]:
     """Foreground (step 2): evaluate the round's top-N miners during
@@ -588,21 +759,21 @@ async def evaluate_foreground_round(
             )
             if fail_reason is not None:
                 # Invalid checkpoint (no chain commit / signature / hash /
-                # expert_group / NaN-Inf): penalize with score=0. Operational
-                # failures below (timeout / OOM / unexpected exception) do
-                # NOT score=0 — those are not the miner's fault.
+                # expert_group / NaN-Inf): mark validation-failed so
+                # `finalize_round_scores` records score=0 at end of round.
+                # Operational failures below (timeout / OOM / unexpected
+                # exception) use plain `mark_failed`, which leaves the
+                # miner's prior EMA untouched — those failures are not
+                # the miner's fault.
                 logger.warning(
-                    "foreground eval: submission failed validation — penalizing with score=0",
+                    "foreground eval: submission failed validation — will record score=0 at finalize",
                     uid=uid, hotkey=hotkey[:6],
                     round_id=round_obj.round_id,
                     reason=fail_reason,
                 )
                 inc_error(component="foreground_eval", kind="validation")
                 inc_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
-                score_aggregator.add_score(
-                    uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
-                )
-                round_obj.mark_failed(uid)
+                round_obj.mark_validation_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
@@ -629,12 +800,10 @@ async def evaluate_foreground_round(
                 tokenizer=tokenizer,
                 combined_seed=round_obj.seed,
                 device=device,
-                score_aggregator=score_aggregator,
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
                 round_obj=round_obj,
-                score_path=score_path,
             )
             try:
                 evaluated = await asyncio.wait_for(eval_coro, timeout=effective_timeout)

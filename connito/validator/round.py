@@ -8,6 +8,7 @@ background workers (download + eval) all anchor on the same `Round`.
 
 from __future__ import annotations
 
+import random
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,7 +22,6 @@ from connito.shared.app_logging import structlog
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
-    from connito.validator.aggregator import MinerScoreAggregator
 
 logger = structlog.get_logger(__name__)
 
@@ -76,6 +76,20 @@ class Round:
     scores: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
+    # UIDs the miner is at fault for: explicit validation failures
+    # (hash/signature/expert_group/NaN-Inf/no_chain_commit) or freeze-time
+    # invalid checkpoints. These get score=0 in the aggregator at finalize.
+    # `failed_uids ⊃ validation_failed_uids` — operational failures
+    # (timeout/OOM/exception/download failure) are in `failed_uids` only
+    # and intentionally receive *no* aggregator entry, so the miner keeps
+    # its prior EMA. The validator's lack of compute/bandwidth must not
+    # dock a miner's reward.
+    validation_failed_uids: set[int] = field(default_factory=set)
+    # Freeze-time invalid-checkpoint penalties. Hotkey map is captured
+    # alongside because these UIDs may not appear in `uid_to_hotkey`
+    # (which only covers roster miners with a valid checkpoint).
+    freeze_zero_uids: set[int] = field(default_factory=set)
+    freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
 
     # Per-round eval telemetry consumed by connito.validator.api. These are
@@ -95,6 +109,8 @@ class Round:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # ---------------- Construction ----------------
+    BG_TOP_SCORED_PREPEND_COUNT: int = 5
+
     @classmethod
     def freeze(
         cls,
@@ -106,7 +122,7 @@ class Round:
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
-        score_aggregator: "MinerScoreAggregator | None" = None,
+        prior_avg_scores: dict[int, float] | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -165,46 +181,155 @@ class Round:
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
-        # Freeze-time penalty: every neuron in the metagraph that is not
-        # in `assignment_result.miners_with_checkpoint` with a valid chain
-        # commit gets score=0 under this round_id. Doing it here —
-        # synchronously, on the main thread — keeps the worker threads
-        # out of the aggregator and catches miners with no commit at all
-        # (those never appear in `miners_with_checkpoint` and so would
-        # be invisible to the bg-download path).
-        if score_aggregator is not None:
-            for hk in metagraph.hotkeys:
-                if hk in assigned_with_valid_ckpt:
-                    continue
-                uid = hotkey_to_uid.get(hk)
-                if uid is None:
-                    continue
-                score_aggregator.add_score(
-                    uid=uid, hotkey=hk, score=0.0, round_id=rid,
-                )
-                logger.info(
-                    "Round.freeze: invalid chain checkpoint — penalizing with score=0",
-                    uid=uid, hotkey=hk[:6], round_id=rid,
-                )
+        # Freeze-time penalty: every metagraph neuron that lacks a valid
+        # chain checkpoint this round is recorded here so
+        # `finalize_round_scores` can stamp it with score=0 in the
+        # aggregator at end of round. Catching it on the main thread
+        # also covers miners with no commit at all — those never appear
+        # in `miners_with_checkpoint` and would otherwise be invisible
+        # to the eval workers entirely.
+        freeze_zero_uids: set[int] = set()
+        freeze_zero_hotkeys: dict[int, str] = {}
+        for hk in metagraph.hotkeys:
+            if hk in assigned_with_valid_ckpt:
+                continue
+            uid = hotkey_to_uid.get(hk)
+            if uid is None:
+                continue
+            freeze_zero_uids.add(uid)
+            freeze_zero_hotkeys[uid] = hk
+            logger.info(
+                "Round.freeze: invalid chain checkpoint — will record score=0 at finalize",
+                uid=uid, hotkey=hk[:6], round_id=rid,
+            )
 
         foreground_uids = tuple(foreground)
 
-        # Order *background* by staleness — longest-since-last-evaluated
-        # first, never-evaluated UIDs treated as infinitely stale. This
-        # ensures the long tail of the roster eventually rotates through
-        # bg-eval instead of always favoring the same incentive-ranked
-        # head. Foreground stays in incentive order; that's the priority
-        # set by design and the per-round eval budget covers it. Each
-        # validator has different `last_evaluated` so background also
-        # spreads naturally across the subnet without an explicit shuffle.
+        # Order *background* in three segments. Earlier segments take
+        # priority and are de-duplicated against later ones via `placed`,
+        # which starts as the foreground set so foreground UIDs cannot
+        # leak into any background segment:
+        #   (a) UIDs receiving non-zero weight from a qualified validator
+        #       (i.e. one whose hotkey is a key in
+        #       `assignment_result.assignment`). Ranked by stake-weighted
+        #       total weight across qualified validators, descending.
+        #       Lets chain consensus pull a previously unseen miner ahead
+        #       of this validator's own EMA leaders.
+        #   (b) top-N background miners by their prior-round avg score
+        #       (`prior_avg_scores`, the same metric that determines the
+        #       weight submission), excluding anyone already in (a).
+        #       Re-evaluating the current local leaders first protects
+        #       the top of the leaderboard against a stale EMA — without
+        #       this, a strong miner that hasn't been picked recently
+        #       could keep its lead even after submitting a worse
+        #       checkpoint. Capped at `BG_TOP_SCORED_PREPEND_COUNT` so
+        #       it cannot crowd out the staleness rotation.
+        #   (c) everyone else, sorted by staleness — longest-since-last-
+        #       evaluated first, never-evaluated UIDs treated as
+        #       infinitely stale. Rotates the long tail through bg-eval
+        #       instead of always favoring the same incentive-ranked
+        #       head. Each validator has different `last_evaluated` so
+        #       the tail spreads naturally across the subnet.
+        # All three segments break ties randomly (no UID-asc fallback)
+        # so a low-numbered UID has no systematic head start.
+        # Foreground stays in incentive order; that's the priority set
+        # by design and the per-round eval budget covers it.
         EPOCH = datetime.min.replace(tzinfo=timezone.utc)
         last_eval_map = last_evaluated or {}
+        prior_scores = prior_avg_scores or {}
 
-        def _staleness_key(uid: int) -> datetime:
-            return last_eval_map.get(uid, EPOCH)
+        bg_set = set(background)
+        placed: set[int] = set(foreground)
 
-        background.sort(key=_staleness_key)
-        background_uids = tuple(background)
+        # (a) Chain-weight prepend — UIDs other qualified validators are
+        # already rewarding. Requires `metagraph.weights` to be populated;
+        # the caller must fetch the metagraph with `lite=False`.
+        weight_prepend_uids: list[int] = []
+        weights_attr = getattr(metagraph, "weights", None)
+        if weights_attr is not None:
+            try:
+                W = weights_attr if isinstance(weights_attr, torch.Tensor) \
+                    else torch.as_tensor(weights_attr)
+            except Exception:
+                W = None
+            if W is None or W.ndim != 2 or W.shape[0] == 0:
+                logger.debug(
+                    "Round.freeze: metagraph.weights empty or malformed — "
+                    "skipping chain-weight prepend",
+                    shape=getattr(weights_attr, "shape", None),
+                )
+                W = None
+            if W is not None:
+                stake_attr = getattr(metagraph, "S", None)
+                S = None
+                if stake_attr is not None:
+                    try:
+                        S = stake_attr if isinstance(stake_attr, torch.Tensor) \
+                            else torch.as_tensor(stake_attr)
+                    except Exception:
+                        S = None
+
+                consensus: dict[int, float] = {}
+                n_rows, n_cols = int(W.shape[0]), int(W.shape[1])
+                for v_hk in assignment.keys():
+                    v_uid = hotkey_to_uid.get(v_hk)
+                    if v_uid is None or v_uid >= n_rows:
+                        continue
+                    row = W[v_uid]
+                    stake = (
+                        float(S[v_uid].item())
+                        if (S is not None and v_uid < int(S.shape[0]))
+                        else 1.0
+                    )
+                    # Iterate only over non-zero entries (matrix is sparse
+                    # in practice — most validators reward a small subset).
+                    nonzero_idx = torch.nonzero(row, as_tuple=True)[0].tolist()
+                    for m_uid in nonzero_idx:
+                        if m_uid in bg_set and m_uid not in placed:
+                            w = float(row[m_uid].item())
+                            consensus[m_uid] = consensus.get(m_uid, 0.0) + stake * w
+
+                weight_prepend_uids = [
+                    uid for uid, _ in sorted(
+                        consensus.items(),
+                        key=lambda kv: (-kv[1], random.random()),
+                    )
+                ]
+                placed.update(weight_prepend_uids)
+        else:
+            logger.debug(
+                "Round.freeze: metagraph has no `weights` attribute — "
+                "skipping chain-weight prepend (metagraph likely fetched with lite=True)",
+            )
+
+        # (b) Top-N by prior-round avg score, excluding anyone already
+        # placed (foreground or (a)). Random tiebreak.
+        scored_candidates = sorted(
+            (
+                (uid, prior_scores.get(uid, 0.0))
+                for uid in bg_set
+                if prior_scores.get(uid, 0.0) > 0.0 and uid not in placed
+            ),
+            key=lambda kv: (-kv[1], random.random()),
+        )
+        score_prepend_uids = [
+            uid for uid, _ in scored_candidates[: cls.BG_TOP_SCORED_PREPEND_COUNT]
+        ]
+        placed.update(score_prepend_uids)
+
+        # (c) Staleness tail — every remaining UID, oldest evaluation
+        # first. Random tiebreak on equal staleness (e.g. all
+        # never-evaluated UIDs share the EPOCH key).
+        stale_tail = sorted(
+            (uid for uid in background if uid not in placed),
+            key=lambda uid: (last_eval_map.get(uid, EPOCH), random.random()),
+        )
+
+        background_uids = tuple([
+            *weight_prepend_uids,
+            *score_prepend_uids,
+            *stale_tail,
+        ])
 
         # CPU-resident clone of global_model.state_dict(). Detach + clone +
         # move to CPU so subsequent in-place mutations of global_model
@@ -219,6 +344,9 @@ class Round:
             roster_size=len(uid_to_hotkey),
             foreground_size=len(foreground_uids),
             background_size=len(background_uids),
+            bg_chain_weight_prepend=len(weight_prepend_uids),
+            bg_score_prepend=len(score_prepend_uids),
+            bg_staleness_tail=len(stale_tail),
             foreground_uids=list(foreground_uids),
         )
 
@@ -240,6 +368,8 @@ class Round:
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
             total_subnet_uids=total_subnet_uids,
             validator_count=validator_count,
+            freeze_zero_uids=freeze_zero_uids,
+            freeze_zero_hotkeys=freeze_zero_hotkeys,
         )
 
     # ---------------- Claim / score helpers ----------------
@@ -301,8 +431,24 @@ class Round:
             return {uid for uid, _ in ranked[:top_k]}
 
     def mark_failed(self, uid: int) -> None:
+        """Mark a UID as failed for operational reasons (download timeout,
+        eval timeout, OOM, unexpected exception). Lands in `failed_uids`
+        only; finalize will *not* write a score=0 for it — the miner's
+        prior EMA is preserved.
+        """
         with self._lock:
             self.failed_uids.add(uid)
+            self.claimed_uids.discard(uid)
+
+    def mark_validation_failed(self, uid: int) -> None:
+        """Mark a UID as failed because its on-disk submission is off-spec
+        (hash/signature/expert_group/NaN-Inf mismatch detected by
+        `validate_miner_submission`). Lands in both `failed_uids` and
+        `validation_failed_uids`; finalize records score=0 for it.
+        """
+        with self._lock:
+            self.failed_uids.add(uid)
+            self.validation_failed_uids.add(uid)
             self.claimed_uids.discard(uid)
 
     def publish_download(self, uid: int, path: Path) -> bool:
