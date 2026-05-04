@@ -385,7 +385,14 @@ EVAL_MAX_BATCHES = 50
 
 @track_model_load_latency()
 def load_model_from_path(path: str, base_model: nn.Module, device: torch.device) -> nn.Module:
-    ckpt = torch.load(path, map_location="cpu")
+    # `path` points to a `.pt` file downloaded from a miner-controlled HF
+    # repo. Without `weights_only=True`, `torch.load` would invoke pickle
+    # and execute any `__reduce__` payload baked into the checkpoint —
+    # giving any miner arbitrary code execution on the validator host
+    # (wallet keys, HF tokens, GPU). `weights_only=True` restricts the
+    # unpickler to tensors and primitive containers, which is all the
+    # miner-checkpoint format below requires.
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt and isinstance(ckpt["model_state_dict"], dict):
         sd = ckpt["model_state_dict"]
     elif isinstance(ckpt, dict):
