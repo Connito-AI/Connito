@@ -124,10 +124,7 @@ def test_round_section_returns_nulls_when_no_round_active():
 # Leaderboard rows
 # ----------------------------------------------------------------------------
 
-_EXPECTED_ROW_KEYS = {
-    "uid", "score", "delta_loss", "val_loss",
-    "weight_submitted", "in_assignment",
-}
+_EXPECTED_ROW_KEYS = {"uid", "score", "delta_loss", "val_loss"}
 
 
 def test_leaderboard_row_has_exactly_the_v2_keys():
@@ -136,12 +133,20 @@ def test_leaderboard_row_has_exactly_the_v2_keys():
         assert set(row.keys()) == _EXPECTED_ROW_KEYS, row
 
 
-def test_leaderboard_row_does_not_leak_chain_metadata():
-    """hotkey / hf_repo_id / hf_revision are derivable from chain and
-    must not appear on rows in v2."""
+def test_leaderboard_row_does_not_leak_chain_or_prometheus_fields():
+    """Fields that are derivable from chain (hotkey, hf_repo_id,
+    hf_revision, in_assignment) or already published to Prometheus
+    (weight_submitted) must not appear on rows. Re-adding any of
+    these is a contract regression."""
     snap = api._build_state_snapshot(_state())
     for row in snap["leaderboard"]:
-        for dropped in ("hotkey", "hf_repo_id", "hf_revision"):
+        for dropped in (
+            "hotkey",
+            "hf_repo_id",
+            "hf_revision",
+            "in_assignment",
+            "weight_submitted",
+        ):
             assert dropped not in row, f"{dropped!r} leaked into row {row}"
 
 
@@ -152,14 +157,6 @@ def test_leaderboard_sort_order_score_desc_with_nulls_last():
     assert uids == [10, 11, 99]
 
 
-def test_in_assignment_reflects_foreground_membership():
-    snap = api._build_state_snapshot(_state())
-    by_uid = {r["uid"]: r for r in snap["leaderboard"]}
-    assert by_uid[10]["in_assignment"] is True
-    assert by_uid[11]["in_assignment"] is True
-    assert by_uid[99]["in_assignment"] is False
-
-
 def test_unscored_uid_renders_with_null_signals():
     snap = api._build_state_snapshot(_state())
     by_uid = {r["uid"]: r for r in snap["leaderboard"]}
@@ -168,8 +165,6 @@ def test_unscored_uid_renders_with_null_signals():
         "score": None,
         "delta_loss": None,
         "val_loss": None,
-        "weight_submitted": None,
-        "in_assignment": False,
     }
 
 
@@ -209,7 +204,6 @@ def test_score_aggregator_failure_does_not_break_endpoint():
     snap = api._build_state_snapshot(s)
     for row in snap["leaderboard"]:
         assert row["score"] is None
-        assert row["weight_submitted"] is None
 
 
 def test_no_round_returns_empty_leaderboard():

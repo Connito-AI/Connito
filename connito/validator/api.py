@@ -1,25 +1,24 @@
 """Lightweight FastAPI server exposing this validator's per-round state.
 
 Single endpoint: ``GET /v1/state.json`` — returns *only* the per-miner
-loss signals and assignment metadata that aren't already published to
-Prometheus or readable from chain. Specifically:
+loss signals that aren't already published to Prometheus or readable
+from chain. Specifically:
 
   - per-miner ``val_loss`` / ``delta_loss`` (high-cardinality time-series
     that we deliberately keep out of Prometheus to bound scrape cost)
-  - the latest ``score`` and rolling-EMA ``weight_submitted`` per miner
-    (the latter mirrors ``validator_miner_weight_submitted`` in
-    Prometheus, included here to keep the leaderboard renderable from
-    one fetch)
-  - ``in_assignment`` — whether the miner is in this validator's
-    deterministic foreground slice this round, i.e. whether the score
-    is authoritative from this validator vs a background drive-by.
+  - the latest raw ``score`` per miner — kept here so the leaderboard
+    is renderable in a single fetch without a Prometheus join
 
 Aggregators that want hotkeys, HF repo/revision, phase / cycle state,
-or baseline-loss history should pull those from the canonical sources
-(``subtensor.metagraph``, ``get_chain_commits``, Prometheus' subnet/eval
-gauges). They are intentionally NOT served here — keeping the validator
-API responsibility narrow makes protocol changes that affect chain or
-Prometheus fields invisible to this endpoint.
+baseline-loss history, the rolling EMA voted on chain
+(``validator_miner_weight_submitted`` in Prometheus), or which miners
+are in this validator's foreground slice (deterministic from
+``get_validator_miner_assignment`` given the metagraph + chain commits)
+should pull those from the canonical sources (``subtensor.metagraph``,
+``get_chain_commits``, Prometheus' subnet/eval gauges). They are
+intentionally NOT served here — keeping the validator API responsibility
+narrow makes protocol changes that affect chain or Prometheus fields
+invisible to this endpoint.
 
 Wired into the validator process by ``connito/validator/run.py``; runs
 on its own daemon thread (uvicorn event loop). All data is read from
@@ -158,36 +157,33 @@ def _build_round_section(s) -> dict[str, Any]:
 def _build_leaderboard_section(s) -> list[dict[str, Any]]:
     """Per-miner leaderboard rows.
 
-    Keeps only fields that aren't trivially derivable from chain
-    (hotkey, hf_repo_id, hf_revision) or Prometheus (cycle/phase data).
-    The remaining fields — per-miner loss, latest score, rolling EMA,
-    in_assignment — are either too high-cardinality for Prometheus or
-    only meaningful as part of a same-snapshot row, so they live here.
+    Keeps only fields that aren't readable from chain (hotkey,
+    hf_repo_id, hf_revision, in_assignment via deterministic
+    re-derivation of the foreground slice) or Prometheus
+    (rolling-EMA weight via `validator_miner_weight_submitted`,
+    cycle/phase state via the `subnet_*` gauges). What's left is
+    per-miner loss data — too high-cardinality for Prometheus — and
+    the latest raw score, which we keep on the row so a frontend can
+    render the leaderboard in a single fetch.
     """
     rd = s.round_ref.current if s.round_ref else None
     if rd is None:
         return []
 
     snap = rd.snapshot()
-    foreground = set(snap["foreground_uids"])
     uid_to_hotkey = snap["uid_to_hotkey"]
     val_loss_by_uid = snap["val_loss_by_uid"]
     baseline_loss = snap["baseline_loss"]
 
     # `latest` = most recent score per uid (this round's score if scored).
-    # `avg` = the rolling weight this validator submits to chain
-    # (mirrors connito/validator/run.py:async_submit_weight which uses
-    # uid_score_pairs(how="avg")). Two queries, one lock acquire each.
+    # The rolling EMA voted on chain is intentionally NOT served here —
+    # consumers read it from `validator_miner_weight_submitted` in
+    # Prometheus, set just before `chain_submitter.async_submit_weight`.
     try:
         latest_scores = s.score_aggregator.uid_score_pairs(how="latest") if s.score_aggregator else {}
     except Exception as e:
         logger.debug("api: score_aggregator.uid_score_pairs(latest) failed", error=str(e))
         latest_scores = {}
-    try:
-        avg_scores = s.score_aggregator.uid_score_pairs(how="avg") if s.score_aggregator else {}
-    except Exception as e:
-        logger.debug("api: score_aggregator.uid_score_pairs(avg) failed", error=str(e))
-        avg_scores = {}
 
     rows: list[dict[str, Any]] = []
     for uid in uid_to_hotkey:
@@ -200,8 +196,6 @@ def _build_leaderboard_section(s) -> list[dict[str, Any]]:
             "score": latest_scores.get(uid),
             "delta_loss": delta_loss,
             "val_loss": val_loss,
-            "weight_submitted": avg_scores.get(uid),
-            "in_assignment": uid in foreground,
         })
 
     # Score desc; rows with no score sink to the bottom.
