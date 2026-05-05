@@ -3,6 +3,7 @@ import copy
 import gc
 import math
 import os
+import signal
 import threading
 import time
 from concurrent.futures import (
@@ -185,6 +186,35 @@ logger = structlog.get_logger(__name__)
 
 
 from connito.shared.memory import cleanup, release_cpu_ram
+
+
+def _install_signal_logging() -> None:
+    """Log SIGTERM / SIGINT / SIGHUP on receipt so docker-initiated kills are
+    visible in the validator log. We re-raise the default handler after logging
+    (default for SIGTERM/SIGHUP is to exit; SIGINT raises KeyboardInterrupt)
+    so the existing shutdown paths in run() still execute.
+    """
+    def _handler(signum: int, frame) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except (ValueError, KeyError):
+            name = str(signum)
+        logger.warning(
+            "Validator received signal — process is being asked to stop",
+            signal=name,
+            signum=signum,
+        )
+        # Restore the default handler and re-raise so normal shutdown happens.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Signals can't be installed from non-main threads; harmless here
+            # because we install at module import time, but guard regardless.
+            pass
 
 
 def _shutdown_background_workers(
@@ -1590,6 +1620,7 @@ if __name__ == "__main__":
         "Validator starting",
         version=pkg_version, git_sha=git_sha[:12], pid1=pid1_comm,
     )
+    _install_signal_logging()
 
     if getattr(args, "test", False):
         from connito.shared.cycle import set_test_mode
