@@ -102,12 +102,6 @@ class Round:
     baseline_loss: float | None = None
     val_loss_by_uid: dict[int, float] = field(default_factory=dict)
 
-    # Subnet shape captured at freeze time — feeds the "Total miners on
-    # subnet" tile on the leaderboard frontend. Kept on the Round so the
-    # API doesn't have to issue a fresh metagraph RPC per request.
-    total_subnet_uids: int = 0  # every UID in the metagraph (validators + miners)
-    validator_count: int = 0    # whitelisted validators (== len(assignment))
-
     # Round-group construction scheme (gated by
     # `config.evaluation.enable_round_group_construction`). All default
     # to `()` / 0 so the legacy code path leaves them empty and downstream
@@ -408,12 +402,6 @@ class Round:
                     weight_group_2_size=len(new_weight_group_2),
                 )
 
-        # Subnet shape snapshot. `metagraph.hotkeys` covers every UID
-        # (validators + miners); `assignment` is keyed by validator hotkey,
-        # so its length is the whitelisted validator count.
-        total_subnet_uids = len(metagraph.hotkeys)
-        validator_count = len(assignment)
-
         return cls(
             round_id=rid,
             seed=seed,
@@ -424,8 +412,6 @@ class Round:
             model_snapshot_cpu=snapshot,
             submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
-            total_subnet_uids=total_subnet_uids,
-            validator_count=validator_count,
             freeze_zero_uids=freeze_zero_uids,
             freeze_zero_hotkeys=freeze_zero_hotkeys,
             weight_group_1=new_weight_group_1,
@@ -660,8 +646,6 @@ class Round:
                 "uid_to_hotkey": dict(self.uid_to_hotkey),
                 "uid_to_chain_checkpoint": dict(self.uid_to_chain_checkpoint),
                 "val_loss_by_uid": dict(self.val_loss_by_uid),
-                "total_subnet_uids": self.total_subnet_uids,
-                "validator_count": self.validator_count,
                 "stats": {
                     "roster": roster_size,
                     "scored": len(self.scored_uids),

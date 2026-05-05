@@ -1,10 +1,28 @@
 """Lightweight FastAPI server exposing this validator's per-round state.
 
-Single endpoint: ``GET /v1/state.json`` — returns the current phase, round
-stats, and the leaderboard from this validator's perspective.
+Single endpoint: ``GET /v1/state.json`` — returns *only* the per-miner
+loss signals and assignment metadata that aren't already published to
+Prometheus or readable from chain. Specifically:
 
-Wired into the validator process by ``connito/validator/run.py``; runs on
-its own daemon thread (uvicorn event loop). All data is read from
+  - per-miner ``val_loss`` / ``delta_loss`` (high-cardinality time-series
+    that we deliberately keep out of Prometheus to bound scrape cost)
+  - the latest ``score`` and rolling-EMA ``weight_submitted`` per miner
+    (the latter mirrors ``validator_miner_weight_submitted`` in
+    Prometheus, included here to keep the leaderboard renderable from
+    one fetch)
+  - ``in_assignment`` — whether the miner is in this validator's
+    deterministic foreground slice this round, i.e. whether the score
+    is authoritative from this validator vs a background drive-by.
+
+Aggregators that want hotkeys, HF repo/revision, phase / cycle state,
+or baseline-loss history should pull those from the canonical sources
+(``subtensor.metagraph``, ``get_chain_commits``, Prometheus' subnet/eval
+gauges). They are intentionally NOT served here — keeping the validator
+API responsibility narrow makes protocol changes that affect chain or
+Prometheus fields invisible to this endpoint.
+
+Wired into the validator process by ``connito/validator/run.py``; runs
+on its own daemon thread (uvicorn event loop). All data is read from
 in-memory references — no chain RPC, no database. Reads are best-effort
 and may be slightly stale relative to the main loop; that's acceptable
 for an admin / observability endpoint.
@@ -27,7 +45,6 @@ import uvicorn
 from fastapi import FastAPI, Request
 
 from connito.shared.app_logging import structlog
-from connito.shared.telemetry import SUBNET_CURRENT_BLOCK
 
 logger = structlog.get_logger(__name__)
 
@@ -41,11 +58,8 @@ def build_app(
     config,
     round_ref,                  # connito.validator.round.RoundRef
     score_aggregator,           # connito.validator.aggregator.MinerScoreAggregator
-    phase_manager,              # connito.sn_owner.cycle.PhaseManager
-    lite_subtensor,
     wallet,
     validator_uid: int | None,
-    baseline_loss_history=None, # connito.validator.baseline_history.BaselineLossHistory
     git_version: str | None = None,  # build tag, surfaced in /v1/state.json meta
 ) -> FastAPI:
     """Build a FastAPI app with the /v1/state.json endpoint.
@@ -64,11 +78,8 @@ def build_app(
     app.state.config = config
     app.state.round_ref = round_ref
     app.state.score_aggregator = score_aggregator
-    app.state.phase_manager = phase_manager
-    app.state.lite_subtensor = lite_subtensor
     app.state.wallet = wallet
     app.state.validator_uid = validator_uid
-    app.state.baseline_loss_history = baseline_loss_history
     app.state.git_version = git_version
 
     @app.get("/healthz")
@@ -86,7 +97,13 @@ def build_app(
 # Snapshot composition — each section is best-effort and isolated
 # ============================================================================
 
-PAYLOAD_VERSION = "1.0"
+# Bumped to 2.0 in the slim-API rework: dropped subnet / phase / hotkey /
+# hf_repo / baseline_loss_history fields. Aggregators that previously
+# read those from this payload must source them from chain (metagraph,
+# chain commits) or Prometheus (subnet_*, validator_eval_loss,
+# validator_miner_weight_submitted). Major bump signals the schema is
+# not backwards-compatible with v1.
+PAYLOAD_VERSION = "2.0"
 
 
 def _build_state_snapshot(s) -> dict[str, Any]:
@@ -96,8 +113,6 @@ def _build_state_snapshot(s) -> dict[str, Any]:
         # the rest of the payload.
         "meta": _build_meta_section(s),
         "validator": _build_validator_section(s),
-        "subnet": _build_subnet_section(s),
-        "phase": _build_phase_section(s),
         "round": _build_round_section(s),
         "leaderboard": _build_leaderboard_section(s),
     }
@@ -121,172 +136,34 @@ def _build_validator_section(s) -> dict[str, Any]:
     return {"hotkey": hotkey, "uid": s.validator_uid}
 
 
-def _build_subnet_section(s) -> dict[str, Any]:
-    """Subnet shape — netuid (static) + total_miners and validator_count
-    (frozen onto Round at the start of each cycle)."""
-    netuid: int | None = None
-    try:
-        netuid = int(getattr(s.config.chain, "netuid", None))
-    except (TypeError, ValueError, AttributeError):
-        netuid = None
-
-    rd = s.round_ref.current if s.round_ref else None
-    if rd is None:
-        return {"netuid": netuid, "total_miners": None, "validator_count": None}
-
-    snap = rd.snapshot()
-    total_uids = snap.get("total_subnet_uids") or 0
-    validator_count = snap.get("validator_count") or 0
-    # "Total miners" = every UID minus the whitelisted validators.
-    total_miners = max(0, total_uids - validator_count) if total_uids else None
-    return {
-        "netuid": netuid,
-        "total_miners": total_miners,
-        "validator_count": validator_count or None,
-    }
-
-
-# Phase-name → actor mapping. PhaseNames are string-typed (see
-# connito/shared/cycle.py:PhaseNames), so equality-string lookups are stable
-# as long as the enum values stay in sync.
-_VALIDATOR_PHASES = frozenset({
-    "Validate", "Merge", "ValidatorCommit1", "ValidatorCommit2",
-})
-_MINER_PHASES = frozenset({
-    "Distribute", "Train", "MinerCommit1", "MinerCommit2", "Submission",
-})
-
-
-def _actor_for_phase(name: str) -> str:
-    if name in _VALIDATOR_PHASES:
-        return "Validator"
-    if name in _MINER_PHASES:
-        return "Miner"
-    return "Unknown"
-
-
-def _compute_upcoming_phases(phase_manager, head_block: int) -> list[tuple[str, int, int]]:
-    """Local mirror of ``PhaseManager.blocks_until_next_phase`` that uses a
-    caller-supplied ``head_block`` instead of ``self.subtensor.block``.
-
-    The original calls into the shared ``lite_subtensor``'s websocket — fine
-    on the main thread but a race against this validator's main loop when
-    invoked from the API request thread (caused a fatal
-    ``websockets.ConcurrencyError`` in production). This pure-computation
-    variant uses only static phase config + the cached head_block so the API
-    thread never touches the shared websocket.
-
-    Returns ``[(name, start_block, end_block), ...]`` for every phase in the
-    cycle, in declaration order.
-    """
-    cycle_len = phase_manager.cycle_length
-    cycle_block_index = head_block % cycle_len
-    cycle_start_block = head_block - cycle_block_index
-
-    out: list[tuple[str, int, int]] = []
-    start = 0
-    for phase in phase_manager.phases:
-        phase_start = start
-        if phase_start >= cycle_block_index:
-            start_block = cycle_start_block + phase_start
-        else:
-            start_block = cycle_start_block + cycle_len + phase_start
-        end_block = start_block + phase["length"] - 1
-        out.append((phase["name"], start_block, end_block))
-        start += phase["length"]
-    return out
-
-
-def _build_phase_section(s) -> dict[str, Any]:
-    # Read the cached head block from the Prometheus gauge that
-    # SystemStatePoller refreshes every ~12s. Avoids a concurrent websocket
-    # `recv()` against the shared lite_subtensor (the main loop's reads of
-    # `lite_subtensor.block` raced this previously and crashed the validator
-    # with `websockets.ConcurrencyError`).
-    head_block: int | None = None
-    try:
-        cached = SUBNET_CURRENT_BLOCK._value.get()
-        if cached:
-            head_block = int(cached)
-    except Exception as e:
-        logger.debug("api: failed to read cached head block", error=str(e))
-
-    if head_block is None or s.phase_manager is None:
-        return {
-            "name": None, "index": None, "head_block": head_block,
-            "started_at_block": None, "ends_at_block": None,
-            "blocks_remaining": None, "cycle_index": None, "cycle_length": None,
-            "upcoming": [],
-        }
-
-    try:
-        # `get_phase(block)` is safe — pass the explicit block and PhaseManager
-        # uses it directly without re-fetching from chain. (SystemStatePoller
-        # already calls it the same way from a background thread.)
-        pr = s.phase_manager.get_phase(head_block)
-    except Exception as e:
-        logger.debug("api: failed to resolve current phase", error=str(e))
-        return {
-            "name": None, "index": None, "head_block": head_block,
-            "started_at_block": None, "ends_at_block": None,
-            "blocks_remaining": None, "cycle_index": None, "cycle_length": None,
-            "upcoming": [],
-        }
-
-    upcoming: list[dict[str, Any]] = []
-    try:
-        # Local pure-computation; no websocket touch (see _compute_upcoming_phases).
-        all_phases = _compute_upcoming_phases(s.phase_manager, head_block)
-        candidates = [
-            (name, start_block)
-            for (name, start_block, _end_block) in all_phases
-            if start_block > pr.phase_start_block
-        ]
-        candidates.sort(key=lambda x: x[1])
-        upcoming = [
-            {"name": name, "start_block": start, "actor": _actor_for_phase(name)}
-            for name, start in candidates[:3]
-        ]
-    except Exception as e:
-        logger.debug("api: failed to enumerate upcoming phases", error=str(e))
-
-    return {
-        "name": pr.phase_name,
-        "index": pr.phase_index,
-        "started_at_block": pr.phase_start_block,
-        "ends_at_block": pr.phase_end_block,
-        "blocks_remaining": pr.blocks_remaining_in_phase,
-        "head_block": head_block,
-        "cycle_index": pr.cycle_index,
-        "cycle_length": pr.cycle_length,
-        "upcoming": upcoming,
-    }
-
-
 def _build_round_section(s) -> dict[str, Any]:
-    history: list[dict[str, Any]] = []
-    if s.baseline_loss_history is not None:
-        try:
-            history = s.baseline_loss_history.snapshot()
-        except Exception as e:
-            logger.debug("api: baseline_loss_history.snapshot failed", error=str(e))
+    """Round identity + baseline_loss only.
 
+    Baseline is kept here (not in Prometheus) so a frontend rendering
+    the leaderboard can derive ``delta_loss = max(0, baseline - val_loss)``
+    consistently across all rows in one fetch — Prometheus
+    ``validator_eval_loss`` gives the same value but with separate
+    scrape staleness vs. the leaderboard's val_loss values.
+    """
     rd = s.round_ref.current if s.round_ref else None
     if rd is None:
-        return {
-            "id": None, "baseline_loss": None, "stats": None,
-            "baseline_loss_history": history,
-        }
+        return {"id": None, "baseline_loss": None}
     snap = rd.snapshot()
     return {
         "id": snap["round_id"],
         "baseline_loss": snap["baseline_loss"],
-        "stats": snap["stats"],
-        "baseline_loss_history": history,
     }
 
 
 def _build_leaderboard_section(s) -> list[dict[str, Any]]:
+    """Per-miner leaderboard rows.
+
+    Keeps only fields that aren't trivially derivable from chain
+    (hotkey, hf_repo_id, hf_revision) or Prometheus (cycle/phase data).
+    The remaining fields — per-miner loss, latest score, rolling EMA,
+    in_assignment — are either too high-cardinality for Prometheus or
+    only meaningful as part of a same-snapshot row, so they live here.
+    """
     rd = s.round_ref.current if s.round_ref else None
     if rd is None:
         return []
@@ -295,7 +172,6 @@ def _build_leaderboard_section(s) -> list[dict[str, Any]]:
     foreground = set(snap["foreground_uids"])
     uid_to_hotkey = snap["uid_to_hotkey"]
     val_loss_by_uid = snap["val_loss_by_uid"]
-    chain_ckpts = snap["uid_to_chain_checkpoint"]
     baseline_loss = snap["baseline_loss"]
 
     # `latest` = most recent score per uid (this round's score if scored).
@@ -314,21 +190,17 @@ def _build_leaderboard_section(s) -> list[dict[str, Any]]:
         avg_scores = {}
 
     rows: list[dict[str, Any]] = []
-    for uid, hotkey in uid_to_hotkey.items():
-        ck = chain_ckpts.get(uid)
+    for uid in uid_to_hotkey:
         val_loss = val_loss_by_uid.get(uid)
         delta_loss: float | None = None
         if val_loss is not None and baseline_loss is not None:
             delta_loss = max(0.0, baseline_loss - val_loss)
         rows.append({
             "uid": uid,
-            "hotkey": hotkey,
             "score": latest_scores.get(uid),
             "delta_loss": delta_loss,
             "val_loss": val_loss,
             "weight_submitted": avg_scores.get(uid),
-            "hf_repo_id": getattr(ck, "hf_repo_id", None),
-            "hf_revision": getattr(ck, "hf_revision", None),
             "in_assignment": uid in foreground,
         })
 
