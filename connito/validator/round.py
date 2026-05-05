@@ -389,9 +389,13 @@ class Round:
                     round_id=rid,
                     cohort_epoch=new_cohort_epoch,
                     cycle_index=int(effective_cycle_index),
-                    foreground_size=len(foreground_uids),
+                    validation_group_a=list(new_validation_a),
+                    validation_group_b=list(new_validation_b),
+                    validation_group_c=list(new_validation_c),
+                    foreground_uids=list(foreground_uids),
+                    background_uids=list(background_uids),
                     weight_group_1=list(new_weight_group_1),
-                    weight_group_2_size=len(new_weight_group_2),
+                    weight_group_2=list(new_weight_group_2),
                 )
 
         return cls(
