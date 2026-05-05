@@ -86,22 +86,19 @@ def read_chain_set_top_k(
     k: int,
     qualified_validator_uids: list[int],
     eligible_miner_uids: set[int] | None = None,
-) -> dict[int, tuple[int, float, float]]:
+) -> dict[int, tuple[float, int, float]]:
     """For each qualified validator, take that validator's top-`k` miners
-    by emitted weight, then tally `(count, total_weight, max_weight)` per
+    by emitted weight, then tally `(total_weight, count, max_weight)` per
     miner uid.
 
-    Returns `{miner_uid: (validator_count, total_weight_received,
+    Returns `{miner_uid: (total_weight_received, validator_count,
     max_weight_from_one_validator)}`.
 
-    The `max_weight` field lets `compute_group_a` enforce a per-validator
-    weight floor (e.g. "must receive > 3% from at least one validator")
-    in addition to the count floor. Without it, a miner could land in
-    Group A purely on count via many tiny weight emissions.
-
-    Sort by `(total_weight, validator_count)` descending to get the
-    chain-set Group `k` ranking — total weight is the primary signal,
-    validator count is a secondary tiebreaker.
+    The tuple is ordered by ranking priority — total weight received is
+    the primary signal for both Group A and Group B selection; validator
+    count is the secondary tiebreaker. The `max_weight` field is used
+    only as a gate (Group A's > 3% per-validator floor) and trails as
+    auxiliary metadata.
 
     Used twice per cohort boundary: `k=3` for chain-set Group 1 (consensus
     candidates for validation Group A) and `k=15` for chain-set Group 2
@@ -128,7 +125,7 @@ def read_chain_set_top_k(
         return {}
 
     n_rows = int(W.shape[0])
-    tally: dict[int, tuple[int, float, float]] = {}
+    tally: dict[int, tuple[float, int, float]] = {}
 
     for v_uid in qualified_validator_uids:
         if v_uid < 0 or v_uid >= n_rows:
@@ -146,8 +143,8 @@ def read_chain_set_top_k(
             continue
         scored.sort(key=lambda mw: mw[1], reverse=True)
         for m_uid, w in scored[:k]:
-            count, total, max_w = tally.get(m_uid, (0, 0.0, 0.0))
-            tally[m_uid] = (count + 1, total + w, max(max_w, w))
+            total, count, max_w = tally.get(m_uid, (0.0, 0, 0.0))
+            tally[m_uid] = (total + w, count + 1, max(max_w, w))
 
     return tally
 
@@ -158,7 +155,7 @@ def read_chain_set_top_k(
 
 
 def compute_group_a(
-    chain_set_top1: dict[int, tuple[int, float, float]],
+    chain_set_top1: dict[int, tuple[float, int, float]],
     *,
     min_consensus: int = 1,
     min_weight_per_validator: float = 0.03,
@@ -183,18 +180,18 @@ def compute_group_a(
     Sort: total weight desc → validator count desc → lower UID.
     """
     eligible = [
-        (uid, count, total, max_w)
-        for uid, (count, total, max_w) in chain_set_top1.items()
+        (uid, total, count, max_w)
+        for uid, (total, count, max_w) in chain_set_top1.items()
         if count >= min_consensus and max_w > min_weight_per_validator
     ]
-    eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
+    eligible.sort(key=lambda x: (-x[1], -x[2], x[0]))
     if max_size is not None:
         eligible = eligible[:max_size]
     return tuple(uid for uid, _, _, _ in eligible)
 
 
 def compute_group_b(
-    chain_set_top2: dict[int, tuple[int, float, float]],
+    chain_set_top2: dict[int, tuple[float, int, float]],
     *,
     group_a: tuple[int, ...],
     ab_total: int = 13,
@@ -213,11 +210,11 @@ def compute_group_b(
     if exclude:
         blocklist |= exclude
     eligible = [
-        (uid, count, total)
-        for uid, (count, total, _max_w) in chain_set_top2.items()
+        (uid, total, count)
+        for uid, (total, count, _max_w) in chain_set_top2.items()
         if uid not in blocklist
     ]
-    eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
+    eligible.sort(key=lambda x: (-x[1], -x[2], x[0]))
     return tuple(uid for uid, _, _ in eligible[:target_size])
 
 
