@@ -273,6 +273,11 @@ def wait_till(
             blocks_remaining,
             max(poll_fallback_block, blocks_remaining * 0.9),
         ) * BITTENSOR_BLOCK_TIME_SECONDS
+        # Same cap as the early-return branch above: don't sleep past the
+        # max so we re-poll the chain at least every WAIT_TILL_MAX_SLEEP_SECONDS
+        # seconds. Without this, a wait with blocks_remaining > ~75 would sleep
+        # past the cap (e.g. blocks_remaining=316 → ~57 min single sleep).
+        sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
 
         if first_print:
             offset_label = ""
