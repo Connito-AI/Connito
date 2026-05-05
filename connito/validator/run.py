@@ -657,11 +657,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # non-blocking commit_status / set_weights call for this validator.
     validate_hf_distribution_config(config)
     wallet, subtensor, lite_subtensor = setup_chain_worker(config, serve=False)
+    # Round-group emission produces up to 18 weights (3 G1 + 15 G2) and
+    # `compute_uid_weights` is already the canonical set — applying the
+    # legacy `top_k_miners_to_reward=3` truncation in `_normalize_uid_weights`
+    # would drop every Group 2 entry (each ~0.2% of stake) and leave only
+    # the 3 Group 1 winners on chain. Skip the cap when the new scheme is on.
     chain_submitter = ChainSubmitter(
         config,
         wallet,
         normalize=True,
-        top_k=config.evaluation.top_k_miners_to_reward,
+        top_k=(
+            None
+            if config.evaluation.enable_round_group_construction
+            else config.evaluation.top_k_miners_to_reward
+        ),
     )
 
     # === set logging ===
