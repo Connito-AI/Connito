@@ -989,7 +989,14 @@ def archive_top_miner_submissions(
             stem = file_path.stem
             dest_name = f"{stem}_rank_{label}_loss_{score_str}.pt"
             dest = archive_dir / dest_name
-            shutil.move(str(file_path), str(dest))
+            # bg-eval's _prune_non_top can delete this file between the
+            # glob above and now (its per-round top-k disagrees with our
+            # rolling-avg top-k). Treat a vanished source as "already
+            # cleaned" rather than crashing the validator.
+            try:
+                shutil.move(str(file_path), str(dest))
+            except FileNotFoundError:
+                continue
             archived.append(dest_name)
         else:
             file_path.unlink(missing_ok=True)

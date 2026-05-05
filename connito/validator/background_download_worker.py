@@ -133,7 +133,10 @@ class BackgroundDownloadWorker(threading.Thread):
                 # publish/pop can't skew the read.
                 pending_eval = round_obj.downloaded_pending_eval_count()
                 if pending_eval > DOWNLOAD_PENDING_EVAL_CAP:
-                    if idle_ticks % IDLE_LOG_EVERY == 0:
+                    # Log once on the rising edge into the cap; stay quiet
+                    # until a successful download resets idle_ticks (same
+                    # pattern as the "no pending targets" branch below).
+                    if idle_ticks == 0:
                         logger.info(
                             "bg-download: pausing — eval backlog above cap",
                             pending_eval=pending_eval,

@@ -117,6 +117,46 @@ class MinerSeries:
         pts = self._window(start, end)
         return float(sum(v for _, v, _ in pts) / len(pts)) if pts else 0.0
 
+    def cycle_means(
+        self,
+        round_id_to_cycle_index: dict[int, int],
+        cycles_in_window: list[int],
+    ) -> tuple[float, float]:
+        """Mean and min per-cycle score over `cycles_in_window`, zero-filling missing cycles.
+
+        Used by the round-group construction scheme's election ballots
+        (spec items 15, 18, 20). For each cycle in the window:
+          - if this miner has one or more points tagged with a `round_id`
+            that maps to that cycle, the cycle's score is the mean of those
+            points (a miner can be evaluated more than once per cycle —
+            foreground + background, or multiple validators in tests);
+          - if the miner has no points in that cycle, the cycle's score is
+            0.0 (sentinel "did not qualify" per spec item 18).
+        Returns `(mean, min)` across the cycles. Tie-breaking in the
+        ballot uses the min — penalizes a single great cycle among
+        bad ones — per spec item 20.
+        """
+        if not cycles_in_window:
+            return 0.0, 0.0
+        per_cycle_sums: dict[int, float] = {c: 0.0 for c in cycles_in_window}
+        per_cycle_counts: dict[int, int] = {c: 0 for c in cycles_in_window}
+        for _ts, score, rid in self.points:
+            if rid is None:
+                continue
+            cycle = round_id_to_cycle_index.get(rid)
+            if cycle is None or cycle not in per_cycle_sums:
+                continue
+            per_cycle_sums[cycle] += float(score)
+            per_cycle_counts[cycle] += 1
+        per_cycle_means: list[float] = []
+        for c in cycles_in_window:
+            count = per_cycle_counts[c]
+            per_cycle_means.append(
+                per_cycle_sums[c] / count if count > 0 else 0.0
+            )
+        mean = sum(per_cycle_means) / len(per_cycle_means)
+        return float(mean), float(min(per_cycle_means))
+
 
 from connito.shared.telemetry import VALIDATOR_MINER_SCORE
 
@@ -347,6 +387,47 @@ class MinerScoreAggregator:
         # Find the cutoff score for the top N
         cutoff_score = sorted_scores[cutoff - 1]
         return scores[uid] >= cutoff_score
+
+    def scores_over_window(
+        self,
+        uids: list[int] | set[int],
+        round_id_to_cycle_index: dict[int, int],
+        cycles_in_window: list[int],
+    ) -> dict[int, tuple[float, float]]:
+        """Return `{uid: (cycle_mean, cycle_min)}` for the given uids.
+
+        Used by the round-group election ballot to rank validation Groups
+        A∪B and B∪C over the previous cohort's 8-cycle window.
+        Missing UIDs (never scored) get `(0.0, 0.0)` so the ballot
+        still ranks them deterministically against scored UIDs.
+        """
+        out: dict[int, tuple[float, float]] = {}
+        with self._lock:
+            for uid in uids:
+                uid_int = int(uid)
+                state = self._miners.get(uid_int)
+                if state is None:
+                    out[uid_int] = (0.0, 0.0)
+                    continue
+                out[uid_int] = state.series.cycle_means(
+                    round_id_to_cycle_index, cycles_in_window
+                )
+        return out
+
+    def all_round_ids(self) -> set[int]:
+        """Every distinct `round_id` tag across every miner's point list.
+
+        Used by the round-group election ballot to build a
+        `round_id -> cycle_index` lookup over the previous cohort's
+        history without scanning each miner separately.
+        """
+        out: set[int] = set()
+        with self._lock:
+            for state in self._miners.values():
+                for _ts, _v, rid in state.series.points:
+                    if rid is not None:
+                        out.add(int(rid))
+        return out
 
     def last_evaluated_per_uid(self) -> dict[int, datetime]:
         """Return ``{uid: most_recent_timestamp}`` for every miner with at
