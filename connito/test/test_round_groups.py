@@ -189,6 +189,36 @@ def test_compute_group_a_empty_when_no_one_passes_both_gates():
     assert g_a == ()
 
 
+def test_compute_group_a_no_cap_returns_all_qualifiers():
+    """With max_size=None, every miner passing the two gates is in Group A
+    — no top-3 cap. Used by build_cohort_groups with max_size=ab_total
+    so Group A can grow up to the full A+B budget.
+    """
+    chain_top1 = {
+        uid: (1, 0.10, 0.10)
+        for uid in range(20)
+    }
+    g_a = compute_group_a(
+        chain_top1, min_consensus=1, min_weight_per_validator=0.03, max_size=None
+    )
+    assert len(g_a) == 20    # all 20 qualify; no cap
+
+
+def test_compute_group_a_max_size_caps_to_ab_total():
+    """When the cap bites, the highest total-weight miners win."""
+    chain_top1 = {
+        uid: (1, 0.10 + uid * 0.001, 0.10 + uid * 0.001)
+        for uid in range(20)
+    }
+    g_a = compute_group_a(
+        chain_top1, min_consensus=1, min_weight_per_validator=0.03, max_size=13
+    )
+    # Sorted by total_weight desc → uids 19, 18, 17, ..., 7 (top 13)
+    assert len(g_a) == 13
+    assert g_a[0] == 19    # highest total weight first
+    assert g_a[-1] == 7    # lowest among the 13 winners
+
+
 def test_compute_group_a_tie_break_by_total_weight_then_uid():
     chain_top1 = {
         10: (3, 1.0, 0.4),
