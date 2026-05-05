@@ -402,7 +402,6 @@ def build_cohort_groups(
     *,
     metagraph,
     qualified_validator_uids: list[int],
-    eligible_miner_uids: set[int],
     validator_seeds: dict[str, int],
     all_miner_hotkeys: list[str],
     my_hotkey: str,
@@ -415,7 +414,12 @@ def build_cohort_groups(
 
     * **Group A / Group B** — derived from the chain-set tally of every
       qualified validator's previous-cohort weight Group 1 / Group 2
-      votes (read from `metagraph.weights`).
+      votes (read from `metagraph.weights`). The tally is **not** filtered
+      to currently-checkpoint-valid miners — chain consensus is historical
+      and immutable. A miner that received heavy emission last cycle but
+      has since let its checkpoint go stale still belongs in Group A; the
+      `freeze_zero_uids` path in `Round.freeze` handles "can't be evaluated
+      now" separately and records score=0 at finalize.
     * **Group C** — `assign_miners_to_validators` over `(all miners \\ A∪B)`,
       this validator's slice, capped at `cfg.validation_group_c_size`.
     * **Foreground** — `assign_miners_to_validators` over `A∪B`, this
@@ -428,13 +432,11 @@ def build_cohort_groups(
         metagraph,
         k=cfg.weight_group_1_size,
         qualified_validator_uids=qualified_validator_uids,
-        eligible_miner_uids=eligible_miner_uids,
     )
     chain_top2 = read_chain_set_top_k(
         metagraph,
         k=cfg.weight_group_2_size,
         qualified_validator_uids=qualified_validator_uids,
-        eligible_miner_uids=eligible_miner_uids,
     )
 
     # Group A absorbs every miner passing the count + weight gates,
@@ -509,7 +511,6 @@ def maybe_advance_cohort(
     score_aggregator: "MinerScoreAggregator | None",
     metagraph,
     qualified_validator_uids: list[int],
-    eligible_miner_uids: set[int],
     validator_seeds: dict[str, int],
     all_miner_hotkeys: list[str],
     my_hotkey: str,
@@ -585,7 +586,6 @@ def maybe_advance_cohort(
     new_groups = build_cohort_groups(
         metagraph=metagraph,
         qualified_validator_uids=qualified_validator_uids,
-        eligible_miner_uids=eligible_miner_uids,
         validator_seeds=validator_seeds,
         all_miner_hotkeys=all_miner_hotkeys,
         my_hotkey=my_hotkey,
