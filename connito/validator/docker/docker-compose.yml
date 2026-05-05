@@ -109,9 +109,13 @@ services:
 
     command: ["--path", "/data/configs/validator.yaml"]
 
-    # Surface a basic liveness signal — telemetry server starts on 8200.
+    # Surface a liveness signal via the Prometheus exporter on port 8200.
+    # The /v1/state.json admin API was removed; aggregators read everything
+    # from Prometheus + chain now (see connito/shared/telemetry.py).
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8200/metrics"]
+      test:
+        - "CMD-SHELL"
+        - "curl -fsS http://localhost:8200/metrics"
       interval: 60s
       timeout: 10s
       retries: 5

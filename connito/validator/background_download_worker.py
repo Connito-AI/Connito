@@ -29,9 +29,11 @@ from connito.shared.app_logging import structlog
 from connito.shared.helper import parse_dynamic_filename
 from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.shared.telemetry import (
+    CHECKPOINT_DOWNLOAD_BYTES,
     VALIDATOR_BG_WORKER_PAUSED,
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
+    inc_eval_failure,
 )
 from connito.validator.round import RoundRef
 
@@ -266,11 +268,15 @@ class BackgroundDownloadWorker(threading.Thread):
                 (tmp_dir / filename).replace(dest)
             except asyncio.TimeoutError:
                 logger.warning("bg-download: timeout", uid=uid, hotkey=hotkey[:6], timeout_sec=timeout)
+                inc_eval_failure(int(uid), "timeout")
                 round_obj.mark_failed(uid)
                 self._record_failure_metric(round_obj)
                 return
             except Exception as e:
                 logger.warning("bg-download: failed", uid=uid, hotkey=hotkey[:6], error=str(e))
+                # HF-side or network-layer failures all surface here; bucket
+                # them under "rpc" so timeouts above stay distinguishable.
+                inc_eval_failure(int(uid), "rpc")
                 round_obj.mark_failed(uid)
                 self._record_failure_metric(round_obj)
                 return
@@ -283,6 +289,11 @@ class BackgroundDownloadWorker(threading.Thread):
                 size_bytes = dest.stat().st_size
             except OSError:
                 size_bytes = None
+            if size_bytes is not None:
+                try:
+                    CHECKPOINT_DOWNLOAD_BYTES.observe(size_bytes)
+                except Exception:
+                    pass
             logger.info(
                 "bg-download: success",
                 uid=uid, hotkey=hotkey[:6],

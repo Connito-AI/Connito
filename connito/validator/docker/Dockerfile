@@ -33,9 +33,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
-    # Default Hivemind/DHT + telemetry ports — overridable at runtime
+    # Default Hivemind/DHT + telemetry + state-API ports — overridable at
+    # runtime. Note: connito.validator.run currently hardcodes the telemetry
+    # and state-API ports as `8200 + rank` / `8300 + rank`, so these env
+    # vars are documentation-only until run.py is updated to read them.
     CONNITO_DHT_PORT=6000 \
     CONNITO_TELEMETRY_PORT=8200 \
+    CONNITO_STATE_API_PORT=8300 \
     CONNITO_GIT_SHA=${GIT_SHA} \
     CONNITO_GIT_VERSION=${GIT_VERSION}
 
@@ -80,8 +84,9 @@ ENV CHECKPOINTS_DIR=/data/checkpoints \
 
 # 6000/tcp + 6000/udp: hivemind DHT (config.dht.port)
 # 8000/tcp:            chain serve port (config.chain.port)
-# 8200/tcp:            prometheus telemetry (8200 + rank)
-EXPOSE 6000/tcp 6000/udp 8000/tcp 8200/tcp
+# 8200/tcp:            prometheus telemetry (8200 + rank) -> /metrics
+# 8300/tcp:            validator state API (8300 + rank)  -> /v1/state.json, /healthz
+EXPOSE 6000/tcp 6000/udp 8000/tcp 8200/tcp 8300/tcp
 
 # Default command — override `--path` to point at your config in compose.
 ENTRYPOINT ["python", "-m", "connito.validator.run"]
