@@ -27,6 +27,7 @@ from connito.validator.round_groups import (
     is_cohort_boundary,
     maybe_advance_cohort,
     read_chain_set_top_k,
+    select_top_n_by_local_score,
     split_foreground_background,
 )
 
@@ -651,30 +652,38 @@ def test_maybe_advance_cohort_clamps_rollback():
 # ---------------------------------------------------------------------------
 
 
-def test_compute_uid_weights_97_3_split_with_equal_g1():
+def test_compute_uid_weights_g1_proportional_to_score():
+    """Group 1's 97% is split in proportion to local score (was equal)."""
     weights = compute_uid_weights(
         weight_group_1=(1, 2, 3),
-        weight_group_2=(4, 5),
-        local_scores={4: 1.0, 5: 1.0},
+        weight_group_2=(),
+        local_scores={1: 1.0, 2: 2.0, 3: 1.0},   # 1:2:1 ratio
     )
-    # Group 1 split equally: 0.97 / 3 each
+    assert weights[1] == pytest.approx(0.97 * 0.25)
+    assert weights[2] == pytest.approx(0.97 * 0.50)
+    assert weights[3] == pytest.approx(0.97 * 0.25)
+    assert sum(weights.values()) == pytest.approx(0.97)
+
+
+def test_compute_uid_weights_g1_falls_back_to_equal_when_all_zero():
+    weights = compute_uid_weights(
+        weight_group_1=(1, 2, 3),
+        weight_group_2=(),
+        local_scores={1: 0.0, 2: 0.0, 3: 0.0},
+    )
     for uid in (1, 2, 3):
         assert weights[uid] == pytest.approx(0.97 / 3)
-    # Group 2 split equally (scores tied)
-    for uid in (4, 5):
-        assert weights[uid] == pytest.approx(0.03 / 2)
-    # Sums to 1.0 (no normalization needed at this layer)
-    assert sum(weights.values()) == pytest.approx(1.0)
 
 
 def test_compute_uid_weights_g2_proportional_to_score():
     weights = compute_uid_weights(
         weight_group_1=(1,),
         weight_group_2=(10, 20),
-        local_scores={10: 3.0, 20: 1.0},   # 3:1 ratio
+        local_scores={1: 1.0, 10: 3.0, 20: 1.0},   # G2 ratio 3:1
         group_1_share=0.97,
         group_2_share=0.03,
     )
+    assert weights[1] == pytest.approx(0.97)
     assert weights[10] == pytest.approx(0.03 * 0.75)
     assert weights[20] == pytest.approx(0.03 * 0.25)
 
@@ -695,6 +704,42 @@ def test_compute_uid_weights_handles_empty_groups():
         weight_group_2=(),
         local_scores={},
     ) == {}
+
+
+# ---------------------------------------------------------------------------
+# select_top_n_by_local_score — used at step 4 weight submission
+# ---------------------------------------------------------------------------
+
+
+def test_select_top_n_by_local_score_orders_by_score_desc():
+    pool = [10, 20, 30, 40]
+    scores = {10: 1.0, 20: 3.0, 30: 2.0, 40: 0.5}
+    assert select_top_n_by_local_score(pool, scores, n=3) == (20, 30, 10)
+
+
+def test_select_top_n_by_local_score_skips_zero_and_missing():
+    """Miners not evaluated (no entry or score=0) are skipped, not included
+    with a 0-weight slot.
+    """
+    pool = [10, 20, 30, 40]
+    scores = {10: 0.5, 30: 0.0}   # 20 absent, 40 absent, 30 zero
+    assert select_top_n_by_local_score(pool, scores, n=3) == (10,)
+
+
+def test_select_top_n_by_local_score_uid_asc_tiebreak():
+    pool = [10, 20, 30]
+    scores = {10: 1.0, 20: 1.0, 30: 1.0}
+    assert select_top_n_by_local_score(pool, scores, n=3) == (10, 20, 30)
+
+
+def test_select_top_n_by_local_score_returns_fewer_when_pool_underfills():
+    pool = [10, 20]
+    scores = {10: 1.0, 20: 2.0}
+    assert select_top_n_by_local_score(pool, scores, n=5) == (20, 10)
+
+
+def test_select_top_n_by_local_score_empty_pool():
+    assert select_top_n_by_local_score([], {1: 1.0}, n=3) == ()
 
 
 # ---------------------------------------------------------------------------

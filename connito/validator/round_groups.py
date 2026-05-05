@@ -663,35 +663,52 @@ def compute_uid_weights(
 ) -> dict[int, float]:
     """Build the chain-submission weight map per spec items 2 and 4.
 
-    Group 1 (97%) is split *equally* among its members — spec item 2
-    says only "split among its 3 members", so equal share is the
-    natural reading and avoids amplifying a small score gap into a
-    large emission gap at the top of the leaderboard.
-
-    Group 2 (3%) is split *in proportion to local score*. If every
-    Group 2 member scored 0.0 in the previous window, fall back to an
-    equal split so the emission still goes out and the chain-set Group 2
-    tally still moves.
+    Both Group 1 (`group_1_share`) and Group 2 (`group_2_share`) are
+    split *in proportion to local score*. If every member of a group
+    scored 0.0, fall back to an equal split so the share still goes
+    out and the chain-set tally still moves.
 
     Everyone not in either group receives 0.0; the chain submitter
     normalizes to 1.0 before sending.
     """
     out: dict[int, float] = {}
 
-    if weight_group_1:
-        per_member = group_1_share / len(weight_group_1)
-        for uid in weight_group_1:
-            out[uid] = out.get(uid, 0.0) + per_member
-
-    if weight_group_2:
-        scores = [(uid, max(0.0, float(local_scores.get(uid, 0.0)))) for uid in weight_group_2]
+    def _allocate(uids: tuple[int, ...], share: float) -> None:
+        if not uids:
+            return
+        scores = [(uid, max(0.0, float(local_scores.get(uid, 0.0)))) for uid in uids]
         total = sum(s for _, s in scores)
         if total > 0.0:
             for uid, s in scores:
-                out[uid] = out.get(uid, 0.0) + group_2_share * (s / total)
+                out[uid] = out.get(uid, 0.0) + share * (s / total)
         else:
-            per_member = group_2_share / len(weight_group_2)
-            for uid in weight_group_2:
+            per_member = share / len(uids)
+            for uid in uids:
                 out[uid] = out.get(uid, 0.0) + per_member
 
+    _allocate(weight_group_1, group_1_share)
+    _allocate(weight_group_2, group_2_share)
     return out
+
+
+def select_top_n_by_local_score(
+    uids: list[int] | tuple[int, ...],
+    local_scores: dict[int, float],
+    *,
+    n: int,
+) -> tuple[int, ...]:
+    """Pick the top-`n` UIDs from `uids` ranked by `local_scores` desc,
+    UID asc as tiebreak.
+
+    Skips UIDs without a positive score (`<= 0.0` or absent) so the
+    weight emission doesn't waste a slot on a miner that wasn't actually
+    evaluated this round. Returns up to `n` UIDs — fewer when the pool
+    has fewer evaluated miners than `n`.
+    """
+    scored = [
+        (int(uid), float(local_scores.get(uid, 0.0)))
+        for uid in uids
+        if float(local_scores.get(uid, 0.0)) > 0.0
+    ]
+    scored.sort(key=lambda kv: (-kv[1], kv[0]))
+    return tuple(uid for uid, _ in scored[:n])
