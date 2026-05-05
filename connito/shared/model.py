@@ -387,6 +387,14 @@ def reload_model_inplace(
     Returns True on success, False on any failure (caller keeps stale model).
     """
     logger.info("Pulling model from peer validator to re-sync excluded validator")
+    t_start = time.monotonic()
+
+    logger.info(
+        "Peer sync: fetching latest checkpoint from chain",
+        primary_dir=str(config.ckpt.validator_checkpoint_path),
+        secondary_dir=str(config.ckpt.checkpoint_path),
+    )
+    t_fetch = time.monotonic()
     try:
         fetch_model_from_chain_validator(
             current_model_meta=None,  # None = always try; no version gate
@@ -397,16 +405,34 @@ def reload_model_inplace(
             expert_group_assignment=expert_manager.expert_group_assignment,
         )
     except Exception as e:
-        logger.warning("Peer sync: fetch_model_from_chain_validator failed", error=str(e))
+        logger.warning(
+            "Peer sync: fetch_model_from_chain_validator failed",
+            error=str(e),
+            elapsed_sec=round(time.monotonic() - t_fetch, 2),
+        )
         return False
+    logger.info(
+        "Peer sync: chain fetch complete",
+        elapsed_sec=round(time.monotonic() - t_fetch, 2),
+    )
 
+    logger.info("Peer sync: selecting best local checkpoint")
     latest = select_best_checkpoint(
         primary_dir=config.ckpt.validator_checkpoint_path,
         secondary_dir=config.ckpt.checkpoint_path,
     )
     if latest is None or latest.path is None:
-        logger.warning("Peer sync: no checkpoint found after download")
+        logger.warning(
+            "Peer sync: no checkpoint found after download",
+            primary_dir=str(config.ckpt.validator_checkpoint_path),
+            secondary_dir=str(config.ckpt.checkpoint_path),
+        )
         return False
+    logger.info(
+        "Peer sync: selected best checkpoint",
+        path=str(latest.path),
+        global_ver=latest.global_ver,
+    )
 
     # Reclaim cached allocator memory and CPU heap before loading the multi-GB
     # state dict. Peer sync runs while bg-eval / training buffers are still
@@ -416,15 +442,31 @@ def reload_model_inplace(
 
     try:
         logger.info("Peer sync: loading state dict from disk", path=str(latest.path))
+        t_load = time.monotonic()
         sd = compile_full_state_dict_from_path(
             latest.path,
             expert_groups=[config.task.exp.group_id, "shared"],
         )
+        load_elapsed = round(time.monotonic() - t_load, 2)
         if not sd:
-            logger.warning("Peer sync: downloaded checkpoint has empty state dict")
+            logger.warning(
+                "Peer sync: downloaded checkpoint has empty state dict",
+                path=str(latest.path),
+                elapsed_sec=load_elapsed,
+            )
             return False
         model_hash = get_model_hash(sd, hex=True)[:6]
-        global_model.load_state_dict(sd, strict=False)
+        logger.info(
+            "Peer sync: state dict loaded",
+            num_keys=len(sd),
+            elapsed_sec=load_elapsed,
+            model_hash=model_hash,
+        )
+
+        logger.info("Peer sync: copying state dict into global_model")
+        t_copy = time.monotonic()
+        result = global_model.load_state_dict(sd, strict=False)
+        copy_elapsed = round(time.monotonic() - t_copy, 2)
         # Drop the CPU copy and reclaim heap before the success log so the
         # caller's next cycle starts with the full memory budget back.
         del sd
@@ -434,8 +476,16 @@ def reload_model_inplace(
             path=str(latest.path),
             global_ver=latest.global_ver,
             model_hash=model_hash,
+            missing_keys=len(result.missing_keys),
+            unexpected_keys=len(result.unexpected_keys),
+            copy_elapsed_sec=copy_elapsed,
+            total_elapsed_sec=round(time.monotonic() - t_start, 2),
         )
         return True
     except Exception as e:
-        logger.warning("Peer sync: failed to load state dict into global_model", error=str(e))
+        logger.warning(
+            "Peer sync: failed to load state dict into global_model",
+            error=str(e),
+            path=str(latest.path),
+        )
         return False
