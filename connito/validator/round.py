@@ -22,6 +22,8 @@ from connito.shared.app_logging import structlog
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
+    from connito.validator.aggregator import MinerScoreAggregator
+    from connito.validator.cohort_state import CohortState
 
 logger = structlog.get_logger(__name__)
 
@@ -92,6 +94,22 @@ class Round:
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
 
+    # Round-group construction scheme (gated by
+    # `config.evaluation.enable_round_group_construction`). All default
+    # to `()` / 0 so the legacy code path leaves them empty and downstream
+    # consumers can branch on `bool(weight_group_1)` without a separate
+    # feature-flag check. Wired in PR 3.
+    weight_group_1: tuple[int, ...] = ()
+    weight_group_2: tuple[int, ...] = ()
+    validation_group_a: tuple[int, ...] = ()
+    validation_group_b: tuple[int, ...] = ()
+    validation_group_c: tuple[int, ...] = ()
+    cohort_epoch: int = 0
+    # Transient — the (possibly newly advanced) cohort state for this
+    # round. The caller in run.py reads this off and persists it after
+    # `Round.freeze` returns. `None` when the feature flag is off.
+    cohort_state: "CohortState | None" = field(default=None, repr=False, compare=False)
+
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # ---------------- Construction ----------------
@@ -109,6 +127,10 @@ class Round:
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
         prior_avg_scores: dict[int, float] | None = None,
+        cycle_index: int | None = None,
+        cycle_length: int | None = None,
+        cohort_state: "CohortState | None" = None,
+        score_aggregator: "MinerScoreAggregator | None" = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -122,6 +144,7 @@ class Round:
         from connito.shared.cycle import (
             get_combined_validator_seed,
             get_validator_miner_assignment,
+            get_validator_seed_from_commit,
         )
 
         # Fetch head-block chain commits ONCE and pass to both helpers; they
@@ -184,42 +207,22 @@ class Round:
                 continue
             freeze_zero_uids.add(uid)
             freeze_zero_hotkeys[uid] = hk
+        if freeze_zero_uids:
             logger.info(
-                "Round.freeze: invalid chain checkpoint — will record score=0 at finalize",
-                uid=uid, hotkey=hk[:6], round_id=rid,
+                "Round.freeze: invalid chain checkpoints — will record score=0 at finalize",
+                round_id=rid,
+                count=len(freeze_zero_uids),
+                uids=sorted(freeze_zero_uids),
             )
 
         foreground_uids = tuple(foreground)
 
-        # Order *background* in three segments. Earlier segments take
-        # priority and are de-duplicated against later ones via `placed`,
-        # which starts as the foreground set so foreground UIDs cannot
-        # leak into any background segment:
-        #   (a) UIDs receiving non-zero weight from a qualified validator
-        #       (i.e. one whose hotkey is a key in
-        #       `assignment_result.assignment`). Ranked by stake-weighted
-        #       total weight across qualified validators, descending.
-        #       Lets chain consensus pull a previously unseen miner ahead
-        #       of this validator's own EMA leaders.
-        #   (b) top-N background miners by their prior-round avg score
-        #       (`prior_avg_scores`, the same metric that determines the
-        #       weight submission), excluding anyone already in (a).
-        #       Re-evaluating the current local leaders first protects
-        #       the top of the leaderboard against a stale EMA — without
-        #       this, a strong miner that hasn't been picked recently
-        #       could keep its lead even after submitting a worse
-        #       checkpoint. Capped at `BG_TOP_SCORED_PREPEND_COUNT` so
-        #       it cannot crowd out the staleness rotation.
-        #   (c) everyone else, sorted by staleness — longest-since-last-
-        #       evaluated first, never-evaluated UIDs treated as
-        #       infinitely stale. Rotates the long tail through bg-eval
-        #       instead of always favoring the same incentive-ranked
-        #       head. Each validator has different `last_evaluated` so
-        #       the tail spreads naturally across the subnet.
-        # All three segments break ties randomly (no UID-asc fallback)
-        # so a low-numbered UID has no systematic head start.
-        # Foreground stays in incentive order; that's the priority set
-        # by design and the per-round eval budget covers it.
+        # Legacy fallback ordering (used only when
+        # `config.evaluation.enable_round_group_construction = False`):
+        # background = top-N by prior avg score, then staleness tail.
+        # The chain-weight prepend that used to live here is now covered
+        # by the round-group scheme's chain-set Group 1/2 read in
+        # `connito.validator.round_groups.read_chain_set_top_k`.
         EPOCH = datetime.min.replace(tzinfo=timezone.utc)
         last_eval_map = last_evaluated or {}
         prior_scores = prior_avg_scores or {}
@@ -227,69 +230,7 @@ class Round:
         bg_set = set(background)
         placed: set[int] = set(foreground)
 
-        # (a) Chain-weight prepend — UIDs other qualified validators are
-        # already rewarding. Requires `metagraph.weights` to be populated;
-        # the caller must fetch the metagraph with `lite=False`.
-        weight_prepend_uids: list[int] = []
-        weights_attr = getattr(metagraph, "weights", None)
-        if weights_attr is not None:
-            try:
-                W = weights_attr if isinstance(weights_attr, torch.Tensor) \
-                    else torch.as_tensor(weights_attr)
-            except Exception:
-                W = None
-            if W is None or W.ndim != 2 or W.shape[0] == 0:
-                logger.debug(
-                    "Round.freeze: metagraph.weights empty or malformed — "
-                    "skipping chain-weight prepend",
-                    shape=getattr(weights_attr, "shape", None),
-                )
-                W = None
-            if W is not None:
-                stake_attr = getattr(metagraph, "S", None)
-                S = None
-                if stake_attr is not None:
-                    try:
-                        S = stake_attr if isinstance(stake_attr, torch.Tensor) \
-                            else torch.as_tensor(stake_attr)
-                    except Exception:
-                        S = None
-
-                consensus: dict[int, float] = {}
-                n_rows, n_cols = int(W.shape[0]), int(W.shape[1])
-                for v_hk in assignment.keys():
-                    v_uid = hotkey_to_uid.get(v_hk)
-                    if v_uid is None or v_uid >= n_rows:
-                        continue
-                    row = W[v_uid]
-                    stake = (
-                        float(S[v_uid].item())
-                        if (S is not None and v_uid < int(S.shape[0]))
-                        else 1.0
-                    )
-                    # Iterate only over non-zero entries (matrix is sparse
-                    # in practice — most validators reward a small subset).
-                    nonzero_idx = torch.nonzero(row, as_tuple=True)[0].tolist()
-                    for m_uid in nonzero_idx:
-                        if m_uid in bg_set and m_uid not in placed:
-                            w = float(row[m_uid].item())
-                            consensus[m_uid] = consensus.get(m_uid, 0.0) + stake * w
-
-                weight_prepend_uids = [
-                    uid for uid, _ in sorted(
-                        consensus.items(),
-                        key=lambda kv: (-kv[1], random.random()),
-                    )
-                ]
-                placed.update(weight_prepend_uids)
-        else:
-            logger.debug(
-                "Round.freeze: metagraph has no `weights` attribute — "
-                "skipping chain-weight prepend (metagraph likely fetched with lite=True)",
-            )
-
-        # (b) Top-N by prior-round avg score, excluding anyone already
-        # placed (foreground or (a)). Random tiebreak.
+        # (b) Top-N by prior-round avg score. Random tiebreak.
         scored_candidates = sorted(
             (
                 (uid, prior_scores.get(uid, 0.0))
@@ -312,7 +253,6 @@ class Round:
         )
 
         background_uids = tuple([
-            *weight_prepend_uids,
             *score_prepend_uids,
             *stale_tail,
         ])
@@ -330,11 +270,127 @@ class Round:
             roster_size=len(uid_to_hotkey),
             foreground_size=len(foreground_uids),
             background_size=len(background_uids),
-            bg_chain_weight_prepend=len(weight_prepend_uids),
-            bg_score_prepend=len(score_prepend_uids),
-            bg_staleness_tail=len(stale_tail),
-            foreground_uids=list(foreground_uids),
         )
+        logger.info(
+            "Round.freeze: foreground",
+            round_id=rid,
+            count=len(foreground_uids),
+            uids=list(foreground_uids),
+        )
+        logger.info(
+            "Round.freeze: bg score prepend",
+            round_id=rid,
+            count=len(score_prepend_uids),
+            uids=list(score_prepend_uids),
+        )
+        logger.info(
+            "Round.freeze: bg staleness tail",
+            round_id=rid,
+            count=len(stale_tail),
+            uids=list(stale_tail),
+        )
+
+        # Round-group construction overlay (spec:
+        # _specs/round-group-construction-scheme.md). When enabled, the
+        # cohort advances at every 8th cycle, and the validation roster
+        # for this round is replaced by Group A + B + C in that order.
+        # The legacy foreground/background just-computed above is the
+        # fallback path used by every test fixture and validator that has
+        # not opted into the new scheme yet.
+        new_cohort_state: "CohortState | None" = None
+        new_weight_group_1: tuple[int, ...] = ()
+        new_weight_group_2: tuple[int, ...] = ()
+        new_validation_a: tuple[int, ...] = ()
+        new_validation_b: tuple[int, ...] = ()
+        new_validation_c: tuple[int, ...] = ()
+        new_cohort_epoch = 0
+        flag_enabled = bool(getattr(
+            getattr(config, "evaluation", None),
+            "enable_round_group_construction",
+            False,
+        ))
+        if flag_enabled:
+            from connito.validator import round_groups
+
+            effective_cycle_length = cycle_length
+            effective_cycle_index = cycle_index
+            if effective_cycle_index is None and effective_cycle_length:
+                effective_cycle_index = rid // int(effective_cycle_length)
+            if effective_cycle_index is None or not effective_cycle_length:
+                logger.warning(
+                    "Round.freeze: round-group flag on but cycle_index/cycle_length missing; "
+                    "falling back to legacy foreground/background construction",
+                    round_id=rid,
+                )
+            else:
+                expert_group = str(getattr(getattr(config, "task", None), "exp", None).group_id) \
+                    if getattr(getattr(config, "task", None), "exp", None) is not None else ""
+                qualified_validator_uids = [
+                    hotkey_to_uid[hk]
+                    for hk in assignment.keys()
+                    if hk in hotkey_to_uid
+                ]
+                # Validator seeds for the seeded `assign_miners_to_validators`
+                # partitions used to construct Group C and Foreground.
+                validator_seeds = get_validator_seed_from_commit(config, commits)
+                new_cohort_state = round_groups.maybe_advance_cohort(
+                    cycle_index=int(effective_cycle_index),
+                    round_id=rid,
+                    cycle_length=int(effective_cycle_length),
+                    current_state=cohort_state,
+                    score_aggregator=score_aggregator,
+                    metagraph=metagraph,
+                    qualified_validator_uids=qualified_validator_uids,
+                    validator_seeds=validator_seeds,
+                    all_miner_hotkeys=list(assignment_result.miners_with_checkpoint),
+                    my_hotkey=config.chain.hotkey_ss58,
+                    hotkey_to_uid=hotkey_to_uid,
+                    expert_group=expert_group,
+                    cfg=config.evaluation,
+                )
+
+                new_weight_group_1 = new_cohort_state.weight_group_1
+                new_weight_group_2 = new_cohort_state.weight_group_2
+                new_validation_a = new_cohort_state.validation_group_a
+                new_validation_b = new_cohort_state.validation_group_b
+                new_validation_c = new_cohort_state.validation_group_c
+                new_cohort_epoch = new_cohort_state.cohort_epoch
+
+                # Override legacy foreground/background with the cohort
+                # validation roster:
+                #   foreground = `cohort_state.foreground_uids` — this
+                #     validator's per-validator seeded partition of A∪B,
+                #     computed at the cohort boundary.
+                #   background = (A ∪ B ∪ C) \\ foreground, preserving
+                #     A → B → C order. Catches A/B miners outside our
+                #     foreground slice plus all of Group C.
+                foreground_uids, background_uids = round_groups.split_foreground_background(
+                    new_cohort_state
+                )
+
+                # Make sure every UID in the new roster has a hotkey
+                # entry — Group A and B may include UIDs outside this
+                # validator's assignment slice that the earlier loop
+                # didn't see. Cover both foreground and background.
+                for uid in (*foreground_uids, *background_uids):
+                    if uid in uid_to_hotkey:
+                        continue
+                    if 0 <= uid < len(metagraph.hotkeys):
+                        uid_to_hotkey[uid] = metagraph.hotkeys[uid]
+
+                logger.info(
+                    "Round.freeze: round-group overlay applied",
+                    round_id=rid,
+                    cohort_epoch=new_cohort_epoch,
+                    cycle_index=int(effective_cycle_index),
+                    validation_group_a=list(new_validation_a),
+                    validation_group_b=list(new_validation_b),
+                    validation_group_c=list(new_validation_c),
+                    foreground_uids=list(foreground_uids),
+                    background_uids=list(background_uids),
+                    weight_group_1=list(new_weight_group_1),
+                    weight_group_2=list(new_weight_group_2),
+                )
 
         return cls(
             round_id=rid,
@@ -348,6 +404,13 @@ class Round:
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
             freeze_zero_uids=freeze_zero_uids,
             freeze_zero_hotkeys=freeze_zero_hotkeys,
+            weight_group_1=new_weight_group_1,
+            weight_group_2=new_weight_group_2,
+            validation_group_a=new_validation_a,
+            validation_group_b=new_validation_b,
+            validation_group_c=new_validation_c,
+            cohort_epoch=new_cohort_epoch,
+            cohort_state=new_cohort_state,
         )
 
     # ---------------- Claim / score helpers ----------------
