@@ -474,7 +474,6 @@ def test_build_cohort_groups_invariants():
     groups = build_cohort_groups(
         metagraph=metagraph,
         qualified_validator_uids=[0, 1, 2, 3],
-        eligible_miner_uids=set(range(n_miners)),
         validator_seeds=validator_seeds,
         all_miner_hotkeys=all_miner_hotkeys,
         my_hotkey="v3",
@@ -518,7 +517,6 @@ def test_build_cohort_groups_consensus_failure_grows_b():
     groups = build_cohort_groups(
         metagraph=metagraph,
         qualified_validator_uids=[0, 1, 2, 3],
-        eligible_miner_uids=set(range(n_miners)),
         validator_seeds=validator_seeds,
         all_miner_hotkeys=all_miner_hotkeys,
         my_hotkey="v3",
@@ -560,7 +558,6 @@ def test_maybe_advance_cohort_holds_within_window():
         score_aggregator=None,
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
-        eligible_miner_uids=set(),
         validator_seeds={},
         all_miner_hotkeys=[],
         my_hotkey="vme",
@@ -588,7 +585,6 @@ def test_maybe_advance_cohort_advances_at_boundary():
         score_aggregator=None,    # no history → empty ballots
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
-        eligible_miner_uids=set(),
         validator_seeds={"vme": 0},
         all_miner_hotkeys=[],
         my_hotkey="vme",
@@ -609,7 +605,6 @@ def test_maybe_advance_cohort_cold_start_returns_empty_ballots():
         score_aggregator=None,
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
-        eligible_miner_uids=set(),
         validator_seeds={"vme": 0},
         all_miner_hotkeys=[],
         my_hotkey="vme",
@@ -636,7 +631,6 @@ def test_maybe_advance_cohort_clamps_rollback():
         score_aggregator=None,
         metagraph=_trivial_metagraph(),
         qualified_validator_uids=[],
-        eligible_miner_uids=set(),
         validator_seeds={},
         all_miner_hotkeys=[],
         my_hotkey="vme",

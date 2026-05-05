@@ -330,11 +330,6 @@ class Round:
                     for hk in assignment.keys()
                     if hk in hotkey_to_uid
                 ]
-                eligible_miner_uids = {
-                    hotkey_to_uid[hk]
-                    for hk in assignment_result.miners_with_checkpoint
-                    if hk in hotkey_to_uid
-                }
                 # Validator seeds for the seeded `assign_miners_to_validators`
                 # partitions used to construct Group C and Foreground.
                 validator_seeds = get_validator_seed_from_commit(config, commits)
@@ -346,7 +341,6 @@ class Round:
                     score_aggregator=score_aggregator,
                     metagraph=metagraph,
                     qualified_validator_uids=qualified_validator_uids,
-                    eligible_miner_uids=eligible_miner_uids,
                     validator_seeds=validator_seeds,
                     all_miner_hotkeys=list(assignment_result.miners_with_checkpoint),
                     my_hotkey=config.chain.hotkey_ss58,
