@@ -8,9 +8,10 @@ the orchestration layer; this module only consumes the snapshots.
 Two axes:
   * **Weight groups** (Group 1 = 3 miners @ 97%, Group 2 = 15 miners @ 3%).
     Per-validator local ballots; what this validator emits on chain.
-  * **Validation groups** (A = 3, B = up to 13 - |A|, C = 17). The
-    `|A| + |B| = 13` invariant means Group A under-fill (consensus
-    failure) grows Group B to compensate.
+  * **Validation groups** (A = every miner getting > 3% from at least
+    one qualified validator (capped at 13), B = `13 - |A|`, C = 17).
+    The `|A| + |B| = 13` invariant means Group A growing crowds out
+    Group B; Group A under-fill grows Group B to compensate.
 
 8-cycle cohort hold: validation Groups A/B/C and weight Groups 1/2 are
 held constant for `cohort_window_cycles` (default 8) cycles, then
@@ -41,7 +42,10 @@ logger = structlog.get_logger(__name__)
 
 @dataclass(frozen=True)
 class ValidationGroups:
-    """Held for the cohort. `|group_a| + |group_b|` is invariant 13."""
+    """Held for the cohort. `|group_a| + |group_b|` is capped at 13 by
+    `compute_group_b` — Group A absorbs every miner passing the gates,
+    Group B fills the remaining slots up to the budget.
+    """
 
     group_a: tuple[int, ...]
     group_b: tuple[int, ...]
@@ -82,22 +86,19 @@ def read_chain_set_top_k(
     k: int,
     qualified_validator_uids: list[int],
     eligible_miner_uids: set[int] | None = None,
-) -> dict[int, tuple[int, float, float]]:
+) -> dict[int, tuple[float, int, float]]:
     """For each qualified validator, take that validator's top-`k` miners
-    by emitted weight, then tally `(count, total_weight, max_weight)` per
+    by emitted weight, then tally `(total_weight, count, max_weight)` per
     miner uid.
 
-    Returns `{miner_uid: (validator_count, total_weight_received,
+    Returns `{miner_uid: (total_weight_received, validator_count,
     max_weight_from_one_validator)}`.
 
-    The `max_weight` field lets `compute_group_a` enforce a per-validator
-    weight floor (e.g. "must receive > 3% from at least one validator")
-    in addition to the count floor. Without it, a miner could land in
-    Group A purely on count via many tiny weight emissions.
-
-    Sort by `(total_weight, validator_count)` descending to get the
-    chain-set Group `k` ranking — total weight is the primary signal,
-    validator count is a secondary tiebreaker.
+    The tuple is ordered by ranking priority — total weight received is
+    the primary signal for both Group A and Group B selection; validator
+    count is the secondary tiebreaker. The `max_weight` field is used
+    only as a gate (Group A's > 3% per-validator floor) and trails as
+    auxiliary metadata.
 
     Used twice per cohort boundary: `k=3` for chain-set Group 1 (consensus
     candidates for validation Group A) and `k=15` for chain-set Group 2
@@ -124,7 +125,7 @@ def read_chain_set_top_k(
         return {}
 
     n_rows = int(W.shape[0])
-    tally: dict[int, tuple[int, float, float]] = {}
+    tally: dict[int, tuple[float, int, float]] = {}
 
     for v_uid in qualified_validator_uids:
         if v_uid < 0 or v_uid >= n_rows:
@@ -142,8 +143,8 @@ def read_chain_set_top_k(
             continue
         scored.sort(key=lambda mw: mw[1], reverse=True)
         for m_uid, w in scored[:k]:
-            count, total, max_w = tally.get(m_uid, (0, 0.0, 0.0))
-            tally[m_uid] = (count + 1, total + w, max(max_w, w))
+            total, count, max_w = tally.get(m_uid, (0.0, 0, 0.0))
+            tally[m_uid] = (total + w, count + 1, max(max_w, w))
 
     return tally
 
@@ -154,37 +155,43 @@ def read_chain_set_top_k(
 
 
 def compute_group_a(
-    chain_set_top1: dict[int, tuple[int, float, float]],
+    chain_set_top1: dict[int, tuple[float, int, float]],
     *,
     min_consensus: int = 1,
     min_weight_per_validator: float = 0.03,
-    max_size: int = 3,
+    max_size: int | None = None,
 ) -> tuple[int, ...]:
-    """Return up to `max_size` UIDs that pass two gates:
+    """Return every UID that passes both gates:
 
       1. **Count floor:** at least `min_consensus` qualified validators
-         placed them in their weight Group 1.
+         placed them in their weight Group 1 (default 1).
       2. **Per-validator weight floor:** at least one of those validators
-         emitted more than `min_weight_per_validator` (default 3%) of
-         their weight to this miner. Prevents a miner from landing in
-         Group A purely via many tiny emissions; Group A is meant to be
-         the "this miner is genuinely top tier" set.
+         emitted more than `min_weight_per_validator` of their weight
+         to this miner (default 3%). Prevents a miner from qualifying
+         via many tiny emissions; Group A is the "genuinely rewarded
+         by some validator" set.
 
-    May under-fill — that's the Group A consensus-failure case (spec edge
-    case). The freed slots are absorbed by Group B via `compute_group_b`.
+    No fixed top-3 cap — Group A absorbs every miner clearing both
+    gates. `max_size` is an optional ceiling that the caller (typically
+    `build_cohort_groups`) sets to `validation_group_ab_total` (13) so
+    Group A doesn't blow the cohort's `|A|+|B|=13` budget. When the cap
+    bites, the highest total-weight miners win.
+
     Sort: total weight desc → validator count desc → lower UID.
     """
     eligible = [
-        (uid, count, total, max_w)
-        for uid, (count, total, max_w) in chain_set_top1.items()
+        (uid, total, count, max_w)
+        for uid, (total, count, max_w) in chain_set_top1.items()
         if count >= min_consensus and max_w > min_weight_per_validator
     ]
-    eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
-    return tuple(uid for uid, _, _, _ in eligible[:max_size])
+    eligible.sort(key=lambda x: (-x[1], -x[2], x[0]))
+    if max_size is not None:
+        eligible = eligible[:max_size]
+    return tuple(uid for uid, _, _, _ in eligible)
 
 
 def compute_group_b(
-    chain_set_top2: dict[int, tuple[int, float, float]],
+    chain_set_top2: dict[int, tuple[float, int, float]],
     *,
     group_a: tuple[int, ...],
     ab_total: int = 13,
@@ -203,11 +210,11 @@ def compute_group_b(
     if exclude:
         blocklist |= exclude
     eligible = [
-        (uid, count, total)
-        for uid, (count, total, _max_w) in chain_set_top2.items()
+        (uid, total, count)
+        for uid, (total, count, _max_w) in chain_set_top2.items()
         if uid not in blocklist
     ]
-    eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
+    eligible.sort(key=lambda x: (-x[1], -x[2], x[0]))
     return tuple(uid for uid, _, _ in eligible[:target_size])
 
 
@@ -395,7 +402,6 @@ def build_cohort_groups(
     *,
     metagraph,
     qualified_validator_uids: list[int],
-    eligible_miner_uids: set[int],
     validator_seeds: dict[str, int],
     all_miner_hotkeys: list[str],
     my_hotkey: str,
@@ -408,7 +414,12 @@ def build_cohort_groups(
 
     * **Group A / Group B** — derived from the chain-set tally of every
       qualified validator's previous-cohort weight Group 1 / Group 2
-      votes (read from `metagraph.weights`).
+      votes (read from `metagraph.weights`). The tally is **not** filtered
+      to currently-checkpoint-valid miners — chain consensus is historical
+      and immutable. A miner that received heavy emission last cycle but
+      has since let its checkpoint go stale still belongs in Group A; the
+      `freeze_zero_uids` path in `Round.freeze` handles "can't be evaluated
+      now" separately and records score=0 at finalize.
     * **Group C** — `assign_miners_to_validators` over `(all miners \\ A∪B)`,
       this validator's slice, capped at `cfg.validation_group_c_size`.
     * **Foreground** — `assign_miners_to_validators` over `A∪B`, this
@@ -421,20 +432,21 @@ def build_cohort_groups(
         metagraph,
         k=cfg.weight_group_1_size,
         qualified_validator_uids=qualified_validator_uids,
-        eligible_miner_uids=eligible_miner_uids,
     )
     chain_top2 = read_chain_set_top_k(
         metagraph,
         k=cfg.weight_group_2_size,
         qualified_validator_uids=qualified_validator_uids,
-        eligible_miner_uids=eligible_miner_uids,
     )
 
+    # Group A absorbs every miner passing the count + weight gates,
+    # capped at `ab_total` so Group A + Group B fits the cohort budget.
+    # Group B then takes the remaining `ab_total - |A|` slots.
     group_a = compute_group_a(
         chain_top1,
         min_consensus=cfg.group_a_min_consensus,
         min_weight_per_validator=cfg.group_a_min_weight_per_validator,
-        max_size=cfg.validation_group_a_size,
+        max_size=cfg.validation_group_ab_total,
     )
     group_b = compute_group_b(
         chain_top2,
@@ -471,11 +483,11 @@ def build_cohort_groups(
     logger.info(
         "round_groups.build_cohort_groups",
         group_a=list(group_a),
-        group_b_size=len(group_b),
-        group_c_size=len(group_c),
-        foreground_size=len(foreground_uids),
+        group_b=list(group_b),
+        group_c=list(group_c),
+        foreground_uids=list(foreground_uids),
         weight_group_1=list(weight.group_1),
-        weight_group_2_size=len(weight.group_2),
+        weight_group_2=list(weight.group_2),
     )
 
     return CohortGroups(
@@ -499,7 +511,6 @@ def maybe_advance_cohort(
     score_aggregator: "MinerScoreAggregator | None",
     metagraph,
     qualified_validator_uids: list[int],
-    eligible_miner_uids: set[int],
     validator_seeds: dict[str, int],
     all_miner_hotkeys: list[str],
     my_hotkey: str,
@@ -575,7 +586,6 @@ def maybe_advance_cohort(
     new_groups = build_cohort_groups(
         metagraph=metagraph,
         qualified_validator_uids=qualified_validator_uids,
-        eligible_miner_uids=eligible_miner_uids,
         validator_seeds=validator_seeds,
         all_miner_hotkeys=all_miner_hotkeys,
         my_hotkey=my_hotkey,
@@ -606,12 +616,12 @@ def maybe_advance_cohort(
         "round_groups.maybe_advance_cohort: new cohort",
         cohort_epoch=new_state.cohort_epoch,
         cycle_index=cycle_index,
-        weight_group_1=list(new_state.weight_group_1),
-        weight_group_2_size=len(new_state.weight_group_2),
         validation_group_a=list(new_state.validation_group_a),
-        validation_group_b_size=len(new_state.validation_group_b),
-        validation_group_c_size=len(new_state.validation_group_c),
-        foreground_size=len(new_state.foreground_uids),
+        validation_group_b=list(new_state.validation_group_b),
+        validation_group_c=list(new_state.validation_group_c),
+        foreground_uids=list(new_state.foreground_uids),
+        weight_group_1=list(new_state.weight_group_1),
+        weight_group_2=list(new_state.weight_group_2),
     )
     return new_state
 
