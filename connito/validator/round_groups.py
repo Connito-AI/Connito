@@ -471,11 +471,11 @@ def build_cohort_groups(
     logger.info(
         "round_groups.build_cohort_groups",
         group_a=list(group_a),
-        group_b_size=len(group_b),
-        group_c_size=len(group_c),
-        foreground_size=len(foreground_uids),
+        group_b=list(group_b),
+        group_c=list(group_c),
+        foreground_uids=list(foreground_uids),
         weight_group_1=list(weight.group_1),
-        weight_group_2_size=len(weight.group_2),
+        weight_group_2=list(weight.group_2),
     )
 
     return CohortGroups(
@@ -606,12 +606,12 @@ def maybe_advance_cohort(
         "round_groups.maybe_advance_cohort: new cohort",
         cohort_epoch=new_state.cohort_epoch,
         cycle_index=cycle_index,
-        weight_group_1=list(new_state.weight_group_1),
-        weight_group_2_size=len(new_state.weight_group_2),
         validation_group_a=list(new_state.validation_group_a),
-        validation_group_b_size=len(new_state.validation_group_b),
-        validation_group_c_size=len(new_state.validation_group_c),
-        foreground_size=len(new_state.foreground_uids),
+        validation_group_b=list(new_state.validation_group_b),
+        validation_group_c=list(new_state.validation_group_c),
+        foreground_uids=list(new_state.foreground_uids),
+        weight_group_1=list(new_state.weight_group_1),
+        weight_group_2=list(new_state.weight_group_2),
     )
     return new_state
 
