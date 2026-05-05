@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import re
 import time
 import traceback
@@ -407,7 +408,16 @@ def reload_model_inplace(
         logger.warning("Peer sync: no checkpoint found after download")
         return False
 
+    # Free unreferenced tensors and CUDA cache before loading the multi-GB
+    # state dict. Peer sync runs while bg-eval / training buffers are still
+    # live; without this, the transient allocation peak during torch.load +
+    # load_state_dict has been seen to OOM-kill the process silently.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     try:
+        logger.info("Peer sync: loading state dict from disk", path=str(latest.path))
         sd = compile_full_state_dict_from_path(
             latest.path,
             expert_groups=[config.task.exp.group_id, "shared"],
@@ -415,13 +425,17 @@ def reload_model_inplace(
         if not sd:
             logger.warning("Peer sync: downloaded checkpoint has empty state dict")
             return False
+        model_hash = get_model_hash(sd, hex=True)[:6]
         global_model.load_state_dict(sd, strict=False)
-        global_model.to(device)
+        # Drop the CPU copy before any further GPU ops — it's a few GB and
+        # nothing past this point needs it.
+        del sd
+        gc.collect()
         logger.info(
             "Peer sync: loaded checkpoint into global_model",
             path=str(latest.path),
             global_ver=latest.global_ver,
-            model_hash=get_model_hash(sd, hex=True)[:6],
+            model_hash=model_hash,
         )
         return True
     except Exception as e:

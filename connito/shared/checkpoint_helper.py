@@ -610,10 +610,10 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
 
             with f as fh:
                 state_dict = torch.load(fh, map_location=torch.device("cpu"))
-                full_state_dict = full_state_dict | state_dict["model_state_dict"]
-                logger.debug(
-                    "loaded checkpoint file", path=f, loss=round(state_dict["loss"] if "loss" in state_dict else -1, 5)
-                )
+                full_state_dict.update(state_dict["model_state_dict"])
+                loss = state_dict["loss"] if "loss" in state_dict else -1
+                del state_dict
+                logger.debug("loaded checkpoint file", path=f, loss=round(loss, 5))
 
     return full_state_dict
 
