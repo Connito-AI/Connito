@@ -927,19 +927,47 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
                 uid_weights = score_aggregator.uid_score_pairs(how="avg")
                 # Round-group construction scheme: when this round was
-                # frozen with a non-empty weight Group 1, override the
-                # legacy avg-pair emission with the spec's 97% / 3%
-                # split. Group 1 (3 miners) is split equally; Group 2
-                # (≤15 miners) is split in proportion to local score.
+                # frozen under the cohort scheme, emit weights based on
+                # *this round's* local scores rather than long-window
+                # averages. Spec semantics:
+                #   - 97% to top-3 of A∪B by this round's local score,
+                #     proportional split.
+                #   - 3% to top-15 of A∪B∪C \\ top-3 by this round's
+                #     local score, proportional split.
                 # ChainSubmitter normalizes to 1.0 before sending.
-                if pending_round.weight_group_1:
+                if pending_round.cohort_state is not None:
                     from connito.validator import round_groups as _rg
+                    # `pending_round.scores` carries the raw per-eval
+                    # signal recorded by `mark_scored` — preferred over
+                    # the rank-based aggregator output for proportional
+                    # emission.
+                    round_local_scores = dict(pending_round.scores)
+                    ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
+                    abc_uids = ab_uids + list(pending_round.validation_group_c)
+                    g1 = _rg.select_top_n_by_local_score(
+                        ab_uids,
+                        round_local_scores,
+                        n=config.evaluation.weight_group_1_size,
+                    )
+                    g1_set = set(g1)
+                    g2_pool = [u for u in abc_uids if u not in g1_set]
+                    g2 = _rg.select_top_n_by_local_score(
+                        g2_pool,
+                        round_local_scores,
+                        n=config.evaluation.weight_group_2_size,
+                    )
                     uid_weights = _rg.compute_uid_weights(
-                        weight_group_1=pending_round.weight_group_1,
-                        weight_group_2=pending_round.weight_group_2,
-                        local_scores=uid_weights,
+                        weight_group_1=g1,
+                        weight_group_2=g2,
+                        local_scores=round_local_scores,
                         group_1_share=config.evaluation.weight_group_1_share,
                         group_2_share=config.evaluation.weight_group_2_share,
+                    )
+                    logger.info(
+                        "(4) round-group local-score emission",
+                        round_id=pending_round.round_id,
+                        weight_group_1=list(g1),
+                        weight_group_2=list(g2),
                     )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
