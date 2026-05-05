@@ -8,9 +8,10 @@ the orchestration layer; this module only consumes the snapshots.
 Two axes:
   * **Weight groups** (Group 1 = 3 miners @ 97%, Group 2 = 15 miners @ 3%).
     Per-validator local ballots; what this validator emits on chain.
-  * **Validation groups** (A = 3, B = up to 13 - |A|, C = 17). The
-    `|A| + |B| = 13` invariant means Group A under-fill (consensus
-    failure) grows Group B to compensate.
+  * **Validation groups** (A = every miner getting > 3% from at least
+    one qualified validator (capped at 13), B = `13 - |A|`, C = 17).
+    The `|A| + |B| = 13` invariant means Group A growing crowds out
+    Group B; Group A under-fill grows Group B to compensate.
 
 8-cycle cohort hold: validation Groups A/B/C and weight Groups 1/2 are
 held constant for `cohort_window_cycles` (default 8) cycles, then
@@ -41,7 +42,10 @@ logger = structlog.get_logger(__name__)
 
 @dataclass(frozen=True)
 class ValidationGroups:
-    """Held for the cohort. `|group_a| + |group_b|` is invariant 13."""
+    """Held for the cohort. `|group_a| + |group_b|` is capped at 13 by
+    `compute_group_b` — Group A absorbs every miner passing the gates,
+    Group B fills the remaining slots up to the budget.
+    """
 
     group_a: tuple[int, ...]
     group_b: tuple[int, ...]
@@ -158,20 +162,24 @@ def compute_group_a(
     *,
     min_consensus: int = 1,
     min_weight_per_validator: float = 0.03,
-    max_size: int = 3,
+    max_size: int | None = None,
 ) -> tuple[int, ...]:
-    """Return up to `max_size` UIDs that pass two gates:
+    """Return every UID that passes both gates:
 
       1. **Count floor:** at least `min_consensus` qualified validators
-         placed them in their weight Group 1.
+         placed them in their weight Group 1 (default 1).
       2. **Per-validator weight floor:** at least one of those validators
-         emitted more than `min_weight_per_validator` (default 3%) of
-         their weight to this miner. Prevents a miner from landing in
-         Group A purely via many tiny emissions; Group A is meant to be
-         the "this miner is genuinely top tier" set.
+         emitted more than `min_weight_per_validator` of their weight
+         to this miner (default 3%). Prevents a miner from qualifying
+         via many tiny emissions; Group A is the "genuinely rewarded
+         by some validator" set.
 
-    May under-fill — that's the Group A consensus-failure case (spec edge
-    case). The freed slots are absorbed by Group B via `compute_group_b`.
+    No fixed top-3 cap — Group A absorbs every miner clearing both
+    gates. `max_size` is an optional ceiling that the caller (typically
+    `build_cohort_groups`) sets to `validation_group_ab_total` (13) so
+    Group A doesn't blow the cohort's `|A|+|B|=13` budget. When the cap
+    bites, the highest total-weight miners win.
+
     Sort: total weight desc → validator count desc → lower UID.
     """
     eligible = [
@@ -180,7 +188,9 @@ def compute_group_a(
         if count >= min_consensus and max_w > min_weight_per_validator
     ]
     eligible.sort(key=lambda x: (-x[2], -x[1], x[0]))
-    return tuple(uid for uid, _, _, _ in eligible[:max_size])
+    if max_size is not None:
+        eligible = eligible[:max_size]
+    return tuple(uid for uid, _, _, _ in eligible)
 
 
 def compute_group_b(
@@ -430,11 +440,14 @@ def build_cohort_groups(
         eligible_miner_uids=eligible_miner_uids,
     )
 
+    # Group A absorbs every miner passing the count + weight gates,
+    # capped at `ab_total` so Group A + Group B fits the cohort budget.
+    # Group B then takes the remaining `ab_total - |A|` slots.
     group_a = compute_group_a(
         chain_top1,
         min_consensus=cfg.group_a_min_consensus,
         min_weight_per_validator=cfg.group_a_min_weight_per_validator,
-        max_size=cfg.validation_group_a_size,
+        max_size=cfg.validation_group_ab_total,
     )
     group_b = compute_group_b(
         chain_top2,
