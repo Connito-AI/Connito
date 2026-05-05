@@ -809,6 +809,25 @@ class EvalCfg(BaseConfig):
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
+    # Round-group construction scheme. When true, Round.freeze() partitions
+    # the roster into validation Groups A (3) / B (10) / C (17) with
+    # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1
+    # (97%) / Group 2 (3%). Default ON; set False to opt back into the
+    # legacy foreground/background construction (kept as a rollback path
+    # until the new scheme is validated on mainnet for several cohorts).
+    # Spec: _specs/round-group-construction-scheme.md.
+    enable_round_group_construction: bool = True
+    cohort_state_filename: str = "cohort_state.json"
+    cohort_window_cycles: int = 8                # 8-cycle hold per spec
+    weight_group_1_size: int = 3
+    weight_group_1_share: float = 0.97
+    weight_group_2_size: int = 15                # spec answers N=15
+    weight_group_2_share: float = 0.03
+    validation_group_a_size: int = 3
+    validation_group_ab_total: int = 13          # |A| + |B| invariant
+    validation_group_c_size: int = 17
+    group_a_min_consensus: int = 1               # ≥ 1 qualified validator
+    group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
 
 
 class ValidatorConfig(WorkerConfig):
