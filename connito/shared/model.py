@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gc
 import re
 import time
 import traceback
@@ -33,6 +32,7 @@ from connito.shared.expert_manager import (
     ExpertAssignments
 )
 from connito.shared.helper import get_model_hash, get_nested_attr
+from connito.shared.memory import cleanup
 from connito.shared.modeling.mycelia import get_base_model
 from connito.shared.schema import verify_message
 
@@ -408,13 +408,11 @@ def reload_model_inplace(
         logger.warning("Peer sync: no checkpoint found after download")
         return False
 
-    # Free unreferenced tensors and CUDA cache before loading the multi-GB
+    # Reclaim cached allocator memory and CPU heap before loading the multi-GB
     # state dict. Peer sync runs while bg-eval / training buffers are still
-    # live; without this, the transient allocation peak during torch.load +
+    # live; without this the transient allocation peak during torch.load +
     # load_state_dict has been seen to OOM-kill the process silently.
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    cleanup(global_model)
 
     try:
         logger.info("Peer sync: loading state dict from disk", path=str(latest.path))
@@ -427,10 +425,10 @@ def reload_model_inplace(
             return False
         model_hash = get_model_hash(sd, hex=True)[:6]
         global_model.load_state_dict(sd, strict=False)
-        # Drop the CPU copy before any further GPU ops — it's a few GB and
-        # nothing past this point needs it.
+        # Drop the CPU copy and reclaim heap before the success log so the
+        # caller's next cycle starts with the full memory budget back.
         del sd
-        gc.collect()
+        cleanup(global_model)
         logger.info(
             "Peer sync: loaded checkpoint into global_model",
             path=str(latest.path),
