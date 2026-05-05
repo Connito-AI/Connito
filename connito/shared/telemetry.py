@@ -105,6 +105,35 @@ VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
     "Rolling EMA voted on chain for a miner",
     ["miner_uid"],
 )
+# Per-miner validation loss measured against this validator's foreground
+# eval set. High-cardinality (one series per miner UID) but bounded by
+# subnet size (~100s); same shape as `validator_miner_score`. Set inside
+# `evaluate_one_miner` immediately after the val_loss is computed.
+# Aggregators compute `delta_loss = max(0, validator_baseline_loss -
+# validator_miner_val_loss)` as needed.
+VALIDATOR_MINER_VAL_LOSS = Gauge(
+    "validator_miner_val_loss",
+    "Per-miner validation loss measured against this validator's foreground eval set",
+    ["miner_uid"],
+)
+# Round-level baseline loss: this validator's eval loss against the
+# pre-merge global model, computed once per round at the start of the
+# foreground pass (see `evaluate_foreground_round`). Single value (no
+# labels) — the latest write wins. Distinct from
+# `validator_eval_loss{expert_group=...}` which tracks training-side
+# eval loss reported via MetricLogger.
+VALIDATOR_BASELINE_LOSS = Gauge(
+    "validator_baseline_loss",
+    "Round baseline loss against this validator's foreground eval set",
+)
+# Numeric ID of the current round, set when `Round.freeze` returns and
+# the round becomes active. Lets aggregators key per-miner score and
+# val_loss readings to a specific round without parsing the round_id
+# label off `validator_round_lifecycle_step`.
+VALIDATOR_CURRENT_ROUND_ID = Gauge(
+    "validator_current_round_id",
+    "Numeric ID of the round this validator is currently evaluating",
+)
 VALIDATOR_SCORE_STD = Gauge("validator_score_std", "Spread of miner scores")
 VALIDATOR_AVG_STEP_STATUS = Counter("validator_avg_step_status", "Averager sync step stats", ["status"])
 VALIDATOR_EVAL_LOSS = Gauge("validator_eval_loss", "Evaluation loss", ["expert_group"])

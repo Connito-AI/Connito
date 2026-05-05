@@ -17,6 +17,8 @@ from connito.shared.evaluate import evaluate_model
 from connito.shared.helper import parse_dynamic_filename
 from connito.shared.telemetry import (
     EvalFailureReason,
+    VALIDATOR_BASELINE_LOSS,
+    VALIDATOR_MINER_VAL_LOSS,
     inc_error,
     inc_eval_failure,
     track_eval_latency,
@@ -524,7 +526,6 @@ async def evaluate_one_miner(
     baseline_loss: float,
     step: int,
     round_id: int | None = None,
-    round_obj=None,  # connito.validator.round.Round; optional for back-compat.
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
 ) -> "MinerEvalJob | None":
@@ -576,13 +577,14 @@ async def evaluate_one_miner(
         # — `finalize_round_scores` is the sole writer for this round's
         # aggregator entries (see PR #93 introducing rank-based scoring).
         score = delta ** 1.2
-        if round_obj is not None:
-            # Stash val_loss for the /v1/state.json leaderboard. Best-effort;
-            # a stash failure must never block scoring.
-            try:
-                round_obj.record_val_loss(int(uid), val_loss)
-            except Exception as e:
-                logger.debug("evaluate_one_miner: record_val_loss failed", uid=int(uid), error=str(e))
+        # Publish per-miner val_loss to Prometheus so external aggregators
+        # can render the leaderboard without a per-validator HTTP scrape.
+        # Best-effort — Prometheus exposition is purely an observability
+        # side-effect and must never block scoring.
+        try:
+            VALIDATOR_MINER_VAL_LOSS.labels(miner_uid=str(int(uid))).set(float(val_loss))
+        except Exception:
+            pass
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -675,11 +677,14 @@ async def evaluate_foreground_round(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Stash for the /v1/state.json endpoint. Best-effort; logged but not raised.
+    # Publish to Prometheus so external aggregators can derive
+    # `delta_loss = max(0, baseline - val_loss)` per miner. Best-effort
+    # — Prometheus exposition is purely an observability side-effect
+    # and must never block scoring.
     try:
-        round_obj.set_baseline_loss(baseline_loss)
-    except Exception as e:
-        logger.debug("foreground eval: set_baseline_loss failed", error=str(e))
+        VALIDATOR_BASELINE_LOSS.set(float(baseline_loss))
+    except Exception:
+        pass
 
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = completed_out if completed_out is not None else []
@@ -803,7 +808,6 @@ async def evaluate_foreground_round(
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
-                round_obj=round_obj,
             )
             try:
                 evaluated = await asyncio.wait_for(eval_coro, timeout=effective_timeout)

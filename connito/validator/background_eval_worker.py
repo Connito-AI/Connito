@@ -337,7 +337,6 @@ class BackgroundEvalWorker(threading.Thread):
                     baseline_loss=baseline,
                     step=round_obj.round_id,
                     round_id=round_obj.round_id,
-                    round_obj=round_obj,
                 )
             finally:
                 self.gpu_eval_lock.release()
