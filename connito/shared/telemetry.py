@@ -94,6 +94,17 @@ MODEL_PARAMETER_COUNT = Gauge("system_model_parameter_count", "Total loaded para
 # Validator (Gauges & Counters)
 VALIDATOR_ACTIVE_MINER_EVALS = Gauge("validator_active_miner_evaluations", "Number of miner_jobs being evaluated")
 VALIDATOR_MINER_SCORE = Gauge("validator_miner_score", "Validation score assigned to a miner", ["miner_uid"])
+# Rolling EMA score actually voted on chain (i.e. the value
+# `score_aggregator.uid_score_pairs(how="avg")` returns and that
+# `chain_submitter.async_submit_weight` consumes). Distinct from
+# `validator_miner_score`, which is the latest *raw* per-round score
+# fed into the aggregator. Set per-round right before chain submission;
+# absent for UIDs the validator hasn't scored yet (no entry rather than 0).
+VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
+    "validator_miner_weight_submitted",
+    "Rolling EMA voted on chain for a miner",
+    ["miner_uid"],
+)
 VALIDATOR_SCORE_STD = Gauge("validator_score_std", "Spread of miner scores")
 VALIDATOR_AVG_STEP_STATUS = Counter("validator_avg_step_status", "Averager sync step stats", ["status"])
 VALIDATOR_EVAL_LOSS = Gauge("validator_eval_loss", "Evaluation loss", ["expert_group"])

@@ -177,6 +177,7 @@ from connito.shared.telemetry import (
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
     VALIDATOR_HEARTBEAT_TOTAL,
+    VALIDATOR_MINER_WEIGHT_SUBMITTED,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
     SystemStatePoller,
     set_validator_identity,
@@ -1057,6 +1058,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         weight_group_1=list(g1),
                         weight_group_2=list(g2),
                     )
+                # Mirror the about-to-submit weights into Prometheus so
+                # external aggregators don't have to scrape `/v1/state.json`
+                # to learn what each validator votes on chain. Mirrors the
+                # semantics of `score_aggregator.uid_score_pairs(how="avg")`
+                # — entries are written only for UIDs we actually weight,
+                # so a miner the validator has never scored has *no* sample
+                # rather than a zero (preserves prior EMA semantics).
+                for _uid, _weight in uid_weights.items():
+                    try:
+                        VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(
+                            miner_uid=str(_uid),
+                        ).set(float(_weight))
+                    except Exception:
+                        pass
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
