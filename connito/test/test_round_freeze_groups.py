@@ -247,9 +247,9 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
     assert r.cohort_state.cohort_epoch == 0
 
 
-def test_flag_on_within_cohort_holds_groups_constant():
-    """Cycle 8k+5: cohort state already exists → Round.freeze reuses it
-    rather than re-electing.
+def test_flag_on_within_cohort_rebuilds_fresh_cohort():
+    """Cycle 8k+5: cohort_state already exists, but Round.freeze rebuilds
+    a fresh cohort every cycle (no in-window short-circuit).
     """
     n = 30
     metagraph = _metagraph(
@@ -282,13 +282,13 @@ def test_flag_on_within_cohort_holds_groups_constant():
         cycle_length=100,
         round_id=1300,
     )
-    # Held groups should pass through unchanged.
-    assert r.validation_group_a == held.validation_group_a
-    assert r.validation_group_b == held.validation_group_b
-    assert r.validation_group_c == held.validation_group_c
-    assert r.weight_group_1 == held.weight_group_1
-    assert r.weight_group_2 == held.weight_group_2
-    assert r.cohort_state is held
+    # Always rebuilds: a new CohortState is returned, distinct from
+    # `held`. Epoch resolves to the same window (cohort_epoch_for(13) == 8)
+    # and highest_seen never decreases.
+    assert r.cohort_state is not None
+    assert r.cohort_state is not held
+    assert r.cohort_state.cohort_epoch == 8
+    assert r.cohort_state.highest_seen_cycle_index >= held.highest_seen_cycle_index
 
 
 def test_flag_on_election_at_boundary_promotes_top_scorers():

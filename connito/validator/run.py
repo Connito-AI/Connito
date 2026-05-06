@@ -898,50 +898,79 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     score_aggregator=score_aggregator,
                     score_path=score_path,
                 )
+                # Drop history older than 8 cycle lengths so the aggregator
+                # only carries the recent window the cohort election + weight
+                # avg actually look at.
+                _cycle_len = int(phase_response.cycle_length)
+                _min_round_id = int(pending_round.round_id) - 8 * _cycle_len
+                _dropped = score_aggregator.prune_before_round(_min_round_id)
+                if _dropped:
+                    try:
+                        score_aggregator.persist_atomic(score_path)
+                    except Exception as e:
+                        logger.warning(
+                            "score_aggregator.persist_atomic after prune failed",
+                            error=str(e),
+                        )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                uid_weights = score_aggregator.uid_score_pairs(how="avg")
+                avg_scores = score_aggregator.uid_score_pairs(how="avg")
+                uid_weights = avg_scores
                 # Round-group construction scheme: when this round was
                 # frozen under the cohort scheme, emit weights based on
-                # *this round's* local scores rather than long-window
-                # averages. Spec semantics:
-                #   - 97% to top-3 of A∪B by this round's local score,
-                #     proportional split.
-                #   - 3% to top-15 of A∪B∪C \\ top-3 by this round's
-                #     local score, proportional split.
+                # the score-aggregator average. Spec semantics:
+                #   - 97% to top-3 of A∪B by avg score, proportional split.
+                #     Group 1 requires >= 3 recorded score points AND a
+                #     score within the last 3 cycles (inclusive of current).
+                #   - 3% to top-15 of A∪B∪C \\ top-3 by avg score,
+                #     proportional split. Group 2 requires >= 2 recorded
+                #     score points AND a score within the last 2 cycles.
                 # ChainSubmitter normalizes to 1.0 before sending.
                 if pending_round.cohort_state is not None:
                     from connito.validator import round_groups as _rg
-                    # `pending_round.scores` carries the raw per-eval
-                    # signal recorded by `mark_scored` — preferred over
-                    # the rank-based aggregator output for proportional
-                    # emission.
-                    round_local_scores = dict(pending_round.scores)
                     ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
                     abc_uids = ab_uids + list(pending_round.validation_group_c)
+                    _cur_rid = int(pending_round.round_id)
+                    g1_min_rid = _cur_rid - 2 * _cycle_len   # last 3 cycles
+                    g2_min_rid = _cur_rid - 1 * _cycle_len   # last 2 cycles
+
+                    def _scored_since(uid: int, min_rid: int) -> bool:
+                        last = score_aggregator.latest_round_id(uid)
+                        return last is not None and last >= min_rid
+
+                    ab_qualified = [
+                        u for u in ab_uids
+                        if score_aggregator.record_count(u) >= 3
+                        and _scored_since(u, g1_min_rid)
+                    ]
                     g1 = _rg.select_top_n_by_local_score(
-                        ab_uids,
-                        round_local_scores,
+                        ab_qualified,
+                        avg_scores,
                         n=config.evaluation.weight_group_1_size,
                     )
                     g1_set = set(g1)
-                    g2_pool = [u for u in abc_uids if u not in g1_set]
+                    g2_pool = [
+                        u for u in abc_uids
+                        if u not in g1_set
+                        and score_aggregator.record_count(u) >= 2
+                        and _scored_since(u, g2_min_rid)
+                    ]
                     g2 = _rg.select_top_n_by_local_score(
                         g2_pool,
-                        round_local_scores,
+                        avg_scores,
                         n=config.evaluation.weight_group_2_size,
                     )
                     uid_weights = _rg.compute_uid_weights(
                         weight_group_1=g1,
                         weight_group_2=g2,
-                        local_scores=round_local_scores,
+                        local_scores=avg_scores,
                         group_1_share=config.evaluation.weight_group_1_share,
                         group_2_share=config.evaluation.weight_group_2_share,
                     )
                     logger.info(
-                        "(4) round-group local-score emission",
+                        "(4) round-group avg-score emission",
                         round_id=pending_round.round_id,
                         weight_group_1=list(g1),
                         weight_group_2=list(g2),

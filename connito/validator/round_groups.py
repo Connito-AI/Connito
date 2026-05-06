@@ -518,39 +518,21 @@ def maybe_advance_cohort(
     expert_group: str,
     cfg,
 ) -> "CohortState":
-    """Return the `CohortState` to use for this cycle.
+    """Return a freshly built `CohortState` for this cycle.
 
-    If `cycle_index` is still within the current cohort window, returns
-    `current_state` unchanged (the 8-cycle hold). At a cohort boundary —
-    or on first run — runs the election from the previous cohort's
-    score history and assembles a fresh `CohortState`.
+    Always re-runs the election from the previous cohort's score history
+    and assembles a new `CohortState` — no in-window short-circuit, so
+    cohort composition tracks the latest scores every cycle rather than
+    holding for 8 cycles.
 
     Cold start (`current_state is None`) emits empty ballots and lets
     `build_cohort_groups` construct Groups A/B/C from chain state alone.
-    Spec edge case "Cold start": promotion rules are skipped during the
-    first 8 cycles, which is the natural consequence of empty ballots.
-
-    Rollback guard: refuses to advance if `cycle_index` is below the
-    persisted `highest_seen_cycle_index` — chain reorg or owner-API
-    drift cannot rewind the cohort.
     """
     from connito.validator.cohort_state import CohortState
 
     window = cfg.cohort_window_cycles
     new_epoch = cohort_epoch_for(cycle_index, window)
 
-    if current_state is not None:
-        if cycle_index < current_state.highest_seen_cycle_index:
-            logger.warning(
-                "round_groups.maybe_advance_cohort: cycle_index < highest_seen — clamping",
-                cycle_index=cycle_index,
-                highest_seen=current_state.highest_seen_cycle_index,
-            )
-            return current_state
-        if current_state.cohort_epoch == new_epoch:
-            return current_state
-
-    # Cohort boundary or first run.
     if current_state is None or score_aggregator is None:
         ballots = ElectionBallots(weight_group_1=(), weight_group_2=())
     else:

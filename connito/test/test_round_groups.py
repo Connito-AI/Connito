@@ -572,7 +572,7 @@ def _trivial_metagraph(n: int = 30) -> SimpleNamespace:
     )
 
 
-def test_maybe_advance_cohort_holds_within_window():
+def test_maybe_advance_cohort_rebuilds_within_window():
     state = CohortState(
         cohort_epoch=8,
         expert_group="g1",
@@ -597,7 +597,12 @@ def test_maybe_advance_cohort_holds_within_window():
         expert_group="g1",
         cfg=_cfg(),
     )
-    assert out is state
+    # Always rebuilds, so a fresh CohortState is returned even within the
+    # current cohort window. Epoch still resolves to the same value
+    # (cohort_epoch_for(11, 8) == 8) but the object is new.
+    assert out is not state
+    assert out.cohort_epoch == 8
+    assert out.highest_seen_cycle_index == 11
 
 
 def test_maybe_advance_cohort_advances_at_boundary():
@@ -649,14 +654,14 @@ def test_maybe_advance_cohort_cold_start_returns_empty_ballots():
     assert out.weight_group_2 == ()
 
 
-def test_maybe_advance_cohort_clamps_rollback():
+def test_maybe_advance_cohort_rebuilds_even_on_rollback():
     state = CohortState(
         cohort_epoch=8,
         expert_group="g1",
         highest_seen_cycle_index=12,
     )
     out = maybe_advance_cohort(
-        cycle_index=5,            # < highest_seen — rollback
+        cycle_index=5,            # < highest_seen
         round_id=100,
         cycle_length=100,
         current_state=state,
@@ -670,7 +675,10 @@ def test_maybe_advance_cohort_clamps_rollback():
         expert_group="g1",
         cfg=_cfg(),
     )
-    assert out is state   # refused to advance
+    # Always rebuilds — no rollback short-circuit.
+    assert out is not state
+    assert out.cohort_epoch == 0      # cohort_epoch_for(5, 8) == 0
+    assert out.highest_seen_cycle_index == 12   # never decreases
 
 
 # ---------------------------------------------------------------------------
