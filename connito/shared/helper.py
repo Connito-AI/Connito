@@ -1,5 +1,6 @@
 import hashlib
 import importlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,34 @@ from typing import Iterable, List
 
 import torch
 import torch.nn.functional as F
+
+
+# File extensions accepted as miner-checkpoint formats. `.safetensors` is the
+# preferred path — no pickle, no code-execution surface. `.pt` is still
+# accepted for backwards compatibility with miners that haven't migrated.
+MINER_CHECKPOINT_SUFFIXES: tuple[str, ...] = (".safetensors", ".pt")
+
+
+def load_state_dict_from_path(path: str | os.PathLike) -> dict[str, torch.Tensor]:
+    """Load a miner-checkpoint state_dict from `.safetensors` or `.pt`.
+
+    `.safetensors` is loaded directly (no pickle path). `.pt` is loaded with
+    `weights_only=True` so a malicious miner cannot execute code via a
+    crafted `__reduce__` payload. Returned dict is always a flat
+    {param_name: Tensor}; `.pt` files that wrap weights in
+    `{"model_state_dict": ...}` are unwrapped here.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".safetensors":
+        from safetensors.torch import load_file
+        return load_file(str(path), device="cpu")
+    obj = torch.load(str(path), map_location="cpu", weights_only=True)
+    if isinstance(obj, dict) and "model_state_dict" in obj and isinstance(obj["model_state_dict"], dict):
+        return obj["model_state_dict"]
+    if isinstance(obj, dict):
+        return obj
+    raise ValueError(f"Unsupported checkpoint format at {path}: {type(obj).__name__}")
 
 
 def sum_model_gradients(model):

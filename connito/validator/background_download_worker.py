@@ -26,7 +26,7 @@ from pathlib import Path
 import bittensor
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import parse_dynamic_filename
+from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, parse_dynamic_filename
 from connito.shared.hf_distribute import download_checkpoint_from_hf
 from connito.shared.telemetry import (
     VALIDATOR_BG_WORKER_PAUSED,
@@ -216,14 +216,21 @@ class BackgroundDownloadWorker(threading.Thread):
 
             repo_id, revision = ckpt.hf_repo_id, ckpt.hf_revision
             expert_group_id = self.config.task.exp.group_id
-            filename = f"model_expgroup_{expert_group_id}.pt"
+            # Try `.safetensors` first (preferred — pickle-free, no
+            # code-execution surface). Fall back to `.pt` for miners that
+            # haven't migrated. MINER_CHECKPOINT_SUFFIXES is ordered
+            # preferred-first.
+            candidate_filenames = [
+                f"model_expgroup_{expert_group_id}{suffix}"
+                for suffix in MINER_CHECKPOINT_SUFFIXES
+            ]
             submission_dir = Path(self.config.ckpt.miner_submission_path)
             submission_dir.mkdir(parents=True, exist_ok=True)
 
             # Skip if a submission for this hotkey already exists locally
             # (e.g. validator restarted mid-round and the file is still on
             # disk). The match is gated on block ∈ this round's submission
-            # window — without that filter, a leftover .pt from a previous
+            # window — without that filter, a leftover file from a previous
             # cycle would short-circuit the fresh fetch and get published,
             # but `gather_validation_job` would silently reject it for
             # being out-of-window.
@@ -241,8 +248,6 @@ class BackgroundDownloadWorker(threading.Thread):
 
             tmp_dir = submission_dir / f".tmp_bg_dl_{hotkey}"
             block = self._subtensor.block if self._subtensor is not None else 0
-            dest_name = f"hotkey_{hotkey}_block_{block}.pt"
-            dest = submission_dir / dest_name
 
             logger.info(
                 "bg-download: fetching",
@@ -250,30 +255,68 @@ class BackgroundDownloadWorker(threading.Thread):
                 repo_id=repo_id,
                 revision=(revision[:8] if revision else None),
                 timeout_sec=timeout,
+                candidates=candidate_filenames,
             )
+
+            downloaded_filename: str | None = None
+            last_error: Exception | None = None
             try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        download_checkpoint_from_hf,
-                        repo_id=repo_id,
-                        revision=revision,
-                        filenames=[filename],
-                        dest_dir=tmp_dir,
-                        token_env_var=self.config.hf.token_env_var,
-                    ),
-                    timeout=timeout,
+                for candidate in candidate_filenames:
+                    # Clear tmp_dir between attempts so a partial download
+                    # from a missing-file failure can't pollute the next try.
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                download_checkpoint_from_hf,
+                                repo_id=repo_id,
+                                revision=revision,
+                                filenames=[candidate],
+                                dest_dir=tmp_dir,
+                                token_env_var=self.config.hf.token_env_var,
+                            ),
+                            timeout=timeout,
+                        )
+                        downloaded_filename = candidate
+                        break
+                    except asyncio.TimeoutError:
+                        # Hard timeout means the validator's network is the
+                        # problem, not a missing file — don't waste budget
+                        # retrying with a different suffix.
+                        logger.warning(
+                            "bg-download: timeout",
+                            uid=uid, hotkey=hotkey[:6], timeout_sec=timeout,
+                        )
+                        round_obj.mark_failed(uid)
+                        self._record_failure_metric(round_obj)
+                        return
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(
+                            "bg-download: candidate not present, trying next",
+                            uid=uid, hotkey=hotkey[:6],
+                            candidate=candidate, error=str(e),
+                        )
+                        continue
+
+                if downloaded_filename is None:
+                    logger.warning(
+                        "bg-download: no candidate file found in HF repo",
+                        uid=uid, hotkey=hotkey[:6],
+                        candidates=candidate_filenames,
+                        last_error=str(last_error) if last_error else None,
+                    )
+                    round_obj.mark_failed(uid)
+                    self._record_failure_metric(round_obj)
+                    return
+
+                # Preserve the source extension so downstream loaders can
+                # dispatch by suffix (.safetensors vs .pt).
+                dest_name = (
+                    f"hotkey_{hotkey}_block_{block}{Path(downloaded_filename).suffix}"
                 )
-                (tmp_dir / filename).replace(dest)
-            except asyncio.TimeoutError:
-                logger.warning("bg-download: timeout", uid=uid, hotkey=hotkey[:6], timeout_sec=timeout)
-                round_obj.mark_failed(uid)
-                self._record_failure_metric(round_obj)
-                return
-            except Exception as e:
-                logger.warning("bg-download: failed", uid=uid, hotkey=hotkey[:6], error=str(e))
-                round_obj.mark_failed(uid)
-                self._record_failure_metric(round_obj)
-                return
+                dest = submission_dir / dest_name
+                (tmp_dir / downloaded_filename).replace(dest)
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -305,7 +348,11 @@ class BackgroundDownloadWorker(threading.Thread):
         (legacy path / round without a window) fall back to hotkey-only
         match — but new code always passes a range so this stays safe.
         """
-        for path in submission_dir.glob("*.pt"):
+        candidates = [
+            p for suffix in MINER_CHECKPOINT_SUFFIXES
+            for p in submission_dir.glob(f"*{suffix}")
+        ]
+        for path in candidates:
             if path.name.startswith(".tmp"):
                 continue
             meta = parse_dynamic_filename(path.name)

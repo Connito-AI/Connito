@@ -14,7 +14,11 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
-from connito.shared.helper import parse_dynamic_filename
+from connito.shared.helper import (
+    MINER_CHECKPOINT_SUFFIXES,
+    load_state_dict_from_path,
+    parse_dynamic_filename,
+)
 from connito.shared.telemetry import track_eval_latency, track_model_load_latency
 
 logger = structlog.get_logger(__name__)
@@ -82,7 +86,11 @@ def cleanup_non_top_submissions(
         return []
 
     deleted: list[str] = []
-    for file_path in submission_dir.glob("*.pt"):
+    submission_files = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in submission_dir.glob(f"*{suffix}")
+    ]
+    for file_path in submission_files:
         if file_path.name.startswith(".tmp"):
             continue
         meta = parse_dynamic_filename(file_path.name)
@@ -497,13 +505,11 @@ EVAL_MAX_BATCHES = 50
 
 @track_model_load_latency()
 def load_model_from_path(path: str, base_model: nn.Module, device: torch.device) -> nn.Module:
-    ckpt = torch.load(path, map_location="cpu")
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt and isinstance(ckpt["model_state_dict"], dict):
-        sd = ckpt["model_state_dict"]
-    elif isinstance(ckpt, dict):
-        sd = ckpt
-    else:
-        raise ValueError(f"Unsupported checkpoint format at {path}: {type(ckpt).__name__}")
+    # `path` points to a miner-controlled checkpoint downloaded from HF.
+    # `load_state_dict_from_path` accepts `.safetensors` (preferred — no
+    # pickle path) or `.pt` (gated by `weights_only=True` so a malicious
+    # `__reduce__` payload cannot execute on the validator host).
+    sd = load_state_dict_from_path(path)
 
     if len(sd) == 0:
         raise ValueError(f"Checkpoint at {path} has empty model_state_dict")

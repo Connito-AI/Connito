@@ -26,13 +26,6 @@ services:
     # multiple instances can run on the same host.
     restart: unless-stopped
     pull_policy: always
-    # Inject /sbin/docker-init (tini) as PID 1 so SIGTERM is forwarded
-    # to the validator process and orphaned children are reaped. Without
-    # this, the validator (CPython) runs as PID 1, which doesn't reap
-    # zombies — Watchtower's stop-and-replace upgrade then fails with
-    # "PID <n> is zombie and can not be killed", leaving a half-dead
-    # container that blocks the next deploy.
-    init: true
 
     # Local development build. Production deploys pull from the registry
     # and ignore this section, but `docker compose build` from this dir
