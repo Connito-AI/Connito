@@ -85,9 +85,120 @@ def test_evaluator_dynamic_precision():
     assert metrics["val_loss"] > 0.0, "Evaluator yielded `val_loss=0.0` check logic"
 
 
+class NaNAfterNBatchesModel(nn.Module):
+    """Returns finite loss for the first ``n_finite`` calls then NaN for the
+    rest. Used to verify the evaluator's divisor counts only finite batches.
+    """
+    def __init__(self, device, n_finite: int, finite_loss: float = 2.0):
+        super().__init__()
+        self.device = device
+        self.n_finite = n_finite
+        self.finite_loss = finite_loss
+        self._calls = 0
+
+    def forward(self, input_ids, attention_mask=None):
+        self._calls += 1
+        loss = (
+            torch.tensor(self.finite_loss, device=self.device)
+            if self._calls <= self.n_finite
+            else torch.tensor(float("nan"), device=self.device)
+        )
+        return SimpleNamespace(loss=loss, aux_loss=torch.tensor(0.0, device=self.device))
+
+
+def test_evaluator_skips_nan_batches_from_divisor():
+    """A miner that NaNs some batches must not get the divisor padded by
+    the failed batches. Returned val_loss = mean over scored (finite)
+    batches only, not the gamed `(scored / total) * honest_loss`.
+    """
+    device = torch.device("cpu")
+    n_finite, n_nan = 4, 6
+    model = NaNAfterNBatchesModel(device=device, n_finite=n_finite, finite_loss=2.0)
+    dataloader = [{"input_ids": torch.tensor([[1]])} for _ in range(n_finite + n_nan)]
+
+    metrics = evaluate_model(
+        step=0,
+        model=model,
+        eval_dataloader=dataloader,
+        device=device,
+        max_eval_batches=None,
+    )
+
+    # Pre-fix behavior would have been `(2.0 * 4) / 10 = 0.8`. The fix
+    # divides by `scored_batches = 4`, recovering the honest mean.
+    assert metrics["val_loss"] == 2.0
+    assert metrics["scored_batches"] == n_finite
+    assert metrics["nan_batches"] == n_nan
+
+
+def test_evaluator_returns_inf_when_every_batch_nans():
+    """100% NaN miner must NOT score val_loss=0 (which would be max
+    delta after `max(0, baseline - val_loss)`). Return +inf so delta
+    clamps to 0."""
+    import math
+    device = torch.device("cpu")
+    model = NaNAfterNBatchesModel(device=device, n_finite=0)
+    dataloader = [{"input_ids": torch.tensor([[1]])} for _ in range(5)]
+
+    metrics = evaluate_model(
+        step=0,
+        model=model,
+        eval_dataloader=dataloader,
+        device=device,
+        max_eval_batches=None,
+    )
+
+    assert math.isinf(metrics["val_loss"])
+    assert metrics["scored_batches"] == 0
+    assert metrics["nan_batches"] == 5
+
+
+def test_evaluator_skips_inf_batches_too():
+    """bf16 overflow lands as +inf before propagating to NaN. The fix
+    treats Inf and NaN equivalently — both drop from the divisor and
+    from aux_loss_sum so a related variant cannot game the ratio."""
+    device = torch.device("cpu")
+
+    class InfThenFiniteModel(nn.Module):
+        def __init__(self, device):
+            super().__init__()
+            self.device = device
+            self._calls = 0
+
+        def forward(self, input_ids, attention_mask=None):
+            self._calls += 1
+            loss = (
+                torch.tensor(float("inf"), device=self.device)
+                if self._calls <= 3
+                else torch.tensor(2.0, device=self.device)
+            )
+            return SimpleNamespace(loss=loss, aux_loss=torch.tensor(0.5, device=self.device))
+
+    model = InfThenFiniteModel(device=device)
+    dataloader = [{"input_ids": torch.tensor([[1]])} for _ in range(5)]
+
+    metrics = evaluate_model(
+        step=0,
+        model=model,
+        eval_dataloader=dataloader,
+        device=device,
+        max_eval_batches=None,
+    )
+
+    # Only the 2 finite batches contribute. (2.0 - 0.5) per finite batch.
+    assert metrics["val_loss"] == 1.5
+    assert metrics["scored_batches"] == 2
+    assert metrics["nan_batches"] == 3
+
+
 if __name__ == "__main__":
     test_checkpoint_precision_preservation()
     print("✓ Checkpointer: Checkpoint precision preservation test passed. No fp16 downcasts occurred.")
-    
+
     test_evaluator_dynamic_precision()
     print("✓ Evaluator: BF16 dynamic precision test passed. FP16 hardcode bypassed.")
+
+    test_evaluator_skips_nan_batches_from_divisor()
+    test_evaluator_returns_inf_when_every_batch_nans()
+    test_evaluator_skips_inf_batches_too()
+    print("✓ Evaluator: NaN-batch divisor fix verified.")
