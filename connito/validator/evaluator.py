@@ -275,6 +275,81 @@ def finalize_round_scores(
     return written
 
 
+@dataclass(frozen=True)
+class WeightSubmissionPayload:
+    """Structured payload returned by `build_submission_uid_weights`.
+
+    `uid_weights` is what the chain submitter consumes; the
+    `weight_group_*` fields are populated only when the cohort-style
+    emission was used (otherwise empty), and exist purely so the caller
+    can log them without recomputing the selection.
+    """
+    uid_weights: dict[int, float]
+    weight_group_1: tuple[int, ...] = ()
+    weight_group_2: tuple[int, ...] = ()
+    cohort_emission: bool = False
+
+
+def build_submission_uid_weights(
+    *,
+    score_aggregator,
+    pending_round=None,
+    eval_cfg=None,
+) -> WeightSubmissionPayload:
+    """Build the `{uid: weight}` payload for a single chain submission.
+
+    Two callers share this:
+
+    * **Restart replay** (no `Round` yet) — `pending_round=None`. Falls
+      back to the score-aggregator avg directly.
+    * **End-of-round step (3 → 4)** — `pending_round` is the live
+      `Round`. When the round was frozen under the cohort scheme,
+      applies the round-group emission rule
+      (`weight_group_1_share` / `weight_group_2_share` over Groups
+      A∪B / A∪B∪C∖G1, ranked by `pending_round.scores`). Otherwise
+      (legacy non-cohort path) returns the aggregator avg.
+
+    `eval_cfg` is required for the cohort branch (it reads the
+    `weight_group_*_size`/`weight_group_*_share` knobs); the avg-only
+    path doesn't need it.
+    """
+    avg_scores = score_aggregator.uid_score_pairs(how="avg")
+    cohort_state = getattr(pending_round, "cohort_state", None) if pending_round is not None else None
+    if cohort_state is None or eval_cfg is None:
+        return WeightSubmissionPayload(uid_weights=avg_scores)
+
+    from connito.validator import round_groups as _rg
+
+    round_local_scores = dict(pending_round.scores)
+    ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
+    abc_uids = ab_uids + list(pending_round.validation_group_c)
+    g1 = _rg.select_top_n_by_local_score(
+        ab_uids,
+        round_local_scores,
+        n=eval_cfg.weight_group_1_size,
+    )
+    g1_set = set(g1)
+    g2_pool = [u for u in abc_uids if u not in g1_set]
+    g2 = _rg.select_top_n_by_local_score(
+        g2_pool,
+        round_local_scores,
+        n=eval_cfg.weight_group_2_size,
+    )
+    uid_weights = _rg.compute_uid_weights(
+        weight_group_1=g1,
+        weight_group_2=g2,
+        local_scores=round_local_scores,
+        group_1_share=eval_cfg.weight_group_1_share,
+        group_2_share=eval_cfg.weight_group_2_share,
+    )
+    return WeightSubmissionPayload(
+        uid_weights=uid_weights,
+        weight_group_1=g1,
+        weight_group_2=g2,
+        cohort_emission=True,
+    )
+
+
 def _prune_non_top_after_eval(
     *,
     config,
