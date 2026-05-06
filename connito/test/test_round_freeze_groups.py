@@ -41,9 +41,9 @@ def _config(*, flag: bool, my_hotkey: str = "vme") -> SimpleNamespace:
             enable_round_group_construction=flag,
             cohort_window_cycles=8,
             weight_group_1_size=3,
-            weight_group_1_share=0.97,
-            weight_group_2_size=15,
-            weight_group_2_share=0.03,
+            weight_group_1_share=0.98,
+            weight_group_2_size=5,
+            weight_group_2_share=0.02,
             validation_group_a_size=3,
             validation_group_ab_total=13,
             validation_group_c_size=17,
@@ -224,21 +224,32 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
 
     # Validation Group A has the 3 consensus miners (uids 5,6,7).
     assert set(r.validation_group_a) == {5, 6, 7}
-    # |A| + |B| invariant.
-    assert len(r.validation_group_a) + len(r.validation_group_b) == 13
+    # |A| + |B| is capped at 13. With weight_group_2_size=5, each
+    # validator's chain-set top-5 here is {5,6,7,21,22}; Group A
+    # absorbs {5,6,7} and Group B picks up {21,22}.
+    assert len(r.validation_group_a) + len(r.validation_group_b) <= 13
+    assert set(r.validation_group_b) == {21, 22}
     # Foreground is a subset of A∪B (per-validator partition of A∪B).
     ab_set = set(r.validation_group_a) | set(r.validation_group_b)
     assert set(r.foreground_uids) <= ab_set
     # Group C is disjoint from A∪B (per-validator partition of all \ A∪B).
     assert set(r.validation_group_c).isdisjoint(ab_set)
-    # Background = (A ∪ B ∪ C) \ foreground.
-    assert set(r.background_uids) == (
-        set(r.validation_group_a) | set(r.validation_group_b) | set(r.validation_group_c)
+    # Background contains (A ∪ B ∪ C) \ foreground at the head, plus a
+    # tail of every miner with a checkpoint that did not land in A/B/C.
+    cohort_bg = (
+        set(r.validation_group_a)
+        | set(r.validation_group_b)
+        | set(r.validation_group_c)
     ) - set(r.foreground_uids)
-    # |fg| + |bg| = full roster, no UID dropped.
-    assert len(r.foreground_uids) + len(r.background_uids) == (
-        len(r.validation_group_a) + len(r.validation_group_b) + len(r.validation_group_c)
-    )
+    bg_set = set(r.background_uids)
+    assert cohort_bg <= bg_set
+    # Background head preserves the cohort ordering.
+    assert set(r.background_uids[: len(cohort_bg)]) == cohort_bg
+    # Tail covers the leftover checkpoint-bearing miners — every miner
+    # with a checkpoint ends up in foreground or background, no UID
+    # silently dropped.
+    full_roster = set(r.foreground_uids) | set(r.background_uids)
+    assert set(range(5, n_total)) <= full_roster
     # Cold start → empty weight ballots.
     assert r.weight_group_1 == ()
     assert r.weight_group_2 == ()
@@ -247,9 +258,9 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
     assert r.cohort_state.cohort_epoch == 0
 
 
-def test_flag_on_within_cohort_holds_groups_constant():
-    """Cycle 8k+5: cohort state already exists → Round.freeze reuses it
-    rather than re-electing.
+def test_flag_on_within_cohort_rebuilds_fresh_cohort():
+    """Cycle 8k+5: cohort_state already exists, but Round.freeze rebuilds
+    a fresh cohort every cycle (no in-window short-circuit).
     """
     n = 30
     metagraph = _metagraph(
@@ -282,13 +293,13 @@ def test_flag_on_within_cohort_holds_groups_constant():
         cycle_length=100,
         round_id=1300,
     )
-    # Held groups should pass through unchanged.
-    assert r.validation_group_a == held.validation_group_a
-    assert r.validation_group_b == held.validation_group_b
-    assert r.validation_group_c == held.validation_group_c
-    assert r.weight_group_1 == held.weight_group_1
-    assert r.weight_group_2 == held.weight_group_2
-    assert r.cohort_state is held
+    # Always rebuilds: a new CohortState is returned, distinct from
+    # `held`. Epoch resolves to the same window (cohort_epoch_for(13) == 8)
+    # and highest_seen never decreases.
+    assert r.cohort_state is not None
+    assert r.cohort_state is not held
+    assert r.cohort_state.cohort_epoch == 8
+    assert r.cohort_state.highest_seen_cycle_index >= held.highest_seen_cycle_index
 
 
 def test_flag_on_election_at_boundary_promotes_top_scorers():

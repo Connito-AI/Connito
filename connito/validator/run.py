@@ -761,6 +761,61 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
+    # === startup recovery: replay any unfinalized round journals ===
+    # If a previous run died before `finalize_round_scores` could run
+    # (SIGKILL, OOM, validator crash), the per-round journal on disk
+    # holds the partial scoring state. Replay each unfinalized journal
+    # through `finalize_round_scores` so the aggregator on disk gets
+    # the same rank-based entries it would have had without the kill.
+    # A failure on a single journal logs a warning and continues — never
+    # abort startup.
+    try:
+        from connito.validator import round_journal as _rj_recover
+        from connito.validator.round_journal import _RecoveryRound
+        _journals = _rj_recover.scan(config.ckpt.checkpoint_path)
+        _recovered = 0
+        for _journal_file in _journals:
+            try:
+                _journal = _rj_recover.load(_journal_file)
+                if _journal is None or _journal.finalized:
+                    continue
+                logger.info(
+                    "Startup recovery: replaying unfinalized round journal",
+                    path=str(_journal_file),
+                    round_id=_journal.round_id,
+                    scored=len(_journal.scored_uids),
+                    failed=len(_journal.failed_uids),
+                    validation_failed=len(_journal.validation_failed_uids),
+                    freeze_zero=len(_journal.freeze_zero_uids),
+                )
+                _stub = _RecoveryRound.from_journal(_journal, _journal_file)
+                finalize_round_scores(
+                    round_obj=_stub,
+                    score_aggregator=score_aggregator,
+                    score_path=score_path,
+                )
+                _recovered += 1
+                logger.info(
+                    "Startup recovery: finalized journal",
+                    round_id=_journal.round_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Startup recovery: failed to replay journal",
+                    path=str(_journal_file),
+                    error=str(e),
+                )
+        if _recovered:
+            logger.info(
+                "Startup recovery: complete",
+                journals_finalized=_recovered,
+                journals_seen=len(_journals),
+            )
+    except Exception as e:
+        logger.warning(
+            "Startup recovery: scan failed", error=str(e),
+        )
+
     # === restart replay: submit weights from loaded historic scores ===
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
@@ -977,50 +1032,105 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     score_aggregator=score_aggregator,
                     score_path=score_path,
                 )
+                # Drop history older than 8 cycle lengths so the aggregator
+                # only carries the recent window the cohort election + weight
+                # avg actually look at.
+                _cycle_len = int(phase_response.cycle_length)
+                _min_round_id = int(pending_round.round_id) - 8 * _cycle_len
+                _dropped = score_aggregator.prune_before_round(_min_round_id)
+                if _dropped:
+                    try:
+                        score_aggregator.persist_atomic(score_path)
+                    except Exception as e:
+                        logger.warning(
+                            "score_aggregator.persist_atomic after prune failed",
+                            error=str(e),
+                        )
+                # Prune per-round journals on the same cutoff so leftover
+                # files don't grow unbounded.
+                try:
+                    from connito.validator import round_journal as _rj_prune
+                    _journals_dropped = _rj_prune.prune_before_round(
+                        config.ckpt.checkpoint_path, _min_round_id,
+                    )
+                    if _journals_dropped:
+                        logger.info(
+                            "round_journal: pruned old journals",
+                            dropped=_journals_dropped,
+                            min_round_id=_min_round_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "round_journal.prune_before_round failed",
+                        error=str(e),
+                    )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                uid_weights = score_aggregator.uid_score_pairs(how="avg")
+                avg_scores = score_aggregator.uid_score_pairs(how="avg")
+                uid_weights = avg_scores
                 # Round-group construction scheme: when this round was
                 # frozen under the cohort scheme, emit weights based on
-                # *this round's* local scores rather than long-window
-                # averages. Spec semantics:
-                #   - 97% to top-3 of A∪B by this round's local score,
-                #     proportional split.
-                #   - 3% to top-15 of A∪B∪C \\ top-3 by this round's
-                #     local score, proportional split.
+                # the score-aggregator average. Spec semantics:
+                #   - 98% to top-3 of A∪B by avg score, proportional split.
+                #     Group 1 requires >= 3 recorded score points AND a
+                #     score recorded in BOTH of the last 2 rounds
+                #     (current + previous).
+                #   - 2% to top-5 of A∪B∪C \\ top-3 by avg score,
+                #     proportional split. Group 2 requires >= 2 recorded
+                #     score points (no recency gate).
                 # ChainSubmitter normalizes to 1.0 before sending.
                 if pending_round.cohort_state is not None:
                     from connito.validator import round_groups as _rg
-                    # `pending_round.scores` carries the raw per-eval
-                    # signal recorded by `mark_scored` — preferred over
-                    # the rank-based aggregator output for proportional
-                    # emission.
-                    round_local_scores = dict(pending_round.scores)
                     ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
                     abc_uids = ab_uids + list(pending_round.validation_group_c)
+                    _cur_rid = int(pending_round.round_id)
+                    g1_required_rids = (_cur_rid, _cur_rid - _cycle_len)
+
+                    ab_qualified = [
+                        u for u in ab_uids
+                        if score_aggregator.record_count(u) >= 3
+                        and score_aggregator.has_round_ids(u, g1_required_rids)
+                    ]
                     g1 = _rg.select_top_n_by_local_score(
-                        ab_uids,
-                        round_local_scores,
+                        ab_qualified,
+                        avg_scores,
                         n=config.evaluation.weight_group_1_size,
                     )
+                    # Guard: if no UID clears the Group 1 gates, redirect
+                    # the 98% share to uid=0 (subnet owner) rather than
+                    # silently emitting only the 2% Group 2 share, which
+                    # would shrink the validator's total emission and
+                    # dilute its consensus signal until a miner clears
+                    # the recency gate.
+                    if not g1:
+                        logger.info(
+                            "(4) g1 empty — redirecting weight_group_1 share to uid=0",
+                            round_id=pending_round.round_id,
+                            ab_uids=list(ab_uids),
+                        )
+                        g1 = (0,)
                     g1_set = set(g1)
-                    g2_pool = [u for u in abc_uids if u not in g1_set]
+                    g2_pool = [
+                        u for u in abc_uids
+                        if u not in g1_set
+                        and score_aggregator.record_count(u) >= 2
+                    ]
                     g2 = _rg.select_top_n_by_local_score(
                         g2_pool,
-                        round_local_scores,
+                        avg_scores,
                         n=config.evaluation.weight_group_2_size,
                     )
                     uid_weights = _rg.compute_uid_weights(
                         weight_group_1=g1,
                         weight_group_2=g2,
-                        local_scores=round_local_scores,
+                        local_scores=avg_scores,
                         group_1_share=config.evaluation.weight_group_1_share,
                         group_2_share=config.evaluation.weight_group_2_share,
                     )
                     logger.info(
-                        "(4) round-group local-score emission",
+                        "(4) round-group avg-score emission",
                         round_id=pending_round.round_id,
                         weight_group_1=list(g1),
                         weight_group_2=list(g2),
@@ -1179,6 +1289,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 cycle_length=phase_response.cycle_length,
                 cohort_state=current_cohort_state,
                 score_aggregator=score_aggregator,
+                score_path=score_path,
+                checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
 
             # Publish the active round id to Prometheus so external
