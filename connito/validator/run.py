@@ -926,7 +926,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 #     score within the last 3 cycles (inclusive of current).
                 #   - 3% to top-15 of A∪B∪C \\ top-3 by avg score,
                 #     proportional split. Group 2 requires >= 2 recorded
-                #     score points AND a score within the last 2 cycles.
+                #     score points (no recency gate).
                 # ChainSubmitter normalizes to 1.0 before sending.
                 if pending_round.cohort_state is not None:
                     from connito.validator import round_groups as _rg
@@ -934,7 +934,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     abc_uids = ab_uids + list(pending_round.validation_group_c)
                     _cur_rid = int(pending_round.round_id)
                     g1_min_rid = _cur_rid - 2 * _cycle_len   # last 3 cycles
-                    g2_min_rid = _cur_rid - 1 * _cycle_len   # last 2 cycles
 
                     def _scored_since(uid: int, min_rid: int) -> bool:
                         last = score_aggregator.latest_round_id(uid)
@@ -955,7 +954,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         u for u in abc_uids
                         if u not in g1_set
                         and score_aggregator.record_count(u) >= 2
-                        and _scored_since(u, g2_min_rid)
                     ]
                     g2 = _rg.select_top_n_by_local_score(
                         g2_pool,

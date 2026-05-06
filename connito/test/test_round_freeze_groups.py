@@ -231,14 +231,22 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
     assert set(r.foreground_uids) <= ab_set
     # Group C is disjoint from A∪B (per-validator partition of all \ A∪B).
     assert set(r.validation_group_c).isdisjoint(ab_set)
-    # Background = (A ∪ B ∪ C) \ foreground.
-    assert set(r.background_uids) == (
-        set(r.validation_group_a) | set(r.validation_group_b) | set(r.validation_group_c)
+    # Background contains (A ∪ B ∪ C) \ foreground at the head, plus a
+    # tail of every miner with a checkpoint that did not land in A/B/C.
+    cohort_bg = (
+        set(r.validation_group_a)
+        | set(r.validation_group_b)
+        | set(r.validation_group_c)
     ) - set(r.foreground_uids)
-    # |fg| + |bg| = full roster, no UID dropped.
-    assert len(r.foreground_uids) + len(r.background_uids) == (
-        len(r.validation_group_a) + len(r.validation_group_b) + len(r.validation_group_c)
-    )
+    bg_set = set(r.background_uids)
+    assert cohort_bg <= bg_set
+    # Background head preserves the cohort ordering.
+    assert set(r.background_uids[: len(cohort_bg)]) == cohort_bg
+    # Tail covers the leftover checkpoint-bearing miners — every miner
+    # with a checkpoint ends up in foreground or background, no UID
+    # silently dropped.
+    full_roster = set(r.foreground_uids) | set(r.background_uids)
+    assert set(range(5, n_total)) <= full_roster
     # Cold start → empty weight ballots.
     assert r.weight_group_1 == ()
     assert r.weight_group_2 == ()
