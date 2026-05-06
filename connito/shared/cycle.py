@@ -100,7 +100,7 @@ def _get_with_retry(
                         body_snippet,
                     )
                     return None
-                logger.debug(
+                logger.warning(
                     "HTTP error, will retry",
                     url=url,
                     status_code=resp.status_code,
@@ -111,14 +111,14 @@ def _get_with_retry(
                     logger.info("Request succeeded after retry", url=url, attempt=attempt + 1)
                 return resp
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-            logger.debug(
+            logger.warning(
                 "Network error calling %s, will retry",
                 url,
                 error=str(net_err),
                 attempt=attempt + 1,
             )
         except requests.exceptions.RequestException as req_err:
-            logger.debug(
+            logger.warning(
                 "Request error calling %s, will retry",
                 url,
                 error=str(req_err),
@@ -128,7 +128,7 @@ def _get_with_retry(
         attempt += 1
         if attempt <= retries:
             sleep_s = backoff**attempt
-            logger.debug("Retrying after backoff", url=url, sleep_seconds=sleep_s, attempt=attempt + 1)
+            logger.info("Retrying after backoff", url=url, sleep_seconds=sleep_s, attempt=attempt + 1)
             time.sleep(sleep_s)
 
     logger.error("Request failed after retries", url=url, total_attempts=retries + 1)
@@ -277,6 +277,11 @@ def wait_till(
             blocks_remaining,
             max(poll_fallback_block, blocks_remaining * 0.9),
         ) * BITTENSOR_BLOCK_TIME_SECONDS
+        # Same cap as the early-return branch above: don't sleep past the
+        # max so we re-poll the chain at least every WAIT_TILL_MAX_SLEEP_SECONDS
+        # seconds. Without this, a wait with blocks_remaining > ~75 would sleep
+        # past the cap (e.g. blocks_remaining=316 → ~57 min single sleep).
+        sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
 
         if first_print:
             offset_label = ""
@@ -290,7 +295,24 @@ def wait_till(
                 f"at {expect_time.strftime('%H:%M:%S')}"
             )
         first_print = False
-        time.sleep(sleep_sec)
+        # Sleep in <=60 s slices and emit a heartbeat every ~5 min so the
+        # log doesn't go silent for long stretches inside a single sleep.
+        # Without this, a hang or external kill during the wait is invisible
+        # because the next "target" log only fires on the next iteration.
+        slept = 0.0
+        slice_sec = 60.0
+        while slept < sleep_sec:
+            this_slice = min(slice_sec, sleep_sec - slept)
+            time.sleep(this_slice)
+            slept += this_slice
+            if slept % 300 < slice_sec and slept + slice_sec < sleep_sec:
+                logger.debug(
+                    "wait_till: heartbeat",
+                    phase_name=phase_name,
+                    block_offset=block_offset,
+                    slept_sec=int(slept),
+                    sleep_sec=int(sleep_sec),
+                )
 
     if phase_response is None:
         logger.warning(

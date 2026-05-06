@@ -1,9 +1,9 @@
 import asyncio
 import copy
-import ctypes
 import gc
 import math
 import os
+import signal
 import threading
 import time
 from concurrent.futures import (
@@ -72,7 +72,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from connito.miner.train_helper import get_status
-from connito.shared.app_logging import configure_logging, log_phase, structlog
+from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import (
     SignedModelHashChainCommit,
     ValidatorChainCommit,
@@ -185,68 +185,36 @@ configure_logging()
 logger = structlog.get_logger(__name__)
 
 
-def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
-    if not torch.cuda.is_available():
-        print(f"[{tag}] CUDA not available")
-        return
-
-    if device is None:
-        device = torch.cuda.current_device()
-
-    torch.cuda.synchronize(device)
-
-    allocated = torch.cuda.memory_allocated(device)
-    reserved = torch.cuda.memory_reserved(device)
-
-    free, total = torch.cuda.mem_get_info(device)  # bytes
-
-    def mb(x):
-        return x / 1024**2
-
-    log_phase(
-        f"[{tag}] cuda:{device}",
-        allocated=f"{mb(allocated):.1f}MB",
-        reserved=f"{mb(reserved):.1f}MB",
-        free=f"{mb(free):.1f}MB",
-        total=f"{mb(total):.1f}MB",
-        alloc_pct=f"{allocated/total*100:.1f}%",
-        reserved_pct=f"{reserved/total*100:.1f}%",
-    )
+from connito.shared.memory import cleanup, release_cpu_ram
 
 
-try:
-    _LIBC = ctypes.CDLL("libc.so.6")
-    _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
-    _LIBC.malloc_trim.restype = ctypes.c_int
-except OSError:
-    _LIBC = None
-
-
-def _release_cpu_ram() -> None:
-    """Ask glibc to return freed arenas to the OS."""
-    if _LIBC is not None:
+def _install_signal_logging() -> None:
+    """Log SIGTERM / SIGINT / SIGHUP on receipt so docker-initiated kills are
+    visible in the validator log. We re-raise the default handler after logging
+    (default for SIGTERM/SIGHUP is to exit; SIGINT raises KeyboardInterrupt)
+    so the existing shutdown paths in run() still execute.
+    """
+    def _handler(signum: int, frame) -> None:
         try:
-            _LIBC.malloc_trim(0)
-        except Exception:
+            name = signal.Signals(signum).name
+        except (ValueError, KeyError):
+            name = str(signum)
+        logger.warning(
+            "Validator received signal — process is being asked to stop",
+            signal=name,
+            signum=signum,
+        )
+        # Restore the default handler and re-raise so normal shutdown happens.
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # Signals can't be installed from non-main threads; harmless here
+            # because we install at module import time, but guard regardless.
             pass
-
-
-def cleanup(global_model) -> None:
-    """
-    Reclaim cached allocator memory. global_model stays resident on GPU.
-    """
-    _cuda_mem_report("VRAM before GPU cleanup")
-
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    _release_cpu_ram()
-
-    _cuda_mem_report("VRAM after GPU cleanup")
 
 
 def _shutdown_background_workers(
@@ -451,7 +419,7 @@ async def aggregate_miner_gradient_change(
         finally:
             del miner_model
             gc.collect()
-            _release_cpu_ram()
+            release_cpu_ram()
 
     return merged_uids
 
@@ -1640,6 +1608,7 @@ if __name__ == "__main__":
     pkg_version, git_sha = _get_build_version()
     print(f"Connito validator — version={pkg_version}  git_sha={git_sha[:12]}", flush=True)
     logger.info("Validator starting", version=pkg_version, git_sha=git_sha[:12])
+    _install_signal_logging()
 
     if getattr(args, "test", False):
         from connito.shared.cycle import set_test_mode
