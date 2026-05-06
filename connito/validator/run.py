@@ -176,8 +176,13 @@ from connito.validator.inter_validator_connection import (
 from connito.shared.telemetry import (
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
+    VALIDATOR_CURRENT_ROUND_ID,
+    VALIDATOR_HEARTBEAT_TOTAL,
+    VALIDATOR_MINER_WEIGHT_SUBMITTED,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
-    SystemStatePoller
+    SystemStatePoller,
+    set_validator_identity,
+    track_metagraph_sync_latency,
 )
 from datetime import datetime
 
@@ -186,6 +191,46 @@ logger = structlog.get_logger(__name__)
 
 
 from connito.shared.memory import cleanup, release_cpu_ram
+
+
+@track_metagraph_sync_latency()
+def _sync_lite_metagraph(subtensor, netuid: int):
+    """Validator-side metagraph fetch via lite_subtensor.
+
+    Wrapped here (rather than at the call site) so the
+    ``track_metagraph_sync_latency`` decorator times every fetch and stamps
+    ``validator_metagraph_last_sync_timestamp`` on success.
+    """
+    return subtensor.metagraph(netuid=netuid)
+
+
+def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
+    if not torch.cuda.is_available():
+        print(f"[{tag}] CUDA not available")
+        return
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    torch.cuda.synchronize(device)
+
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+
+    free, total = torch.cuda.mem_get_info(device)  # bytes
+
+    def mb(x):
+        return x / 1024**2
+
+    log_phase(
+        f"[{tag}] cuda:{device}",
+        allocated=f"{mb(allocated):.1f}MB",
+        reserved=f"{mb(reserved):.1f}MB",
+        free=f"{mb(free):.1f}MB",
+        total=f"{mb(total):.1f}MB",
+        alloc_pct=f"{allocated/total*100:.1f}%",
+        reserved_pct=f"{reserved/total*100:.1f}%",
+    )
 
 
 def _install_signal_logging() -> None:
@@ -716,6 +761,60 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
+    # === startup recovery: replay any unfinalized round journals ===
+    # If a previous run died before `finalize_round_scores` could run
+    # (SIGKILL, OOM, validator crash), the per-round journal on disk
+    # holds the partial scoring state. Replay each unfinalized journal
+    # through `finalize_round_scores` so the aggregator on disk gets
+    # the same rank-based entries it would have had without the kill.
+    # A failure on a single journal logs a warning and continues — never
+    # abort startup.
+    try:
+        from connito.validator import round_journal as _rj_recover
+        from connito.validator.round_journal import _RecoveryRound
+        _journals = _rj_recover.scan(config.ckpt.checkpoint_path)
+        _recovered = 0
+        for _journal_file in _journals:
+            try:
+                _journal = _rj_recover.load(_journal_file)
+                if _journal is None or _journal.finalized:
+                    continue
+                logger.info(
+                    "Startup recovery: replaying unfinalized round journal",
+                    path=str(_journal_file),
+                    round_id=_journal.round_id,
+                    scored=len(_journal.scored_uids),
+                    failed=len(_journal.failed_uids),
+                    validation_failed=len(_journal.validation_failed_uids),
+                    freeze_zero=len(_journal.freeze_zero_uids),
+                )
+                _stub = _RecoveryRound.from_journal(_journal, _journal_file)
+                finalize_round_scores(
+                    round_obj=_stub,
+                    score_aggregator=score_aggregator,
+                    score_path=score_path,
+                )
+                _recovered += 1
+                logger.info(
+                    "Startup recovery: finalized journal",
+                    round_id=_journal.round_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Startup recovery: failed to replay journal",
+                    path=str(_journal_file),
+                    error=str(e),
+                )
+        if _recovered:
+            logger.info(
+                "Startup recovery: complete",
+                journals_finalized=_recovered,
+                journals_seen=len(_journals),
+            )
+    except Exception as e:
+        logger.warning(
+            "Startup recovery: scan failed", error=str(e),
+        )
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
@@ -732,12 +831,44 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
 
+    # Resolve this validator's UID so the poller can emit vtrust / consensus
+    # for our own slot. Failing this lookup keeps the metagraph block of the
+    # poller inert (validator_uid=None) rather than crashing startup.
+    validator_uid: int | None
+    try:
+        bootstrap_metagraph = _sync_lite_metagraph(lite_subtensor, config.chain.netuid)
+        validator_uid = bootstrap_metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+    except Exception as e:
+        logger.warning(
+            "Could not resolve validator UID for telemetry; metagraph metrics will be inert",
+            error=str(e),
+        )
+        validator_uid = None
+
+    # Stamp identity onto the connito_validator info metric so every Prom scrape
+    # carries which validator emitted it, and stash git_version for the
+    # /v1/state.json meta block. _get_build_version() reads CONNITO_GIT_VERSION
+    # / CONNITO_GIT_SHA env vars (baked into the Docker image) with a git-cli
+    # fallback in source checkouts.
+    git_version, git_sha = _get_build_version()
+    try:
+        set_validator_identity(
+            hotkey=wallet.hotkey.ss58_address,
+            uid=validator_uid,
+            version=git_version,
+            netuid=int(config.chain.netuid),
+        )
+    except Exception as e:
+        logger.warning("Failed to stamp connito_validator_info; continuing", error=str(e))
+
     # Start telemetry sidecar poller
     poller = SystemStatePoller(
         subtensor=lite_subtensor,
         phase_manager=PhaseManager(config, lite_subtensor),
         group_averagers=group_averagers,
-        interval_sec=12.0
+        netuid=config.chain.netuid,
+        validator_uid=validator_uid,
+        interval_sec=12.0,
     )
     poller.start()
 
@@ -834,6 +965,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     try:
         while True:
+            # Liveness signal: alert on rate(validator_main_loop_heartbeat_total[5m]) == 0
+            VALIDATOR_HEARTBEAT_TOTAL.inc()
 
             # for each step, we run 1 backward
             # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
@@ -880,6 +1013,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             "score_aggregator.persist_atomic after prune failed",
                             error=str(e),
                         )
+                # Prune per-round journals on the same cutoff so leftover
+                # files don't grow unbounded.
+                try:
+                    from connito.validator import round_journal as _rj_prune
+                    _journals_dropped = _rj_prune.prune_before_round(
+                        config.ckpt.checkpoint_path, _min_round_id,
+                    )
+                    if _journals_dropped:
+                        logger.info(
+                            "round_journal: pruned old journals",
+                            dropped=_journals_dropped,
+                            min_round_id=_min_round_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "round_journal.prune_before_round failed",
+                        error=str(e),
+                    )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
@@ -906,6 +1057,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         weight_group_1=list(payload.weight_group_1),
                         weight_group_2=list(payload.weight_group_2),
                     )
+                # Mirror the about-to-submit weights into Prometheus so
+                # external aggregators don't have to scrape `/v1/state.json`
+                # to learn what each validator votes on chain. Mirrors the
+                # semantics of `score_aggregator.uid_score_pairs(how="avg")`
+                # — entries are written only for UIDs we actually weight,
+                # so a miner the validator has never scored has *no* sample
+                # rather than a zero (preserves prior EMA semantics).
+                for _uid, _weight in uid_weights.items():
+                    try:
+                        VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(
+                            miner_uid=str(_uid),
+                        ).set(float(_weight))
+                    except Exception:
+                        pass
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
@@ -1046,7 +1211,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 cycle_length=phase_response.cycle_length,
                 cohort_state=current_cohort_state,
                 score_aggregator=score_aggregator,
+                score_path=score_path,
+                checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
+
+            # Publish the active round id to Prometheus so external
+            # aggregators can key per-miner score / val_loss readings to
+            # a specific round without parsing labels off the lifecycle
+            # gauge. Best-effort.
+            try:
+                VALIDATOR_CURRENT_ROUND_ID.set(float(new_round.round_id))
+            except Exception:
+                pass
 
             # Persist the (possibly newly advanced) cohort state to disk
             # BEFORE round_ref.swap so a crash between freeze and swap can

@@ -109,12 +109,14 @@ services:
 
     command: ["--path", "/data/configs/validator.yaml"]
 
-    # Surface a basic liveness signal — telemetry server starts on 8200.
-    # The previous (10 s timeout, 5 retries) settings killed the container
-    # at the first multi-minute /metrics rendering hiccup — see follow-up
-    # SIGTERM handler in validator.run for diagnostics. Bumped to give 10 min
-    # of headroom and added curl --max-time so the probe itself can't hang
-    # past the docker timeout.
+    # Surface a liveness signal via the Prometheus exporter on port 8200.
+    # The /v1/state.json admin API was removed; aggregators read everything
+    # from Prometheus + chain now (see connito/shared/telemetry.py).
+    # Previous (10 s timeout, 5 retries) settings killed the container at the
+    # first multi-minute /metrics rendering hiccup — see follow-up SIGTERM
+    # handler in validator.run for diagnostics. Bumped to give 10 min of
+    # headroom and added curl --max-time so the probe itself can't hang past
+    # the docker timeout.
     healthcheck:
       test: ["CMD", "curl", "-fsS", "--max-time", "30", "http://localhost:8200/metrics"]
       interval: 60s

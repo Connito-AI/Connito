@@ -9,6 +9,7 @@ torch==2.10.0
 pydantic-settings==2.2.1
 structlog==24.1.0
 prometheus-client==0.20.0
+psutil==6.1.1
 PyYAML==6.0.1
 typer==0.24.1
 python-dotenv==1.1.0
@@ -76,3 +77,6 @@ ruff==0.6.3
 black==24.8.0
 mypy==1.11.1
 types-PyYAML==6.0.12.20240808
+
+# Grafana dashboard generation (run `generate-dashboard` to emit JSON).
+grafanalib==0.7.1
