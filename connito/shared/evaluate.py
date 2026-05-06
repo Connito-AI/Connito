@@ -79,7 +79,6 @@ def evaluate_model(
                     # of the divisor as well. Explicit no-op `+= 0`
                     # keeps the parallel structure with the else-branch.
                     nan_batches += 1
-                    scored_batches += 1
                 else:
                     loss_sum += float(outputs.loss.item())
                     aux_loss_sum += (
