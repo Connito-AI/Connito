@@ -721,9 +721,43 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
     # aggregator is empty (fresh install or v0.1.31 wipe above). Shares the
-    # weight-building helper with the end-of-round path; with no Round to
-    # pass in, the helper returns the aggregator avg directly.
-    _replay_payload = build_submission_uid_weights(score_aggregator=score_aggregator)
+    # weight-building helper with the end-of-round path; if a persisted
+    # CohortState is on disk we drive cohort-style emission (98/2 + gates +
+    # empty-G1 guard) — otherwise the helper falls back to the aggregator
+    # avg directly.
+    _replay_cohort_state = None
+    if config.evaluation.enable_round_group_construction:
+        _replay_cohort_path = (
+            Path(config.ckpt.checkpoint_path) / config.evaluation.cohort_state_filename
+        )
+        _replay_task = getattr(config, "task", None)
+        _replay_exp = getattr(_replay_task, "exp", None) if _replay_task is not None else None
+        _replay_expected_eg = str(_replay_exp.group_id) if _replay_exp is not None else ""
+        try:
+            _replay_cohort_state = cohort_state_module.load(
+                _replay_cohort_path,
+                expected_expert_group=_replay_expected_eg,
+            )
+        except Exception as e:
+            logger.warning(
+                "Restart replay: failed to load cohort_state.json — emission falls back to aggregator avg",
+                error=str(e),
+                path=str(_replay_cohort_path),
+            )
+            _replay_cohort_state = None
+    # Anchor the recency gate at the highest round_id present in the
+    # loaded aggregator — that's the round where the validator last
+    # finalized scores, which matches what the end-of-round path would
+    # have used as `cur_rid` when emitting weights for that cycle.
+    _replay_known_rids = score_aggregator.all_round_ids()
+    _replay_round_id = max(_replay_known_rids) if _replay_known_rids else None
+    _replay_payload = build_submission_uid_weights(
+        score_aggregator=score_aggregator,
+        cohort_state=_replay_cohort_state,
+        round_id=_replay_round_id,
+        cycle_length=int(config.cycle.cycle_length),
+        eval_cfg=config.evaluation,
+    )
     _replay_uid_weights = _replay_payload.uid_weights
     _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
     if _replay_nonzero > 0:
@@ -922,9 +956,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
                 payload = build_submission_uid_weights(
                     score_aggregator=score_aggregator,
-                    pending_round=pending_round,
-                    eval_cfg=config.evaluation,
+                    cohort_state=pending_round.cohort_state,
+                    round_id=pending_round.round_id,
                     cycle_length=_cycle_len,
+                    eval_cfg=config.evaluation,
                 )
                 uid_weights = payload.uid_weights
                 if payload.g1_redirected_to_uid_zero:

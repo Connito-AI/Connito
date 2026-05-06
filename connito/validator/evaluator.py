@@ -296,47 +296,54 @@ class WeightSubmissionPayload:
 def build_submission_uid_weights(
     *,
     score_aggregator,
-    pending_round=None,
-    eval_cfg=None,
+    cohort_state=None,
+    round_id: int | None = None,
     cycle_length: int | None = None,
+    eval_cfg=None,
 ) -> WeightSubmissionPayload:
     """Build the `{uid: weight}` payload for a single chain submission.
 
-    Two callers share this:
+    Decoupled from any wrapper Round — the cohort fields are passed
+    directly so callers without a Round (e.g. restart replay) can also
+    drive cohort-style emission as long as a persisted `CohortState`
+    is available on disk.
 
-    * **Restart replay** (no `Round`) — `pending_round=None`. Falls
-      back to the score-aggregator avg directly so on-chain weights
-      are recovered immediately after a restart instead of waiting a
-      full cycle for the end-of-step-3 path.
-    * **End-of-round step (3 → 4)** — `pending_round` is the live
-      `Round`. When the round was frozen under the cohort scheme,
-      applies the production emission rule:
-        - Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
-          of A∪B by aggregator avg, restricted to UIDs with
-          `record_count >= 3` AND a score recorded in BOTH the current
-          and previous rounds (`round_id = cur` and `cur - cycle_length`).
-          Empty-G1 guard: if no UID clears, redirect to `uid = 0`
-          (subnet owner) so the validator stays at full emission.
-        - Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
-          of A∪B∪C \\ G1 by aggregator avg, restricted to UIDs with
-          `record_count >= 2` (no recency gate).
-      A non-cohort round (`cohort_state is None`) falls back to the
-      aggregator avg.
+    Inputs needed for cohort-style emission:
+      * `cohort_state` — provides `validation_group_a/b/c`.
+      * `round_id` — anchor for the recency gate
+        (`{round_id, round_id - cycle_length}`).
+      * `cycle_length` — block-spacing between consecutive rounds.
+      * `eval_cfg` — reads `weight_group_*_size` and `weight_group_*_share`.
 
-    `eval_cfg` and `cycle_length` are required for the cohort branch
-    (the recency gate reads `cycle_length`, the share/size knobs come
-    from `eval_cfg`). Missing either falls back to avg.
+    Cohort emission rule (when all four are present):
+      * Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
+        of A∪B by aggregator avg, restricted to UIDs with
+        `record_count >= 3` AND a score recorded in BOTH the current
+        and previous rounds. Empty-G1 guard: if no UID clears,
+        redirect to `uid = 0` (subnet owner) so the validator stays
+        at full emission.
+      * Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
+        of A∪B∪C \\ G1 by aggregator avg, restricted to UIDs with
+        `record_count >= 2` (no recency gate).
+
+    With any of the four cohort inputs missing (cold-start replay
+    before disk has a CohortState, legacy non-cohort rounds, etc.) the
+    helper falls back to the score-aggregator avg directly.
     """
     avg_scores = score_aggregator.uid_score_pairs(how="avg")
-    cohort_state = getattr(pending_round, "cohort_state", None) if pending_round is not None else None
-    if cohort_state is None or eval_cfg is None or cycle_length is None:
+    if (
+        cohort_state is None
+        or round_id is None
+        or cycle_length is None
+        or eval_cfg is None
+    ):
         return WeightSubmissionPayload(uid_weights=avg_scores)
 
     from connito.validator import round_groups as _rg
 
-    ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
-    abc_uids = ab_uids + list(pending_round.validation_group_c)
-    cur_rid = int(pending_round.round_id)
+    ab_uids = list(cohort_state.validation_group_a) + list(cohort_state.validation_group_b)
+    abc_uids = ab_uids + list(cohort_state.validation_group_c)
+    cur_rid = int(round_id)
     g1_required_rids = (cur_rid, cur_rid - int(cycle_length))
 
     ab_qualified = [

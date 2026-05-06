@@ -28,6 +28,19 @@ def _eval_cfg(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
+def _cohort_state(
+    *,
+    a: tuple[int, ...] = (),
+    b: tuple[int, ...] = (),
+    c: tuple[int, ...] = (),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        validation_group_a=a,
+        validation_group_b=b,
+        validation_group_c=c,
+    )
+
+
 def _aggregator_with_history(
     *,
     cur_rid: int,
@@ -71,8 +84,9 @@ def _aggregator_with_history(
     return agg
 
 
-def test_replay_path_falls_back_to_aggregator_avg():
-    """No `pending_round` (restart replay) → aggregator avg directly."""
+def test_no_cohort_state_falls_back_to_aggregator_avg():
+    """No `cohort_state` provided → aggregator avg directly. Covers the
+    cold-start replay case where `cohort_state.json` does not exist."""
     agg = _aggregator_with_history(
         cur_rid=1000,
         cycle_length=100,
@@ -86,60 +100,28 @@ def test_replay_path_falls_back_to_aggregator_avg():
     assert set(payload.uid_weights) == {1, 2}
 
 
-def test_legacy_round_without_cohort_state_falls_back_to_avg():
-    """`pending_round.cohort_state is None` (legacy path) → aggregator avg."""
-    agg = _aggregator_with_history(
-        cur_rid=1000,
-        cycle_length=100,
-        uids_full_history=[1, 2],
-    )
-    pending = SimpleNamespace(
-        cohort_state=None,
-        round_id=1000,
-        scores={},
-        validation_group_a=(),
-        validation_group_b=(),
-        validation_group_c=(),
-    )
-    payload = build_submission_uid_weights(
-        score_aggregator=agg,
-        pending_round=pending,
-        eval_cfg=_eval_cfg(),
-        cycle_length=100,
-    )
-    assert payload.cohort_emission is False
-    assert set(payload.uid_weights) == {1, 2}
-
-
-def test_cohort_path_emits_g1_g2_split():
-    """With a cohort state plus full history on A∪B, helper applies
-    the 98/2 top-3 / top-5 split with the >=3 records + last-2-rounds gate."""
+def test_cohort_path_emits_g1_g2_split_without_pending_round():
+    """Helper accepts `cohort_state` directly — no Round wrapper required.
+    With full history on A∪B, applies the 98/2 top-3 / top-5 split with
+    the >= 3 records + last-2-rounds gate."""
     cur_rid = 1000
     cycle_length = 100
     agg = _aggregator_with_history(
         cur_rid=cur_rid,
         cycle_length=cycle_length,
-        uids_full_history=[1, 2, 3],          # → Group 1
-        uids_partial_history=[4, 5, 6, 7],    # → Group 2 (>= 2 records)
-    )
-    pending = SimpleNamespace(
-        cohort_state=object(),
-        round_id=cur_rid,
-        scores={},
-        validation_group_a=(1, 2, 3),
-        validation_group_b=(4, 5),
-        validation_group_c=(6, 7),
+        uids_full_history=[1, 2, 3],
+        uids_partial_history=[4, 5, 6, 7],
     )
     payload = build_submission_uid_weights(
         score_aggregator=agg,
-        pending_round=pending,
-        eval_cfg=_eval_cfg(),
+        cohort_state=_cohort_state(a=(1, 2, 3), b=(4, 5), c=(6, 7)),
+        round_id=cur_rid,
         cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
     )
     assert payload.cohort_emission is True
     assert payload.g1_redirected_to_uid_zero is False
     assert set(payload.weight_group_1) == {1, 2, 3}
-    # G2 pool = (A ∪ B ∪ C) \ G1, restricted to >= 2 records → {4,5,6,7}
     assert set(payload.weight_group_2) <= {4, 5, 6, 7}
     assert pytest.approx(sum(payload.uid_weights.values()), abs=1e-6) == 1.0
 
@@ -160,22 +142,14 @@ def test_cohort_path_excludes_uids_missing_one_of_last_2_rounds():
         agg.add_score(uid=2, hotkey="hk2", score=1.0,
                       ts=ts.replace(microsecond=i + 10), round_id=rid)
 
-    pending = SimpleNamespace(
-        cohort_state=object(),
-        round_id=cur_rid,
-        scores={},
-        validation_group_a=(1, 2),
-        validation_group_b=(),
-        validation_group_c=(),
-    )
     payload = build_submission_uid_weights(
         score_aggregator=agg,
-        pending_round=pending,
-        eval_cfg=_eval_cfg(),
+        cohort_state=_cohort_state(a=(1, 2)),
+        round_id=cur_rid,
         cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
     )
     assert payload.cohort_emission is True
-    # Only uid 2 clears the gates.
     assert payload.weight_group_1 == (2,)
 
 
@@ -187,84 +161,61 @@ def test_cohort_path_empty_g1_redirects_to_uid_zero():
     agg = _aggregator_with_history(
         cur_rid=cur_rid,
         cycle_length=cycle_length,
-        uids_full_history=[],                  # nobody clears g1
-        uids_partial_history=[4, 5, 6],        # g2 candidates exist
-    )
-    pending = SimpleNamespace(
-        cohort_state=object(),
-        round_id=cur_rid,
-        scores={},
-        validation_group_a=(),
-        validation_group_b=(),
-        validation_group_c=(4, 5, 6),
+        uids_full_history=[],
+        uids_partial_history=[4, 5, 6],
     )
     payload = build_submission_uid_weights(
         score_aggregator=agg,
-        pending_round=pending,
-        eval_cfg=_eval_cfg(),
+        cohort_state=_cohort_state(c=(4, 5, 6)),
+        round_id=cur_rid,
         cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
     )
     assert payload.cohort_emission is True
     assert payload.g1_redirected_to_uid_zero is True
     assert payload.weight_group_1 == (0,)
-    # Total stays at 100% emission — uid 0 collects the full 98%.
     assert pytest.approx(payload.uid_weights[0], abs=1e-6) == 0.98
     assert pytest.approx(sum(payload.uid_weights.values()), abs=1e-6) == 1.0
 
 
 def test_cohort_path_without_eval_cfg_falls_back_to_avg():
-    """Cohort state present but missing `eval_cfg` → fall back to avg
-    rather than crashing on a missing knob."""
-    agg = _aggregator_with_history(
-        cur_rid=1000,
-        cycle_length=100,
-        uids_full_history=[1, 2],
-    )
-    pending = SimpleNamespace(
-        cohort_state=object(),
-        round_id=1000,
-        scores={},
-        validation_group_a=(1,),
-        validation_group_b=(2,),
-        validation_group_c=(),
-    )
+    agg = _aggregator_with_history(cur_rid=1000, cycle_length=100, uids_full_history=[1, 2])
     payload = build_submission_uid_weights(
         score_aggregator=agg,
-        pending_round=pending,
-        eval_cfg=None,
+        cohort_state=_cohort_state(a=(1,), b=(2,)),
+        round_id=1000,
         cycle_length=100,
+        eval_cfg=None,
+    )
+    assert payload.cohort_emission is False
+
+
+def test_cohort_path_without_round_id_falls_back_to_avg():
+    """No anchor for the recency gate → fall back to avg."""
+    agg = _aggregator_with_history(cur_rid=1000, cycle_length=100, uids_full_history=[1, 2])
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1,), b=(2,)),
+        round_id=None,
+        cycle_length=100,
+        eval_cfg=_eval_cfg(),
     )
     assert payload.cohort_emission is False
 
 
 def test_cohort_path_without_cycle_length_falls_back_to_avg():
-    """Cohort state present but missing `cycle_length` → fall back to avg
-    (the recency gate cannot be evaluated without it)."""
-    agg = _aggregator_with_history(
-        cur_rid=1000,
-        cycle_length=100,
-        uids_full_history=[1, 2],
-    )
-    pending = SimpleNamespace(
-        cohort_state=object(),
-        round_id=1000,
-        scores={},
-        validation_group_a=(1,),
-        validation_group_b=(2,),
-        validation_group_c=(),
-    )
+    agg = _aggregator_with_history(cur_rid=1000, cycle_length=100, uids_full_history=[1, 2])
     payload = build_submission_uid_weights(
         score_aggregator=agg,
-        pending_round=pending,
-        eval_cfg=_eval_cfg(),
+        cohort_state=_cohort_state(a=(1,), b=(2,)),
+        round_id=1000,
         cycle_length=None,
+        eval_cfg=_eval_cfg(),
     )
     assert payload.cohort_emission is False
 
 
 def test_payload_is_a_frozen_dataclass():
-    """Defensive: callers should not be able to mutate the payload after
-    construction."""
     p = WeightSubmissionPayload(uid_weights={1: 1.0})
     with pytest.raises((TypeError, AttributeError)):
         p.weight_group_1 = (1, 2, 3)   # type: ignore[misc]
