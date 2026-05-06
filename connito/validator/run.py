@@ -946,6 +946,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         avg_scores,
                         n=config.evaluation.weight_group_1_size,
                     )
+                    # Guard: if no UID clears the Group 1 gates, redirect
+                    # the 98% share to uid=0 (subnet owner) rather than
+                    # silently emitting only the 2% Group 2 share, which
+                    # would shrink the validator's total emission and
+                    # dilute its consensus signal until a miner clears
+                    # the recency gate.
+                    if not g1:
+                        logger.info(
+                            "(4) g1 empty — redirecting weight_group_1 share to uid=0",
+                            round_id=pending_round.round_id,
+                            ab_uids=list(ab_uids),
+                        )
+                        g1 = (0,)
                     g1_set = set(g1)
                     g2_pool = [
                         u for u in abc_uids

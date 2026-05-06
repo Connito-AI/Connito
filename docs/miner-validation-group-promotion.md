@@ -143,6 +143,11 @@ The two ballots are emitted from
   one tagged with `round_id = current_round_id` and one tagged with
   `round_id = current_round_id − cycle_length`. Missing either round
   drops the miner off the Group 1 ballot for this cycle.
+- **Empty-Group-1 guard:** if no UID clears the gates, the 98 % share
+  is redirected to `uid = 0` (subnet owner) rather than dropped.
+  This keeps the validator's total emission at 100 % so its
+  consensus signal is not diluted while it waits for a miner to
+  clear the recency gate.
 
 **Weight Group 2 — `cfg.weight_group_2_share` (default 2 %), top-`cfg.weight_group_2_size` (default 5) of A ∪ B ∪ C \\ G1 by aggregator avg:**
 
