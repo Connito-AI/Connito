@@ -368,6 +368,32 @@ class Round:
                     new_cohort_state
                 )
 
+                # Tail: every miner with a chain checkpoint that did not
+                # land in this round's A/B/C roster. Appended to
+                # background_uids (after the consensus tier) so they
+                # still get downloaded + evaluated when there is spare
+                # capacity. Ordered staleness-first (longest-since-last
+                # evaluated), random tiebreak so equal-staleness UIDs
+                # rotate naturally across cycles.
+                abc_set = (
+                    set(new_validation_a)
+                    | set(new_validation_b)
+                    | set(new_validation_c)
+                )
+                cohort_set = abc_set | set(foreground_uids)
+                tail_pool: list[int] = []
+                _seen_tail: set[int] = set()
+                for uid in (*foreground, *background):
+                    if uid in cohort_set or uid in _seen_tail:
+                        continue
+                    _seen_tail.add(uid)
+                    tail_pool.append(uid)
+                tail_pool.sort(
+                    key=lambda u: (last_eval_map.get(u, EPOCH), random.random())
+                )
+                if tail_pool:
+                    background_uids = tuple([*background_uids, *tail_pool])
+
                 # Make sure every UID in the new roster has a hotkey
                 # entry — Group A and B may include UIDs outside this
                 # validator's assignment slice that the earlier loop
@@ -388,6 +414,7 @@ class Round:
                     validation_group_c=list(new_validation_c),
                     foreground_uids=list(foreground_uids),
                     background_uids=list(background_uids),
+                    tail_uids=list(tail_pool),
                     weight_group_1=list(new_weight_group_1),
                     weight_group_2=list(new_weight_group_2),
                 )
