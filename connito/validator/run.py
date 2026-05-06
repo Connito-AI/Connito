@@ -123,6 +123,7 @@ from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter
 from connito.validator.evaluator import (
     MinerEvalJob,
+    build_submission_uid_weights,
     evaluate_foreground_round,
     finalize_round_scores,
     load_model_from_path,
@@ -719,8 +720,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === restart replay: submit weights from loaded historic scores ===
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
-    # aggregator is empty (fresh install or v0.1.31 wipe above).
-    _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
+    # aggregator is empty (fresh install or v0.1.31 wipe above). Shares the
+    # weight-building helper with the end-of-round path; with no Round to
+    # pass in, the helper returns the aggregator avg directly.
+    _replay_payload = build_submission_uid_weights(score_aggregator=score_aggregator)
+    _replay_uid_weights = _replay_payload.uid_weights
     _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
     if _replay_nonzero > 0:
         @dataclass
@@ -916,72 +920,26 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                avg_scores = score_aggregator.uid_score_pairs(how="avg")
-                uid_weights = avg_scores
-                # Round-group construction scheme: when this round was
-                # frozen under the cohort scheme, emit weights based on
-                # the score-aggregator average. Spec semantics:
-                #   - 98% to top-3 of A∪B by avg score, proportional split.
-                #     Group 1 requires >= 3 recorded score points AND a
-                #     score recorded in BOTH of the last 2 rounds
-                #     (current + previous).
-                #   - 2% to top-5 of A∪B∪C \\ top-3 by avg score,
-                #     proportional split. Group 2 requires >= 2 recorded
-                #     score points (no recency gate).
-                # ChainSubmitter normalizes to 1.0 before sending.
-                if pending_round.cohort_state is not None:
-                    from connito.validator import round_groups as _rg
-                    ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
-                    abc_uids = ab_uids + list(pending_round.validation_group_c)
-                    _cur_rid = int(pending_round.round_id)
-                    g1_required_rids = (_cur_rid, _cur_rid - _cycle_len)
-
-                    ab_qualified = [
-                        u for u in ab_uids
-                        if score_aggregator.record_count(u) >= 3
-                        and score_aggregator.has_round_ids(u, g1_required_rids)
-                    ]
-                    g1 = _rg.select_top_n_by_local_score(
-                        ab_qualified,
-                        avg_scores,
-                        n=config.evaluation.weight_group_1_size,
+                payload = build_submission_uid_weights(
+                    score_aggregator=score_aggregator,
+                    pending_round=pending_round,
+                    eval_cfg=config.evaluation,
+                    cycle_length=_cycle_len,
+                )
+                uid_weights = payload.uid_weights
+                if payload.g1_redirected_to_uid_zero:
+                    logger.info(
+                        "(4) g1 empty — redirecting weight_group_1 share to uid=0",
+                        round_id=pending_round.round_id,
+                        ab_uids=list(pending_round.validation_group_a)
+                        + list(pending_round.validation_group_b),
                     )
-                    # Guard: if no UID clears the Group 1 gates, redirect
-                    # the 98% share to uid=0 (subnet owner) rather than
-                    # silently emitting only the 2% Group 2 share, which
-                    # would shrink the validator's total emission and
-                    # dilute its consensus signal until a miner clears
-                    # the recency gate.
-                    if not g1:
-                        logger.info(
-                            "(4) g1 empty — redirecting weight_group_1 share to uid=0",
-                            round_id=pending_round.round_id,
-                            ab_uids=list(ab_uids),
-                        )
-                        g1 = (0,)
-                    g1_set = set(g1)
-                    g2_pool = [
-                        u for u in abc_uids
-                        if u not in g1_set
-                        and score_aggregator.record_count(u) >= 2
-                    ]
-                    g2 = _rg.select_top_n_by_local_score(
-                        g2_pool,
-                        avg_scores,
-                        n=config.evaluation.weight_group_2_size,
-                    )
-                    uid_weights = _rg.compute_uid_weights(
-                        weight_group_1=g1,
-                        weight_group_2=g2,
-                        local_scores=avg_scores,
-                        group_1_share=config.evaluation.weight_group_1_share,
-                        group_2_share=config.evaluation.weight_group_2_share,
-                    )
+                if payload.cohort_emission:
                     logger.info(
                         "(4) round-group avg-score emission",
                         round_id=pending_round.round_id,
-                        weight_group_1=list(g1),
-                        weight_group_2=list(g2),
+                        weight_group_1=list(payload.weight_group_1),
+                        weight_group_2=list(payload.weight_group_2),
                     )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.

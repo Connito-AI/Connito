@@ -275,6 +275,111 @@ def finalize_round_scores(
     return written
 
 
+@dataclass(frozen=True)
+class WeightSubmissionPayload:
+    """Structured payload returned by `build_submission_uid_weights`.
+
+    `uid_weights` is what the chain submitter consumes; the
+    `weight_group_*` fields are populated only when the cohort-style
+    emission was used (otherwise empty), and exist purely so the caller
+    can log them without recomputing the selection.
+    `g1_redirected_to_uid_zero` is set when the empty-G1 guard fires —
+    the caller logs that case under its own info line.
+    """
+    uid_weights: dict[int, float]
+    weight_group_1: tuple[int, ...] = ()
+    weight_group_2: tuple[int, ...] = ()
+    cohort_emission: bool = False
+    g1_redirected_to_uid_zero: bool = False
+
+
+def build_submission_uid_weights(
+    *,
+    score_aggregator,
+    pending_round=None,
+    eval_cfg=None,
+    cycle_length: int | None = None,
+) -> WeightSubmissionPayload:
+    """Build the `{uid: weight}` payload for a single chain submission.
+
+    Two callers share this:
+
+    * **Restart replay** (no `Round`) — `pending_round=None`. Falls
+      back to the score-aggregator avg directly so on-chain weights
+      are recovered immediately after a restart instead of waiting a
+      full cycle for the end-of-step-3 path.
+    * **End-of-round step (3 → 4)** — `pending_round` is the live
+      `Round`. When the round was frozen under the cohort scheme,
+      applies the production emission rule:
+        - Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
+          of A∪B by aggregator avg, restricted to UIDs with
+          `record_count >= 3` AND a score recorded in BOTH the current
+          and previous rounds (`round_id = cur` and `cur - cycle_length`).
+          Empty-G1 guard: if no UID clears, redirect to `uid = 0`
+          (subnet owner) so the validator stays at full emission.
+        - Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
+          of A∪B∪C \\ G1 by aggregator avg, restricted to UIDs with
+          `record_count >= 2` (no recency gate).
+      A non-cohort round (`cohort_state is None`) falls back to the
+      aggregator avg.
+
+    `eval_cfg` and `cycle_length` are required for the cohort branch
+    (the recency gate reads `cycle_length`, the share/size knobs come
+    from `eval_cfg`). Missing either falls back to avg.
+    """
+    avg_scores = score_aggregator.uid_score_pairs(how="avg")
+    cohort_state = getattr(pending_round, "cohort_state", None) if pending_round is not None else None
+    if cohort_state is None or eval_cfg is None or cycle_length is None:
+        return WeightSubmissionPayload(uid_weights=avg_scores)
+
+    from connito.validator import round_groups as _rg
+
+    ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
+    abc_uids = ab_uids + list(pending_round.validation_group_c)
+    cur_rid = int(pending_round.round_id)
+    g1_required_rids = (cur_rid, cur_rid - int(cycle_length))
+
+    ab_qualified = [
+        u for u in ab_uids
+        if score_aggregator.record_count(u) >= 3
+        and score_aggregator.has_round_ids(u, g1_required_rids)
+    ]
+    g1 = _rg.select_top_n_by_local_score(
+        ab_qualified,
+        avg_scores,
+        n=eval_cfg.weight_group_1_size,
+    )
+    g1_redirected = False
+    if not g1:
+        g1 = (0,)
+        g1_redirected = True
+    g1_set = set(g1)
+    g2_pool = [
+        u for u in abc_uids
+        if u not in g1_set
+        and score_aggregator.record_count(u) >= 2
+    ]
+    g2 = _rg.select_top_n_by_local_score(
+        g2_pool,
+        avg_scores,
+        n=eval_cfg.weight_group_2_size,
+    )
+    uid_weights = _rg.compute_uid_weights(
+        weight_group_1=g1,
+        weight_group_2=g2,
+        local_scores=avg_scores,
+        group_1_share=eval_cfg.weight_group_1_share,
+        group_2_share=eval_cfg.weight_group_2_share,
+    )
+    return WeightSubmissionPayload(
+        uid_weights=uid_weights,
+        weight_group_1=g1,
+        weight_group_2=g2,
+        cohort_emission=True,
+        g1_redirected_to_uid_zero=g1_redirected,
+    )
+
+
 def _prune_non_top_after_eval(
     *,
     config,
