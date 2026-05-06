@@ -11,7 +11,6 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -717,76 +716,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
-    # === restart replay: submit weights from loaded historic scores ===
-    # Recovers the on-chain weights immediately after a restart instead of
-    # waiting a full cycle for the end-of-step-3 submission. No-op when
-    # the aggregator is empty (fresh install or v0.1.31 wipe above). When
-    # a persisted CohortState is available the helper drives the same
-    # cohort-style emission (98 / 2 + history gates + empty-G1 guard) the
-    # end-of-round path uses; otherwise it falls back to the aggregator avg.
-    _replay_cohort_state = None
-    if config.evaluation.enable_round_group_construction:
-        _replay_cohort_path = (
-            Path(config.ckpt.checkpoint_path) / config.evaluation.cohort_state_filename
-        )
-        _replay_task = getattr(config, "task", None)
-        _replay_exp = getattr(_replay_task, "exp", None) if _replay_task is not None else None
-        _replay_expected_eg = str(_replay_exp.group_id) if _replay_exp is not None else ""
-        try:
-            _replay_cohort_state = cohort_state_module.load(
-                _replay_cohort_path,
-                expected_expert_group=_replay_expected_eg,
-            )
-        except Exception as e:
-            logger.warning(
-                "Restart replay: failed to load cohort_state.json — emission falls back to aggregator avg",
-                error=str(e),
-                path=str(_replay_cohort_path),
-            )
-            _replay_cohort_state = None
-    # Anchor the recency gate at the highest round_id present in the
-    # loaded aggregator — that's the round where the validator last
-    # finalized scores, matching what the end-of-round path would have
-    # used as `cur_rid` when emitting weights for that cycle.
-    _replay_known_rids = score_aggregator.all_round_ids()
-    _replay_round_id = max(_replay_known_rids) if _replay_known_rids else None
-    _replay_payload = build_submission_uid_weights(
-        score_aggregator=score_aggregator,
-        cohort_state=_replay_cohort_state,
-        round_id=_replay_round_id,
-        cycle_length=int(config.cycle.cycle_length),
-        eval_cfg=config.evaluation,
-    )
-    _replay_uid_weights = _replay_payload.uid_weights
-    _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
-    if _replay_nonzero > 0:
-        @dataclass
-        class _ReplayRound:
-            round_id: int
-            weights_submitted: bool = False
-
-        _replay_round = _ReplayRound(round_id=int(global_opt_step))
-        logger.info(
-            "Restart replay: submitting weights from loaded historic scores",
-            uids=len(_replay_uid_weights),
-            nonzero_uids=_replay_nonzero,
-            cohort_emission=_replay_payload.cohort_emission,
-            g1_redirected_to_uid_zero=_replay_payload.g1_redirected_to_uid_zero,
-        )
-        try:
-            _replay_future = chain_submitter.async_submit_weight(_replay_round, _replay_uid_weights)
-            try:
-                _replay_future.result(timeout=120.0)
-                logger.info(
-                    "Restart replay: submission completed",
-                    weights_submitted=_replay_round.weights_submitted,
-                )
-            except FuturesTimeoutError:
-                logger.warning("Restart replay: submission did not complete within 120s; continuing")
-        except Exception as e:
-            logger.warning("Restart replay: submission scheduling failed", error=str(e))
-    else:
-        logger.info("Restart replay: skipped — no non-zero historic scores to submit")
+    # Stale on-chain weights are recovered without a startup-blocking
+    # replay — the per-cycle fallback path in the main loop already
+    # re-emits the previous chain weights when `last_update` is past
+    # `max_weight_age`, and the next end-of-step-3 submission lands a
+    # fresh cohort-style emission within one cycle anyway.
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
