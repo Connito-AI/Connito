@@ -3,6 +3,7 @@ import copy
 import gc
 import math
 import os
+import secrets
 import signal
 import threading
 import time
@@ -949,10 +950,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # `finalize_round_scores`. Archive/prune below runs with bg-eval
             # gated, preserving the file-race protection that used to live
             # at this point in the loop.
+            #
+            # Fresh 32-bit random seed each cycle. Read by every validator at
+            # the next Submission start via `get_combined_validator_seed`,
+            # which sha256s the sorted concat — so cohort-wide assignment
+            # rotates each cycle even when miner/validator membership is
+            # static. 32 bits = up to 10 decimal digits, ≤14 bytes of JSON,
+            # well within the 128-byte commit budget shared with model_hash.
+            new_miner_seed = secrets.randbits(32)
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
                 global_ver=global_opt_step,
                 expert_group=config.task.exp.group_id,
+                miner_seed=new_miner_seed,
             ))
 
             if config.ckpt.archive_submissions:
