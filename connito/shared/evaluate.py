@@ -78,9 +78,8 @@ def evaluate_model(
                     # NOT increment `scored_batches`, so they drop out
                     # of the divisor as well. Explicit no-op `+= 0`
                     # keeps the parallel structure with the else-branch.
-                    loss_sum += 0.0
-                    aux_loss_sum += 0.0
                     nan_batches += 1
+                    scored_batches += 1
                 else:
                     loss_sum += float(outputs.loss.item())
                     aux_loss_sum += (
@@ -121,14 +120,6 @@ def evaluate_model(
             "nan_batches": nan_batches,
             "scored_batches": 0,
         }
-
-    if nan_batches > 0:
-        logger.warning(
-            "evaluate_model: NaN/Inf batches dropped from loss avg",
-            nan_batches=nan_batches,
-            scored_batches=scored_batches,
-            step=step,
-        )
 
     val_loss = (loss_sum - aux_loss_sum) / scored_batches
     val_aux_loss = aux_loss_sum / scored_batches
