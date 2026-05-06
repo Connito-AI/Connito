@@ -501,6 +501,27 @@ class MinerScoreAggregator:
                     best = rid
             return best
 
+    def has_round_ids(self, uid: int, round_ids: list[int] | tuple[int, ...]) -> bool:
+        """True iff ``uid`` has at least one recorded score for every
+        ``round_id`` in ``round_ids``."""
+        uid = int(uid)
+        if not round_ids:
+            return True
+        targets = {int(r) for r in round_ids}
+        with self._lock:
+            state = self._miners.get(uid)
+            if state is None:
+                return False
+            seen: set[int] = set()
+            for _ts, _v, rid in state.series.points:
+                if rid is None:
+                    continue
+                if rid in targets:
+                    seen.add(int(rid))
+                    if seen == targets:
+                        return True
+            return seen == targets
+
     # ---------- Persistence ----------
     def to_json(self) -> str:
         """Serialize miners to JSON (schema v2: envelope + round_id per point)."""

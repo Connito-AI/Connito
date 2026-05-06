@@ -921,10 +921,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Round-group construction scheme: when this round was
                 # frozen under the cohort scheme, emit weights based on
                 # the score-aggregator average. Spec semantics:
-                #   - 97% to top-3 of A∪B by avg score, proportional split.
+                #   - 98% to top-3 of A∪B by avg score, proportional split.
                 #     Group 1 requires >= 3 recorded score points AND a
-                #     score within the last 3 cycles (inclusive of current).
-                #   - 3% to top-15 of A∪B∪C \\ top-3 by avg score,
+                #     score recorded in BOTH of the last 2 rounds
+                #     (current + previous).
+                #   - 2% to top-5 of A∪B∪C \\ top-3 by avg score,
                 #     proportional split. Group 2 requires >= 2 recorded
                 #     score points (no recency gate).
                 # ChainSubmitter normalizes to 1.0 before sending.
@@ -933,16 +934,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
                     abc_uids = ab_uids + list(pending_round.validation_group_c)
                     _cur_rid = int(pending_round.round_id)
-                    g1_min_rid = _cur_rid - 2 * _cycle_len   # last 3 cycles
-
-                    def _scored_since(uid: int, min_rid: int) -> bool:
-                        last = score_aggregator.latest_round_id(uid)
-                        return last is not None and last >= min_rid
+                    g1_required_rids = (_cur_rid, _cur_rid - _cycle_len)
 
                     ab_qualified = [
                         u for u in ab_uids
                         if score_aggregator.record_count(u) >= 3
-                        and _scored_since(u, g1_min_rid)
+                        and score_aggregator.has_round_ids(u, g1_required_rids)
                     ]
                     g1 = _rg.select_top_n_by_local_score(
                         ab_qualified,

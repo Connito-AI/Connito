@@ -18,7 +18,7 @@ start of every cycle's Submission phase.
 | Group | Role | Size | Where it comes from |
 |-------|------|------|---------------------|
 | **A** | Consensus tier — miners already heavily rewarded by the rest of the subnet | up to 13 (shares budget with B) | Chain-set top-3 tally (`metagraph.weights`) |
-| **B** | Candidate tier — miners on the chain-set top-15 but not yet hitting Group A's gates | `13 − \|A\|` | Chain-set top-15 tally |
+| **B** | Candidate tier — miners on the chain-set top-5 but not yet hitting Group A's gates | `13 − \|A\|` | Chain-set top-5 tally (`cfg.weight_group_2_size`) |
 | **C** | Exploration tier — every other registered miner, partitioned across validators | up to `validation_group_c_size` (default 17) per validator | Seeded `assign_miners_to_validators` over `(all miners) \\ (A ∪ B)` |
 
 `|A| + |B|` is capped at `validation_group_ab_total` (default 13)
@@ -55,14 +55,15 @@ validator and earn local score points. Without Group C exposure a
 fresh miner accumulates no history and cannot clear the upper tiers'
 weight-emission gates.
 
-### Group B — top-`(13 − |A|)` of the chain-set top-15 tally
+### Group B — top-`(13 − |A|)` of the chain-set top-5 tally
 
 A miner enters Group B when:
 
 1. At least one **qualified validator** placed them in their on-chain
-   weight Group 2 (top-15) last cycle. "Qualified" means the
-   validator hotkey is recognized by `validator_miner_assignment` —
-   stale, deregistered, or unrecognized validators are ignored.
+   weight Group 2 (top-`cfg.weight_group_2_size`, default 5) last
+   cycle. "Qualified" means the validator hotkey is recognized by
+   `validator_miner_assignment` — stale, deregistered, or
+   unrecognized validators are ignored.
 2. They are not already in Group A (Group A drains first; Group B
    takes only the remaining `13 − |A|` slots).
 3. After excluding Group A, they rank in the top of the chain-set
@@ -103,11 +104,11 @@ A miner can climb the tiers only by accumulating chain-set votes —
 has scored:
 
 1. **C → B (chain-set Group 2).** Receive non-zero weight from any
-   qualified validator's top-15 ballot. Each validator builds that
+   qualified validator's top-5 ballot. Each validator builds that
    ballot from its **local rolling-average** score history — see
    "Local weight emission" below — so in practice scoring well in
    Group C against multiple validators is the path: each validator's
-   local avg pushes you into its on-chain top-15, and the chain-set
+   local avg pushes you into its on-chain top-5, and the chain-set
    tally then pulls you into the global Group B next cycle.
 
 2. **B → A (chain-set Group 1).** Receive **> 3 %** weight from at
@@ -134,14 +135,16 @@ have additional history gates layered on top.
 The two ballots are emitted from
 `connito/validator/run.py` right after `finalize_round_scores`:
 
-**Weight Group 1 — `cfg.weight_group_1_share` (default 97 %), top-3 of A ∪ B by aggregator avg:**
+**Weight Group 1 — `cfg.weight_group_1_share` (default 98 %), top-3 of A ∪ B by aggregator avg:**
 
 - Local score-aggregator avg ranking, restricted to `A ∪ B`.
 - Miner must have **≥ 3** score records in the aggregator.
-- Miner must have been scored within the **last 3 cycles**:
-  `latest_round_id ≥ current_round_id − 2 × cycle_length`.
+- Miner must have a score recorded in **both** of the last 2 rounds:
+  one tagged with `round_id = current_round_id` and one tagged with
+  `round_id = current_round_id − cycle_length`. Missing either round
+  drops the miner off the Group 1 ballot for this cycle.
 
-**Weight Group 2 — `cfg.weight_group_2_share` (default 3 %), top-15 of A ∪ B ∪ C \\ G1 by aggregator avg:**
+**Weight Group 2 — `cfg.weight_group_2_share` (default 2 %), top-`cfg.weight_group_2_size` (default 5) of A ∪ B ∪ C \\ G1 by aggregator avg:**
 
 - Local score-aggregator avg ranking, restricted to
   `A ∪ B ∪ C` minus the miners already on this validator's
@@ -208,10 +211,10 @@ the seeded Group C partition does not pick them.
   `finalize_round_scores` writes `score = 0` for that round.
   Repeated failures pull the avg down and eventually push the miner
   out of the upper tiers via the chain-set tally.
-- **Stale aggregator.** A miner that goes 3+ cycles without a score
-  record fails the Group 1 recency gate and drops off this validator's
-  top-3 ballot. Group 2 has no recency gate — it only requires
-  ≥ 2 records.
+- **Stale aggregator.** A miner that misses **either** of the last
+  2 rounds fails the Group 1 recency gate and drops off this
+  validator's top-3 ballot for the cycle. Group 2 has no recency gate —
+  it only requires ≥ 2 records.
 
 ---
 

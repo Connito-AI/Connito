@@ -6,7 +6,7 @@ trivially unit-testable. All chain reads happen in `Round.freeze()` and
 the orchestration layer; this module only consumes the snapshots.
 
 Two axes:
-  * **Weight groups** (Group 1 = 3 miners @ 97%, Group 2 = 15 miners @ 3%).
+  * **Weight groups** (Group 1 = 3 miners @ 98%, Group 2 = 5 miners @ 2%).
     Per-validator local ballots; what this validator emits on chain.
   * **Validation groups** (A = every miner getting > 3% from at least
     one qualified validator (capped at 13), B = `13 - |A|`, C = 17).
@@ -650,8 +650,8 @@ def compute_uid_weights(
     weight_group_1: tuple[int, ...],
     weight_group_2: tuple[int, ...],
     local_scores: dict[int, float],
-    group_1_share: float = 0.97,
-    group_2_share: float = 0.03,
+    group_1_share: float = 0.98,
+    group_2_share: float = 0.02,
 ) -> dict[int, float]:
     """Build the chain-submission weight map per spec items 2 and 4.
 

@@ -42,9 +42,9 @@ def _cfg(**overrides) -> SimpleNamespace:
     base = dict(
         cohort_window_cycles=8,
         weight_group_1_size=3,
-        weight_group_1_share=0.97,
-        weight_group_2_size=15,
-        weight_group_2_share=0.03,
+        weight_group_1_share=0.98,
+        weight_group_2_size=5,
+        weight_group_2_share=0.02,
         validation_group_a_size=3,
         validation_group_ab_total=13,
         validation_group_c_size=17,
@@ -515,8 +515,10 @@ def test_build_cohort_groups_invariants():
     )
     # All validators agreed — Group A is full.
     assert len(groups.validation.group_a) == 3
-    # |A| + |B| invariant.
-    assert len(groups.validation.group_a) + len(groups.validation.group_b) == 13
+    # |A| + |B| is bounded by 13. With weight_group_2_size=5, each
+    # validator's chain-set top-5 here is {0,1,2,3,4}; Group A absorbs
+    # {0,1,2} and Group B picks up {3,4}.
+    assert len(groups.validation.group_a) + len(groups.validation.group_b) <= 13
     # Group C drawn from non-A∪B pool.
     ab_set = set(groups.validation.group_a) | set(groups.validation.group_b)
     assert set(groups.validation.group_c).isdisjoint(ab_set)
@@ -682,21 +684,21 @@ def test_maybe_advance_cohort_rebuilds_even_on_rollback():
 
 
 # ---------------------------------------------------------------------------
-# compute_uid_weights — 97% / 3% split
+# compute_uid_weights — 98% / 2% split
 # ---------------------------------------------------------------------------
 
 
 def test_compute_uid_weights_g1_proportional_to_score():
-    """Group 1's 97% is split in proportion to local score (was equal)."""
+    """Group 1's 98% is split in proportion to local score (was equal)."""
     weights = compute_uid_weights(
         weight_group_1=(1, 2, 3),
         weight_group_2=(),
         local_scores={1: 1.0, 2: 2.0, 3: 1.0},   # 1:2:1 ratio
     )
-    assert weights[1] == pytest.approx(0.97 * 0.25)
-    assert weights[2] == pytest.approx(0.97 * 0.50)
-    assert weights[3] == pytest.approx(0.97 * 0.25)
-    assert sum(weights.values()) == pytest.approx(0.97)
+    assert weights[1] == pytest.approx(0.98 * 0.25)
+    assert weights[2] == pytest.approx(0.98 * 0.50)
+    assert weights[3] == pytest.approx(0.98 * 0.25)
+    assert sum(weights.values()) == pytest.approx(0.98)
 
 
 def test_compute_uid_weights_g1_falls_back_to_equal_when_all_zero():
@@ -706,7 +708,7 @@ def test_compute_uid_weights_g1_falls_back_to_equal_when_all_zero():
         local_scores={1: 0.0, 2: 0.0, 3: 0.0},
     )
     for uid in (1, 2, 3):
-        assert weights[uid] == pytest.approx(0.97 / 3)
+        assert weights[uid] == pytest.approx(0.98 / 3)
 
 
 def test_compute_uid_weights_g2_proportional_to_score():
@@ -714,12 +716,12 @@ def test_compute_uid_weights_g2_proportional_to_score():
         weight_group_1=(1,),
         weight_group_2=(10, 20),
         local_scores={1: 1.0, 10: 3.0, 20: 1.0},   # G2 ratio 3:1
-        group_1_share=0.97,
-        group_2_share=0.03,
+        group_1_share=0.98,
+        group_2_share=0.02,
     )
-    assert weights[1] == pytest.approx(0.97)
-    assert weights[10] == pytest.approx(0.03 * 0.75)
-    assert weights[20] == pytest.approx(0.03 * 0.25)
+    assert weights[1] == pytest.approx(0.98)
+    assert weights[10] == pytest.approx(0.02 * 0.75)
+    assert weights[20] == pytest.approx(0.02 * 0.25)
 
 
 def test_compute_uid_weights_g2_falls_back_to_equal_when_all_zero():
@@ -728,8 +730,8 @@ def test_compute_uid_weights_g2_falls_back_to_equal_when_all_zero():
         weight_group_2=(10, 20),
         local_scores={10: 0.0, 20: 0.0},
     )
-    assert weights[10] == pytest.approx(0.03 / 2)
-    assert weights[20] == pytest.approx(0.03 / 2)
+    assert weights[10] == pytest.approx(0.02 / 2)
+    assert weights[20] == pytest.approx(0.02 / 2)
 
 
 def test_compute_uid_weights_handles_empty_groups():

@@ -41,9 +41,9 @@ def _config(*, flag: bool, my_hotkey: str = "vme") -> SimpleNamespace:
             enable_round_group_construction=flag,
             cohort_window_cycles=8,
             weight_group_1_size=3,
-            weight_group_1_share=0.97,
-            weight_group_2_size=15,
-            weight_group_2_share=0.03,
+            weight_group_1_share=0.98,
+            weight_group_2_size=5,
+            weight_group_2_share=0.02,
             validation_group_a_size=3,
             validation_group_ab_total=13,
             validation_group_c_size=17,
@@ -224,8 +224,11 @@ def test_flag_on_cold_start_populates_groups_from_chain_consensus():
 
     # Validation Group A has the 3 consensus miners (uids 5,6,7).
     assert set(r.validation_group_a) == {5, 6, 7}
-    # |A| + |B| invariant.
-    assert len(r.validation_group_a) + len(r.validation_group_b) == 13
+    # |A| + |B| is capped at 13. With weight_group_2_size=5, each
+    # validator's chain-set top-5 here is {5,6,7,21,22}; Group A
+    # absorbs {5,6,7} and Group B picks up {21,22}.
+    assert len(r.validation_group_a) + len(r.validation_group_b) <= 13
+    assert set(r.validation_group_b) == {21, 22}
     # Foreground is a subset of A∪B (per-validator partition of A∪B).
     ab_set = set(r.validation_group_a) | set(r.validation_group_b)
     assert set(r.foreground_uids) <= ab_set
