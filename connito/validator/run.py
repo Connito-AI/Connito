@@ -716,6 +716,61 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
+    # === startup recovery: replay any unfinalized round journals ===
+    # If a previous run died before `finalize_round_scores` could run
+    # (SIGKILL, OOM, validator crash), the per-round journal on disk
+    # holds the partial scoring state. Replay each unfinalized journal
+    # through `finalize_round_scores` so the aggregator on disk gets
+    # the same rank-based entries it would have had without the kill.
+    # A failure on a single journal logs a warning and continues — never
+    # abort startup.
+    try:
+        from connito.validator import round_journal as _rj_recover
+        from connito.validator.round_journal import _RecoveryRound
+        _journals = _rj_recover.scan(config.ckpt.checkpoint_path)
+        _recovered = 0
+        for _journal_file in _journals:
+            try:
+                _journal = _rj_recover.load(_journal_file)
+                if _journal is None or _journal.finalized:
+                    continue
+                logger.info(
+                    "Startup recovery: replaying unfinalized round journal",
+                    path=str(_journal_file),
+                    round_id=_journal.round_id,
+                    scored=len(_journal.scored_uids),
+                    failed=len(_journal.failed_uids),
+                    validation_failed=len(_journal.validation_failed_uids),
+                    freeze_zero=len(_journal.freeze_zero_uids),
+                )
+                _stub = _RecoveryRound.from_journal(_journal, _journal_file)
+                finalize_round_scores(
+                    round_obj=_stub,
+                    score_aggregator=score_aggregator,
+                    score_path=score_path,
+                )
+                _recovered += 1
+                logger.info(
+                    "Startup recovery: finalized journal",
+                    round_id=_journal.round_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Startup recovery: failed to replay journal",
+                    path=str(_journal_file),
+                    error=str(e),
+                )
+        if _recovered:
+            logger.info(
+                "Startup recovery: complete",
+                journals_finalized=_recovered,
+                journals_seen=len(_journals),
+            )
+    except Exception as e:
+        logger.warning(
+            "Startup recovery: scan failed", error=str(e),
+        )
+
     # === restart replay: submit weights from loaded historic scores ===
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when the
@@ -912,6 +967,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             "score_aggregator.persist_atomic after prune failed",
                             error=str(e),
                         )
+                # Prune per-round journals on the same cutoff so leftover
+                # files don't grow unbounded.
+                try:
+                    from connito.validator import round_journal as _rj_prune
+                    _journals_dropped = _rj_prune.prune_before_round(
+                        config.ckpt.checkpoint_path, _min_round_id,
+                    )
+                    if _journals_dropped:
+                        logger.info(
+                            "round_journal: pruned old journals",
+                            dropped=_journals_dropped,
+                            min_round_id=_min_round_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "round_journal.prune_before_round failed",
+                        error=str(e),
+                    )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
@@ -1123,6 +1196,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 cycle_length=phase_response.cycle_length,
                 cohort_state=current_cohort_state,
                 score_aggregator=score_aggregator,
+                score_path=score_path,
+                checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
 
             # Persist the (possibly newly advanced) cohort state to disk

@@ -110,6 +110,18 @@ class Round:
     # `Round.freeze` returns. `None` when the feature flag is off.
     cohort_state: "CohortState | None" = field(default=None, repr=False, compare=False)
 
+    # Per-round journal: every `mark_scored / mark_failed /
+    # mark_validation_failed` writes the round's mutation state to
+    # `journal_path`. Survives a kill before `finalize_round_scores` so
+    # bg-eval work isn't lost; also kept post-finalize as an audit log.
+    # `score_aggregator + score_path` let `mark_scored` write the raw
+    # in-cycle score to the aggregator alongside the journal.
+    # All three default `None` so legacy fixtures and tests that build
+    # `Round` directly (without `Round.freeze`) keep working.
+    journal_path: "Path | None" = field(default=None, repr=False, compare=False)
+    score_aggregator: "MinerScoreAggregator | None" = field(default=None, repr=False, compare=False)
+    score_path: "Path | None" = field(default=None, repr=False, compare=False)
+
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     # ---------------- Construction ----------------
@@ -131,6 +143,8 @@ class Round:
         cycle_length: int | None = None,
         cohort_state: "CohortState | None" = None,
         score_aggregator: "MinerScoreAggregator | None" = None,
+        score_path: "Path | None" = None,
+        checkpoint_path: "Path | None" = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -419,7 +433,17 @@ class Round:
                     weight_group_2=list(new_weight_group_2),
                 )
 
-        return cls(
+        # Resolve the journal location. If `checkpoint_path` is provided
+        # we mirror the aggregator's checkpoint dir; otherwise leave
+        # `journal_path=None` and the round skips journaling (used by
+        # legacy tests that construct rounds directly without
+        # `Round.freeze`).
+        resolved_journal_path: "Path | None" = None
+        if checkpoint_path is not None:
+            from connito.validator import round_journal as _rj
+            resolved_journal_path = _rj.journal_path_for(checkpoint_path, rid)
+
+        new_round = cls(
             round_id=rid,
             seed=seed,
             validator_miner_assignment=assignment,
@@ -438,7 +462,24 @@ class Round:
             validation_group_c=new_validation_c,
             cohort_epoch=new_cohort_epoch,
             cohort_state=new_cohort_state,
+            journal_path=resolved_journal_path,
+            score_aggregator=score_aggregator,
+            score_path=score_path,
         )
+
+        # Initial journal write — captures `freeze_zero_*` and the
+        # uid→hotkey map so the recovery pass has the full set of
+        # `finalize_round_scores` inputs even if nothing else mutates.
+        if resolved_journal_path is not None:
+            try:
+                new_round._persist_journal()
+            except Exception as e:
+                logger.warning(
+                    "Round.freeze: initial journal write failed",
+                    error=str(e), round_id=rid, path=str(resolved_journal_path),
+                )
+
+        return new_round
 
     # ---------------- Claim / score helpers ----------------
     def claim_for_foreground(self, uid: int) -> bool:
@@ -467,16 +508,96 @@ class Round:
         with self._lock:
             self.claimed_uids.discard(uid)
 
+    def _journal_snapshot_locked(self) -> dict | None:
+        """Build the journal payload while holding `self._lock`. Returns
+        `None` if journaling is not configured (legacy/test rounds).
+        Caller must persist the snapshot OUTSIDE the lock so disk IO
+        does not block other workers.
+        """
+        if self.journal_path is None:
+            return None
+        return {
+            "round_id": self.round_id,
+            "uid_to_hotkey": dict(self.uid_to_hotkey),
+            "scores": dict(self.scores),
+            "scored_uids": tuple(sorted(self.scored_uids)),
+            "failed_uids": tuple(sorted(self.failed_uids)),
+            "validation_failed_uids": tuple(sorted(self.validation_failed_uids)),
+            "freeze_zero_uids": tuple(sorted(self.freeze_zero_uids)),
+            "freeze_zero_hotkeys": dict(self.freeze_zero_hotkeys),
+            "finalized": False,
+        }
+
+    def _persist_journal(self) -> None:
+        """Snapshot + write the journal atomically.
+
+        Two-phase: take the snapshot under `self._lock`, then release
+        the lock before writing to disk so concurrent eval threads are
+        not blocked on IO. Any IO failure logs a warning and returns —
+        a journal failure must never abort an evaluation.
+        """
+        if self.journal_path is None:
+            return
+        with self._lock:
+            payload = self._journal_snapshot_locked()
+        if payload is None:
+            return
+        try:
+            from connito.validator import round_journal as _rj
+            _rj.write_atomic(
+                self.journal_path,
+                _rj.RoundJournal(**payload),
+            )
+        except Exception as e:
+            logger.warning(
+                "Round: journal write failed",
+                error=str(e), round_id=self.round_id, path=str(self.journal_path),
+            )
+
+    def _record_in_cycle_score(self, uid: int, hotkey: str, score: float) -> None:
+        """Write the raw in-cycle score to the aggregator alongside the
+        journal. `finalize_round_scores` calls
+        `score_aggregator.drop_round(round_id)` first, so these raw
+        entries get cleanly replaced with rank-based ones at finalize.
+        Until finalize runs, the aggregator on disk carries the raw
+        delta tagged with this round_id — slightly under-weights the
+        miner vs. rank-based but survives a kill.
+        """
+        if self.score_aggregator is None:
+            return
+        try:
+            self.score_aggregator.add_score(
+                uid=uid, hotkey=hotkey, score=float(score), round_id=self.round_id,
+            )
+            if self.score_path is not None:
+                self.score_aggregator.persist_atomic(self.score_path)
+        except Exception as e:
+            logger.warning(
+                "Round: in-cycle aggregator write failed",
+                error=str(e), uid=uid, round_id=self.round_id,
+            )
+
     def mark_scored(self, uid: int, score: float = 0.0) -> None:
         """Record a successful evaluation. `score` is this-round's score
         (e.g. ``delta ** 1.2`` from `evaluate_one_miner`); it is stored
         in `self.scores` so per-round ranking — used by post-eval
         submission cleanup — never has to consult the global aggregator.
+
+        Also writes to the per-round journal and (if configured) the
+        score aggregator with the raw delta tagged with this round_id,
+        so a kill before `finalize_round_scores` runs does not lose the
+        evaluation. Both writes happen OUTSIDE `self._lock` to avoid
+        blocking other workers on disk IO.
         """
+        score_f = float(score)
         with self._lock:
             self.scored_uids.add(uid)
-            self.scores[uid] = float(score)
+            self.scores[uid] = score_f
             self.claimed_uids.discard(uid)
+            hotkey = self.uid_to_hotkey.get(uid)
+        self._persist_journal()
+        if hotkey is not None:
+            self._record_in_cycle_score(uid, hotkey, score_f)
 
     def top_scored_uids_this_round(self, top_k: int) -> set[int]:
         """Top-`top_k` UIDs by *this round's* score. Returns every scored
@@ -507,6 +628,7 @@ class Round:
         with self._lock:
             self.failed_uids.add(uid)
             self.claimed_uids.discard(uid)
+        self._persist_journal()
 
     def mark_validation_failed(self, uid: int) -> None:
         """Mark a UID as failed because its on-disk submission is off-spec
@@ -518,6 +640,7 @@ class Round:
             self.failed_uids.add(uid)
             self.validation_failed_uids.add(uid)
             self.claimed_uids.discard(uid)
+        self._persist_journal()
 
     def publish_download(self, uid: int, path: Path) -> bool:
         with self._lock:

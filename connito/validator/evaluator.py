@@ -260,6 +260,39 @@ def finalize_round_scores(
                 round_id=round_obj.round_id, error=str(e),
             )
 
+    # Flip the round's journal to `finalized=true` and rewrite it so the
+    # post-finalize file on disk reflects the rank-based scores. The
+    # journal stays on disk after this — pruned by age along with the
+    # aggregator entries it backs (see `prune_before_round` callers in
+    # run.py).
+    journal_path = getattr(round_obj, "journal_path", None)
+    if journal_path is not None:
+        try:
+            from connito.validator import round_journal as _rj
+            scored_set, failed_set = round_obj.processed_uids_snapshot()
+            with round_obj._lock:  # noqa: SLF001
+                journal_scores = dict(round_obj.scores)
+                journal_uid_to_hotkey = dict(round_obj.uid_to_hotkey)
+            _rj.write_atomic(
+                journal_path,
+                _rj.RoundJournal(
+                    round_id=round_obj.round_id,
+                    uid_to_hotkey=journal_uid_to_hotkey,
+                    scores=journal_scores,
+                    scored_uids=tuple(sorted(scored_set)),
+                    failed_uids=tuple(sorted(failed_set)),
+                    validation_failed_uids=tuple(sorted(validation_failed)),
+                    freeze_zero_uids=tuple(sorted(freeze_zero)),
+                    freeze_zero_hotkeys=dict(freeze_hotkeys),
+                    finalized=True,
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                "finalize_round_scores: journal flip-to-finalized failed",
+                round_id=round_obj.round_id, error=str(e),
+            )
+
     logger.info(
         "finalize_round_scores: round scored by rank",
         round_id=round_obj.round_id,
