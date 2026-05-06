@@ -77,6 +77,7 @@ from connito.shared.chain import (
     SignedModelHashChainCommit,
     ValidatorChainCommit,
     VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    get_chain_commits,
     validate_validator_chain_commit_payload,
     setup_chain_worker,
 )
@@ -103,6 +104,8 @@ from connito.shared.hf_distribute import (
 from connito.shared.cycle import (
     BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
+    get_validator_miner_assignment,
+    get_validator_seed_from_commit,
     wait_till,
 )
 from connito.shared.dataloader import get_dataloader
@@ -721,29 +724,59 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Recovers the on-chain weights immediately after a restart instead of
     # waiting a full cycle for the end-of-step-3 submission. No-op when
     # the aggregator is empty (fresh install or v0.1.31 wipe above).
-    # Shares the helper with the end-of-round path: when a CohortState is
-    # on disk the helper drives cohort-style emission (98 / 2 + recency
-    # gate + empty-G1 guard); otherwise it falls back to the aggregator avg.
+    # Builds a fresh CohortState off the live metagraph + chain commits
+    # so the post-restart submission drives the same cohort-style emission
+    # (98 / 2 + recency gate + empty-G1 guard) the end-of-round path uses.
+    # Falls back to aggregator avg on any chain-fetch failure.
     _replay_cohort_state = None
     if config.evaluation.enable_round_group_construction:
-        _replay_cohort_path = (
-            Path(config.ckpt.checkpoint_path) / config.evaluation.cohort_state_filename
-        )
-        _replay_task = getattr(config, "task", None)
-        _replay_exp = getattr(_replay_task, "exp", None) if _replay_task is not None else None
-        _replay_expected_eg = str(_replay_exp.group_id) if _replay_exp is not None else ""
         try:
-            _replay_cohort_state = cohort_state_module.load(
-                _replay_cohort_path,
-                expected_expert_group=_replay_expected_eg,
+            from connito.validator import round_groups as _replay_rg
+
+            _replay_metagraph = lite_subtensor.metagraph(
+                netuid=config.chain.netuid, lite=False,
+            )
+            _replay_commits = get_chain_commits(config, subtensor)
+            _replay_assignment = get_validator_miner_assignment(
+                config, subtensor,
+                commits=_replay_commits,
+                metagraph=_replay_metagraph,
+            )
+            _replay_validator_seeds = get_validator_seed_from_commit(
+                config, _replay_commits,
+            )
+            _replay_hotkey_to_uid = {
+                hk: uid for uid, hk in enumerate(_replay_metagraph.hotkeys)
+            }
+            _replay_qualified_validator_uids = [
+                _replay_hotkey_to_uid[hk]
+                for hk in _replay_assignment.assignment.keys()
+                if hk in _replay_hotkey_to_uid
+            ]
+            _replay_block = int(lite_subtensor.block)
+            _replay_cycle_length = int(config.cycle.cycle_length)
+            _replay_cohort_state = _replay_rg.maybe_advance_cohort(
+                cycle_index=_replay_block // _replay_cycle_length,
+                round_id=_replay_block,
+                cycle_length=_replay_cycle_length,
+                current_state=None,
+                score_aggregator=score_aggregator,
+                metagraph=_replay_metagraph,
+                qualified_validator_uids=_replay_qualified_validator_uids,
+                validator_seeds=_replay_validator_seeds,
+                all_miner_hotkeys=list(_replay_assignment.miners_with_checkpoint),
+                my_hotkey=config.chain.hotkey_ss58,
+                hotkey_to_uid=_replay_hotkey_to_uid,
+                expert_group=str(config.task.exp.group_id),
+                cfg=config.evaluation,
             )
         except Exception as e:
             logger.warning(
-                "Restart replay: failed to load cohort_state.json — emission falls back to aggregator avg",
+                "Restart replay: failed to build fresh CohortState — emission falls back to aggregator avg",
                 error=str(e),
-                path=str(_replay_cohort_path),
             )
             _replay_cohort_state = None
+
     # Anchor the recency gate at the highest round_id in the loaded
     # aggregator — that's the last round we finalized scores for, which
     # matches what the end-of-round path would have used as `cur_rid`.
