@@ -74,6 +74,12 @@ def evaluate_model(
                 outputs = model(**device_batch)
 
                 if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
+                    # NaN/Inf batches contribute 0 to both sums and do
+                    # NOT increment `scored_batches`, so they drop out
+                    # of the divisor as well. Explicit no-op `+= 0`
+                    # keeps the parallel structure with the else-branch.
+                    loss_sum += 0.0
+                    aux_loss_sum += 0.0
                     nan_batches += 1
                 else:
                     loss_sum += float(outputs.loss.item())
