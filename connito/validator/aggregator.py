@@ -89,6 +89,20 @@ class MinerSeries:
         self.points = [p for p in self.points if p[2] != round_id]
         return before - len(self.points)
 
+    def prune_before_round(self, min_round_id: int) -> int:
+        """Drop tagged points whose round_id is below ``min_round_id``.
+
+        Untagged points (legacy schema v1) are left alone — their age
+        cannot be derived from round_id and the on-disk retention cap
+        already bounds them.
+        """
+        before = len(self.points)
+        self.points = [
+            p for p in self.points
+            if p[2] is None or p[2] >= min_round_id
+        ]
+        return before - len(self.points)
+
     def clear(self) -> None:
         self.points.clear()
 
@@ -450,6 +464,63 @@ class MinerScoreAggregator:
         with self._lock:
             for state in self._miners.values():
                 state.series.prune_before(cutoff)
+
+    def prune_before_round(self, min_round_id: int) -> int:
+        """Drop history points tagged with ``round_id < min_round_id`` across all miners.
+
+        Used to enforce an "8 cycles of history" cap based on round_id —
+        the caller passes ``current_round_id - 8 * cycle_length``.
+        Returns the total number of points dropped.
+        """
+        dropped = 0
+        with self._lock:
+            for state in self._miners.values():
+                dropped += state.series.prune_before_round(min_round_id)
+        return dropped
+
+    def record_count(self, uid: int) -> int:
+        """Number of recorded score points for ``uid`` (0 if unknown)."""
+        uid = int(uid)
+        with self._lock:
+            state = self._miners.get(uid)
+            return len(state.series.points) if state else 0
+
+    def latest_round_id(self, uid: int) -> int | None:
+        """Highest ``round_id`` recorded for ``uid``, or ``None`` if the uid
+        has no points or every point predates the round_id tag (legacy v1)."""
+        uid = int(uid)
+        with self._lock:
+            state = self._miners.get(uid)
+            if state is None:
+                return None
+            best: int | None = None
+            for _ts, _v, rid in state.series.points:
+                if rid is None:
+                    continue
+                if best is None or rid > best:
+                    best = rid
+            return best
+
+    def has_round_ids(self, uid: int, round_ids: list[int] | tuple[int, ...]) -> bool:
+        """True iff ``uid`` has at least one recorded score for every
+        ``round_id`` in ``round_ids``."""
+        uid = int(uid)
+        if not round_ids:
+            return True
+        targets = {int(r) for r in round_ids}
+        with self._lock:
+            state = self._miners.get(uid)
+            if state is None:
+                return False
+            seen: set[int] = set()
+            for _ts, _v, rid in state.series.points:
+                if rid is None:
+                    continue
+                if rid in targets:
+                    seen.add(int(rid))
+                    if seen == targets:
+                        return True
+            return seen == targets
 
     # ---------- Persistence ----------
     def to_json(self) -> str:

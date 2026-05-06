@@ -11,7 +11,6 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -123,6 +122,7 @@ from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter
 from connito.validator.evaluator import (
     MinerEvalJob,
+    build_submission_uid_weights,
     evaluate_foreground_round,
     finalize_round_scores,
     load_model_from_path,
@@ -716,38 +716,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
-    # === restart replay: submit weights from loaded historic scores ===
-    # Recovers the on-chain weights immediately after a restart instead of
-    # waiting a full cycle for the end-of-step-3 submission. No-op when the
-    # aggregator is empty (fresh install or v0.1.31 wipe above).
-    _replay_uid_weights = score_aggregator.uid_score_pairs(how="avg")
-    _replay_nonzero = sum(1 for v in _replay_uid_weights.values() if v > 0)
-    if _replay_nonzero > 0:
-        @dataclass
-        class _ReplayRound:
-            round_id: int
-            weights_submitted: bool = False
-
-        _replay_round = _ReplayRound(round_id=int(global_opt_step))
-        logger.info(
-            "Restart replay: submitting weights from loaded historic scores",
-            uids=len(_replay_uid_weights),
-            nonzero_uids=_replay_nonzero,
-        )
-        try:
-            _replay_future = chain_submitter.async_submit_weight(_replay_round, _replay_uid_weights)
-            try:
-                _replay_future.result(timeout=120.0)
-                logger.info(
-                    "Restart replay: submission completed",
-                    weights_submitted=_replay_round.weights_submitted,
-                )
-            except FuturesTimeoutError:
-                logger.warning("Restart replay: submission did not complete within 120s; continuing")
-        except Exception as e:
-            logger.warning("Restart replay: submission scheduling failed", error=str(e))
-    else:
-        logger.info("Restart replay: skipped — no non-zero historic scores to submit")
 
     # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
@@ -898,53 +866,45 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     score_aggregator=score_aggregator,
                     score_path=score_path,
                 )
+                # Drop history older than 8 cycle lengths so the aggregator
+                # only carries the recent window the cohort election + weight
+                # avg actually look at.
+                _cycle_len = int(phase_response.cycle_length)
+                _min_round_id = int(pending_round.round_id) - 8 * _cycle_len
+                _dropped = score_aggregator.prune_before_round(_min_round_id)
+                if _dropped:
+                    try:
+                        score_aggregator.persist_atomic(score_path)
+                    except Exception as e:
+                        logger.warning(
+                            "score_aggregator.persist_atomic after prune failed",
+                            error=str(e),
+                        )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
                 )
-                uid_weights = score_aggregator.uid_score_pairs(how="avg")
-                # Round-group construction scheme: when this round was
-                # frozen under the cohort scheme, emit weights based on
-                # *this round's* local scores rather than long-window
-                # averages. Spec semantics:
-                #   - 97% to top-3 of A∪B by this round's local score,
-                #     proportional split.
-                #   - 3% to top-15 of A∪B∪C \\ top-3 by this round's
-                #     local score, proportional split.
-                # ChainSubmitter normalizes to 1.0 before sending.
-                if pending_round.cohort_state is not None:
-                    from connito.validator import round_groups as _rg
-                    # `pending_round.scores` carries the raw per-eval
-                    # signal recorded by `mark_scored` — preferred over
-                    # the rank-based aggregator output for proportional
-                    # emission.
-                    round_local_scores = dict(pending_round.scores)
-                    ab_uids = list(pending_round.validation_group_a) + list(pending_round.validation_group_b)
-                    abc_uids = ab_uids + list(pending_round.validation_group_c)
-                    g1 = _rg.select_top_n_by_local_score(
-                        ab_uids,
-                        round_local_scores,
-                        n=config.evaluation.weight_group_1_size,
-                    )
-                    g1_set = set(g1)
-                    g2_pool = [u for u in abc_uids if u not in g1_set]
-                    g2 = _rg.select_top_n_by_local_score(
-                        g2_pool,
-                        round_local_scores,
-                        n=config.evaluation.weight_group_2_size,
-                    )
-                    uid_weights = _rg.compute_uid_weights(
-                        weight_group_1=g1,
-                        weight_group_2=g2,
-                        local_scores=round_local_scores,
-                        group_1_share=config.evaluation.weight_group_1_share,
-                        group_2_share=config.evaluation.weight_group_2_share,
-                    )
+                payload = build_submission_uid_weights(
+                    score_aggregator=score_aggregator,
+                    cohort_state=pending_round.cohort_state,
+                    round_id=pending_round.round_id,
+                    cycle_length=_cycle_len,
+                    eval_cfg=config.evaluation,
+                )
+                uid_weights = payload.uid_weights
+                if payload.g1_redirected_to_uid_zero:
                     logger.info(
-                        "(4) round-group local-score emission",
+                        "(4) g1 empty — redirecting weight_group_1 share to uid=0",
                         round_id=pending_round.round_id,
-                        weight_group_1=list(g1),
-                        weight_group_2=list(g2),
+                        ab_uids=list(pending_round.validation_group_a)
+                        + list(pending_round.validation_group_b),
+                    )
+                if payload.cohort_emission:
+                    logger.info(
+                        "(4) round-group avg-score emission",
+                        round_id=pending_round.round_id,
+                        weight_group_1=list(payload.weight_group_1),
+                        weight_group_2=list(payload.weight_group_2),
                     )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.

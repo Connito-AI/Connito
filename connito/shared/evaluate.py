@@ -46,6 +46,19 @@ def evaluate_model(
     model.eval()
     loss_sum: float = 0.0
     aux_loss_sum: float = 0.0
+    # Count of batches that produced a finite loss. The previous
+    # implementation skipped NaN-loss batches from `loss_sum` but still
+    # included them in the divisor, so a miner that crafts weights to
+    # overflow logits to inf/NaN under bf16 autocast on a fraction `p` of
+    # batches would report `(1 - p) * honest_loss` instead of
+    # `honest_loss` — gaming the val_loss downward and inflating their
+    # reward. Divide by `scored_batches` instead so a NaN/Inf batch
+    # contributes nothing to either side of the ratio. Also skip
+    # `aux_loss_sum` on NaN/Inf batches so a related variant (subtract
+    # aux_loss but skip loss) cannot replicate the same exploit.
+    scored_batches: int = 0
+    nan_batches: int = 0
+    batch_step = -1
     with torch.no_grad():
         for batch_step, batch in enumerate(iterable=eval_dataloader):
             device_batch = {}
@@ -60,14 +73,20 @@ def evaluate_model(
             with torch.amp.autocast(autocast_device, dtype=eval_dtype):
                 outputs = model(**device_batch)
 
-                if not torch.isnan(outputs.loss):
+                if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
+                    # NaN/Inf batches contribute 0 to both sums and do
+                    # NOT increment `scored_batches`, so they drop out
+                    # of the divisor as well. Explicit no-op `+= 0`
+                    # keeps the parallel structure with the else-branch.
+                    nan_batches += 1
+                else:
                     loss_sum += float(outputs.loss.item())
-
-                aux_loss_sum += (
-                    float(outputs.aux_loss.item())
-                    if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None
-                    else 0
-                )
+                    aux_loss_sum += (
+                        float(outputs.aux_loss.item())
+                        if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None
+                        else 0.0
+                    )
+                    scored_batches += 1
 
             del device_batch, outputs
             gc.collect()
@@ -79,10 +98,33 @@ def evaluate_model(
             "eval loss",
             loss_sum=round(loss_sum, 4),
             aux_loss_sum=round(aux_loss_sum, 4),
-            batches=batch_step,
+            scored_batches=scored_batches,
+            nan_batches=nan_batches,
             step=step,
         )
-    
-    # Avoid zero division if dataloader was empty or evaluated only 1 batch (batch_step is 0-indexed)
-    total_batches = batch_step + 1 if batch_step is not None else 1
-    return {"val_loss": (loss_sum - aux_loss_sum) / total_batches, "val_aux_loss": aux_loss_sum / total_batches}
+
+    # Every batch was NaN/Inf — the miner's checkpoint is malicious or
+    # broken. Return `+inf` so the caller's `delta = max(0, baseline -
+    # val_loss)` clamps to 0 (score=0). Returning 0.0 would have given
+    # them maximum delta.
+    if scored_batches == 0:
+        if nan_batches > 0:
+            logger.warning(
+                "evaluate_model: every eval batch produced NaN/Inf loss",
+                nan_batches=nan_batches, step=step,
+            )
+        return {
+            "val_loss": float("inf"),
+            "val_aux_loss": 0.0,
+            "nan_batches": nan_batches,
+            "scored_batches": 0,
+        }
+
+    val_loss = (loss_sum - aux_loss_sum) / scored_batches
+    val_aux_loss = aux_loss_sum / scored_batches
+    return {
+        "val_loss": val_loss,
+        "val_aux_loss": val_aux_loss,
+        "nan_batches": nan_batches,
+        "scored_batches": scored_batches,
+    }
