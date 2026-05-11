@@ -362,6 +362,14 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     cleanup_stale_temporary_checkpoints: bool = True
     miner_submission_max_age_cycles: PositiveFloat = 1.5
     miner_submission_archive_max_files: PositiveInt = 500
+    # Maximum number of UIDs that may sit in `Round.downloaded_pool` waiting
+    # for bg-eval to pick them up before bg-download stops fetching new
+    # checkpoints. Without this cap, bg-download will happily pull every
+    # miner's shard onto disk even when bg-eval is many minutes behind, which
+    # wastes HF bandwidth and (more importantly) inflates the on-disk backlog
+    # the cycle-tail prune has to tear down. Re-checked every poll so the cap
+    # self-clears once eval drains the queue.
+    download_pending_eval_cap: PositiveInt = 10
 
 
 class DhtCfg(BaseConfig):
