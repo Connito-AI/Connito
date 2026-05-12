@@ -371,7 +371,6 @@ def setup_training(
             config=config,
             checkpoint_path=latest_checkpoint_path,
             outer_optimizer=outer_optimizer,
-            outer_scaler=outer_scaler,
             rank=rank,
             device=device,
             data_loader=train_dataloader,
