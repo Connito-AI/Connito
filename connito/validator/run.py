@@ -723,12 +723,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # default that won't change cross-validator behavior.
     score_history_window: int = 80
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
-    if pkg_version == "v0.1.31":
-        # One-time wipe: drop any prior aggregator state on disk so the v0.1.31
+    if pkg_version == "v0.2.3":
+        # One-time wipe: drop any prior aggregator state on disk so the v0.2.3
         # rollout starts every validator with a clean score history. Subsequent
-        # restarts on v0.1.31 fall through the `score_path.exists()` branch and
+        # restarts on v0.2.3 fall through the `score_path.exists()` branch and
         # load whatever this version has persisted.
-        logger.info("Clearing historic score_aggregator for v0.1.31", pkg_version=pkg_version)
+        logger.info("Clearing historic score_aggregator for v0.2.3", pkg_version=pkg_version)
         score_path.unlink(missing_ok=True)
         score_aggregator = MinerScoreAggregator(
             max_points=score_window,
