@@ -94,15 +94,40 @@ MODEL_PARAMETER_COUNT = Gauge("system_model_parameter_count", "Total loaded para
 # Validator (Gauges & Counters)
 VALIDATOR_ACTIVE_MINER_EVALS = Gauge("validator_active_miner_evaluations", "Number of miner_jobs being evaluated")
 VALIDATOR_MINER_SCORE = Gauge("validator_miner_score", "Validation score assigned to a miner", ["miner_uid"])
-# Rolling EMA score actually voted on chain (i.e. the value
-# `score_aggregator.uid_score_pairs(how="avg")` returns and that
-# `chain_submitter.async_submit_weight` consumes). Distinct from
-# `validator_miner_score`, which is the latest *raw* per-round score
-# fed into the aggregator. Set per-round right before chain submission;
-# absent for UIDs the validator hasn't scored yet (no entry rather than 0).
+# Post-normalization chain weight written immediately before chain
+# submission. Mirrors the (uid, weight) tuples that `set_weights`
+# receives after `_normalize_uid_weights` filters non-positive entries,
+# applies any configured top_k, and renormalizes to sum=1. Each round's
+# cohort `.clear()`s prior labels before writing so per-validator sums
+# stay at 1.0 instead of accumulating across cohorts. Also mirrored from
+# the fallback submission paths in `connito.shared.chain` so a
+# fallback-mode validator's gauge no longer carries the prior round's
+# weights. Absent for UIDs not weighted this cycle (no entry rather than 0).
+#
+# For the per-miner EMA score that *drives* the weight allocation
+# (i.e. `score_aggregator.uid_score_pairs(how="avg")`), see
+# `VALIDATOR_MINER_SCORE_EMA` below.
 VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
     "validator_miner_weight_submitted",
-    "Rolling EMA voted on chain for a miner",
+    "Post-normalization chain weight last submitted for a miner",
+    ["miner_uid"],
+)
+# Rolling EMA score this validator currently holds for a miner — the
+# value `score_aggregator.uid_score_pairs(how="avg")` returns and that
+# `compute_uid_weights` consumes to allocate the 98% G1 + 2% G2 pie.
+# Distinct from `validator_miner_score`, which is the latest *raw* per-
+# round observation (no smoothing). A miner's chain weight is a
+# bucketed, normalized function of this EMA, not the EMA itself, so the
+# two gauges generally disagree (intentionally — they answer different
+# questions).
+#
+# Written per-round right before chain submission; the per-cohort
+# `.clear()` mirrors `validator_miner_weight_submitted` semantics so a
+# miner no longer scored gets dropped instead of carrying the prior
+# value forever. Absent for UIDs the validator has never scored.
+VALIDATOR_MINER_SCORE_EMA = Gauge(
+    "validator_miner_score_ema",
+    "Rolling EMA score this validator holds for a miner (feeds weight allocation)",
     ["miner_uid"],
 )
 # Per-miner validation loss measured against this validator's foreground

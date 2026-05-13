@@ -20,7 +20,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from connito.shared.app_logging import structlog
 from connito.shared.config import WorkerConfig
-from connito.shared.telemetry import track_chain_commit_latency, count_rpc_errors
+from connito.shared.telemetry import (
+    VALIDATOR_MINER_WEIGHT_SUBMITTED,
+    count_rpc_errors,
+    track_chain_commit_latency,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -409,6 +413,40 @@ def serve_axon(config: WorkerConfig, wallet: bittensor.Wallet, subtensor: bitten
     )
 
 
+def _mirror_submitted_weights_to_gauge(
+    uid_weights: dict[int | str, float],
+    *,
+    normalize: bool = True,
+    top_k: int | None = None,
+) -> None:
+    """Clear ``VALIDATOR_MINER_WEIGHT_SUBMITTED`` and re-write it with the
+    post-normalize (uid -> weight) pairs that the chain extrinsic will see.
+
+    Called from the fallback submission paths so that a validator
+    spending a cycle in fallback mode does not export the prior round's
+    cohort weights. Mirrors the equivalent block in ``run.py`` that
+    surrounds the primary ``async_submit_weight`` call. Best-effort —
+    metric failures must never block submission.
+    """
+    try:
+        prepared = _normalize_uid_weights(uid_weights, normalize=normalize, top_k=top_k)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to normalize fallback weights for gauge", error=str(exc))
+        return
+    try:
+        VALIDATOR_MINER_WEIGHT_SUBMITTED.clear()
+    except Exception:
+        pass
+    if prepared is None:
+        return
+    uids, weights = prepared
+    for _uid, _weight in zip(uids, weights):
+        try:
+            VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(miner_uid=str(_uid)).set(float(_weight))
+        except Exception:
+            pass
+
+
 def _submit_fallback_weights(
     config: WorkerConfig,
     wallet: bittensor.Wallet,
@@ -458,6 +496,7 @@ def _submit_fallback_weights(
                 count=len(miner_prev_weights),
                 dropped_validator_uids=dropped,
             )
+            _mirror_submitted_weights_to_gauge(miner_prev_weights, normalize=True, top_k=None)
             return submit_weights(config, wallet, subtensor, miner_prev_weights, normalize=True,
                                   wait_for_inclusion=wait_for_inclusion,
                                   wait_for_finalization=wait_for_finalization)
@@ -505,6 +544,9 @@ def _submit_fallback_weights(
         top_uids=miner_uids,
         top_scores=[round(s, 6) for _, s in top_peers],
         excluded_validator_count=len(validator_uids),
+    )
+    _mirror_submitted_weights_to_gauge(
+        {uid: weight for uid in miner_uids}, normalize=True, top_k=None,
     )
     result = subtensor.set_weights(
         wallet=wallet,
@@ -559,6 +601,7 @@ async def _asubmit_fallback_weights(
                 "Falling back to previous weights from chain (miners only)",
                 count=len(miner_prev_weights), dropped_validator_uids=dropped,
             )
+            _mirror_submitted_weights_to_gauge(miner_prev_weights, normalize=True, top_k=None)
             return await submit_weights_async(
                 config, wallet, async_subtensor, miner_prev_weights, normalize=True,
                 wait_for_inclusion=wait_for_inclusion,
@@ -592,6 +635,9 @@ async def _asubmit_fallback_weights(
     logger.warning(
         "No previous weights found on chain (async); submitting even fallback weights",
         top_uids=miner_uids,
+    )
+    _mirror_submitted_weights_to_gauge(
+        {uid: weight for uid in miner_uids}, normalize=True, top_k=None,
     )
     result = await async_subtensor.set_weights(
         wallet=wallet,

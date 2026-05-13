@@ -28,6 +28,7 @@ from connito.shared.chain import (
     SignedModelHashChainCommit,
     ValidatorChainCommit,
     _asubmit_fallback_weights,
+    _normalize_uid_weights,
     acommit_status,
     submit_weights_async,
 )
@@ -136,6 +137,31 @@ class ChainSubmitter:
         )
         coro = self._submit_weight_one(round_obj, uid_weights)
         return self._runner.submit(coro)
+
+    def prepare_uid_weights(
+        self,
+        uid_weights: dict[int | str, float],
+    ) -> dict[int, float]:
+        """Return the (uid -> weight) dict that would be submitted to chain
+        for ``uid_weights`` under this submitter's normalize/top_k config.
+
+        Mirrors what ``submit_weights_async`` does internally: filters
+        non-finite / non-positive entries, applies ``top_k`` truncation
+        when configured, and renormalizes to sum=1 when ``normalize`` is
+        on. Returns an empty dict if nothing survives the filter.
+
+        Callers use this to write the post-normalization weights to
+        Prometheus before fire-and-forgetting the chain submission, so
+        the gauge reflects what actually lands on chain (modulo u16
+        quantization) rather than the pre-normalization input.
+        """
+        prepared = _normalize_uid_weights(
+            uid_weights, normalize=self.normalize, top_k=self.top_k,
+        )
+        if prepared is None:
+            return {}
+        uids, weights = prepared
+        return {int(uid): float(weight) for uid, weight in zip(uids, weights)}
 
     def async_submit_fallback_weights(self) -> Future:
         logger.info(

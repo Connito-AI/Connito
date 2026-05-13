@@ -179,6 +179,7 @@ from connito.shared.telemetry import (
     VALIDATOR_AVG_STEP_STATUS,
     VALIDATOR_CURRENT_ROUND_ID,
     VALIDATOR_HEARTBEAT_TOTAL,
+    VALIDATOR_MINER_SCORE_EMA,
     VALIDATOR_MINER_WEIGHT_SUBMITTED,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
     SystemStatePoller,
@@ -1076,16 +1077,62 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
                 # Mirror the about-to-submit weights into Prometheus so
                 # external aggregators don't have to scrape `/v1/state.json`
-                # to learn what each validator votes on chain. Mirrors the
-                # semantics of `score_aggregator.uid_score_pairs(how="avg")`
-                # — entries are written only for UIDs we actually weight,
-                # so a miner the validator has never scored has *no* sample
+                # to learn what each validator votes on chain. Two gauges:
+                #
+                #   - `validator_miner_weight_submitted`: post-normalize
+                #     chain weight (matches `metagraph.weights[V][M]` mod
+                #     u16 quantization) — what _will_ land on chain after
+                #     `submit_weights_async` runs `_normalize_uid_weights`.
+                #   - `validator_miner_score_ema`: the rolling EMA score
+                #     that drove the cohort allocation. Mirrors
+                #     `score_aggregator.uid_score_pairs(how="avg")`.
+                #
+                # Both gauges `.clear()` before writing so labels from
+                # prior cohorts don't accumulate (without this, per-
+                # validator sums grow as cohorts rotate). Entries are
+                # written only for UIDs actually scored/weighted — a
+                # miner the validator has never scored has *no* sample
                 # rather than a zero (preserves prior EMA semantics).
-                for _uid, _weight in uid_weights.items():
+                try:
+                    submitted_weights = chain_submitter.prepare_uid_weights(uid_weights)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "prepare_uid_weights raised; mirroring raw uid_weights to gauge",
+                        error=str(exc),
+                    )
+                    submitted_weights = {int(u): float(w) for u, w in uid_weights.items()}
+                try:
+                    VALIDATOR_MINER_WEIGHT_SUBMITTED.clear()
+                except Exception:
+                    pass
+                for _uid, _weight in submitted_weights.items():
                     try:
                         VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(
                             miner_uid=str(_uid),
                         ).set(float(_weight))
+                    except Exception:
+                        pass
+                try:
+                    VALIDATOR_MINER_SCORE_EMA.clear()
+                except Exception:
+                    pass
+                try:
+                    ema_scores = score_aggregator.uid_score_pairs(how="avg")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "score_aggregator.uid_score_pairs(how=avg) raised; skipping EMA gauge write",
+                        error=str(exc),
+                    )
+                    ema_scores = {}
+                for _uid, _ema in ema_scores.items():
+                    if not math.isfinite(_ema) or _ema <= 0.0:
+                        # Preserve "absent = unscored" semantics: don't
+                        # write zero/non-finite samples.
+                        continue
+                    try:
+                        VALIDATOR_MINER_SCORE_EMA.labels(
+                            miner_uid=str(_uid),
+                        ).set(float(_ema))
                     except Exception:
                         pass
                 # Fire-and-forget. ChainSubmitter sets
