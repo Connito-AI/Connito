@@ -1132,20 +1132,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # gated, preserving the file-race protection that used to live
             # at this point in the loop.
             #
-            # Fresh 16-bit random seed each cycle. Read by every validator at
-            # the next Submission start via `get_combined_validator_seed`,
-            # which sha256s the sorted concat — so cohort-wide assignment
-            # rotates each cycle even when miner/validator membership is
-            # static. 16 bits = up to 5 decimal digits, ≤9 bytes of JSON; the
-            # downstream sha256 supplies the entropy `assign_miners_to_validators`
-            # actually needs, so going wider just costs commit-budget bytes
-            # for no shuffle-quality gain.
+            # Generate this cycle's eval seed locally but DO NOT publish it
+            # to chain yet — see the Submission-phase commit below for the
+            # actual publication. Holding the seed off-chain until after
+            # MinerCommit2 closes prevents miners from reading it during
+            # their own commit window and pre-overfitting a checkpoint to
+            # the resulting (otherwise-deterministic) eval data slice.
+            # 16 bits supplies enough entropy for `assign_miners_to_validators`
+            # via the downstream sha256; wider just costs commit-budget bytes.
             new_miner_seed = secrets.randbits(16)
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
                 global_ver=global_opt_step,
                 expert_group=config.task.exp.group_id,
-                miner_seed=new_miner_seed,
+                # miner_seed deliberately omitted here — published in the
+                # Submission-phase commit further down so miners can't read
+                # it during MinerCommit1/2 and predict the eval slice.
             ))
 
             if config.ckpt.archive_submissions:
@@ -1180,6 +1182,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # picks up its background_uids, eval worker waits for
             # eval_window_active to open after Merge.
             phase_response = wait_till(config, PhaseNames.submission)
+
+            # Publish this cycle's eval seed now that MinerCommit2 has
+            # closed. Miners reading the chain during their commit window
+            # saw no seed value (`miner_seed` was omitted from the
+            # MinerCommit1-phase commit above), so they cannot have
+            # pre-computed the dataloader's batch order and overfit a
+            # checkpoint to it. The commit overwrites the MinerCommit1-
+            # phase commit (Bittensor commitments are one-value-per-hotkey),
+            # carrying the same model_hash/global_ver/expert_group fields
+            # plus the freshly-revealed seed. Round.freeze below reads
+            # this commit via `get_combined_validator_seed`, so we wait a
+            # few blocks before freeze to give the extrinsic time to land.
+            chain_submitter.async_commit(ValidatorChainCommit(
+                model_hash=current_model_hash,
+                global_ver=global_opt_step,
+                expert_group=config.task.exp.group_id,
+                miner_seed=new_miner_seed,
+            ))
+            phase_response = wait_till(
+                config, PhaseNames.submission, block_offset=3,
+            )
 
             logger.info(
                 "(0) Submission phase entered — freezing round",

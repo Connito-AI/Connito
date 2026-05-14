@@ -491,8 +491,20 @@ def get_combined_validator_seed(
 
     validator_seeds = get_validator_seed_from_commit(config, commits)
     if not validator_seeds:
-        logger.warning("No validator seeds found on chain — returning fallback seed '0'")
-        return hashlib.sha256(b"0").hexdigest()
+        # Falling back to a constant seed (the previous behavior:
+        # `sha256(b"0")`) is itself a vulnerability: a miner who can
+        # force every validator's seed commit to be missing — or who
+        # observes that the chain has no seeds during their commit
+        # window — could predict the eval slice and overfit. Halt the
+        # round instead. The caller (Round.freeze) propagates this and
+        # the cycle's eval is skipped for this validator, which is the
+        # safe failure mode.
+        raise RuntimeError(
+            "No validator seeds available on chain; refusing to use a "
+            "predictable fallback seed. Re-check validator commits — at "
+            "least one validator must publish its `miner_seed` during "
+            "the Submission phase (after MinerCommit2 closes)."
+        )
 
     combined_seed_str = "".join(str(validator_seeds[v]) for v in sorted(validator_seeds.keys()))
     return hashlib.sha256(combined_seed_str.encode()).hexdigest()
