@@ -15,8 +15,11 @@ from types import SimpleNamespace
 import pytest
 
 from connito.shared.chain import (
+    SUBNET_OWNER_UID,
+    SUBNET_OWNER_WEIGHT_SHARE,
     _FALLBACK_TOP_N_PEERS,
     _submit_fallback_weights,
+    reserve_subnet_owner_share,
 )
 
 
@@ -91,6 +94,21 @@ def test_top_n_constant_matches_request():
     assert _FALLBACK_TOP_N_PEERS == 3
 
 
+def _assert_miners_plus_owner_share(call, expected_miner_uids):
+    """The peer-consensus top-N path now reserves
+    `SUBNET_OWNER_WEIGHT_SHARE` for `SUBNET_OWNER_UID` after the even
+    miner split, so every successful peer submission carries
+    [miner_uid_1, ..., miner_uid_N, owner_uid] with weights
+    [share/N * (1 - owner_share)] * N + [owner_share].
+    """
+    expected_uids = [*expected_miner_uids, SUBNET_OWNER_UID]
+    n = len(expected_miner_uids)
+    per_miner = (1 - SUBNET_OWNER_WEIGHT_SHARE) / n
+    expected_weights = [per_miner] * n + [SUBNET_OWNER_WEIGHT_SHARE]
+    assert call["uids"] == expected_uids, (call["uids"], expected_uids)
+    assert call["weights"] == pytest.approx(expected_weights)
+
+
 def test_emits_top_3_when_differentiated_peer_present(patched_whitelist):
     # Validators: me (uid 0), peer1 (uid 1). Miners: uids 2..6.
     patched_whitelist("me_hk", "peer1_hk")
@@ -113,10 +131,7 @@ def test_emits_top_3_when_differentiated_peer_present(patched_whitelist):
     )
     assert ok is True
     assert len(sub.set_weights_calls) == 1
-    call = sub.set_weights_calls[0]
-    assert call["uids"] == [2, 3, 4]
-    # Even weight across the three.
-    assert call["weights"] == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+    _assert_miners_plus_owner_share(sub.set_weights_calls[0], [2, 3, 4])
 
 
 def test_even_peers_are_excluded_from_aggregation(patched_whitelist):
@@ -141,9 +156,8 @@ def test_even_peers_are_excluded_from_aggregation(patched_whitelist):
         wait_for_inclusion=False, wait_for_finalization=False,
     )
     assert ok is True
-    call = sub.set_weights_calls[0]
-    # Only peer2's vote counts → uid 6 is the only top-3 candidate.
-    assert call["uids"] == [6]
+    # Only peer2's vote counts → uid 6, plus the owner share.
+    _assert_miners_plus_owner_share(sub.set_weights_calls[0], [6])
 
 
 def test_all_peers_even_falls_back_to_uid_zero(patched_whitelist):
@@ -203,7 +217,7 @@ def test_single_uid_vote_counts_as_differentiated(patched_whitelist):
         wait_for_inclusion=False, wait_for_finalization=False,
     )
     assert ok is True
-    assert sub.set_weights_calls[0]["uids"] == [2]
+    _assert_miners_plus_owner_share(sub.set_weights_calls[0], [2])
 
 
 def test_validator_uids_excluded_from_top_n(patched_whitelist):
@@ -222,8 +236,9 @@ def test_validator_uids_excluded_from_top_n(patched_whitelist):
         wait_for_inclusion=False, wait_for_finalization=False,
     )
     assert ok is True
-    # uid 2 is a validator and must be filtered; only uid 3 remains.
-    assert sub.set_weights_calls[0]["uids"] == [3]
+    # uid 2 is a validator and must be filtered; only uid 3 remains
+    # (plus the subnet-owner share).
+    _assert_miners_plus_owner_share(sub.set_weights_calls[0], [3])
 
 
 def test_zero_stake_peers_skipped(patched_whitelist):
@@ -246,8 +261,8 @@ def test_zero_stake_peers_skipped(patched_whitelist):
         wait_for_inclusion=False, wait_for_finalization=False,
     )
     assert ok is True
-    # Only peer2 counts → uid 4.
-    assert sub.set_weights_calls[0]["uids"] == [4]
+    # Only peer2 counts → uid 4 (plus the subnet-owner share).
+    _assert_miners_plus_owner_share(sub.set_weights_calls[0], [4])
 
 
 def test_prev_weights_are_ignored(patched_whitelist):
@@ -270,7 +285,65 @@ def test_prev_weights_are_ignored(patched_whitelist):
     )
     assert ok is True
     assert sub.set_weights_calls, "expected a set_weights call"
-    call = sub.set_weights_calls[0]
-    # Peer consensus from peer1 → uid 2 only. uid 3 (only in our own
-    # prior weights, not in any peer's vote) must NOT appear.
-    assert call["uids"] == [2]
+    # Peer consensus from peer1 → uid 2 only (plus owner share). uid 3
+    # (only in our own prior weights, not in any peer's vote) must NOT
+    # appear.
+    _assert_miners_plus_owner_share(sub.set_weights_calls[0], [2])
+
+
+# ---------------------------------------------------------------------
+# reserve_subnet_owner_share: unit tests for the helper itself
+# ---------------------------------------------------------------------
+
+
+def test_reserve_owner_share_normal_case():
+    out = reserve_subnet_owner_share({1: 0.6, 2: 0.4})
+    assert out == pytest.approx({
+        1: 0.6 * 0.95,
+        2: 0.4 * 0.95,
+        0: 0.05,
+    })
+    assert sum(out.values()) == pytest.approx(1.0)
+
+
+def test_reserve_owner_share_empty_input():
+    """Empty input → owner gets all of it."""
+    assert reserve_subnet_owner_share({}) == {0: 1.0}
+
+
+def test_reserve_owner_share_owner_already_present():
+    """If uid=0 was already in the input, its scaled-down weight stacks
+    on top of the reserved share."""
+    out = reserve_subnet_owner_share({0: 0.2, 1: 0.8})
+    assert out == pytest.approx({
+        0: 0.2 * 0.95 + 0.05,
+        1: 0.8 * 0.95,
+    })
+    assert sum(out.values()) == pytest.approx(1.0)
+
+
+def test_reserve_owner_share_zero_share_is_passthrough():
+    inp = {1: 0.5, 2: 0.5}
+    out = reserve_subnet_owner_share(inp, share=0.0)
+    assert out == inp
+    assert 0 not in out
+
+
+def test_reserve_owner_share_full_share_collapses_to_owner():
+    out = reserve_subnet_owner_share({1: 0.5, 2: 0.5}, share=1.0)
+    assert out == {0: 1.0}
+
+
+def test_reserve_owner_share_custom_owner_uid():
+    """The owner UID is configurable (defaults to subnet-owner uid=0)."""
+    out = reserve_subnet_owner_share({1: 1.0}, owner_uid=42, share=0.1)
+    assert out == pytest.approx({1: 0.9, 42: 0.1})
+
+
+def test_reserve_owner_share_preserves_sum_with_unequal_weights():
+    inp = {1: 0.7, 2: 0.2, 3: 0.1}
+    out = reserve_subnet_owner_share(inp)
+    assert sum(out.values()) == pytest.approx(1.0)
+    # Ratios among miners preserved.
+    assert out[1] / out[2] == pytest.approx(inp[1] / inp[2])
+    assert out[2] / out[3] == pytest.approx(inp[2] / inp[3])

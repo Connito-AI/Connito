@@ -53,6 +53,50 @@ _CHAIN_READ_BACKOFF_S: float = 2.0
 # emission shape mirrors a successful round's G1 selection.
 _FALLBACK_TOP_N_PEERS: int = 3
 
+# Every weight submission (regular round + fallback peer-top-3)
+# reserves this fraction for the subnet owner (uid=0). The fallback's
+# uid=0 escalation path (all peers in even-weight state) already emits
+# 100% to uid=0 and is unaffected.
+SUBNET_OWNER_UID: int = 0
+SUBNET_OWNER_WEIGHT_SHARE: float = 0.05
+
+
+def reserve_subnet_owner_share(
+    uid_weights: dict[int, float],
+    *,
+    share: float = SUBNET_OWNER_WEIGHT_SHARE,
+    owner_uid: int = SUBNET_OWNER_UID,
+) -> dict[int, float]:
+    """Return a new ``{uid: weight}`` dict where ``owner_uid`` receives
+    at least ``share`` of the total. All other entries are scaled by
+    ``(1 - share)``; if ``owner_uid`` is already present, its prior
+    weight is also scaled and then ``share`` is added on top.
+
+    Assumes the input sums to ~1.0; the output is normalized to the
+    same total.
+
+    Edge cases:
+      - Empty input → ``{owner_uid: 1.0}``.
+      - ``share <= 0`` → input returned unchanged.
+      - ``share >= 1`` → ``{owner_uid: 1.0}`` (rest collapses to zero).
+
+    Note: this helper does NOT defend against ``top_k`` filtering on
+    the downstream submitter — if ``top_k`` is set tightly enough that
+    ``owner_uid``'s 5% gets cut, the share is lost. The validator's
+    current ``ChainSubmitter`` uses ``top_k=None`` so this is fine in
+    production; reconsider if that changes.
+    """
+    if share <= 0.0:
+        return dict(uid_weights)
+    if share >= 1.0:
+        return {owner_uid: 1.0}
+    if not uid_weights:
+        return {owner_uid: 1.0}
+    scale = 1.0 - share
+    out: dict[int, float] = {int(uid): float(w) * scale for uid, w in uid_weights.items()}
+    out[owner_uid] = out.get(owner_uid, 0.0) + share
+    return out
+
 
 
 # --- Status structure and submission (for miner validator communication)---
@@ -457,7 +501,7 @@ def _peer_miner_contribution(
     )
     if is_even:
         return None
-    return {uid: v_stake * fw for uid, fw in peer_miner_weights.items()}
+    return {uid: fw for uid, fw in peer_miner_weights.items()}
 
 
 def _pick_top_n_miner_uids(
@@ -541,19 +585,24 @@ def _submit_fallback_weights(
             logger.warning("Failed to set uid=0 fallback weight")
         return success
 
-    weight = 1.0 / len(miner_uids)
+    # Each miner gets an equal share of (1 - SUBNET_OWNER_WEIGHT_SHARE).
+    miner_weights_raw = {uid: 1.0 / len(miner_uids) for uid in miner_uids}
+    final = reserve_subnet_owner_share(miner_weights_raw)
+    submit_uids = list(final.keys())
+    submit_weights_list = list(final.values())
     logger.warning(
-        "Fallback: no usable previous weights; submitting even weight "
-        "to top stake-weighted miners from differentiated peers",
+        "Fallback: submitting even weight to top stake-weighted miners "
+        "from differentiated peers (with subnet-owner share)",
         top_uids=miner_uids,
         top_scores=[round(s, 6) for _, s in top_peers],
         excluded_validator_count=len(validator_uids),
+        subnet_owner_share=SUBNET_OWNER_WEIGHT_SHARE,
     )
     result = subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
-        uids=miner_uids,
-        weights=[weight] * len(miner_uids),
+        uids=submit_uids,
+        weights=submit_weights_list,
         wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )
@@ -620,17 +669,23 @@ async def _asubmit_fallback_weights(
             logger.warning("Failed to set uid=0 fallback weight (async)")
         return success
 
-    weight = 1.0 / len(miner_uids)
+    # Mirror of the sync helper: even share across top-3, then reserve
+    # SUBNET_OWNER_WEIGHT_SHARE for uid=0.
+    miner_weights_raw = {uid: 1.0 / len(miner_uids) for uid in miner_uids}
+    final = reserve_subnet_owner_share(miner_weights_raw)
+    submit_uids = list(final.keys())
+    submit_weights_list = list(final.values())
     logger.warning(
-        "Fallback (async): no usable previous weights; submitting even "
-        "weight to top stake-weighted miners from differentiated peers",
+        "Fallback (async): submitting even weight to top stake-weighted "
+        "miners from differentiated peers (with subnet-owner share)",
         top_uids=miner_uids,
+        subnet_owner_share=SUBNET_OWNER_WEIGHT_SHARE,
     )
     result = await async_subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
-        uids=miner_uids,
-        weights=[weight] * len(miner_uids),
+        uids=submit_uids,
+        weights=submit_weights_list,
         wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )
