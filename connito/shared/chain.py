@@ -414,43 +414,6 @@ def serve_axon(config: WorkerConfig, wallet: bittensor.Wallet, subtensor: bitten
     )
 
 
-def _select_prev_weights_for_reuse(
-    prev_weights: dict[int, float],
-    validator_uids: set[int],
-) -> dict[int, float] | None:
-    """Decide whether our own previous on-chain weights are reusable.
-
-    Returns the miner-only filtered dict if the previous submission was
-    *differentiated* (real per-miner ranking). Returns ``None`` when:
-      - there's no prior submission at all,
-      - the prior submission was already in an even-weight fallback
-        shape (≥1 miner weight, all equal) and should be recomputed
-        rather than perpetuated, or
-      - every prior entry was a validator UID (nothing to reuse).
-
-    Pure function — no I/O. Caller is responsible for fetching
-    `prev_weights` from chain and for the subsequent logging /
-    submission.
-    """
-    if not prev_weights:
-        return None
-    miner_prev_weights = {
-        uid: w for uid, w in prev_weights.items()
-        if int(uid) not in validator_uids
-    }
-    if not miner_prev_weights:
-        return None
-    values = list(miner_prev_weights.values())
-    is_even = (
-        len(values) >= 1
-        and max(values) > 0
-        and (max(values) - min(values)) < 1e-9
-    )
-    if is_even:
-        return None
-    return miner_prev_weights
-
-
 def _peer_miner_contribution(
     vneuron,
     validator_uids: set[int],
@@ -519,42 +482,31 @@ def _submit_fallback_weights(
 ) -> bool:
     """Submit fallback weights from a sync ``Subtensor``.
 
-    Try reusing our own differentiated previous weights first. Otherwise
-    aggregate stake-weighted votes from other validators whose
+    Aggregate stake-weighted votes from other validators whose
     submissions are themselves differentiated (i.e. not in an
     even-weight fallback shape) and emit even weight to the top-3
     miners. If no peer is differentiated, emit 100% on uid=0 — the
     validator still earns this cycle's emission rather than echoing a
     subnet-wide even-weight cascade.
 
+    Note: we deliberately do **not** reuse our own previous on-chain
+    weights. Those could be a stale snapshot from a buggy cycle or
+    from our own earlier fallback emission; a fresh look at peer
+    consensus is always safer than perpetuating our last submission.
+
     The sync/async split exists only at the I/O boundary; the pure
-    decisions live in `_select_prev_weights_for_reuse`,
-    `_peer_miner_contribution`, and `_pick_top_n_miner_uids`.
+    decisions live in `_peer_miner_contribution` and
+    `_pick_top_n_miner_uids`.
     """
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
 
     metagraph = subtensor.metagraph(netuid=config.chain.netuid)
     my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
-    full_neuron = subtensor.neuron_for_uid(uid=my_uid, netuid=config.chain.netuid)
-    prev_weights = {uid: float(w) for uid, w in full_neuron.weights} if full_neuron else {}
 
     validator_hotkeys = get_validator_whitelist_from_api(config)
     validator_uids = {
         metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
     }
-
-    reuse = _select_prev_weights_for_reuse(prev_weights, validator_uids)
-    if reuse is not None:
-        logger.info(
-            "Falling back to previous weights from chain (miners only)",
-            count=len(reuse),
-            dropped_validator_uids=len(prev_weights) - len(reuse),
-        )
-        return submit_weights(
-            config, wallet, subtensor, reuse, normalize=True,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
-        )
 
     miner_score: dict[int, float] = {}
     any_peer_differentiated = False
@@ -629,26 +581,11 @@ async def _asubmit_fallback_weights(
 
     metagraph = await async_subtensor.metagraph(netuid=config.chain.netuid)
     my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
-    full_neuron = await async_subtensor.neuron_for_uid(uid=my_uid, netuid=config.chain.netuid)
-    prev_weights = {uid: float(w) for uid, w in full_neuron.weights} if full_neuron else {}
 
     validator_hotkeys = get_validator_whitelist_from_api(config)
     validator_uids = {
         metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
     }
-
-    reuse = _select_prev_weights_for_reuse(prev_weights, validator_uids)
-    if reuse is not None:
-        logger.info(
-            "Falling back to previous weights from chain (miners only)",
-            count=len(reuse),
-            dropped_validator_uids=len(prev_weights) - len(reuse),
-        )
-        return await submit_weights_async(
-            config, wallet, async_subtensor, reuse, normalize=True,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
-        )
 
     miner_score: dict[int, float] = {}
     any_peer_differentiated = False

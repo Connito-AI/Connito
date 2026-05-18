@@ -250,14 +250,16 @@ def test_zero_stake_peers_skipped(patched_whitelist):
     assert sub.set_weights_calls[0]["uids"] == [4]
 
 
-def test_prev_weights_reuse_path_still_works(patched_whitelist):
-    """If our own previous weights are differentiated, the function
-    reuses them via `submit_weights` rather than going to peer
-    consensus. This test confirms we haven't broken that branch."""
+def test_prev_weights_are_ignored(patched_whitelist):
+    """Our own previous on-chain weights are intentionally not used as
+    a fallback source — peer consensus is consulted unconditionally.
+    Even when self has a differentiated history on miners 2 and 3, the
+    submission reflects peer consensus (peer1 picks miner 2 only)."""
     patched_whitelist("me_hk", "peer1_hk")
     metagraph = _FakeMetagraph(["me_hk", "peer1_hk", "m_a", "m_b"])
     neurons = {
-        # Self has differentiated previous weights on miners 2 and 3.
+        # Self has differentiated previous weights — these MUST be
+        # ignored under the current contract.
         0: _FakeNeuron(stake=0.0, weights=[(2, 0.8), (3, 0.2)]),
         1: _FakeNeuron(stake=100.0, weights=[(2, 1.0)]),
     }
@@ -267,9 +269,8 @@ def test_prev_weights_reuse_path_still_works(patched_whitelist):
         wait_for_inclusion=False, wait_for_finalization=False,
     )
     assert ok is True
-    # `submit_weights` is called via the reuse branch; the captured
-    # set_weights kwargs should contain both uids 2 and 3 (not just the
-    # peer-consensus top-N which would be [2]).
     assert sub.set_weights_calls, "expected a set_weights call"
     call = sub.set_weights_calls[0]
-    assert set(call["uids"]) == {2, 3}
+    # Peer consensus from peer1 → uid 2 only. uid 3 (only in our own
+    # prior weights, not in any peer's vote) must NOT appear.
+    assert call["uids"] == [2]
