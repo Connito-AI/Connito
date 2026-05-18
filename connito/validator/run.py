@@ -77,6 +77,7 @@ from connito.shared.chain import (
     SignedModelHashChainCommit,
     ValidatorChainCommit,
     VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+    get_peer_consensus_top_uids,
     validate_validator_chain_commit_payload,
     setup_chain_worker,
 )
@@ -1059,6 +1060,45 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     cycle_length=_cycle_len,
                     eval_cfg=config.evaluation,
                 )
+                # Empty local G1 used to redirect straight to uid=0.
+                # Prefer to echo the network's stake-weighted consensus
+                # first: pull the top-G1-size miners that other validators
+                # are voting on (skipping any peer that is itself in an
+                # even-weight fallback so we don't amplify circular
+                # noise). If every peer is also in the fallback shape,
+                # `get_peer_consensus_top_uids` returns None and we keep
+                # the original uid=0 redirect.
+                if payload.g1_redirected_to_uid_zero:
+                    try:
+                        peer_uids = get_peer_consensus_top_uids(
+                            config=config,
+                            wallet=wallet,
+                            subtensor=lite_subtensor,
+                            top_n=int(config.evaluation.weight_group_1_size),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "(4) peer-consensus lookup failed; "
+                            "falling back to uid=0 redirect",
+                            round_id=pending_round.round_id,
+                            error=str(e),
+                        )
+                        peer_uids = None
+                    if peer_uids:
+                        payload = build_submission_uid_weights(
+                            score_aggregator=score_aggregator,
+                            cohort_state=pending_round.cohort_state,
+                            round_id=pending_round.round_id,
+                            cycle_length=_cycle_len,
+                            eval_cfg=config.evaluation,
+                            peer_consensus_uids=tuple(peer_uids),
+                        )
+                        logger.info(
+                            "(4) g1 empty — using peer-consensus stake-weighted "
+                            "top miners instead of uid=0",
+                            round_id=pending_round.round_id,
+                            peer_consensus_uids=list(peer_uids),
+                        )
                 uid_weights = payload.uid_weights
                 if payload.g1_redirected_to_uid_zero:
                     logger.info(

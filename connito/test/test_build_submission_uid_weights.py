@@ -219,3 +219,106 @@ def test_payload_is_a_frozen_dataclass():
     p = WeightSubmissionPayload(uid_weights={1: 1.0})
     with pytest.raises((TypeError, AttributeError)):
         p.weight_group_1 = (1, 2, 3)   # type: ignore[misc]
+
+
+def test_empty_g1_uses_peer_consensus_when_supplied():
+    """When local G1 is empty AND peer_consensus_uids is supplied, the
+    G1 share goes evenly to the peer-consensus UIDs — not to uid=0."""
+    cur_rid = 1000
+    cycle_length = 100
+    agg = _aggregator_with_history(
+        cur_rid=cur_rid,
+        cycle_length=cycle_length,
+        uids_full_history=[],
+        uids_partial_history=[4, 5, 6],
+    )
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(c=(4, 5, 6)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+        peer_consensus_uids=(11, 22, 33),
+    )
+    assert payload.cohort_emission is True
+    assert payload.g1_redirected_to_uid_zero is False
+    assert payload.g1_used_peer_consensus is True
+    assert payload.weight_group_1 == (11, 22, 33)
+    # All three peer UIDs have no local score; compute_uid_weights
+    # falls back to an equal split of the 0.98 G1 share.
+    assert 0 not in payload.uid_weights
+    assert pytest.approx(payload.uid_weights[11], abs=1e-6) == 0.98 / 3
+    assert pytest.approx(payload.uid_weights[22], abs=1e-6) == 0.98 / 3
+    assert pytest.approx(payload.uid_weights[33], abs=1e-6) == 0.98 / 3
+    assert pytest.approx(sum(payload.uid_weights.values()), abs=1e-6) == 1.0
+
+
+def test_empty_g1_falls_back_to_uid_zero_when_peer_consensus_is_none():
+    """Behaviour unchanged from the original empty-G1 guard when no
+    peer-consensus UIDs are passed in."""
+    cur_rid = 1000
+    cycle_length = 100
+    agg = _aggregator_with_history(
+        cur_rid=cur_rid,
+        cycle_length=cycle_length,
+        uids_full_history=[],
+        uids_partial_history=[4, 5, 6],
+    )
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(c=(4, 5, 6)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+        peer_consensus_uids=None,
+    )
+    assert payload.g1_redirected_to_uid_zero is True
+    assert payload.g1_used_peer_consensus is False
+    assert payload.weight_group_1 == (0,)
+
+
+def test_empty_g1_falls_back_to_uid_zero_when_peer_consensus_is_empty_tuple():
+    """An empty tuple is treated the same as None — no peer signal to
+    echo, so uid=0 redirect kicks in."""
+    cur_rid = 1000
+    cycle_length = 100
+    agg = _aggregator_with_history(
+        cur_rid=cur_rid,
+        cycle_length=cycle_length,
+        uids_full_history=[],
+        uids_partial_history=[4, 5, 6],
+    )
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(c=(4, 5, 6)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+        peer_consensus_uids=(),
+    )
+    assert payload.g1_redirected_to_uid_zero is True
+    assert payload.g1_used_peer_consensus is False
+    assert payload.weight_group_1 == (0,)
+
+
+def test_non_empty_g1_ignores_peer_consensus():
+    """Local G1 is the source of truth when it exists; peer-consensus
+    is only consulted as an empty-G1 fallback."""
+    cur_rid = 1000
+    cycle_length = 100
+    agg = _aggregator_with_history(
+        cur_rid=cur_rid,
+        cycle_length=cycle_length,
+        uids_full_history=[1, 2, 3],
+    )
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1, 2, 3)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+        peer_consensus_uids=(99, 100, 101),
+    )
+    assert payload.g1_used_peer_consensus is False
+    assert payload.g1_redirected_to_uid_zero is False
+    assert set(payload.weight_group_1) == {1, 2, 3}

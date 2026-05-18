@@ -609,6 +609,93 @@ async def _asubmit_fallback_weights(
     return success
 
 
+def get_peer_consensus_top_uids(
+    config: WorkerConfig,
+    wallet: bittensor.Wallet,
+    subtensor: bittensor.Subtensor,
+    top_n: int = 3,
+) -> list[int] | None:
+    """Aggregate other validators' on-chain miner weights, stake-weighted,
+    and return the top-`top_n` miner UIDs by aggregated score.
+
+    Validators whose own submission is in an even-weight fallback shape
+    (>= 2 non-zero miner weights, all equal) are *skipped* during
+    aggregation — their signal is itself a fallback and would only echo
+    noise. If *every* other validator is in that state, returns ``None``;
+    the caller is expected to escalate to a more conservative fallback
+    (e.g. uid=0) rather than amplify a circular even-weight emission.
+
+    Validator UIDs and the caller's own UID are excluded from the
+    returned list — we only return miner UIDs.
+    """
+    from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402
+
+    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
+    try:
+        my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+    except ValueError:
+        # Not registered on this netuid yet — no peer to compare against
+        # makes sense in that state. Caller handles None.
+        return None
+
+    validator_hotkeys = get_validator_whitelist_from_api(config)
+    validator_uids = {
+        metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
+    }
+    peer_uids = validator_uids - {my_uid}
+    if not peer_uids:
+        return None
+
+    miner_score: dict[int, float] = {}
+    any_peer_differentiated = False
+    for vuid in peer_uids:
+        try:
+            vneuron = subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
+        except Exception as exc:
+            logger.debug(
+                "peer-consensus: neuron_for_uid failed; skipping peer",
+                vuid=vuid, error=str(exc),
+            )
+            continue
+        if vneuron is None:
+            continue
+        v_stake = float(getattr(vneuron, "stake", 0.0))
+        if v_stake <= 0:
+            continue
+        miner_weights = {
+            int(uid): float(w)
+            for uid, w in getattr(vneuron, "weights", [])
+            if int(uid) not in validator_uids
+            and int(uid) != my_uid
+            and float(w) > 0
+        }
+        if not miner_weights:
+            continue
+        values = list(miner_weights.values())
+        # Even-weight detection: 2+ miner weights and all equal. A
+        # single-uid vote is treated as differentiated (it's a concrete
+        # pick, not a uniform spread).
+        is_even = (
+            len(values) >= 2
+            and (max(values) - min(values)) < 1e-9
+        )
+        if is_even:
+            continue
+        any_peer_differentiated = True
+        for uid_i, fw in miner_weights.items():
+            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
+
+    if not any_peer_differentiated:
+        return None
+
+    top_peers = sorted(
+        miner_score.items(), key=lambda kv: (-kv[1], kv[0]),
+    )[:top_n]
+    if not top_peers:
+        return None
+    return [uid for uid, _ in top_peers]
+
+
 # --- Chain weight submission ---
 @track_chain_commit_latency()
 @count_rpc_errors()

@@ -345,14 +345,19 @@ class WeightSubmissionPayload:
     `weight_group_*` fields are populated only when the cohort-style
     emission was used (otherwise empty), and exist purely so the caller
     can log them without recomputing the selection.
-    `g1_redirected_to_uid_zero` is set when the empty-G1 guard fires —
-    the caller logs that case under its own info line.
+    `g1_redirected_to_uid_zero` is set when the empty-G1 guard fires
+    and no peer-consensus fallback was supplied — the caller logs that
+    case under its own info line.
+    `g1_used_peer_consensus` is set when an empty local G1 was filled
+    in from stake-weighted peer votes instead of redirecting to uid=0;
+    `weight_group_1` then holds the peer-consensus UIDs.
     """
     uid_weights: dict[int, float]
     weight_group_1: tuple[int, ...] = ()
     weight_group_2: tuple[int, ...] = ()
     cohort_emission: bool = False
     g1_redirected_to_uid_zero: bool = False
+    g1_used_peer_consensus: bool = False
 
 
 def build_submission_uid_weights(
@@ -362,6 +367,7 @@ def build_submission_uid_weights(
     round_id: int | None = None,
     cycle_length: int | None = None,
     eval_cfg=None,
+    peer_consensus_uids: tuple[int, ...] | None = None,
 ) -> WeightSubmissionPayload:
     """Build the `{uid: weight}` payload for a single chain submission.
 
@@ -419,9 +425,19 @@ def build_submission_uid_weights(
         n=eval_cfg.weight_group_1_size,
     )
     g1_redirected = False
+    g1_used_peer_consensus = False
     if not g1:
-        g1 = (0,)
-        g1_redirected = True
+        # Local G1 came up empty (no UID has the recency + record_count
+        # gates met). Prefer a peer-consensus fallback if the caller
+        # supplied one — that keeps emission on real miners. Otherwise
+        # redirect the G1 share to uid=0 so the validator still earns
+        # emission this cycle.
+        if peer_consensus_uids:
+            g1 = tuple(peer_consensus_uids)
+            g1_used_peer_consensus = True
+        else:
+            g1 = (0,)
+            g1_redirected = True
     g1_set = set(g1)
     g2_pool = [
         u for u in abc_uids
@@ -446,6 +462,7 @@ def build_submission_uid_weights(
         weight_group_2=g2,
         cohort_emission=True,
         g1_redirected_to_uid_zero=g1_redirected,
+        g1_used_peer_consensus=g1_used_peer_consensus,
     )
 
 
