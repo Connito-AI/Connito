@@ -98,7 +98,7 @@ from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_hf_repo_ids,
-    upload_checkpoint_to_hf,
+    upload_checkpoint_to_hf_subprocess,
 )
 from connito.shared.cycle import (
     BITTENSOR_BLOCK_TIME_SECONDS,
@@ -1635,7 +1635,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     # would contend on the same network/disk.
                     merge_phase_active.set()
                     try:
-                        hf_revision = upload_checkpoint_to_hf(
+                        # Subprocess isolation: huggingface_hub's chunked
+                        # upload + TLS holds the GIL long enough to starve
+                        # the bittensor websocket keepalive thread in this
+                        # process, which then dumps a ConnectionClosedError
+                        # mid-upload and forces a substrate reconnect/retry
+                        # on the next extrinsic. A spawned child has its
+                        # own interpreter, so the parent's keepalive keeps
+                        # ticking.
+                        hf_revision = upload_checkpoint_to_hf_subprocess(
                             ckpt_dir=model_ckpt.path,
                             repo_id=hf_upload_repo_id,
                             token_env_var=config.hf.token_env_var,

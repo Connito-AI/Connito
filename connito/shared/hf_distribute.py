@@ -162,6 +162,120 @@ def upload_checkpoint_to_hf(
     return revision
 
 
+def _upload_child(
+    conn,
+    ckpt_dir: str,
+    repo_id: str,
+    token: str | None,
+    token_env_var: str,
+    commit_message: str | None,
+    allow_patterns: list[str] | None,
+) -> None:
+    # Entry point in the spawned child. Pickle boundary keeps args
+    # simple types (str/list); reconstruct Path inside the child.
+    try:
+        revision = upload_checkpoint_to_hf(
+            ckpt_dir=Path(ckpt_dir),
+            repo_id=repo_id,
+            token=token,
+            token_env_var=token_env_var,
+            commit_message=commit_message,
+            allow_patterns=allow_patterns,
+        )
+        conn.send(("ok", revision))
+    except BaseException as e:
+        import traceback as _tb
+        conn.send(("err", (type(e).__name__, str(e), _tb.format_exc())))
+    finally:
+        conn.close()
+
+
+def upload_checkpoint_to_hf_subprocess(
+    ckpt_dir: Path,
+    repo_id: str,
+    token: str | None = None,
+    token_env_var: str = "HF_TOKEN",
+    commit_message: str | None = None,
+    allow_patterns: list[str] | None = None,
+    timeout_sec: float | None = None,
+) -> str:
+    """Run `upload_checkpoint_to_hf` in a spawned child process.
+
+    The motivation is isolation, not parallelism: when the parent process
+    is a long-running validator with a sync-websocket keepalive thread
+    (bittensor's substrate client), huggingface_hub's chunked-upload
+    workers + TLS encryption hold the GIL long enough to starve the
+    keepalive of CPU. The keepalive thread then misses its pong window
+    and the websocket library raises a `ConnectionClosedError` whose
+    traceback lands on stderr — the parent then has to reconnect and
+    rebroadcast its next extrinsic (substrate replies "Invalid
+    Transaction / Transaction is outdated" on the stale nonce).
+
+    Spawning a fresh interpreter for the upload removes that GIL pressure
+    from the parent entirely. NIC bandwidth and the kernel TCP send queue
+    are still shared, so under a true bandwidth wall this is not enough —
+    apply OS-level shaping (cgroup net_cls, tc, trickle) to the child
+    process if that becomes the limit.
+
+    Use `spawn` rather than `fork`: the validator has CUDA initialized
+    in the parent, and a forked child inherits a half-initialized CUDA
+    context that segfaults on first use.
+    """
+    import multiprocessing as _mp
+
+    ctx = _mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_upload_child,
+        args=(
+            child_conn,
+            str(ckpt_dir),
+            repo_id,
+            token,
+            token_env_var,
+            commit_message,
+            allow_patterns,
+        ),
+        name="hf-upload-worker",
+    )
+    proc.start()
+    # Parent doesn't write — close its handle so the child sees EOF
+    # cleanly on its own copy of the read end if it ever inspects.
+    child_conn.close()
+
+    try:
+        proc.join(timeout=timeout_sec)
+        if proc.is_alive():
+            # Timed out: terminate, then escalate to kill if needed.
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            raise TimeoutError(
+                f"HF upload subprocess exceeded {timeout_sec}s; killed"
+            )
+
+        # The child writes exactly one message before exiting; if the
+        # pipe is empty, the child crashed before reaching either branch
+        # of its try/except (e.g. import failure, OOM-kill).
+        if not parent_conn.poll():
+            raise RuntimeError(
+                f"HF upload subprocess exited without sending a result "
+                f"(exitcode={proc.exitcode})"
+            )
+
+        tag, payload = parent_conn.recv()
+        if tag == "ok":
+            return payload
+        exc_type, exc_msg, exc_tb = payload
+        raise RuntimeError(
+            f"HF upload subprocess failed: {exc_type}: {exc_msg}\n{exc_tb}"
+        )
+    finally:
+        parent_conn.close()
+
+
 def download_checkpoint_from_hf(
     repo_id: str,
     revision: str,

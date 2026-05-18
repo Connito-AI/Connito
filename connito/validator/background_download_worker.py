@@ -219,14 +219,12 @@ class BackgroundDownloadWorker(threading.Thread):
 
             repo_id, revision = ckpt.hf_repo_id, ckpt.hf_revision
             expert_group_id = self.config.task.exp.group_id
-            # Try `.safetensors` first (preferred — pickle-free, no
-            # code-execution surface). Fall back to `.pt` for miners that
-            # haven't migrated. MINER_CHECKPOINT_SUFFIXES is ordered
-            # preferred-first.
-            candidate_filenames = [
-                f"model_expgroup_{expert_group_id}{suffix}"
-                for suffix in MINER_CHECKPOINT_SUFFIXES
-            ]
+            # Only fetch `.safetensors` — pickle-free, no code-execution
+            # surface. Legacy `.pt` submissions are no longer probed: doing
+            # so doubled HF round-trips on every miner that hadn't uploaded
+            # at all (every miss became two 404s), and `.pt` is deprecated
+            # for new miner submissions.
+            candidate_filenames = [f"model_expgroup_{expert_group_id}.safetensors"]
             submission_dir = Path(self.config.ckpt.miner_submission_path)
             submission_dir.mkdir(parents=True, exist_ok=True)
 
