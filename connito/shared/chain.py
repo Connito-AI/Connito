@@ -48,6 +48,11 @@ _WEIGHT_SUBMIT_BACKOFF_S: float = 2.0
 _CHAIN_READ_MAX_RETRIES: int = 5
 _CHAIN_READ_BACKOFF_S: float = 2.0
 
+# How many miner UIDs the peer-consensus fallback emits even-weight to.
+# Matches the validator's `weight_group_1_size` default so the fallback
+# emission shape mirrors a successful round's G1 selection.
+_FALLBACK_TOP_N_PEERS: int = 3
+
 
 
 # --- Status structure and submission (for miner validator communication)---
@@ -470,10 +475,14 @@ def _submit_fallback_weights(
             logger.warning("No miner weights remain after excluding validators, falling through to fallback")
 
     # Fallback path: submit even weight to the top-3 miners ranked by
-    # stake-weighted votes from other validators (excluding self). Each
-    # miner's score = sum over (other validators) of
-    # (validator_stake * weight_from_validator_to_miner).
+    # stake-weighted votes from *differentiated* other validators
+    # (validators whose own submission is itself in an even-weight
+    # fallback shape are skipped — their votes would just amplify
+    # circular noise). If every other validator is in that fallback
+    # state, escalate to uid=0 so the validator still earns emission
+    # this cycle without copying a meaningless even-weight signal.
     miner_score: dict[int, float] = {}
+    any_peer_differentiated = False
     for vuid in validator_uids - {my_uid}:
         vneuron = subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
         if vneuron is None:
@@ -481,6 +490,7 @@ def _submit_fallback_weights(
         v_stake = float(getattr(vneuron, "stake", 0.0))
         if v_stake <= 0:
             continue
+        peer_miner_weights: dict[int, float] = {}
         for uid, w in vneuron.weights:
             uid_i = int(uid)
             if uid_i in validator_uids or uid_i == my_uid:
@@ -488,20 +498,54 @@ def _submit_fallback_weights(
             fw = float(w)
             if fw <= 0:
                 continue
+            peer_miner_weights[uid_i] = fw
+        if not peer_miner_weights:
+            continue
+        peer_values = list(peer_miner_weights.values())
+        # Even-weight detection: >= 2 non-zero miner weights, all equal.
+        # A single-uid vote is treated as differentiated (concrete pick).
+        peer_is_even = (
+            len(peer_values) >= 2
+            and (max(peer_values) - min(peer_values)) < 1e-9
+        )
+        if peer_is_even:
+            continue
+        any_peer_differentiated = True
+        for uid_i, fw in peer_miner_weights.items():
             miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
 
-    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_peers = sorted(
+        miner_score.items(), key=lambda kv: (-kv[1], kv[0]),
+    )[:_FALLBACK_TOP_N_PEERS]
     miner_uids = [uid for uid, _ in top_peers]
     if not miner_uids:
+        # All other validators are themselves in the even-weight
+        # fallback state (or none have votes). Don't echo their
+        # uninformative signal — submit a 100%-on-uid=0 emission so
+        # we still earn this cycle.
         logger.warning(
-            "No miner UIDs with stake-weighted votes from other validators, skipping fallback",
+            "Fallback: all other validators in even-weight state; "
+            "submitting 100% weight to uid=0 instead of echoing",
             other_validator_count=len(validator_uids - {my_uid}),
+            any_peer_differentiated=any_peer_differentiated,
         )
-        return False
+        result = subtensor.set_weights(
+            wallet=wallet,
+            netuid=config.chain.netuid,
+            uids=[0],
+            weights=[1.0],
+            wait_for_inclusion=wait_for_inclusion,
+            wait_for_finalization=wait_for_finalization,
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if not success:
+            logger.warning("Failed to set uid=0 fallback weight")
+        return success
 
     weight = 1.0 / len(miner_uids)
     logger.warning(
-        "No previous weights found on chain, submitting even fallback weights to top stake-weighted miners",
+        "Fallback: no usable previous weights; submitting even weight "
+        "to top stake-weighted miners from differentiated peers",
         top_uids=miner_uids,
         top_scores=[round(s, 6) for _, s in top_peers],
         excluded_validator_count=len(validator_uids),
@@ -565,7 +609,13 @@ async def _asubmit_fallback_weights(
                 wait_for_finalization=wait_for_finalization,
             )
 
+    # Mirrors the sync helper: aggregate stake-weighted votes from
+    # other validators, skipping any peer whose own submission is in
+    # an even-weight fallback shape (>= 2 miner weights, all equal).
+    # If every peer is in that state, emit 100% on uid=0 rather than
+    # echoing a circular even-weight signal.
     miner_score: dict[int, float] = {}
+    any_peer_differentiated = False
     for vuid in validator_uids - {my_uid}:
         vneuron = await async_subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
         if vneuron is None:
@@ -573,6 +623,7 @@ async def _asubmit_fallback_weights(
         v_stake = float(getattr(vneuron, "stake", 0.0))
         if v_stake <= 0:
             continue
+        peer_miner_weights: dict[int, float] = {}
         for uid, w in vneuron.weights:
             uid_i = int(uid)
             if uid_i in validator_uids or uid_i == my_uid:
@@ -580,17 +631,48 @@ async def _asubmit_fallback_weights(
             fw = float(w)
             if fw <= 0:
                 continue
+            peer_miner_weights[uid_i] = fw
+        if not peer_miner_weights:
+            continue
+        peer_values = list(peer_miner_weights.values())
+        peer_is_even = (
+            len(peer_values) >= 2
+            and (max(peer_values) - min(peer_values)) < 1e-9
+        )
+        if peer_is_even:
+            continue
+        any_peer_differentiated = True
+        for uid_i, fw in peer_miner_weights.items():
             miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
 
-    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_peers = sorted(
+        miner_score.items(), key=lambda kv: (-kv[1], kv[0]),
+    )[:_FALLBACK_TOP_N_PEERS]
     miner_uids = [uid for uid, _ in top_peers]
     if not miner_uids:
-        logger.warning("No miner UIDs with stake-weighted votes from other validators")
-        return False
+        logger.warning(
+            "Fallback (async): all other validators in even-weight state; "
+            "submitting 100% weight to uid=0 instead of echoing",
+            other_validator_count=len(validator_uids - {my_uid}),
+            any_peer_differentiated=any_peer_differentiated,
+        )
+        result = await async_subtensor.set_weights(
+            wallet=wallet,
+            netuid=config.chain.netuid,
+            uids=[0],
+            weights=[1.0],
+            wait_for_inclusion=wait_for_inclusion,
+            wait_for_finalization=wait_for_finalization,
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if not success:
+            logger.warning("Failed to set uid=0 fallback weight (async)")
+        return success
 
     weight = 1.0 / len(miner_uids)
     logger.warning(
-        "No previous weights found on chain (async); submitting even fallback weights",
+        "Fallback (async): no usable previous weights; submitting even "
+        "weight to top stake-weighted miners from differentiated peers",
         top_uids=miner_uids,
     )
     result = await async_subtensor.set_weights(
