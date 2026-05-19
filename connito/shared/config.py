@@ -233,10 +233,17 @@ class DataCfg(BaseConfig):
     # window. Without this, every eval round only reaches the head of each
     # source's stream (~first few thousand rows), which is small enough to
     # memorize and turns "score on validation" into "score on a fixed
-    # public subset." Defaults to 0 (disabled) so this lands as a
-    # coordinated rollout — operators flip together to keep cross-
-    # validator loss numbers comparable for weight consensus.
-    eval_source_shuffle_buffer: int = 0
+    # public subset."
+    #
+    # Default 50_000 (~200 MB RAM per source × 2 sources ≈ 400 MB total
+    # working set during eval) enables the protection out of the box.
+    # During the auto-upgrade rollout window, validators on the new
+    # default and validators still on the old default will draw
+    # different eval batches and produce non-comparable losses for the
+    # same `combined_seed` — same brief consensus-divergence shape as
+    # the recent block-hash seed mix-in. Operators who need to opt out
+    # for memory reasons can set this to 0 in their config.
+    eval_source_shuffle_buffer: int = 50_000
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
