@@ -225,6 +225,18 @@ class DataCfg(BaseConfig):
     rank: int = 1
     dataset_class: str | None = None
     vali_fraction: float = 0.1
+    # Per-source streaming-shuffle buffer used ONLY when a seed is passed
+    # (i.e. validator eval; miners pass seed=None and are unaffected). When
+    # > 0, each source is `ds.shuffle(seed=int_seed, buffer_size=N)`-d
+    # before interleave + fractional filter, which (a) shuffles HF shard
+    # order with the seed and (b) buffer-shuffles within the active read
+    # window. Without this, every eval round only reaches the head of each
+    # source's stream (~first few thousand rows), which is small enough to
+    # memorize and turns "score on validation" into "score on a fixed
+    # public subset." Defaults to 0 (disabled) so this lands as a
+    # coordinated rollout — operators flip together to keep cross-
+    # validator loss numbers comparable for weight consensus.
+    eval_source_shuffle_buffer: int = 0
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
