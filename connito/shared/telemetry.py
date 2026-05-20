@@ -156,6 +156,37 @@ VALIDATOR_MINER_EVAL_FAILURES = Counter(
     "Failures encountered while evaluating a miner submission, by reason",
     ["miner_uid", "reason"],
 )
+# Per-miner aggregator snapshot. Set right before chain submission alongside
+# VALIDATOR_MINER_WEIGHT_SUBMITTED so a single Prometheus scrape carries
+# everything the leaderboard needs without re-deriving from per-round samples.
+# Absent for UIDs the validator has never scored (no entry rather than 0).
+VALIDATOR_MINER_SCORE_LATEST = Gauge(
+    "validator_miner_score_latest",
+    "Most recent per-round rank score the aggregator holds for a miner",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_SCORE_AVG = Gauge(
+    "validator_miner_score_avg",
+    "Rolling average of per-round rank scores within the aggregator window",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_SCORE_SAMPLES = Gauge(
+    "validator_miner_score_samples",
+    "Number of score samples retained for a miner within the aggregator window",
+    ["miner_uid"],
+)
+# Last-known per-miner eval outcome on THIS validator. Integer-coded so the
+# gateway can render miner-facing strings without label cardinality blowing
+# up (one series per miner_uid, value = code from EVAL_STATUS_CODES below).
+# 0 == ok; non-zero codes correspond to the failure reason the validator
+# observed most recently. Stable across rounds — the gateway is expected
+# to read `last_over_time(...)` so this remains queryable even on cycles
+# where the miner is not in the eval set.
+VALIDATOR_MINER_EVAL_STATUS = Gauge(
+    "validator_miner_eval_status",
+    "Current per-miner eval status code (0=ok; see EVAL_STATUS_CODES)",
+    ["miner_uid"],
+)
 
 # Per-round lifecycle (background submission validation)
 VALIDATOR_ROUND_LIFECYCLE_STEP = Gauge(
@@ -246,10 +277,66 @@ CHAIN_WEIGHT_SET_FAILURE = Counter("chain_weight_set_failure", "Failed weight se
 ERRORS_TOTAL = Counter("connito_errors_total", "Errors counted by component and kind", ["component", "kind"])
 
 
-EvalFailureReason = Literal["timeout", "corrupt", "oom", "checksum", "rpc", "unknown"]
-_EVAL_FAILURE_REASONS: frozenset[str] = frozenset(
-    {"timeout", "corrupt", "oom", "checksum", "rpc", "unknown"}
-)
+EvalFailureReason = Literal[
+    # Legacy buckets — kept callable for back-compat with older call sites
+    # and dashboards. New code should prefer the miner-facing reasons below.
+    "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
+    # Miner-facing failure categories. Each maps to a stable integer code in
+    # EVAL_STATUS_CODES so the gateway can render them without label changes.
+    "deadline",
+    "no_chain_commit",
+    "signature_invalid",
+    "hash_mismatch",
+    "expert_group_or_nan",
+    "non_finite_loss",
+    "download_failed",
+    "statedict_parse_failed",
+]
+_EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
+    "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
+    "deadline",
+    "no_chain_commit", "signature_invalid", "hash_mismatch",
+    "expert_group_or_nan", "non_finite_loss",
+    "download_failed", "statedict_parse_failed",
+})
+
+# Stable integer codes surfaced by VALIDATOR_MINER_EVAL_STATUS. Treat as a
+# public contract — the gateway joins on these to produce miner-facing labels,
+# and changing a code retroactively reinterprets old samples in Prometheus.
+EVAL_STATUS_OK: int = 0
+EVAL_STATUS_CODES: dict[int, str] = {
+    0: "ok",
+    1: "non_finite_loss",
+    2: "statedict_parse_failed",
+    3: "signature_invalid",
+    4: "hash_mismatch",
+    5: "expert_group_or_nan",
+    6: "no_chain_commit",
+    7: "download_failed",
+    8: "oom",
+    9: "timeout",
+    10: "deadline_exceeded",
+    11: "rpc_error",
+    99: "unknown",
+}
+_EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
+    "non_finite_loss": 1,
+    "statedict_parse_failed": 2,
+    "signature_invalid": 3,
+    "hash_mismatch": 4,
+    "expert_group_or_nan": 5,
+    "no_chain_commit": 6,
+    "download_failed": 7,
+    "oom": 8,
+    "timeout": 9,
+    "deadline": 10,
+    "rpc": 11,
+    # Legacy aliases — fold into the closest miner-facing code so old
+    # call sites continue producing meaningful status values.
+    "corrupt": 2,
+    "checksum": 4,
+    "unknown": 99,
+}
 
 
 def inc_error(component: str, kind: str) -> None:
@@ -260,6 +347,45 @@ def inc_eval_failure(miner_uid: int | str, reason: EvalFailureReason | str) -> N
     """Record a miner eval failure. Unknown reasons are coerced to 'unknown' to keep cardinality bounded."""
     safe_reason = reason if reason in _EVAL_FAILURE_REASONS else "unknown"
     VALIDATOR_MINER_EVAL_FAILURES.labels(miner_uid=str(miner_uid), reason=safe_reason).inc()
+
+
+def set_miner_eval_status(miner_uid: int | str, reason: EvalFailureReason | str | None) -> None:
+    """Update the per-miner eval status gauge. Pass ``reason=None`` to mark
+    the latest eval as OK (code 0). Unknown reasons coerce to code 99 so the
+    gateway can still render *something* rather than dropping the sample.
+
+    Best-effort — never raises. Telemetry must not influence scoring.
+    """
+    try:
+        if reason is None:
+            code = EVAL_STATUS_OK
+        else:
+            code = _EVAL_REASON_TO_STATUS_CODE.get(str(reason), 99)
+        VALIDATOR_MINER_EVAL_STATUS.labels(miner_uid=str(miner_uid)).set(float(code))
+    except Exception:
+        pass
+
+
+def set_miner_score_snapshot(
+    miner_uid: int | str,
+    *,
+    latest: float | None,
+    avg: float | None,
+    samples: int | None,
+) -> None:
+    """Publish the aggregator's per-miner snapshot (latest / avg / sample
+    count) to Prometheus. Each arg is independent — pass ``None`` to skip
+    that gauge for this uid. Best-effort.
+    """
+    try:
+        if latest is not None:
+            VALIDATOR_MINER_SCORE_LATEST.labels(miner_uid=str(miner_uid)).set(float(latest))
+        if avg is not None:
+            VALIDATOR_MINER_SCORE_AVG.labels(miner_uid=str(miner_uid)).set(float(avg))
+        if samples is not None:
+            VALIDATOR_MINER_SCORE_SAMPLES.labels(miner_uid=str(miner_uid)).set(float(samples))
+    except Exception:
+        pass
 
 
 # ==============================================================================
