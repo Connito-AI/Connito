@@ -182,6 +182,7 @@ from connito.shared.telemetry import (
     VALIDATOR_MINER_WEIGHT_SUBMITTED,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
     SystemStatePoller,
+    set_miner_score_snapshot,
     set_validator_identity,
     track_metagraph_sync_latency,
 )
@@ -1081,6 +1082,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # — entries are written only for UIDs we actually weight,
                 # so a miner the validator has never scored has *no* sample
                 # rather than a zero (preserves prior EMA semantics).
+                #
+                # Same scrape also publishes the aggregator snapshot
+                # (latest / avg / sample count) for every UID we weight,
+                # so the gateway can render miner-facing telemetry without
+                # re-deriving from per-round samples. Best-effort throughout
+                # — a Prometheus failure must not block weight submission.
+                try:
+                    _latest_scores = score_aggregator.uid_score_pairs(how="latest")
+                    _avg_scores = score_aggregator.uid_score_pairs(how="avg")
+                except Exception as _e:
+                    logger.warning(
+                        "Failed to read aggregator snapshot for telemetry",
+                        error=str(_e),
+                    )
+                    _latest_scores, _avg_scores = {}, {}
                 for _uid, _weight in uid_weights.items():
                     try:
                         VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(
@@ -1088,6 +1104,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         ).set(float(_weight))
                     except Exception:
                         pass
+                    try:
+                        _samples = score_aggregator.record_count(int(_uid))
+                    except Exception:
+                        _samples = None
+                    set_miner_score_snapshot(
+                        int(_uid),
+                        latest=_latest_scores.get(int(_uid)),
+                        avg=_avg_scores.get(int(_uid)),
+                        samples=_samples,
+                    )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
