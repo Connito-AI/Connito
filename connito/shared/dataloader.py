@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import random
 from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
@@ -215,6 +216,63 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
 
         # Convert string seed to integer for interleave_datasets if provided
         int_seed = int(str(seed)[:8], 16) if seed else 42
+
+        # Streaming-shuffle each source BEFORE interleave when the caller
+        # passed a seed (validator eval path; miners pass seed=None so this
+        # is a no-op for training).
+        #
+        # Without this, the eval pool is bounded by the HEAD of each
+        # source's stream: HF reads shards in file order, `interleave`
+        # only changes which source supplies each position, and the
+        # `_fractional_index_filter` + `split_dataset_by_node` together
+        # consume ~max_eval_batches * world_size / vali_fraction
+        # positions per round — for the default config (50, 10, 0.1)
+        # that's ~5,000 positions, drawn from ~2,500 head rows of each
+        # source regardless of seed. A 50-seed probe over
+        # (allenai/c4 en, nvidia/Nemotron-CC-Math-v1 4plus) found only
+        # ~2,000 distinct samples ever drawn — small enough for a miner
+        # to memorize and reach near-zero validation loss without ever
+        # generalizing. `.shuffle()` on a streaming dataset both permutes
+        # shard order (so different shards lead each round) and
+        # buffer-shuffles within the active window — together that turns
+        # the candidate pool into the full source for any seed that lands
+        # on a different shard permutation.
+        shuffle_buffer = int(
+            getattr(config.task.exp.data, "eval_source_shuffle_buffer", 0) or 0
+        )
+        if seed is not None and shuffle_buffer > 0:
+            logger.debug(
+                "Shuffling each source before interleave",
+                seed=seed, int_seed=int_seed, buffer_size=shuffle_buffer,
+            )
+            dataset_splits = [
+                ds.shuffle(seed=int_seed, buffer_size=shuffle_buffer)
+                for ds in dataset_splits
+            ]
+
+        # Random per-source read offset, applied AFTER the buffer shuffle.
+        # `.shuffle(seed, buffer_size=B)` alone leaves the read locked to the
+        # first ~B rows of whichever shard ended up at position 0 of the
+        # permuted shard list — the validator only consumes ~5K rows per
+        # round and the buffer never slides deeper than that. `.skip(N)`
+        # advances the read into the body of the lead shard, so the
+        # reachable pool spans the full shard rather than just its head.
+        # Different `int_seed` → different offset per source (RNG seeded
+        # off `int_seed` advances per source) → window lands at a
+        # different depth each round.
+        skip_max = int(
+            getattr(config.task.exp.data, "eval_source_skip_max", 0) or 0
+        )
+        if seed is not None and skip_max > 0:
+            skip_rng = random.Random(int_seed)
+            offsets = [skip_rng.randrange(0, skip_max) for _ in dataset_splits]
+            logger.debug(
+                "Skipping random offset per source",
+                seed=seed, int_seed=int_seed, skip_max=skip_max, offsets=offsets,
+            )
+            dataset_splits = [
+                ds.skip(offset) for ds, offset in zip(dataset_splits, offsets, strict=True)
+            ]
 
         if len(dataset_splits) == 1:
             split = dataset_splits[0]
