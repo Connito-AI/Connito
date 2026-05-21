@@ -26,9 +26,11 @@ from connito.shared.async_runner import AsyncRunner
 from connito.shared.chain import (
     MinerChainCommit,
     SignedModelHashChainCommit,
+    SUBNET_OWNER_WEIGHT_SHARE,
     ValidatorChainCommit,
     _asubmit_fallback_weights,
     acommit_status,
+    reserve_subnet_owner_share,
     submit_weights_async,
 )
 from connito.validator.round import Round
@@ -153,6 +155,17 @@ class ChainSubmitter:
         round_obj: Round,
         uid_weights: dict[int | str, float],
     ) -> bool:
+        # Reserve a fixed share for the subnet owner before submission.
+        # `build_submission_uid_weights` produces miner-only weights; we
+        # inject the owner share here so the wire submission always
+        # carries it (matching the fallback path). Applied before
+        # `submit_weights_async` runs its own filter/top_k/normalize —
+        # safe because the validator's `top_k` is currently `None`; a
+        # tight `top_k` could drop the 5% share and would need a fix
+        # there before being enabled.
+        uid_weights = reserve_subnet_owner_share(
+            {int(uid): float(w) for uid, w in uid_weights.items()},
+        )
         nonzero = sum(1 for v in uid_weights.values() if v > 0)
         logger.info(
             "ChainSubmitter: submitting weights to chain (RPC starting)",
@@ -163,6 +176,7 @@ class ChainSubmitter:
             normalize=self.normalize,
             wait_for_inclusion=self.wait_for_inclusion,
             wait_for_finalization=self.wait_for_finalization,
+            subnet_owner_share=SUBNET_OWNER_WEIGHT_SHARE,
             top_weights={
                 str(k): round(v, 4)
                 for k, v in sorted(

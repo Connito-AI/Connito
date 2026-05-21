@@ -48,6 +48,55 @@ _WEIGHT_SUBMIT_BACKOFF_S: float = 2.0
 _CHAIN_READ_MAX_RETRIES: int = 5
 _CHAIN_READ_BACKOFF_S: float = 2.0
 
+# How many miner UIDs the peer-consensus fallback emits even-weight to.
+# Matches the validator's `weight_group_1_size` default so the fallback
+# emission shape mirrors a successful round's G1 selection.
+_FALLBACK_TOP_N_PEERS: int = 3
+
+# Every weight submission (regular round + fallback peer-top-3)
+# reserves this fraction for the subnet owner (uid=0). The fallback's
+# uid=0 escalation path (all peers in even-weight state) already emits
+# 100% to uid=0 and is unaffected.
+SUBNET_OWNER_UID: int = 0
+SUBNET_OWNER_WEIGHT_SHARE: float = 0.05
+
+
+def reserve_subnet_owner_share(
+    uid_weights: dict[int, float],
+    *,
+    share: float = SUBNET_OWNER_WEIGHT_SHARE,
+    owner_uid: int = SUBNET_OWNER_UID,
+) -> dict[int, float]:
+    """Return a new ``{uid: weight}`` dict where ``owner_uid`` receives
+    at least ``share`` of the total. All other entries are scaled by
+    ``(1 - share)``; if ``owner_uid`` is already present, its prior
+    weight is also scaled and then ``share`` is added on top.
+
+    Assumes the input sums to ~1.0; the output is normalized to the
+    same total.
+
+    Edge cases:
+      - Empty input → ``{owner_uid: 1.0}``.
+      - ``share <= 0`` → input returned unchanged.
+      - ``share >= 1`` → ``{owner_uid: 1.0}`` (rest collapses to zero).
+
+    Note: this helper does NOT defend against ``top_k`` filtering on
+    the downstream submitter — if ``top_k`` is set tightly enough that
+    ``owner_uid``'s 5% gets cut, the share is lost. The validator's
+    current ``ChainSubmitter`` uses ``top_k=None`` so this is fine in
+    production; reconsider if that changes.
+    """
+    if share <= 0.0:
+        return dict(uid_weights)
+    if share >= 1.0:
+        return {owner_uid: 1.0}
+    if not uid_weights:
+        return {owner_uid: 1.0}
+    scale = 1.0 - share
+    out: dict[int, float] = {int(uid): float(w) * scale for uid, w in uid_weights.items()}
+    out[owner_uid] = out.get(owner_uid, 0.0) + share
+    return out
+
 
 
 # --- Status structure and submission (for miner validator communication)---
@@ -409,6 +458,65 @@ def serve_axon(config: WorkerConfig, wallet: bittensor.Wallet, subtensor: bitten
     )
 
 
+def _peer_miner_contribution(
+    vneuron,
+    validator_uids: set[int],
+    my_uid: int,
+) -> dict[int, float] | None:
+    """Return one peer's stake-weighted contribution to the fallback
+    aggregation, or ``None`` if the peer should be skipped.
+
+    A peer is skipped when:
+      - the neuron lookup returned ``None``,
+      - the peer has zero stake,
+      - none of the peer's positive weights land on miners
+        (everything was on validators or self), or
+      - the peer's miner weights are themselves in an even-weight
+        fallback shape (≥2 non-zero weights all equal) — counting
+        them would just amplify a circular signal.
+
+    A single-UID vote is treated as differentiated (it's a concrete
+    pick, not a uniform spread).
+    """
+    if vneuron is None:
+        return None
+    v_stake = float(getattr(vneuron, "stake", 0.0))
+    if v_stake <= 0:
+        return None
+    peer_miner_weights: dict[int, float] = {}
+    for uid, w in getattr(vneuron, "weights", []):
+        uid_i = int(uid)
+        if uid_i in validator_uids or uid_i == my_uid:
+            continue
+        fw = float(w)
+        if fw <= 0:
+            continue
+        peer_miner_weights[uid_i] = fw
+    if not peer_miner_weights:
+        return None
+    values = list(peer_miner_weights.values())
+    is_even = (
+        len(values) >= 2
+        and (max(values) - min(values)) < 1e-9
+    )
+    if is_even:
+        return None
+    return {uid: fw for uid, fw in peer_miner_weights.items()}
+
+
+def _pick_top_n_miner_uids(
+    miner_score: dict[int, float],
+    top_n: int,
+) -> list[tuple[int, float]]:
+    """Sort ``{uid: score}`` desc by score, ties broken by uid asc, and
+    slice to ``top_n``. Returns ``[(uid, score), ...]`` for both the
+    UID list and per-UID logging.
+    """
+    return sorted(
+        miner_score.items(), key=lambda kv: (-kv[1], kv[0]),
+    )[:top_n]
+
+
 def _submit_fallback_weights(
     config: WorkerConfig,
     wallet: bittensor.Wallet,
@@ -416,101 +524,85 @@ def _submit_fallback_weights(
     wait_for_inclusion: bool = True,
     wait_for_finalization: bool = True,
 ) -> bool:
-    """Try previous weights from chain, otherwise submit uniform weights.
+    """Submit fallback weights from a sync ``Subtensor``.
 
-    Validator UIDs are excluded — weights are only set on miners. The uniform
-    fallback targets the union of miners currently receiving non-zero weight
-    from any other validator on-chain (self is excluded); this mirrors the
-    rest of the subnet's active miner set without needing an explicit list.
+    Aggregate stake-weighted votes from other validators whose
+    submissions are themselves differentiated (i.e. not in an
+    even-weight fallback shape) and emit even weight to the top-3
+    miners. If no peer is differentiated, emit 100% on uid=0 — the
+    validator still earns this cycle's emission rather than echoing a
+    subnet-wide even-weight cascade.
+
+    Note: we deliberately do **not** reuse our own previous on-chain
+    weights. Those could be a stale snapshot from a buggy cycle or
+    from our own earlier fallback emission; a fresh look at peer
+    consensus is always safer than perpetuating our last submission.
+
+    The sync/async split exists only at the I/O boundary; the pure
+    decisions live in `_peer_miner_contribution` and
+    `_pick_top_n_miner_uids`.
     """
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
 
     metagraph = subtensor.metagraph(netuid=config.chain.netuid)
     my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
-    full_neuron = subtensor.neuron_for_uid(uid=my_uid, netuid=config.chain.netuid)
-    prev_weights = {uid: float(w) for uid, w in full_neuron.weights} if full_neuron else {}
 
     validator_hotkeys = get_validator_whitelist_from_api(config)
     validator_uids = {
         metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
     }
 
-    if prev_weights:
-        miner_prev_weights = {
-            uid: w for uid, w in prev_weights.items()
-            if int(uid) not in validator_uids
-        }
-        dropped = len(prev_weights) - len(miner_prev_weights)
-
-        # Detect the fallback shape on chain: all miner weights equal. Covers
-        # both the current top-3-even pattern and the legacy many-miner
-        # uniform pattern; if we see it we recompute rather than reuse.
-        values = list(miner_prev_weights.values())
-        is_even = (
-            len(values) >= 1
-            and max(values) > 0
-            and (max(values) - min(values)) < 1e-9
-        )
-
-        if miner_prev_weights and not is_even:
-            logger.info(
-                "Falling back to previous weights from chain (miners only)",
-                count=len(miner_prev_weights),
-                dropped_validator_uids=dropped,
-            )
-            return submit_weights(config, wallet, subtensor, miner_prev_weights, normalize=True,
-                                  wait_for_inclusion=wait_for_inclusion,
-                                  wait_for_finalization=wait_for_finalization)
-        if is_even:
-            logger.info(
-                "Previous on-chain weights are even (fallback pattern); recomputing",
-                count=len(miner_prev_weights),
-            )
-        else:
-            logger.warning("No miner weights remain after excluding validators, falling through to fallback")
-
-    # Fallback path: submit even weight to the top-3 miners ranked by
-    # stake-weighted votes from other validators (excluding self). Each
-    # miner's score = sum over (other validators) of
-    # (validator_stake * weight_from_validator_to_miner).
     miner_score: dict[int, float] = {}
+    any_peer_differentiated = False
     for vuid in validator_uids - {my_uid}:
         vneuron = subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
-        if vneuron is None:
+        contrib = _peer_miner_contribution(vneuron, validator_uids, my_uid)
+        if contrib is None:
             continue
-        v_stake = float(getattr(vneuron, "stake", 0.0))
-        if v_stake <= 0:
-            continue
-        for uid, w in vneuron.weights:
-            uid_i = int(uid)
-            if uid_i in validator_uids or uid_i == my_uid:
-                continue
-            fw = float(w)
-            if fw <= 0:
-                continue
-            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
+        any_peer_differentiated = True
+        for uid_i, score in contrib.items():
+            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + score
 
-    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_peers = _pick_top_n_miner_uids(miner_score, _FALLBACK_TOP_N_PEERS)
     miner_uids = [uid for uid, _ in top_peers]
     if not miner_uids:
         logger.warning(
-            "No miner UIDs with stake-weighted votes from other validators, skipping fallback",
+            "Fallback: all other validators in even-weight state; "
+            "submitting 100% weight to uid=0 instead of echoing",
             other_validator_count=len(validator_uids - {my_uid}),
+            any_peer_differentiated=any_peer_differentiated,
         )
-        return False
+        result = subtensor.set_weights(
+            wallet=wallet,
+            netuid=config.chain.netuid,
+            uids=[0],
+            weights=[1.0],
+            wait_for_inclusion=wait_for_inclusion,
+            wait_for_finalization=wait_for_finalization,
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if not success:
+            logger.warning("Failed to set uid=0 fallback weight")
+        return success
 
-    weight = 1.0 / len(miner_uids)
+    # Each miner gets an equal share of (1 - SUBNET_OWNER_WEIGHT_SHARE).
+    miner_weights_raw = {uid: 1.0 / len(miner_uids) for uid in miner_uids}
+    final = reserve_subnet_owner_share(miner_weights_raw)
+    submit_uids = list(final.keys())
+    submit_weights_list = list(final.values())
     logger.warning(
-        "No previous weights found on chain, submitting even fallback weights to top stake-weighted miners",
+        "Fallback: submitting even weight to top stake-weighted miners "
+        "from differentiated peers (with subnet-owner share)",
         top_uids=miner_uids,
         top_scores=[round(s, 6) for _, s in top_peers],
         excluded_validator_count=len(validator_uids),
+        subnet_owner_share=SUBNET_OWNER_WEIGHT_SHARE,
     )
     result = subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
-        uids=miner_uids,
-        weights=[weight] * len(miner_uids),
+        uids=submit_uids,
+        weights=submit_weights_list,
         wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )
@@ -529,75 +621,71 @@ async def _asubmit_fallback_weights(
     wait_for_inclusion: bool = True,
     wait_for_finalization: bool = True,
 ) -> bool:
-    """Async equivalent of `_submit_fallback_weights`."""
+    """Async equivalent of `_submit_fallback_weights`.
+
+    Same shape, same decisions, same helper calls — only the I/O is
+    awaited.
+    """
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402
 
     metagraph = await async_subtensor.metagraph(netuid=config.chain.netuid)
     my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
-    full_neuron = await async_subtensor.neuron_for_uid(uid=my_uid, netuid=config.chain.netuid)
-    prev_weights = {uid: float(w) for uid, w in full_neuron.weights} if full_neuron else {}
 
     validator_hotkeys = get_validator_whitelist_from_api(config)
     validator_uids = {
         metagraph.hotkeys.index(hk) for hk in validator_hotkeys if hk in metagraph.hotkeys
     }
 
-    if prev_weights:
-        miner_prev_weights = {
-            uid: w for uid, w in prev_weights.items()
-            if int(uid) not in validator_uids
-        }
-        dropped = len(prev_weights) - len(miner_prev_weights)
-        values = list(miner_prev_weights.values())
-        is_even = (
-            len(values) >= 1
-            and max(values) > 0
-            and (max(values) - min(values)) < 1e-9
-        )
-        if miner_prev_weights and not is_even:
-            logger.info(
-                "Falling back to previous weights from chain (miners only)",
-                count=len(miner_prev_weights), dropped_validator_uids=dropped,
-            )
-            return await submit_weights_async(
-                config, wallet, async_subtensor, miner_prev_weights, normalize=True,
-                wait_for_inclusion=wait_for_inclusion,
-                wait_for_finalization=wait_for_finalization,
-            )
-
     miner_score: dict[int, float] = {}
+    any_peer_differentiated = False
     for vuid in validator_uids - {my_uid}:
         vneuron = await async_subtensor.neuron_for_uid(uid=vuid, netuid=config.chain.netuid)
-        if vneuron is None:
+        contrib = _peer_miner_contribution(vneuron, validator_uids, my_uid)
+        if contrib is None:
             continue
-        v_stake = float(getattr(vneuron, "stake", 0.0))
-        if v_stake <= 0:
-            continue
-        for uid, w in vneuron.weights:
-            uid_i = int(uid)
-            if uid_i in validator_uids or uid_i == my_uid:
-                continue
-            fw = float(w)
-            if fw <= 0:
-                continue
-            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + v_stake * fw
+        any_peer_differentiated = True
+        for uid_i, score in contrib.items():
+            miner_score[uid_i] = miner_score.get(uid_i, 0.0) + score
 
-    top_peers = sorted(miner_score.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_peers = _pick_top_n_miner_uids(miner_score, _FALLBACK_TOP_N_PEERS)
     miner_uids = [uid for uid, _ in top_peers]
     if not miner_uids:
-        logger.warning("No miner UIDs with stake-weighted votes from other validators")
-        return False
+        logger.warning(
+            "Fallback (async): all other validators in even-weight state; "
+            "submitting 100% weight to uid=0 instead of echoing",
+            other_validator_count=len(validator_uids - {my_uid}),
+            any_peer_differentiated=any_peer_differentiated,
+        )
+        result = await async_subtensor.set_weights(
+            wallet=wallet,
+            netuid=config.chain.netuid,
+            uids=[0],
+            weights=[1.0],
+            wait_for_inclusion=wait_for_inclusion,
+            wait_for_finalization=wait_for_finalization,
+        )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if not success:
+            logger.warning("Failed to set uid=0 fallback weight (async)")
+        return success
 
-    weight = 1.0 / len(miner_uids)
+    # Mirror of the sync helper: even share across top-3, then reserve
+    # SUBNET_OWNER_WEIGHT_SHARE for uid=0.
+    miner_weights_raw = {uid: 1.0 / len(miner_uids) for uid in miner_uids}
+    final = reserve_subnet_owner_share(miner_weights_raw)
+    submit_uids = list(final.keys())
+    submit_weights_list = list(final.values())
     logger.warning(
-        "No previous weights found on chain (async); submitting even fallback weights",
+        "Fallback (async): submitting even weight to top stake-weighted "
+        "miners from differentiated peers (with subnet-owner share)",
         top_uids=miner_uids,
+        subnet_owner_share=SUBNET_OWNER_WEIGHT_SHARE,
     )
     result = await async_subtensor.set_weights(
         wallet=wallet,
         netuid=config.chain.netuid,
-        uids=miner_uids,
-        weights=[weight] * len(miner_uids),
+        uids=submit_uids,
+        weights=submit_weights_list,
         wait_for_inclusion=wait_for_inclusion,
         wait_for_finalization=wait_for_finalization,
     )

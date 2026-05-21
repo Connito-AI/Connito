@@ -225,6 +225,49 @@ class DataCfg(BaseConfig):
     rank: int = 1
     dataset_class: str | None = None
     vali_fraction: float = 0.1
+    # Per-source streaming-shuffle buffer used ONLY when a seed is passed
+    # (i.e. validator eval; miners pass seed=None and are unaffected). When
+    # > 0, each source is `ds.shuffle(seed=int_seed, buffer_size=N)`-d
+    # before interleave + fractional filter, which (a) shuffles HF shard
+    # order with the seed and (b) buffer-shuffles within the active read
+    # window. Without this, every eval round only reaches the head of each
+    # source's stream (~first few thousand rows), which is small enough to
+    # memorize and turns "score on validation" into "score on a fixed
+    # public subset."
+    #
+    # Default 50_000 (~200 MB RAM per source × 2 sources ≈ 400 MB total
+    # working set during eval) enables the protection out of the box.
+    # During the auto-upgrade rollout window, validators on the new
+    # default and validators still on the old default will draw
+    # different eval batches and produce non-comparable losses for the
+    # same `combined_seed` — same brief consensus-divergence shape as
+    # the recent block-hash seed mix-in. Operators who need to opt out
+    # for memory reasons can set this to 0 in their config.
+    eval_source_shuffle_buffer: int = 50_000
+    # Per-source random read offset applied AFTER the buffer shuffle. When
+    # > 0, each source is `ds.skip(rng.randrange(0, N))`-d so the validator
+    # reads from a random DEPTH into the (already-randomly-chosen) lead
+    # shard, not always from row 0.
+    #
+    # Why both this and `eval_source_shuffle_buffer` are needed:
+    #   - `.shuffle(seed, buffer_size=B)` permutes which shard leads each
+    #     round AND buffer-shuffles within a B-wide window. But the
+    #     validator only consumes ~5,000 positions per round, so the read
+    #     never advances past the first ~B rows of the lead shard. Across
+    #     seeds you get different shards' HEADS — not different rows of
+    #     the same shard's body.
+    #   - `.skip(N)` slides the buffer window N rows deep into the lead
+    #     shard, so the reachable pool spans the BODY of each shard. The
+    #     reachable set then grows along two axes: (shard permuted to lead)
+    #     and (offset into that shard).
+    #
+    # Cost: `.skip(N)` on a streaming dataset is O(N) decode-and-discard,
+    # paid once per source per round at eval start. 50_000 adds a few
+    # seconds per round. Tune down if too slow; tune up for even less
+    # predictability. Same coordinated-rollout discipline as
+    # `eval_source_shuffle_buffer` — validators on different defaults
+    # diverge for one round, then re-converge.
+    eval_source_skip_max: int = 50_000
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
