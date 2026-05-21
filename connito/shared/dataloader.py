@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import random
 from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
@@ -247,6 +248,30 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             dataset_splits = [
                 ds.shuffle(seed=int_seed, buffer_size=shuffle_buffer)
                 for ds in dataset_splits
+            ]
+
+        # Random per-source read offset, applied AFTER the buffer shuffle.
+        # `.shuffle(seed, buffer_size=B)` alone leaves the read locked to the
+        # first ~B rows of whichever shard ended up at position 0 of the
+        # permuted shard list — the validator only consumes ~5K rows per
+        # round and the buffer never slides deeper than that. `.skip(N)`
+        # advances the read into the body of the lead shard, so the
+        # reachable pool spans the full shard rather than just its head.
+        # Different `int_seed` → different offset per source (RNG seeded
+        # off `int_seed` advances per source) → window lands at a
+        # different depth each round.
+        skip_max = int(
+            getattr(config.task.exp.data, "eval_source_skip_max", 0) or 0
+        )
+        if seed is not None and skip_max > 0:
+            skip_rng = random.Random(int_seed)
+            offsets = [skip_rng.randrange(0, skip_max) for _ in dataset_splits]
+            logger.debug(
+                "Skipping random offset per source",
+                seed=seed, int_seed=int_seed, skip_max=skip_max, offsets=offsets,
+            )
+            dataset_splits = [
+                ds.skip(offset) for ds, offset in zip(dataset_splits, offsets, strict=True)
             ]
 
         if len(dataset_splits) == 1:
