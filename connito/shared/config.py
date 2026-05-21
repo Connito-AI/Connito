@@ -910,6 +910,14 @@ class ValidatorConfig(WorkerConfig):
             f"WATCHTOWER_POLL_INTERVAL=300",
             f"WATCHTOWER_NOTIFICATIONS=",
             f"WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL=",
+            f"",
+            f"# --- Central log aggregation (opt-in; see docs/validator-docker-operators.md) ---",
+            f"# Uncomment COMPOSE_FILE and fill the three values below to ship validator",
+            f"# stdout to Grafana Cloud Loki. Credentials are issued by the subnet owner.",
+            f"# COMPOSE_FILE=docker-compose.yml:docker-compose.loki.override.yml",
+            f"# LOKI_URL=",
+            f"# HOTKEY_SS58=",
+            f"# VALIDATOR_UID=",
         ]
 
         env_path.parent.mkdir(parents=True, exist_ok=True)
