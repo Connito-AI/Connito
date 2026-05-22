@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import gc
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ from connito.shared.telemetry import (
     VALIDATOR_MINER_VAL_LOSS,
     inc_error,
     inc_eval_failure,
+    set_miner_eval_status,
     track_eval_latency,
     track_model_load_latency,
 )
@@ -34,15 +36,25 @@ logger = structlog.get_logger(__name__)
 
 # Maps the short reason strings returned by `validate_miner_submission` onto
 # the closed `EvalFailureReason` enum used by the
-# `validator_miner_eval_failures_total` Counter. Keeping the mapping here (and
-# not in telemetry.py) so the validator-side semantics live with the eval code.
+# `validator_miner_eval_failures_total` Counter and the
+# `validator_miner_eval_status` Gauge. Each row gets its own miner-facing
+# bucket so a miner reading the gateway can tell a bad signature apart from
+# a hash mismatch or an expert-group / NaN-Inf violation.
 _VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
-    "no_chain_commit": "unknown",
-    "signature": "corrupt",
-    "hash": "checksum",
-    "expert_group_or_nan": "corrupt",
+    "no_chain_commit": "no_chain_commit",
+    "signature": "signature_invalid",
+    "hash": "hash_mismatch",
+    "expert_group_or_nan": "expert_group_or_nan",
     "unknown": "unknown",
 }
+
+
+def _record_eval_failure(uid: int, reason: EvalFailureReason | str) -> None:
+    """Helper that pairs the failure Counter with the per-miner status Gauge
+    so every call site stays in sync. Both writes are best-effort.
+    """
+    inc_eval_failure(int(uid), reason)
+    set_miner_eval_status(int(uid), reason)
 
 
 def cleanup_non_top_submissions(
@@ -271,7 +283,8 @@ def finalize_round_scores(
     # Freeze-time invalid-checkpoint penalties. Skip any UID that ended
     # up in scored/validation_failed (cannot happen today, but keep the
     # override explicit if the freeze logic ever shifts).
-    for uid in freeze_zero - scored - validation_failed:
+    freeze_zero_only = freeze_zero - scored - validation_failed
+    for uid in freeze_zero_only:
         hotkey = freeze_hotkeys.get(uid) or round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -279,6 +292,22 @@ def finalize_round_scores(
             uid=uid, hotkey=hotkey, score=0.0, round_id=round_obj.round_id,
         )
         written[uid] = 0.0
+
+    # Telemetry — emit eval_status for the freeze_zero bucket here because
+    # the per-uid `_record_eval_failure` call sites only fire when the eval
+    # loop actually picks the miner up. Freeze-time invalid checkpoints
+    # never reach that point, so without this loop the gateway has no signal
+    # for "we knew at freeze you had no/invalid commit." validation_failed
+    # statuses are already set at the validate_miner_submission call site
+    # with the specific sub-reason (signature/hash/expert_group_or_nan), so
+    # do not overwrite them here. Wrapped broadly — telemetry must never
+    # block finalize.
+    try:
+        from connito.shared.telemetry import set_miner_eval_status as _set_status
+        for uid in freeze_zero_only:
+            _set_status(int(uid), "no_chain_commit")
+    except Exception:
+        pass
 
     if score_path is not None:
         try:
@@ -764,6 +793,16 @@ def evaluate_one_miner_sync(
             VALIDATOR_MINER_VAL_LOSS.labels(miner_uid=str(int(uid))).set(float(val_loss))
         except Exception:
             pass
+        # Surface the eval outcome on the per-miner status gauge so miners
+        # can self-serve the answer to "why was my val_loss empty?". A
+        # non-finite loss does not abort scoring — downstream finalize will
+        # naturally produce a 0 ranking score — but the gauge lets the
+        # gateway distinguish "evaluated and clean" from "evaluated and the
+        # eval blew up numerically", which the failure Counter doesn't.
+        if math.isfinite(val_loss):
+            set_miner_eval_status(int(uid), None)
+        else:
+            set_miner_eval_status(int(uid), "non_finite_loss")
         logger.info(
             "evaluate_one_miner: complete",
             uid=int(uid),
@@ -786,14 +825,14 @@ def evaluate_one_miner_sync(
             "evaluate_one_miner: deadline exceeded — bailing cleanly",
             uid=int(uid), hotkey=hotkey[:6], round_id=round_id, error=str(e),
         )
-        inc_eval_failure(int(uid), "deadline")
+        _record_eval_failure(int(uid), "deadline")
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return None
     except torch.cuda.OutOfMemoryError:
         logger.error("evaluate_one_miner: OOM", uid=int(uid))
-        inc_eval_failure(int(uid), "oom")
+        _record_eval_failure(int(uid), "oom")
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -801,13 +840,14 @@ def evaluate_one_miner_sync(
     except (ValueError, RuntimeError, EOFError) as e:
         # ValueError: load_model_from_path's "Unsupported checkpoint format" /
         # empty state_dict guard. RuntimeError / EOFError: torch.load rejecting
-        # truncated or malformed payloads. All three signal a corrupt download.
-        logger.exception("evaluate_one_miner: corrupt checkpoint", uid=int(uid), error=str(e))
-        inc_eval_failure(int(uid), "corrupt")
+        # truncated or malformed payloads. All three signal an unreadable
+        # state_dict on disk, which is what the miner needs to see.
+        logger.exception("evaluate_one_miner: statedict parse failed", uid=int(uid), error=str(e))
+        _record_eval_failure(int(uid), "statedict_parse_failed")
         return None
     except Exception as e:
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
-        inc_eval_failure(int(uid), "unknown")
+        _record_eval_failure(int(uid), "unknown")
         return None
 
 
@@ -1027,7 +1067,7 @@ async def evaluate_foreground_round(
                     reason=fail_reason,
                 )
                 inc_error(component="foreground_eval", kind="validation")
-                inc_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
+                _record_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
                 round_obj.mark_validation_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
@@ -1067,7 +1107,7 @@ async def evaluate_foreground_round(
                     uid=uid, hotkey=hotkey[:6],
                     timeout_sec=round(effective_timeout, 2),
                 )
-                inc_eval_failure(int(uid), "timeout")
+                _record_eval_failure(int(uid), "timeout")
                 round_obj.mark_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
@@ -1076,7 +1116,7 @@ async def evaluate_foreground_round(
                 continue
             except Exception as e:
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
-                inc_eval_failure(int(uid), "unknown")
+                _record_eval_failure(int(uid), "unknown")
                 round_obj.mark_failed(uid)
                 _prune_non_top_after_eval(
                     config=config,
