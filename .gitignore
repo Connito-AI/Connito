@@ -137,6 +137,8 @@ Thumbs.db
 
 # *
 **.csv
+# Test fixtures shipped with the bench tools must be tracked.
+!bench/sample_data/*.csv
 **/wandb/**
 **/checkpoints/**
 **/bittensor_subnetinfo_daily/**

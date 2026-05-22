@@ -1,0 +1,26 @@
+# HELP miner_training_loss Local model training loss
+# TYPE miner_training_loss gauge
+miner_training_loss{expert_group="group_0"} 2.0314
+# HELP miner_learning_rate Current learning rate
+# TYPE miner_learning_rate gauge
+miner_learning_rate 0.00005
+# HELP miner_gradient_norm Gradient norm per step
+# TYPE miner_gradient_norm gauge
+miner_gradient_norm 0.51
+# HELP moe_expert_load Tokens routed to each expert
+# TYPE moe_expert_load gauge
+moe_expert_load{layer_idx="0",expert_idx="0"} 9200.0
+moe_expert_load{layer_idx="0",expert_idx="1"} 8800.0
+moe_expert_load{layer_idx="0",expert_idx="2"} 1500.0
+moe_expert_load{layer_idx="0",expert_idx="3"} 8400.0
+moe_expert_load{layer_idx="0",expert_idx="4"} 300.0
+moe_expert_load{layer_idx="0",expert_idx="5"} 9100.0
+moe_expert_load{layer_idx="1",expert_idx="0"} 7600.0
+moe_expert_load{layer_idx="1",expert_idx="1"} 200.0
+moe_expert_load{layer_idx="1",expert_idx="2"} 8900.0
+moe_expert_load{layer_idx="1",expert_idx="3"} 9200.0
+moe_expert_load{layer_idx="1",expert_idx="4"} 8800.0
+moe_expert_load{layer_idx="1",expert_idx="5"} 100.0
+# HELP moe_topk_routing_entropy Diversity of routing decisions
+# TYPE moe_topk_routing_entropy gauge
+moe_topk_routing_entropy 1.45
