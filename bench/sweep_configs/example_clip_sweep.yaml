@@ -1,0 +1,25 @@
+# Example gradient-clipping sweep.
+#
+# The current default is `grad_clip = 1.0`. This sweep probes whether
+# a tighter / looser clip stabilizes the loss curve on short training
+# runs. Useful as a low-risk smoke test before touching deeper HPs.
+
+sweep_name: grad_clip_search_2026_05
+base_config: null
+
+mini_train:
+  steps: 100
+  base_model: deepseek-ai/DeepSeek-V2-Lite
+  expert_group: exp_math
+  dry_run_stub_model: false
+
+local_scorer:
+  max_batches: 20
+  seeds: [42, 1337, 314159]
+  baseline_loss: 4.78
+
+grid:
+  - param: opt.grad_clip
+    values: [0.5, 1.0, 2.0, 5.0]
+
+output_dir: bench/sweep_results/grad_clip_search_2026_05

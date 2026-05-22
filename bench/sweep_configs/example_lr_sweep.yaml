@@ -1,0 +1,40 @@
+# Example learning-rate sweep.
+#
+# 6 learning rates x 3 weight decays = 18 trials. Each trial trains
+# for `mini_train.steps` optimizer steps with the override applied to
+# the base config, then scores the resulting checkpoint with a
+# validator-replica eval across `local_scorer.seeds` to gauge
+# robustness.
+#
+# Usage:
+#   python -m bench.sweep_runner --dry-run --config bench/sweep_configs/example_lr_sweep.yaml
+#   python -m bench.sweep_runner --config bench/sweep_configs/example_lr_sweep.yaml --max-trials 4
+
+sweep_name: lr_search_2026_05
+# `base_config: null` => start from `connito.shared.config:WorkerConfig` defaults.
+# Set to a YAML path to layer overrides on top of an explicit base.
+base_config: null
+
+mini_train:
+  steps: 100
+  base_model: deepseek-ai/DeepSeek-V2-Lite
+  expert_group: exp_math
+  # Set to `true` to skip real training and use the deterministic stub
+  # scorer — useful in CI where torch + transformers are unavailable.
+  dry_run_stub_model: false
+
+local_scorer:
+  max_batches: 20
+  seeds: [42, 1337, 314159]
+  # Top-of-leaderboard baseline observed on the dashboard. The score
+  # formula is `score = max(0, baseline - val_loss) ** 1.2` per
+  # `connito/validator/evaluator.py:787`.
+  baseline_loss: 4.78
+
+grid:
+  - param: opt.lr
+    values: [1.0e-6, 5.0e-6, 1.0e-5, 3.0e-5, 5.0e-5, 1.0e-4]
+  - param: opt.weight_decay
+    values: [0.0, 0.01, 0.1]
+
+output_dir: bench/sweep_results/lr_search_2026_05
