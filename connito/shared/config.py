@@ -296,7 +296,26 @@ class MoECfg(BaseConfig):
 
 
 class OptimizerCfg(BaseConfig):
-    lr: float = 1e-5
+    # Inner (per-miner) AdamW defaults.
+    # lr 3e-5: 3x previous baseline; standard fine-tuning starting point for MoE
+    # models on streaming data. Pairs with cosine + warmup to absorb the higher LR.
+    lr: float = 3e-5
+    # AdamW betas. (0.9, 0.999) is the standard parameterization; the prior
+    # (0.9, 0.95) second-moment beta underweights long-horizon variance estimates
+    # and tends to make the optimizer respond too aggressively to recent grads on
+    # streaming/shard-rotated data.
+    betas: tuple[float, float] = (0.9, 0.999)
+    # Epsilon for AdamW. 1e-6 is the recommended value for bf16/fp16-mixed
+    # training: 1e-8 sits near bf16's subnormal range and can produce
+    # numerically unstable updates.
+    eps: float = 1e-6
+    # AdamW weight decay. Lifted from train.py (previously hardcoded to 0.1)
+    # so operators can tune it without editing source.
+    weight_decay: float = 0.1
+    # Inner-step grad clipping max-norm. 0.5 is a more conservative clip than
+    # the prior 1.0; gives smoother trajectories and lower NaN risk under the
+    # higher LR above. Lifted from train.py to make it config-driven.
+    grad_clip_max_norm: float = 0.5
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
 
@@ -318,7 +337,11 @@ class ParallelismCfg(BaseConfig):
 
 class ScheduleCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"total_steps"})
-    warmup_steps: int = 0
+    # 500 warmup steps ~= 0.6% of total_steps (88k). Cold-starting cosine with
+    # no warmup at the new 3e-5 LR risks an early loss spike on the first few
+    # steps; this gives the optimizer time to estimate second moments before
+    # the LR reaches peak.
+    warmup_steps: int = 500
     total_steps: PositiveInt = 88_000
 
 

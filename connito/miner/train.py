@@ -181,7 +181,13 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    inner_optimizer = torch.optim.AdamW(trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95))
+    inner_optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=config.opt.lr,
+        weight_decay=config.opt.weight_decay,
+        betas=config.opt.betas,
+        eps=config.opt.eps,
+    )
 
     # === scheduler === (for inner optimizer)
     logger.debug("init - scheduler")
@@ -459,7 +465,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     inner_scaler.update()
                     continue
 
-                grad_norm = clip_grad_norm_(grad_params, 1.0, error_if_nonfinite=False)
+                grad_norm = clip_grad_norm_(grad_params, config.opt.grad_clip_max_norm, error_if_nonfinite=False)
                 grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
                 if not math.isfinite(grad_norm_value):
                     logger.warning("Non-finite grad norm detected; skipping optimizer step", step=step)
