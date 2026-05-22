@@ -268,6 +268,22 @@ class DataCfg(BaseConfig):
     # `eval_source_shuffle_buffer` — validators on different defaults
     # diverge for one round, then re-converge.
     eval_source_skip_max: int = 50_000
+    # HuggingFace gradient checkpointing toggle. When True, activations
+    # for transformer blocks are recomputed during backward instead of
+    # stored, trading ~20% throughput for a large memory reduction.
+    # Operators can then raise `per_device_train_batch_size` /
+    # `batch_size` to net positive on `tokens/sec` per GB. Default False
+    # for backward compatibility — opt in per-config.
+    #
+    # Caveat: `model.config.use_cache` MUST be False while grad
+    # checkpointing is on (the helper sets it). Order with torch.compile
+    # (Unit 10): enable grad ckpt FIRST, then compile.
+    use_gradient_checkpointing: bool = False
+    # When False (default), use the newer non-reentrant grad checkpointing
+    # API (`use_reentrant=False`) — faster and recommended for new code.
+    # Set True only if you hit a backend that mis-handles non-reentrant
+    # (rare on modern HuggingFace transformers).
+    gradient_checkpointing_reentrant: bool = False
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):

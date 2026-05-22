@@ -95,6 +95,63 @@ def grad_hook(name):
 
     return h
 
+
+def enable_gradient_checkpointing(model: nn.Module, reentrant: bool = False) -> None:
+    """
+    Enable HuggingFace gradient checkpointing on `model` when supported.
+
+    Activations for transformer blocks are recomputed during backward instead
+    of being stored, trading ~20% throughput for a large memory reduction.
+    Operators can then raise the per-device batch size to net positive on
+    tokens/sec per GB.
+
+    Notes
+    -----
+    - `use_reentrant=False` selects the newer non-reentrant API
+      (faster and recommended). Pass `reentrant=True` only if the
+      backend mis-handles non-reentrant (rare on modern transformers).
+    - `model.config.use_cache` must be False while grad checkpointing
+      is on; we set it here defensively even when `use_cache` is already
+      False.
+    - When ordered against `torch.compile` (Unit 10), grad checkpointing
+      must be enabled BEFORE `torch.compile(model)`.
+    - No-op (warning logged, no crash) if `model` does not expose
+      `gradient_checkpointing_enable`.
+    """
+    if not hasattr(model, "gradient_checkpointing_enable"):
+        logger.warning(
+            "Model does not support gradient_checkpointing_enable; skipping",
+            model_type=type(model).__name__,
+        )
+        return
+
+    # `use_cache=True` is incompatible with gradient checkpointing — the
+    # KV cache assumes activations are kept around, but grad ckpt deletes
+    # them. Disable defensively on the model config when available.
+    model_config = getattr(model, "config", None)
+    if model_config is not None and getattr(model_config, "use_cache", False):
+        model_config.use_cache = False
+        logger.info("Disabled model.config.use_cache for gradient checkpointing")
+
+    try:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": reentrant},
+        )
+    except TypeError:
+        # Older transformers releases do not accept
+        # `gradient_checkpointing_kwargs`. Fall back to the legacy call —
+        # the older default (reentrant=True) is the only available
+        # behavior there.
+        model.gradient_checkpointing_enable()
+        logger.info(
+            "Gradient checkpointing enabled (legacy fallback; "
+            "transformers does not support gradient_checkpointing_kwargs)",
+            requested_reentrant=reentrant,
+        )
+        return
+
+    logger.info("Gradient checkpointing enabled", reentrant=reentrant)
+
 def freeze_parameters(
     model: nn.Module,
     expert_manager: ExpertManager,
@@ -243,7 +300,20 @@ def get_model_from_checkpoint(
     model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
     model = model.to(device=_device, dtype=model_dtype)
-    model.gradient_checkpointing_enable()
+    # Gradient checkpointing is opt-in via `task.exp.data.use_gradient_checkpointing`.
+    # Default off — trades ~20% throughput for a large memory reduction, so
+    # operators turn it on only when they want to raise batch size to net
+    # positive on tokens/sec per GB. Callers (train.py / validator/run.py)
+    # may also call `enable_gradient_checkpointing` after this returns; the
+    # helper is idempotent — HuggingFace's flag is a simple bool set on
+    # every block.
+    if get_nested_attr(config, "task.exp.data.use_gradient_checkpointing", False):
+        enable_gradient_checkpointing(
+            model,
+            reentrant=get_nested_attr(
+                config, "task.exp.data.gradient_checkpointing_reentrant", False
+            ),
+        )
     return model, latest_checkpoint
 
 def load_model(
