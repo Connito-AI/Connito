@@ -241,7 +241,12 @@ def setup_training(
     )
 
 
-from connito.shared.telemetry import TelemetryManager, SystemStatePoller
+from connito.shared.telemetry import (
+    SystemStatePoller,
+    TelemetryManager,
+    attach_moe_routing_telemetry_hooks,
+    emit_moe_routing_telemetry,
+)
 from connito.sn_owner.cycle import PhaseManager
 
 def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
@@ -295,6 +300,21 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         train_dataloader,
         current_model_meta,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+
+    # === MoE routing telemetry ===
+    # Wrap every MoE block's `route_tokens_to_experts` so we capture
+    # per-batch routing decisions and can emit routing-entropy / per-expert
+    # load histograms at metric-logging time. Best-effort: wrapping failures
+    # (e.g. an architecture without `route_tokens_to_experts`) are silently
+    # dropped by the helper and training continues unaffected. This is the
+    # early-warning system for router collapse after the
+    # `moe.router_aux_loss_coef` drop from 1.0 -> 0.01; see
+    # connito/shared/config.py:MoECfg.
+    moe_routing_wrapped_blocks = attach_moe_routing_telemetry_hooks(model)
+    logger.info(
+        "Attached MoE routing telemetry wrappers",
+        wrapped_block_count=len(moe_routing_wrapped_blocks),
+    )
 
     # === training ===
     precision = get_nested_attr(config, "model.precision", "fp16-mixed")
@@ -551,6 +571,17 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             # === local validation and log metric ===
             if is_inner_optimizer_step and inner_opt_step % config.log.metric_interval == 0:
                 logger.info("(3) Local evaluation")
+
+                # Observe per-layer routing-entropy and per-expert load
+                # histograms before eval. We piggyback on the metric_interval
+                # so the cardinality footprint matches the rest of the
+                # miner metrics. Best-effort; emit_moe_routing_telemetry()
+                # swallows any per-block failure.
+                emit_moe_routing_telemetry(
+                    model,
+                    expert_group=config.task.expert_group_name,
+                    rank=rank,
+                )
 
                 try:
                     val_metric = evaluate_model(

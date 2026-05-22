@@ -290,7 +290,22 @@ class MoECfg(BaseConfig):
     partial_topk: PositiveInt = 1
     full_topk: PositiveInt = 2
     aux_load_balance: bool = True
-    router_aux_loss_coef: float = 1.0
+    # Validator scoring: `val_loss = (loss_sum - aux_loss_sum) / scored_batches`
+    # (connito/shared/evaluate.py:146). The validator subtracts aux_loss from
+    # val_loss, so aux_loss has zero direct effect on the score. During
+    # training, a high coefficient consumes gradient capacity for routing
+    # balance instead of LM loss. Dropping the coef from 1.0 -> 0.01 lets the
+    # model drive LM loss down faster while retaining some balance signal so
+    # the router does not collapse onto a single expert. Setting this to 0.0
+    # is risky (router collapse, instability, NaN); monitor
+    # `moe_routing_entropy` / `moe_routing_entropy_distribution` and roll back
+    # if entropy drops below `router_collapse_alert_entropy_threshold`.
+    router_aux_loss_coef: float = 0.01
+    # Operator alert threshold for router collapse: when per-layer routing
+    # entropy drops below this value, the router is concentrating most tokens
+    # on a small subset of experts and the aux_loss_coef should be raised back
+    # toward 1.0. Consumed by Grafana alerts (not by training directly).
+    router_collapse_alert_entropy_threshold: float = 0.5
     partial_moe: bool = True
     num_worker_groups: PositiveInt = 2
 

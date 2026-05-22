@@ -243,6 +243,34 @@ MOE_AUX_LOSS = Gauge("moe_aux_loss", "Router load-balance loss")
 MOE_EXPERTS_ACTIVE = Gauge("moe_experts_active_count", "Number of experts that received tokens in batch")
 MOE_ROUTING_ENTROPY = Gauge("moe_topk_routing_entropy", "Diversity of routing decisions")
 MOE_EXPERT_UTILIZATION = Gauge("moe_expert_utilization_ratio", "Utilization proportion per group/layer", ["group_idx", "layer_idx"])
+
+# Per-layer routing-entropy histogram. Observe one sample per (rank, layer)
+# every metric_interval steps. Buckets cover the typical range for a
+# `num_experts=8, top_k=2` router: uniform-random routing peaks near
+# ln(8) ≈ 2.08, full collapse onto a single expert is 0.0. When the bulk of
+# samples drifts below ~0.5 (see `router_collapse_alert_entropy_threshold`)
+# the router is concentrating on a handful of experts and the aux_loss_coef
+# should be raised back toward 1.0. Cardinality: groups × ranks × MoE layers,
+# bounded by the model architecture (DeepSeek-V2-Lite has 26 hidden layers,
+# of which ~25 are MoE — well within Prometheus headroom).
+MOE_ROUTING_ENTROPY_HIST = Histogram(
+    "moe_routing_entropy_distribution",
+    "Routing entropy per layer",
+    labelnames=("expert_group", "rank", "layer"),
+    buckets=(0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, float("inf")),
+)
+# Per-expert token-load distribution. Each observe() is the fraction of
+# routed tokens that landed on a given expert in the most recent batch.
+# Uniform routing across 8 experts → 1/8 = 0.125 per expert; full collapse
+# → one expert at 1.0 and the rest at 0.0. Pair with
+# `moe_routing_entropy_distribution` to detect "high entropy but one expert
+# still dominates" (e.g. mass concentrated near the 0.5 bucket boundary).
+MOE_EXPERT_LOAD_HIST = Histogram(
+    "moe_expert_load_distribution",
+    "Per-expert token load distribution",
+    labelnames=("expert_group", "rank", "expert_id"),
+    buckets=(0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5, 1.0, float("inf")),
+)
 MINER_PERPLEXITY = Gauge("miner_perplexity", "Training perplexity (exp of loss)")
 MINER_TOTAL_TOKENS = Gauge("miner_total_tokens", "Cumulative tokens processed since run start")
 MINER_TOTAL_SAMPLES = Gauge("miner_total_samples", "Cumulative samples processed since run start")
@@ -386,6 +414,213 @@ def set_miner_score_snapshot(
             VALIDATOR_MINER_SCORE_SAMPLES.labels(miner_uid=str(miner_uid)).set(float(samples))
     except Exception:
         pass
+
+
+# ==============================================================================
+# MoE routing telemetry helpers
+# ==============================================================================
+#
+# These helpers observe the MoE router's actual behaviour at training time so
+# operators can detect router collapse (one expert absorbs most tokens) as
+# soon as it starts. They are best-effort: any exception (model lacks an MoE
+# block, hooks fail to attach on a custom layout, no batches have been routed
+# yet) is swallowed silently. Telemetry must never block or break training.
+#
+# The validator scores miners by `(loss_sum - aux_loss_sum) / scored_batches`
+# (see connito/shared/evaluate.py:146), so the LM loss term dominates the
+# reward. Lowering `moe.router_aux_loss_coef` (1.0 → 0.01) frees gradient
+# capacity for the LM loss but increases collapse risk — that risk is what
+# these histograms surface.
+
+# Attribute name used to stash the most recent router observation on each
+# MoE block. Picked to be unlikely to collide with any module field.
+_MOE_ROUTING_OBS_ATTR = "_connito_routing_obs"
+# Attribute used to retain the original `route_tokens_to_experts` method
+# after monkey-patching, so we can re-attach idempotently without stacking
+# wrappers and so future detach work is possible.
+_MOE_ROUTING_ORIGINAL_FN_ATTR = "_connito_routing_original_fn"
+
+
+def _make_routing_capture_wrapper(moe_block: Any, original_fn: Any) -> Any:
+    """Return a function that calls ``original_fn`` and caches the topk
+    indices it returned onto ``moe_block`` under
+    ``_MOE_ROUTING_OBS_ATTR``.
+
+    PyTorch ``register_forward_hook`` only fires on ``Module.__call__``,
+    so it cannot intercept a method that the parent ``forward`` invokes
+    internally. The MoE block's main ``forward()`` returns the routed
+    hidden states (not the topk indices we need for entropy), so we wrap
+    the ``route_tokens_to_experts`` method itself. The wrapped function
+    preserves the original signature and return value byte-for-byte so
+    nothing in the routing path changes — we only piggyback a CPU
+    snapshot for later metric emission.
+    """
+
+    def wrapped(router_logits: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        result = original_fn(router_logits, *args, **kwargs)
+        try:
+            if isinstance(result, tuple) and len(result) >= 1:
+                topk_idx = result[0]
+                if torch.is_tensor(topk_idx):
+                    num_experts = int(
+                        getattr(moe_block, "num_experts", None)
+                        or getattr(getattr(moe_block, "config", None), "n_routed_experts", 0)
+                        or 0
+                    )
+                    if num_experts > 0:
+                        # Snapshot on the SAME device the routing tensor
+                        # already lives on. A `.to("cpu", copy=True)` here
+                        # would force a synchronous device-to-host copy on
+                        # every forward pass — for DeepSeek-V2-Lite that
+                        # is ~25 D2H stalls per microbatch, which silently
+                        # caps training throughput. We accumulate on the
+                        # original device (the bincount in emit() also
+                        # runs on-device, cheap) and only cross to CPU
+                        # when we actually need to emit a metric.
+                        setattr(
+                            moe_block,
+                            _MOE_ROUTING_OBS_ATTR,
+                            {
+                                "topk_idx": topk_idx.detach().clone(),
+                                "num_experts": num_experts,
+                            },
+                        )
+        except Exception:
+            # Telemetry must never break training. Drop the sample silently.
+            pass
+        return result
+
+    return wrapped
+
+
+def _iter_moe_blocks(model: Any) -> list[tuple[int, Any]]:
+    """Walk `model.named_modules()` and return `(layer_idx, moe_block)`
+    pairs for every MoE block carrying a `route_tokens_to_experts` method.
+
+    The layer index is extracted from the module path
+    (`model.layers.<i>.mlp`); blocks without a parseable index are skipped
+    so we never observe a metric without a meaningful `layer` label.
+    """
+    import re
+
+    # Match `layers.<i>` anywhere in the dotted module path. We anchor on
+    # a word boundary instead of a leading dot because the path may start
+    # with `layers.` (when the model itself is the root, e.g. the unit
+    # test fake) or `model.layers.` (the production DeepSeek-V2-Lite
+    # layout). Either way the integer immediately after `layers.` is the
+    # layer index we want.
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+    found: list[tuple[int, Any]] = []
+    try:
+        for name, module in model.named_modules():
+            if not hasattr(module, "route_tokens_to_experts"):
+                continue
+            m = layer_re.search(name)
+            if m is None:
+                continue
+            found.append((int(m.group(1)), module))
+    except Exception:
+        pass
+    return found
+
+
+def attach_moe_routing_telemetry_hooks(model: Any) -> list[Any]:
+    """Install the routing-capture wrapper on every MoE block's
+    `route_tokens_to_experts` method.
+
+    Returns the list of moe blocks that were newly wrapped, so callers
+    can introspect the count for logging. Idempotent: blocks already
+    carrying a saved original function are skipped so re-calling does
+    not stack wrappers.
+    """
+    wrapped_blocks: list[Any] = []
+    for _layer_idx, moe_block in _iter_moe_blocks(model):
+        try:
+            if getattr(moe_block, _MOE_ROUTING_ORIGINAL_FN_ATTR, None) is not None:
+                continue
+            original_fn = moe_block.route_tokens_to_experts
+            setattr(moe_block, _MOE_ROUTING_ORIGINAL_FN_ATTR, original_fn)
+            moe_block.route_tokens_to_experts = _make_routing_capture_wrapper(
+                moe_block, original_fn,
+            )
+            wrapped_blocks.append(moe_block)
+        except Exception:
+            # Best-effort: any failure to wrap one block must not block
+            # the others or training itself.
+            continue
+    return wrapped_blocks
+
+
+def emit_moe_routing_telemetry(
+    model: Any,
+    *,
+    expert_group: str,
+    rank: int | str,
+) -> None:
+    """Compute and observe routing entropy / per-expert load histograms.
+
+    For each MoE block with a fresh observation, compute:
+      * `H(p) = -Σ p_i log p_i` over the per-expert token-fraction vector,
+        observed onto `MOE_ROUTING_ENTROPY_HIST{expert_group, rank, layer}`.
+      * Per-expert load `p_i`, observed onto
+        `MOE_EXPERT_LOAD_HIST{expert_group, rank, expert_id}`.
+
+    `expert_group` and `rank` are the same labels already used by other
+    miner-side metrics (e.g. `miner_training_loss{expert_group=...}`), and
+    `layer` and `expert_id` are emitted as strings to keep label types
+    stable across architectures. Best-effort: any per-block exception is
+    swallowed so partial telemetry still lands.
+    """
+    blocks = _iter_moe_blocks(model)
+    if not blocks:
+        return
+    rank_str = str(rank)
+    group_str = str(expert_group)
+    for layer_idx, moe_block in blocks:
+        obs = getattr(moe_block, _MOE_ROUTING_OBS_ATTR, None)
+        if obs is None:
+            continue
+        try:
+            topk_idx = obs["topk_idx"]
+            num_experts = int(obs["num_experts"])
+            if num_experts <= 0 or topk_idx.numel() == 0:
+                continue
+            # Per-expert token count: bincount over the flat topk index
+            # tensor. Each token contributes `top_k` slots (one per
+            # selected expert), so the sum equals num_tokens * top_k.
+            # We run bincount on whatever device the stash lives on (GPU
+            # if training on GPU) and only cross to CPU on the small
+            # `probs` vector (size = num_experts, typically 8), so a
+            # single emit triggers one tiny D2H copy per layer instead
+            # of one full topk_idx D2H copy per forward pass.
+            flat = topk_idx.reshape(-1).to(torch.long)
+            counts = torch.bincount(flat, minlength=num_experts).to(torch.float64)
+            total = float(counts.sum().item())
+            if total <= 0.0:
+                continue
+            probs = counts / total
+            # Routing entropy in nats: -Σ p log p, with 0 log 0 = 0.
+            log_probs = torch.where(
+                probs > 0,
+                torch.log(probs.clamp(min=1e-12)),
+                torch.zeros_like(probs),
+            )
+            entropy = float(-(probs * log_probs).sum().item())
+            probs_cpu = probs.detach().to("cpu").tolist()
+            MOE_ROUTING_ENTROPY_HIST.labels(
+                expert_group=group_str,
+                rank=rank_str,
+                layer=str(layer_idx),
+            ).observe(entropy)
+            for expert_id, load in enumerate(probs_cpu):
+                MOE_EXPERT_LOAD_HIST.labels(
+                    expert_group=group_str,
+                    rank=rank_str,
+                    expert_id=str(expert_id),
+                ).observe(float(load))
+        except Exception:
+            # Per-block failure must not skip the remaining blocks.
+            continue
 
 
 # ==============================================================================
