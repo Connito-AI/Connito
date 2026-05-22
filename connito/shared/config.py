@@ -322,6 +322,29 @@ class ScheduleCfg(BaseConfig):
     total_steps: PositiveInt = 88_000
 
 
+class LocalEvalCfg(BaseConfig):
+    """Mid-training mini-eval (validator-replica) configuration.
+
+    Opt-in (``enabled=False`` by default) so existing miner runs are
+    bit-for-bit unaffected. When enabled, the training loop runs a
+    short replica of the validator's eval pass every ``interval_steps``
+    optimizer steps, surfaces val_loss to Prometheus, and (optionally)
+    compares against a frozen baseline checkpoint to flag regressions
+    before the validator scores the next submission.
+
+    Defaults are tuned to be cheap: a single seed and ``max_batches=10``
+    (the validator runs 50). Keeping the cost low matters — this runs
+    inside the inner training loop and must not eat the per-cycle
+    training budget.
+    """
+    enabled: bool = False
+    interval_steps: PositiveInt = 500
+    max_batches: PositiveInt = 10
+    seeds: list[int] = Field(default_factory=lambda: [42])
+    use_baseline_compare: bool = False
+    baseline_checkpoint_path: str | None = None
+
+
 class CheckpointCfg(BaseConfig):
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
@@ -812,6 +835,7 @@ class WorkerConfig(BaseConfig):
 class MinerConfig(WorkerConfig):
     role: str = "miner"
     local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
+    local_eval: LocalEvalCfg = Field(default_factory=LocalEvalCfg)
 
     @model_validator(mode="after")
     def _derive_all(self):

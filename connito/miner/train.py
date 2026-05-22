@@ -19,6 +19,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
+from connito.miner.local_eval import LocalEvaluator
 from connito.miner.train_helper import free_cuda_models, get_status
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
@@ -314,6 +315,37 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         get_nested_attr(config, "train.max_consecutive_non_finite_batches", 50)
     )
 
+    # === mini-eval (Unit 8) ===
+    # Validator-replica eval run inside the training loop. Disabled by
+    # default (`config.local_eval.enabled=False`) so existing runs are
+    # unaffected. When enabled, surfaces val_loss to Prometheus every
+    # `interval_steps` optimizer steps so regressions show up in real
+    # time instead of waiting for the next validator round (~58 min).
+    local_evaluator: LocalEvaluator | None = None
+    if get_nested_attr(config, "local_eval.enabled", False):
+        try:
+            local_evaluator = LocalEvaluator(
+                config=config,
+                tokenizer=tokenizer,
+                device=device,
+                rank=rank,
+                baseline_model=None,
+                expert_group_name=str(config.task.expert_group_name),
+            )
+            logger.info(
+                "mini-eval enabled",
+                interval_steps=local_evaluator.interval_steps,
+                max_batches=local_evaluator.max_batches,
+                seeds=local_evaluator.seeds,
+                use_baseline_compare=local_evaluator.use_baseline_compare,
+            )
+        except Exception as e:
+            # Telemetry must never crash training. If construction blows up
+            # (bad tokenizer, missing data sources, etc.) we log and run
+            # without the mini-eval.
+            logger.warning("mini-eval init failed; continuing without it", error=str(e))
+            local_evaluator = None
+
     inner_optimizer.zero_grad()
     try:
         start_inner_opt = current_model_meta.inner_opt if current_model_meta is not None else 0
@@ -528,6 +560,44 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 new_model_hash = get_model_hash(model.state_dict(), hex=True)
                 logger.info("Updated model", old_model_hash=old_model_hash, new_model_hash=new_model_hash)
+
+            # === Mini-eval (Unit 8) ===
+            # Runs every `local_eval.interval_steps` optimizer steps. The
+            # whole block is wrapped in try/except so a transient failure
+            # (HF network blip, OOM in eval that we can recover from) does
+            # not crash the training loop. `should_run` returns False when
+            # the feature is disabled, so the cost is one cheap bool check
+            # per inner step in the disabled case.
+            if (
+                is_inner_optimizer_step
+                and local_evaluator is not None
+                and local_evaluator.should_run(inner_opt_step)
+            ):
+                logger.info("(3.5) Mini-eval", inner_opt_step=inner_opt_step)
+                was_training = model.training
+                try:
+                    # `LocalEvaluator.run` already wraps the eval pass in
+                    # `torch.no_grad()` and `model.eval()` via the shared
+                    # `evaluate_model`. The autocast context inside the
+                    # eval picks bf16/fp16 based on hardware support, so
+                    # we don't need a separate autocast scope here.
+                    with torch.no_grad():
+                        mini_eval_metrics = local_evaluator.run(model=model, step=inner_opt_step)
+                    metric_logger.log(mini_eval_metrics, print_log=False)
+                except Exception as e:
+                    logger.warning(
+                        "mini-eval crashed; continuing training",
+                        step=step,
+                        inner_opt_step=inner_opt_step,
+                        error=str(e),
+                    )
+                finally:
+                    # Always restore the model's training mode. The
+                    # evaluator's own try/finally already does this, but
+                    # adding it here too defends against a future
+                    # refactor that splits the restoration out.
+                    if was_training:
+                        model.train()
 
             # === Log metric ===
             if (

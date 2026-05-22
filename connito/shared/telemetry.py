@@ -250,6 +250,34 @@ MINER_STEP_TIME_HOURS = Gauge("miner_step_time_hours", "Wall-clock time of the l
 MINER_TOTAL_TRAINING_TIME_HOURS = Gauge("miner_total_training_time_hours", "Total accumulated training time (hours)")
 MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of expert parameter values (health check)")
 
+# Mid-training mini-eval (Unit 8) — a validator-replica eval pass run
+# every N optimizer steps inside the miner training loop. The point is
+# to surface val_loss BEFORE the validator does, so regressions show up
+# in real time rather than ~58 min later (the validator round cadence).
+#
+# Cardinality: labels are `expert_group` (bounded by num_worker_groups),
+# `rank` (bounded by local DP world size), and `seed` (bounded by the
+# length of `local_eval.seeds`). One series per (group, rank, seed)
+# tuple — default config emits a single series per miner process.
+MINER_LOCAL_VAL_LOSS = Gauge(
+    "miner_local_val_loss",
+    "Mini-eval validation loss observed mid-training (Unit 8 mini-eval)",
+    labelnames=("expert_group", "rank", "seed"),
+)
+# Delta against an (optionally configured) baseline checkpoint. Only
+# written when `local_eval.use_baseline_compare=True` and a baseline
+# val_loss is available on the LocalEvaluator. Sign convention matches
+# the validator: positive == miner is BETTER than baseline.
+MINER_LOCAL_DELTA = Gauge(
+    "miner_local_delta",
+    "Mini-eval delta (baseline_val_loss - miner_val_loss); positive = improvement (Unit 8)",
+    labelnames=("expert_group", "rank", "seed"),
+)
+MINER_LOCAL_EVAL_STEPS_TOTAL = Counter(
+    "miner_local_eval_steps_total",
+    "Mini-eval invocations completed (one increment per LocalEvaluator.run call)",
+)
+
 # Histograms (Latency & Sizes)
 EVAL_LATENCY_SECONDS = Histogram("validator_eval_latency_seconds", "Latency of run_evaluation()")
 MODEL_LOAD_LATENCY_SECONDS = Histogram("validator_model_load_latency_seconds", "Latency of load_model_from_path()")
