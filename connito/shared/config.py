@@ -301,6 +301,39 @@ class OptimizerCfg(BaseConfig):
     outer_momentum: float = 0.9
 
 
+class BatchFilterCfg(BaseConfig):
+    """Configuration for the rolling-z-score loss-spike batch filter.
+
+    See ``connito/miner/batch_filter.py`` for the rationale. Defaults are
+    conservative (``enabled=False``, ``z=4``) so existing miners are
+    unaffected until they explicitly switch it on in their config yaml:
+
+        training:
+          batch_filter:
+            enabled: true
+    """
+    enabled: bool = False
+    z_threshold: float = Field(default=4.0, gt=0.0)
+    window: PositiveInt = 200
+    warmup: PositiveInt = 50
+
+    @model_validator(mode="after")
+    def _validate_warmup_le_window(self):
+        if self.warmup > self.window:
+            raise ValueError(
+                f"training.batch_filter.warmup ({self.warmup}) must be "
+                f"<= training.batch_filter.window ({self.window})"
+            )
+        return self
+
+
+class TrainingCfg(BaseConfig):
+    """Per-miner training-loop knobs that are not part of the optimizer or
+    scheduler. Currently hosts the opt-in loss-spike batch filter.
+    """
+    batch_filter: BatchFilterCfg = Field(default_factory=BatchFilterCfg)
+
+
 class ParallelismCfg(BaseConfig):
     gradient_accumulation_steps: PositiveInt = 4
     global_opt_interval: PositiveInt = 100
@@ -812,6 +845,7 @@ class WorkerConfig(BaseConfig):
 class MinerConfig(WorkerConfig):
     role: str = "miner"
     local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
+    training: TrainingCfg = Field(default_factory=TrainingCfg)
 
     @model_validator(mode="after")
     def _derive_all(self):

@@ -236,6 +236,16 @@ MINER_LEARNING_RATE = Gauge("miner_learning_rate", "Current learning rate")
 MINER_LOCAL_STEP_RATE = Gauge("miner_local_step_rate", "Rate of completed iterations (steps/sec)")
 MINER_TOKENS_PER_SEC = Gauge("miner_tokens_per_sec", "Throughput in tokens per second")
 MINER_GRAD_ACCUM_STEPS = Gauge("miner_grad_accum_steps", "Gradient accumulation steps effectuated")
+# Cumulative count of forward-pass batches dropped by the rolling-z-score
+# loss-spike filter (see connito/miner/batch_filter.py). When the filter is
+# disabled this counter stays at 0; when enabled the rate() should be a
+# small fraction of the inner-step rate (~0.001-0.01 batches/sec depending
+# on dataset noise). A sudden spike here is a useful "the dataset shape
+# changed" signal independent of training loss.
+MINER_BATCHES_SKIPPED_TOTAL = Counter(
+    "miner_batches_skipped_total",
+    "Forward-pass batches dropped before backward by the loss-spike filter",
+)
 
 # MoE / Expert Routing (Gauges)
 MOE_EXPERT_LOAD = Gauge("moe_expert_load", "Tokens routed to each expert", ["layer_idx", "expert_idx"])

@@ -19,6 +19,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
+from connito.miner.batch_filter import LossSpikeFilter
 from connito.miner.train_helper import free_cuda_models, get_status
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
@@ -40,6 +41,7 @@ from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gra
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import freeze_parameters, load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
+from connito.shared.telemetry import MINER_BATCHES_SKIPPED_TOTAL
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -314,6 +316,25 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         get_nested_attr(config, "train.max_consecutive_non_finite_batches", 50)
     )
 
+    # === Loss-spike batch filter (Unit 14) ===
+    # Opt-in; when enabled, batches whose raw loss exceeds the rolling mean
+    # by `z * sigma` are dropped before the backward pass. See
+    # connito/miner/batch_filter.py for details.
+    batch_filter_cfg = get_nested_attr(config, "training.batch_filter", None)
+    loss_spike_filter: LossSpikeFilter | None = None
+    if batch_filter_cfg is not None and getattr(batch_filter_cfg, "enabled", False):
+        loss_spike_filter = LossSpikeFilter(
+            window=int(batch_filter_cfg.window),
+            z_threshold=float(batch_filter_cfg.z_threshold),
+            warmup=int(batch_filter_cfg.warmup),
+        )
+        logger.info(
+            "LossSpikeFilter enabled",
+            window=loss_spike_filter.window,
+            z_threshold=loss_spike_filter.z_threshold,
+            warmup=loss_spike_filter.warmup,
+        )
+
     inner_optimizer.zero_grad()
     try:
         start_inner_opt = current_model_meta.inner_opt if current_model_meta is not None else 0
@@ -400,6 +421,28 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     continue
                 consecutive_non_finite_batches = 0
                 logger.info("batch loss", loss=outputs.loss.item(), inner_opt_step=inner_opt_step)
+
+                # === Loss-spike outlier filter ===
+                # Apply BEFORE backward so an outlier batch contributes no
+                # gradient. We compare against the un-scaled outputs.loss
+                # (the per-batch loss) rather than the grad-accum-scaled
+                # `loss` so the rolling statistics are independent of
+                # gradient_accumulation_steps and remain comparable across
+                # config changes.
+                if loss_spike_filter is not None:
+                    raw_loss_value = float(outputs.loss.item())
+                    if loss_spike_filter.should_skip(raw_loss_value):
+                        MINER_BATCHES_SKIPPED_TOTAL.inc()
+                        logger.info(
+                            "Skipping outlier batch (loss-spike filter)",
+                            loss=raw_loss_value,
+                            step=step,
+                            inner_opt_step=inner_opt_step,
+                            **loss_spike_filter.stats(),
+                        )
+                        del loss, aux_loss, batch_device, outputs
+                        gc.collect()
+                        continue
 
                 loss_batch += loss.item()
                 aux_loss_batch += aux_loss.item()
