@@ -269,6 +269,42 @@ class DataCfg(BaseConfig):
     # diverge for one round, then re-converge.
     eval_source_skip_max: int = 50_000
 
+    # ------------------------------------------------------------------
+    # Sequence packing (Unit 11 / 18). Opt-in. Default OFF so existing
+    # behavior is preserved bit-for-bit until operators flip this on.
+    #
+    # When True, the dataloader stops emitting pad-tokens to fill
+    # `sequence_length` and instead concatenates tokenized documents
+    # (separated by EOS/BOS) until each emitted chunk is fully packed
+    # with real tokens. On the C4 + Nemotron mix this yields ~2-3x more
+    # useful tokens per batch, which under the delta-driven validator
+    # scoring (`delta = max(0, baseline - val_loss)`) directly increases
+    # learning signal per compute unit.
+    #
+    # `pack_concat_sep`:
+    #   - "eos": insert tokenizer.eos_token_id between docs (default).
+    #   - "bos": insert tokenizer.bos_token_id between docs.
+    #   - "none": no separator (raw concatenation).
+    # `pack_drop_partial`:
+    #   - True (default): drop the trailing partial chunk so we never
+    #     re-introduce pad-token waste.
+    #   - False: right-pad the final chunk with the tokenizer's pad
+    #     token (REQUIRES `tokenizer.pad_token_id` to be set; the
+    #     `DataCollatorForLanguageModeling(mlm=False)` collator only
+    #     masks `pad_token_id` from loss, so an EOS fallback would
+    #     leak training signal on the tail — see
+    #     `connito.shared.packed_dataloader.pack_iterable`).
+    #
+    # Validator consensus note: turning this on while peers run the
+    # default (False) will produce different eval batches for the same
+    # combined_seed and the per-miner losses will be non-comparable
+    # across validators — same brief consensus-divergence shape as the
+    # `eval_source_shuffle_buffer` default rollout. Coordinate the flip
+    # across the validator set before flipping it on for eval.
+    use_packing: bool = False
+    pack_concat_sep: Literal["eos", "bos", "none"] = "eos"
+    pack_drop_partial: bool = True
+
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
         if self.dataset_sources is not None and len(self.dataset_sources) == 0:

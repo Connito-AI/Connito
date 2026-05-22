@@ -15,6 +15,7 @@ from transformers import DataCollator, DataCollatorForLanguageModeling, PreTrain
 
 from connito.shared.app_logging import structlog
 from connito.shared.helper import h256_int, import_from_string
+from connito.shared.packed_dataloader import PackedDataset
 
 # Default per-request timeout for HuggingFace Hub network reads. Bg-eval's
 # dataloader streams from HF, and a hung connection inside the streaming
@@ -307,11 +308,37 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 logger.warning(f"Falling back to unsharded split due to split_dataset_by_node error: {e}")
 
         # Tokenize on-the-fly via adapter (safer for streaming than heavy .map chains).
-        tokenized_stream = cls(
-            hf_iterable=split,
-            tokenizer=tokenizer,
-            seq_length=config.task.exp.data.sequence_length,
-        )
+        # When `data.use_packing=True`, route through PackedDataset which
+        # concatenates documents into fully-saturated chunks instead of
+        # padding each sample to `sequence_length`. See
+        # `connito.shared.packed_dataloader` for the rationale; the
+        # default (use_packing=False) preserves the original padded
+        # behavior bit-for-bit.
+        use_packing = bool(getattr(config.task.exp.data, "use_packing", False))
+        if use_packing:
+            pack_concat_sep = getattr(config.task.exp.data, "pack_concat_sep", "eos")
+            pack_drop_partial = bool(
+                getattr(config.task.exp.data, "pack_drop_partial", True)
+            )
+            logger.debug(
+                "Using sequence packing for tokenized stream",
+                pack_concat_sep=pack_concat_sep,
+                pack_drop_partial=pack_drop_partial,
+                seq_length=config.task.exp.data.sequence_length,
+            )
+            tokenized_stream = PackedDataset(
+                hf_iterable=split,
+                tokenizer=tokenizer,
+                seq_length=config.task.exp.data.sequence_length,
+                pack_concat_sep=pack_concat_sep,
+                drop_partial=pack_drop_partial,
+            )
+        else:
+            tokenized_stream = cls(
+                hf_iterable=split,
+                tokenizer=tokenizer,
+                seq_length=config.task.exp.data.sequence_length,
+            )
 
         return tokenized_stream
 
