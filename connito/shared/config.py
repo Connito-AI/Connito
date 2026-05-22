@@ -213,6 +213,22 @@ class DatasetSourceCfg(BaseConfig):
         return self
 
 
+class DataQualityCfg(BaseConfig):
+    """Opt-in quality filter applied to streaming dataset samples.
+
+    When ``enabled=True``, samples that look uninformative (too short),
+    boilerplate (high word-repetition ratio), or broken-encoding (high
+    junk-character ratio) are dropped before tokenization. Default OFF
+    so the existing training pipeline is unchanged for operators who do
+    not opt in.
+    """
+
+    enabled: bool = False
+    min_length: PositiveInt = 200
+    max_repetition_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+    max_junk_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
+
+
 class DataCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir"})
     dataset_name: str = "allenai/c4"
@@ -268,6 +284,13 @@ class DataCfg(BaseConfig):
     # `eval_source_shuffle_buffer` — validators on different defaults
     # diverge for one round, then re-converge.
     eval_source_skip_max: int = 50_000
+    # Opt-in quality filter applied during training data streaming. When
+    # `quality_filter.enabled` is True, samples that are too short,
+    # boilerplate (high repetition), or contain too many non-printable /
+    # broken-unicode characters are dropped before tokenization. Default
+    # OFF — existing data pipeline is unchanged unless an operator opts
+    # in via their expert-group config.
+    quality_filter: DataQualityCfg = Field(default_factory=DataQualityCfg)
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):

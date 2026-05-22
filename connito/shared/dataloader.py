@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 import random
+import string
 from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
@@ -15,6 +16,11 @@ from transformers import DataCollator, DataCollatorForLanguageModeling, PreTrain
 
 from connito.shared.app_logging import structlog
 from connito.shared.helper import h256_int, import_from_string
+
+# Set of characters considered "clean" for the unicode-junk heuristic.
+# `string.printable` already includes \t, \n, \r, \x0b, \x0c, plus the space,
+# so the explicit additions are defensive — keep the set easy to read.
+_QUALITY_FILTER_ALLOWED_CHARS: frozenset[str] = frozenset(string.printable + " \t\n")
 
 # Default per-request timeout for HuggingFace Hub network reads. Bg-eval's
 # dataloader streams from HF, and a hung connection inside the streaming
@@ -43,6 +49,80 @@ def _fractional_index_filter(_example, idx: int, seed: str | int, threshold: int
     """Deterministically decide whether to keep a sample based on its streaming index."""
     score = h256_int("dataset_selection", str(idx), seed)
     return score <= threshold
+
+
+def is_low_quality(
+    text: str,
+    *,
+    min_length: int = 200,
+    max_repetition_ratio: float = 0.5,
+    max_junk_ratio: float = 0.2,
+) -> bool:
+    """Heuristic quality check used to drop noisy training samples.
+
+    Motivated by inspection of the validator eval pool (50% C4 + 50%
+    Nemotron-CC-Math-v1): C4 in particular contains boilerplate, broken
+    HTML, unicode garbage, and repetitive spam. Training on those wastes
+    miner capacity and slows convergence.
+
+    Parameters
+    ----------
+    text:
+        Raw text sample.
+    min_length:
+        Samples shorter than this many characters are considered
+        uninformative and dropped.
+    max_repetition_ratio:
+        Fraction of duplicated whitespace-split words above which a
+        sample is considered boilerplate. Computed as
+        ``1 - (unique_words / total_words)``. Only applied when the
+        sample has at least 10 words (shorter samples are dominated by
+        noise in this ratio).
+    max_junk_ratio:
+        Fraction of characters outside ``string.printable + " \\t\\n"``
+        above which a sample is considered broken encoding.
+
+    Returns
+    -------
+    bool
+        ``True`` when the sample should be DROPPED, ``False`` to keep it.
+    """
+    if len(text) < min_length:
+        return True
+
+    # Repetition: ratio of duplicated whitespace-split words. Skip for
+    # very short word counts where the ratio is dominated by noise.
+    words = text.split()
+    if len(words) >= 10:
+        unique = len(set(words))
+        repetition_ratio = 1.0 - (unique / len(words))
+        if repetition_ratio > max_repetition_ratio:
+            return True
+
+    # Junk: non-printable or unusual unicode characters as a proxy for
+    # broken-encoding boilerplate (e.g. mojibake, control-byte spam).
+    junk_count = sum(1 for c in text if c not in _QUALITY_FILTER_ALLOWED_CHARS)
+    junk_ratio = junk_count / max(len(text), 1)
+    if junk_ratio > max_junk_ratio:
+        return True
+
+    return False
+
+
+def _quality_filter_keep(
+    example: dict[str, Any],
+    *,
+    min_length: int,
+    max_repetition_ratio: float,
+    max_junk_ratio: float,
+) -> bool:
+    """Adapter for HF `dataset.filter` — returns True to KEEP the sample."""
+    return not is_low_quality(
+        str(example.get("text", "")),
+        min_length=min_length,
+        max_repetition_ratio=max_repetition_ratio,
+        max_junk_ratio=max_junk_ratio,
+    )
 
 
 # -----------------------------
@@ -297,6 +377,26 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             # Wrap with partial instead of relying on fn_kwargs to keep worker execution simple.
             filter_fn = partial(_fractional_index_filter, seed=seed, threshold=threshold)
             split = split.filter(filter_fn, with_indices=True)
+
+        # Optional opt-in quality filter: drops uninformative / boilerplate /
+        # broken-encoding samples (e.g. noisy C4 rows) before sharding +
+        # tokenization. Default OFF (`data.quality_filter.enabled=False`),
+        # so existing pipelines are unchanged unless operators opt in.
+        quality_cfg = getattr(config.task.exp.data, "quality_filter", None)
+        if quality_cfg is not None and getattr(quality_cfg, "enabled", False):
+            logger.debug(
+                "Applying quality filter",
+                min_length=quality_cfg.min_length,
+                max_repetition_ratio=quality_cfg.max_repetition_ratio,
+                max_junk_ratio=quality_cfg.max_junk_ratio,
+            )
+            quality_filter_fn = partial(
+                _quality_filter_keep,
+                min_length=quality_cfg.min_length,
+                max_repetition_ratio=quality_cfg.max_repetition_ratio,
+                max_junk_ratio=quality_cfg.max_junk_ratio,
+            )
+            split = split.filter(quality_filter_fn)
 
         # Shard across processes if rank/world_size are provided.
         # split_dataset_by_node works with streaming datasets and avoids overlapping samples.

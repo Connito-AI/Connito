@@ -1,5 +1,10 @@
 group_id: 0
 data:
+  # Per-source `weight` values control the interleave mix ratio. They are
+  # normalized internally (the loader divides by the total), so 0.5/0.5
+  # below is the default 50:50 C4 + Nemotron mix. Operators may tune the
+  # mix to bias toward math (e.g. 0.3/0.7) if validator-scored content is
+  # math-heavy — see `connito/shared/dataloader.py:get_tokenised_dataset`.
   dataset_sources:
     - path: "allenai/c4"
       name: "en"
@@ -9,6 +14,15 @@ data:
       name: "4plus"
       weight: 0.5
       text_column: "text"
+  # Opt-in quality filter for training data. Default OFF. When enabled,
+  # drops samples that are uninformative (< min_length chars), boilerplate
+  # (repetition_ratio > max_repetition_ratio), or broken-encoding
+  # (junk_ratio > max_junk_ratio). Useful for cleaning noisy C4 rows.
+  quality_filter:
+    enabled: false
+    min_length: 200
+    max_repetition_ratio: 0.5
+    max_junk_ratio: 0.2
   per_device_train_batch_size: 1
   batch_size: 4
   sequence_length: 4096
