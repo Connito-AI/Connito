@@ -187,15 +187,48 @@ class RunCfg(BaseConfig):
     root_path: Path = Field(default_factory=find_project_root)
 
 
+_VALID_ATTN_IMPLEMENTATIONS: frozenset[str] = frozenset({
+    "auto",
+    "sdpa",
+    "flash_attention_2",
+    "flash_attention_3",
+    "eager",
+})
+
+
 class ModelCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"model_path", "base_arch_model"})
     model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
     base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
     foundation: bool = True
     torch_compile: bool = False
-    attn_implementation: str = "sdpa"
+    # Attention kernel selection.
+    #   "auto"               — resolve at load time: pick `flash_attention_2`
+    #                          when flash-attn is importable AND the local GPU
+    #                          has compute capability >= 8.0 (Ampere+), else
+    #                          fall back to `sdpa`. Safe default.
+    #   "sdpa"               — PyTorch native scaled-dot-product attention.
+    #                          Works on every supported GPU + CPU.
+    #   "flash_attention_2"  — Force Flash Attention 2 (~30–50% throughput on
+    #                          long sequences). Falls back to `sdpa` with a
+    #                          warning if flash-attn isn't importable or the
+    #                          GPU is unsupported — never crashes.
+    #   "flash_attention_3"  — Force Flash Attention 3 (Hopper / H100+ only;
+    #                          requires a flash-attn build with FA3 support).
+    #   "eager"              — Reference PyTorch implementation. Slow; for
+    #                          debugging only.
+    attn_implementation: str = "auto"
     precision: str = "fp16-mixed"
     device: str = "cuda"
+
+    @model_validator(mode="after")
+    def _validate_attn_implementation(self):
+        if self.attn_implementation not in _VALID_ATTN_IMPLEMENTATIONS:
+            raise ValueError(
+                f"model.attn_implementation must be one of "
+                f"{sorted(_VALID_ATTN_IMPLEMENTATIONS)}; got {self.attn_implementation!r}"
+            )
+        return self
 
 
 class DatasetSourceCfg(BaseConfig):

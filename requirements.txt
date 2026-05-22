@@ -28,6 +28,14 @@ torchdata==0.11.0
 scipy==1.15.3
 prefetch_generator==1.0.3
 unsloth @ git+https://github.com/unslothai/unsloth.git; platform_system == "Linux"
+# Flash Attention 2/3 — opt-in throughput boost on Ampere+ GPUs (compute
+# capability >= 8.0; e.g. A100/H100/4090). Requires CUDA toolkit + matching
+# torch wheel at install time and may fail to build on CPU-only / older-GPU
+# environments. Loader code in `connito/shared/modeling/mycelia.py`
+# auto-detects availability and gracefully falls back to `sdpa` when this
+# dep is missing or the GPU is unsupported, so it's safe to comment out on
+# unsupported hosts (e.g. CI/macOS).
+flash-attn>=2.5.0; platform_system == "Linux"
 
 # -----------------------------
 # API / server (validator)

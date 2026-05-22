@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
 import warnings
 from collections import OrderedDict
@@ -58,6 +59,103 @@ logger = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------
+# Attention implementation resolution
+# ---------------------------------------------------------------------
+# Compute capability >= 8.0 (Ampere) is the official Flash Attention 2
+# baseline. Turing (7.5) and Volta (7.0) are unsupported.
+_FLASH_ATTN_MIN_CC_MAJOR: int = 8
+
+
+def _flash_attn_available() -> bool:
+    """Return True iff `flash_attn` is importable in the current env.
+
+    `find_spec` is cheap and does NOT execute the module, so it's safe
+    to call on hosts where `flash_attn` cannot be loaded (e.g. CPU-only
+    machines where the import would fail at module top level)."""
+    try:
+        return importlib.util.find_spec("flash_attn") is not None
+    except (ImportError, ValueError):
+        # `find_spec` raises ValueError for broken meta-path finders and
+        # ImportError for partially-installed packages; treat both as
+        # "not available" rather than crashing the loader.
+        return False
+
+
+def _gpu_supports_flash_attn() -> bool:
+    """Return True iff the active CUDA device is Ampere+ (compute cap >= 8.0)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except (RuntimeError, AssertionError):
+        return False
+    return major >= _FLASH_ATTN_MIN_CC_MAJOR
+
+
+def _resolve_attn_implementation(requested: str) -> str:
+    """Resolve a `model.attn_implementation` config value to a concrete
+    HuggingFace `attn_implementation` string.
+
+    Rules:
+        - "auto"               → "flash_attention_2" if flash-attn is
+                                 importable AND GPU is Ampere+, else "sdpa".
+        - "flash_attention_2" /
+          "flash_attention_3"  → kept as-is when available; otherwise
+                                 falls back to "sdpa" with a warning.
+        - "sdpa" / "eager"     → kept as-is (no environment probe).
+        - anything else        → returned unchanged (Pydantic validator
+                                 already rejects unknown values; this
+                                 helper is intentionally permissive so
+                                 it can be unit-tested in isolation).
+
+    Never raises — Flash Attention is a perf optimization, not a
+    correctness requirement, so we gracefully degrade to `sdpa` on any
+    unsupported configuration rather than blocking training startup.
+    """
+    if requested == "auto":
+        flash_ok = _flash_attn_available()
+        gpu_ok = _gpu_supports_flash_attn()
+        if flash_ok and gpu_ok:
+            logger.info(
+                "Resolved attn_implementation",
+                requested="auto",
+                resolved="flash_attention_2",
+                reason="flash-attn importable and GPU compute cap >= 8.0",
+            )
+            return "flash_attention_2"
+        logger.info(
+            "Resolved attn_implementation",
+            requested="auto",
+            resolved="sdpa",
+            flash_attn_importable=flash_ok,
+            gpu_ampere_or_newer=gpu_ok,
+        )
+        return "sdpa"
+
+    if requested in ("flash_attention_2", "flash_attention_3"):
+        if not _flash_attn_available():
+            logger.warning(
+                "Requested attn_implementation unavailable: flash_attn not importable; "
+                "falling back to sdpa",
+                requested=requested,
+                fallback="sdpa",
+            )
+            return "sdpa"
+        if not _gpu_supports_flash_attn():
+            logger.warning(
+                "Requested attn_implementation unavailable: GPU compute cap < 8.0 "
+                "(Ampere+ required); falling back to sdpa",
+                requested=requested,
+                fallback="sdpa",
+            )
+            return "sdpa"
+        return requested
+
+    # "sdpa", "eager", or any other value — caller-validated, pass through.
+    return requested
+
+
+# ---------------------------------------------------------------------
 # Loading helpers
 # ---------------------------------------------------------------------
 def load_pretrained_state_dict(
@@ -91,8 +189,14 @@ def load_pretrained_model_low_mem(
     model_path: str,
     moe_config,
     model_dtype: torch.dtype = torch.float16,
+    attn_implementation: str | None = None,
 ) -> nn.Module:
-    """Load pretrained weights directly into the custom model with low CPU memory usage."""
+    """Load pretrained weights directly into the custom model with low CPU memory usage.
+
+    `attn_implementation`, when provided, is forwarded to the HuggingFace
+    `from_pretrained` call so callers can request `flash_attention_2`,
+    `sdpa`, etc. Pass `None` (default) to let HuggingFace pick.
+    """
     if bool(getattr(moe_config, "full", False)):
         logger.info(
             "Using direct explicit state_dict load for full model to avoid meta-tensor finalize issues",
@@ -107,13 +211,15 @@ def load_pretrained_model_low_mem(
         logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
         return model
 
-    model = model_class.from_pretrained(
-        model_path,
+    from_pretrained_kwargs: dict = dict(
         config=moe_config,
         dtype=model_dtype,
         low_cpu_mem_usage=False,
         ignore_mismatched_sizes=True,
     )
+    if attn_implementation is not None:
+        from_pretrained_kwargs["attn_implementation"] = attn_implementation
+    model = model_class.from_pretrained(model_path, **from_pretrained_kwargs)
 
     meta_expert_params = [
         name
@@ -161,9 +267,16 @@ def get_base_model(
 
     topk = config.moe.partial_topk if partial else config.moe.full_topk
     model_path = config.model.model_path.lower()
-    
+
     moe_config = get_moe_model_config(config, topk, group_ids, expert_manager, full = not partial)
-        
+
+    # Resolve `attn_implementation` (e.g. "auto" → "flash_attention_2" on
+    # Ampere+ when flash-attn is installed; fall back to "sdpa" otherwise).
+    # Quantized/Unsloth paths below skip this — they manage their own
+    # attention backends.
+    requested_attn = getattr(config.model, "attn_implementation", "auto")
+    resolved_attn = _resolve_attn_implementation(requested_attn)
+
     is_validator = config.role == "validator"
     use_quantization = get_nested_attr(config, "model.use_quantization", False) and is_validator
     use_unsloth = get_nested_attr(config, "model.use_unsloth", False) and is_validator
@@ -210,8 +323,9 @@ def get_base_model(
             max_memory=max_memory,
             low_cpu_mem_usage=True,
             torch_dtype=model_dtype,
+            attn_implementation=resolved_attn,
         )
-        logger.info("✓ Loaded with BitsAndBytes quantization")
+        logger.info("✓ Loaded with BitsAndBytes quantization", attn_implementation=resolved_attn)
         return model
 
     # === STANDARD PATH (Miners / non-quantized validators) ===
@@ -223,6 +337,7 @@ def get_base_model(
             model_path=config.model.model_path,
             moe_config=moe_config,
             model_dtype=model_dtype,
+            attn_implementation=resolved_attn,
         )
     else:
         # Partial path: a bare `_CausalLMClass(moe_config)` would leave every
