@@ -1,5 +1,8 @@
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum, auto
+from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
 
@@ -193,6 +196,190 @@ def download_worker(
             logger.info(f"<{PhaseNames.distribute}> task completed.")
 
 
+def _run_best_checkpoint_selection(
+    config,
+    latest_checkpoint: ModelCheckpoint,
+) -> ModelCheckpoint:
+    """Score the last N saved checkpoints across multiple seeds locally
+    and return a ``ModelCheckpoint`` whose ``path`` points at the winner.
+
+    No-op pass-through when ``config.commit.selection.enabled=False`` —
+    the existing "latest checkpoint" path is preserved bit-for-bit so
+    miners that haven't opted in see no behavior change.
+
+    Errors during selection (missing checkpoints, OOM, evaluator
+    crash) are logged and the original ``latest_checkpoint`` is
+    returned unchanged. The selection is a pure optimization on top
+    of the existing commit path — a failure here must not block the
+    cycle commit.
+
+    Side effect: writes a JSON selection report to
+    ``<checkpoint_path>/best_ckpt_selection_<timestamp>.json`` so
+    operators can audit which checkpoint was picked and why.
+    """
+    selection_cfg = getattr(getattr(config, "commit", None), "selection", None)
+    if selection_cfg is None or not getattr(selection_cfg, "enabled", False):
+        return latest_checkpoint
+
+    # Local imports — the selector pulls in transformers / safetensors /
+    # base model assembly which is heavy. Only pay that cost when the
+    # feature is opted in.
+    try:
+        from connito.miner.best_ckpt_selector import (
+            BestCheckpointSelector,
+            discover_candidate_checkpoints,
+        )
+        from connito.shared.expert_manager import ExpertManager as _ExpertManager
+        from connito.shared.modeling.mycelia import get_base_model, get_base_tokenizer
+        import torch as _torch
+    except Exception as e:
+        logger.warning(
+            f"<{PhaseNames.miner_commit_1}> best-ckpt selection: failed to import dependencies; "
+            "falling back to latest checkpoint",
+            error=str(e),
+        )
+        return latest_checkpoint
+
+    candidates = discover_candidate_checkpoints(
+        checkpoint_dir=Path(config.ckpt.checkpoint_path),
+        candidate_count=int(selection_cfg.candidate_count),
+        include_ema=bool(selection_cfg.include_ema),
+    )
+    if not candidates:
+        logger.warning(
+            f"<{PhaseNames.miner_commit_1}> best-ckpt selection: no candidates found; "
+            "falling back to latest checkpoint",
+            checkpoint_path=str(config.ckpt.checkpoint_path),
+        )
+        return latest_checkpoint
+
+    # Short-circuit when only one candidate would be evaluated — running
+    # selection adds wall-clock with no benefit. Latest-checkpoint path
+    # is already what would win.
+    if len(candidates) == 1:
+        logger.info(
+            f"<{PhaseNames.miner_commit_1}> best-ckpt selection: single candidate; "
+            "skipping multi-seed scoring",
+            candidate=str(candidates[0]),
+        )
+        return latest_checkpoint
+
+    try:
+        tokenizer = get_base_tokenizer(config)
+        expert_manager = _ExpertManager(config)
+        base_model = get_base_model(
+            config,
+            expert_manager=expert_manager,
+            group_ids=[config.task.exp.group_id],
+            partial=True,
+        )
+        device = _torch.device(getattr(config.model, "device", "cuda"))
+
+        selector = BestCheckpointSelector(
+            config=config,
+            tokenizer=tokenizer,
+            base_model=base_model,
+            device=device,
+            seeds=list(selection_cfg.local_eval_seeds),
+            max_batches=int(selection_cfg.max_eval_batches),
+            rank=int(getattr(config.task.exp.data, "rank", 0)),
+        )
+        winner_path, report = selector.select(candidates)
+    except Exception as e:
+        logger.error(
+            f"<{PhaseNames.miner_commit_1}> best-ckpt selection failed; "
+            "falling back to latest checkpoint",
+            error=str(e),
+            exc_info=True,
+        )
+        return latest_checkpoint
+
+    # Persist the selection report alongside the checkpoint directory
+    # so operators can audit which candidate was picked. Failures here
+    # are non-fatal — the commit must proceed regardless.
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        report_path = Path(config.ckpt.checkpoint_path) / f"best_ckpt_selection_{ts}.json"
+        report_payload = {
+            "timestamp_utc": ts,
+            "selected_path": str(winner_path),
+            "original_latest_path": (
+                str(latest_checkpoint.path) if latest_checkpoint.path else None
+            ),
+            **report,
+        }
+        report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+        logger.info(
+            f"<{PhaseNames.miner_commit_1}> best-ckpt selection report written",
+            report_path=str(report_path),
+        )
+    except Exception as e:
+        logger.warning(
+            f"<{PhaseNames.miner_commit_1}> failed to persist selection report",
+            error=str(e),
+        )
+
+    if Path(winner_path) == Path(latest_checkpoint.path):
+        logger.info(
+            f"<{PhaseNames.miner_commit_1}> best-ckpt selection: latest checkpoint won",
+            winner=str(winner_path),
+        )
+        return latest_checkpoint
+
+    logger.info(
+        f"<{PhaseNames.miner_commit_1}> best-ckpt selection: substituting winner",
+        winner=str(winner_path),
+        original_latest=str(latest_checkpoint.path),
+    )
+    # Replace the path; keep the existing global_ver / inner_opt
+    # metadata from `latest_checkpoint` unless we can derive better
+    # values from the winner's directory name. Hash and signature are
+    # computed below in `_prepare_checkpoint_for_commit` after this
+    # substitution, so they reflect the WINNER's bytes — not the
+    # latest checkpoint's.
+    from connito.shared.checkpoints import build_local_checkpoint
+
+    winner_path_obj = Path(winner_path)
+    winner_ckpt = build_local_checkpoint(winner_path_obj, role="miner")
+    if winner_ckpt is None:
+        # Winner is the EMA snapshot (a single file like
+        # ``ema.safetensors``, not a ``globalver_*`` directory). The
+        # current HF upload path uploads a DIRECTORY filtered by
+        # ``allow_patterns=[model_expgroup_{gid}.{safetensors,pt}]``
+        # so we can't safely swap to a single-file path here —
+        # ``upload_checkpoint_to_hf`` would raise FileNotFoundError
+        # ("checkpoint dir not found"), and even if it didn't the
+        # EMA's filename doesn't match the allow-pattern so the
+        # upload would be empty. Fall back to the latest training
+        # checkpoint, which is also what we'd get without
+        # ``include_ema=True``. The EMA's val_loss is still visible
+        # in the persisted selection report.
+        #
+        # When Unit 13 lands, it should either save the EMA as a
+        # ``globalver_*`` directory containing
+        # ``model_expgroup_{gid}.safetensors`` (so this branch is
+        # never hit) or this integration should be extended to copy
+        # the EMA into latest_checkpoint.path before commit.
+        if not winner_path_obj.is_dir():
+            logger.info(
+                f"<{PhaseNames.miner_commit_1}> best-ckpt selection: "
+                "EMA-style single-file winner cannot be uploaded as-is; "
+                "falling back to latest checkpoint",
+                winner=str(winner_path_obj),
+            )
+            return latest_checkpoint
+        # Directory with non-parseable name — shouldn't happen with
+        # the current trainer naming, but keep the path so signing
+        # / upload at least exercises the new dir.
+        latest_checkpoint.path = winner_path_obj
+        return latest_checkpoint
+
+    # Winner is a training checkpoint with parseable filename. Use
+    # its metadata so the chain commit's `global_ver` lines up with
+    # the actual bytes being uploaded.
+    return winner_ckpt
+
+
 def _prepare_checkpoint_for_commit(
     config,
     wallet,
@@ -200,12 +387,21 @@ def _prepare_checkpoint_for_commit(
 ) -> ModelCheckpoint:
     """Pick the latest local checkpoint, sign it, and publish the path to
     shared state.
+
+    When ``config.commit.selection.enabled=True``, the latest-checkpoint
+    pick is post-processed by ``_run_best_checkpoint_selection`` which
+    may substitute a different checkpoint (the one with the lowest mean
+    val_loss across multiple seeds). The signing happens AFTER this
+    substitution so the on-chain hash reflects the actual bytes that
+    will be uploaded to HF.
     """
     latest_checkpoint = select_best_checkpoint(
         primary_dir=config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt
     )
     if latest_checkpoint is None or latest_checkpoint.path is None:
         raise FileNotReadyError("Not checkpoint found, skip commit.")
+
+    latest_checkpoint = _run_best_checkpoint_selection(config, latest_checkpoint)
 
     latest_checkpoint.expert_group = config.task.exp.group_id
     latest_checkpoint.sign_hash(wallet=wallet)

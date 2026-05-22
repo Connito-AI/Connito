@@ -322,6 +322,51 @@ class ScheduleCfg(BaseConfig):
     total_steps: PositiveInt = 88_000
 
 
+class CommitSelectionCfg(BaseConfig):
+    """Multi-seed best-checkpoint selection before MinerCommit2 (Unit 15).
+
+    Opt-in (``enabled=False`` by default) so existing miner runs are
+    bit-for-bit unaffected. When enabled, the commit worker runs a
+    short replica of the validator's eval pass over the last
+    ``candidate_count`` saved checkpoints (plus the EMA snapshot when
+    ``include_ema=True`` and Unit 13's ``ema.safetensors`` is present
+    in the checkpoint directory) against every seed in
+    ``local_eval_seeds`` and commits the candidate with the lowest
+    **mean** val_loss across seeds.
+
+    Per-validator weight variance on SN102 is large (dashboard:
+    UID 79 = 0.37 from v1 vs 0.0066 from v2). A multi-seed mean
+    targets robustness across the validator pool rather than the
+    single-seed peak.
+
+    Defaults are tuned to keep selection cheap relative to the
+    miner-commit phase wall-clock budget: 3 candidates × 3 seeds × 20
+    batches ≈ 180 batches total. The validator runs 50 batches per
+    miner per round, so this stays well under the same wall-clock
+    envelope.
+    """
+    enabled: bool = False
+    # Number of recent training checkpoints to score. The EMA snapshot
+    # is added on top when ``include_ema=True``.
+    candidate_count: PositiveInt = 3
+    # Try the EMA snapshot artifact (Unit 13) if it exists.
+    include_ema: bool = True
+    # Integer seeds; one eval pass per seed per candidate. The
+    # validator uses a single combined seed per round, so the mean
+    # over these multiple seeds is what makes the selection robust
+    # across the per-validator variance.
+    local_eval_seeds: list[int] = Field(default_factory=lambda: [42, 1337, 314159])
+    # Per-seed batch cap forwarded to ``evaluate_model``. The
+    # validator runs 50 batches per miner per round; 20 is the
+    # cheap-but-representative budget for the selection.
+    max_eval_batches: PositiveInt = 20
+
+
+class CommitCfg(BaseConfig):
+    """Miner commit-phase configuration."""
+    selection: CommitSelectionCfg = Field(default_factory=CommitSelectionCfg)
+
+
 class CheckpointCfg(BaseConfig):
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
@@ -812,6 +857,7 @@ class WorkerConfig(BaseConfig):
 class MinerConfig(WorkerConfig):
     role: str = "miner"
     local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
+    commit: CommitCfg = Field(default_factory=CommitCfg)
 
     @model_validator(mode="after")
     def _derive_all(self):
