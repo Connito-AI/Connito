@@ -1,5 +1,8 @@
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
 
@@ -10,6 +13,7 @@ load_dotenv()
 
 import bittensor
 
+from connito.miner.ema_tracker import EMA_SHADOW_FILENAME
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import (
     CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS,
@@ -193,13 +197,130 @@ def download_worker(
             logger.info(f"<{PhaseNames.distribute}> task completed.")
 
 
+def _ema_commit_enabled(config) -> bool:
+    """True when miner config requests committing the EMA snapshot."""
+    ema_cfg = getattr(config, "ema", None)
+    if ema_cfg is None:
+        return False
+    return bool(getattr(ema_cfg, "enabled", False) and getattr(ema_cfg, "commit_ema_snapshot", False))
+
+
+def _materialize_ema_snapshot_dir(
+    src_ckpt_dir: Path,
+    expert_group_id: int,
+) -> Path | None:
+    """Stage an EMA-substituted copy of the expert-group shard in a temp dir.
+
+    Reads ``ema_shadow.safetensors`` (written by ``train.py`` at checkpoint
+    time) and writes it out as ``model_expgroup_{id}.safetensors`` inside a
+    fresh temp directory. The returned directory is what gets hashed and
+    uploaded in place of the live last-step shard.
+
+    Returns ``None`` when the EMA shadow file is absent (e.g. first checkpoint
+    before any optimizer step landed). Callers should fall back to the
+    live checkpoint in that case so the miner still submits something.
+
+    The caller is responsible for cleaning up the returned directory.
+    """
+    src_ckpt_dir = Path(src_ckpt_dir)
+    ema_path = src_ckpt_dir / EMA_SHADOW_FILENAME
+    if not ema_path.exists():
+        logger.warning(
+            f"commit_ema_snapshot=True but {EMA_SHADOW_FILENAME} not found; "
+            "falling back to live checkpoint for this round",
+            checkpoint_dir=str(src_ckpt_dir),
+        )
+        return None
+
+    # The EMA shadow only contains trainable params (typically the
+    # expert-group shard's experts). The validator's download path expects
+    # `model_expgroup_{id}.safetensors`, so we materialize the EMA tensors
+    # under that filename inside a fresh temp dir. Any non-expert tensors
+    # in the shadow are simply written too — the validator only loads
+    # tensor keys it recognizes from this group.
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ema_commit_"))
+    try:
+        import torch
+        from safetensors.torch import load_file, save_file
+        shadow_state = load_file(str(ema_path), device="cpu")
+        # Match the dtype used by the live shard so the EMA-staged upload
+        # isn't unexpectedly 2x larger. The live shard's writer
+        # (`save_state_dict_by_expert_group`) uses
+        # `next(model.parameters()).dtype` — typically fp16 because the
+        # backbone is fp16-listed first. Trainable params are upcast to
+        # fp32 during training, so the shadow is fp32; downcast back to
+        # fp16 (or bf16 when configured) here to keep upload size on par
+        # with the non-EMA path. Cast via .to() handles the precision
+        # tradeoff cleanly; values that overflow fp16 will saturate but
+        # that's the same behavior the live shard already accepts.
+        live_shard_path_st = src_ckpt_dir / f"model_expgroup_{expert_group_id}.safetensors"
+        live_shard_path_pt = src_ckpt_dir / f"model_expgroup_{expert_group_id}.pt"
+        target_dtype: torch.dtype | None = None
+        try:
+            if live_shard_path_st.exists():
+                live_sd = load_file(str(live_shard_path_st), device="cpu")
+            elif live_shard_path_pt.exists():
+                live_sd = torch.load(str(live_shard_path_pt), map_location="cpu", weights_only=True)
+                live_sd = live_sd.get("model_state_dict", live_sd) if isinstance(live_sd, dict) else {}
+            else:
+                live_sd = None
+            if live_sd:
+                # Use the dtype of any floating-point tensor in the live shard.
+                for _v in live_sd.values():
+                    if torch.is_tensor(_v) and torch.is_floating_point(_v):
+                        target_dtype = _v.dtype
+                        break
+        except Exception:
+            target_dtype = None
+
+        if target_dtype is None:
+            target_dtype = torch.float16  # safe default matching legacy save_dtype
+
+        casted_state = {
+            k: (
+                v.to(dtype=target_dtype).contiguous()
+                if torch.is_floating_point(v)
+                else v.contiguous()
+            )
+            for k, v in shadow_state.items()
+        }
+        out_path = tmp_dir / f"model_expgroup_{expert_group_id}.safetensors"
+        save_file(casted_state, str(out_path))
+        logger.info(
+            "Staged EMA snapshot for commit",
+            staging_dir=str(tmp_dir),
+            num_params=len(casted_state),
+            expert_group=expert_group_id,
+            target_dtype=str(target_dtype),
+        )
+        return tmp_dir
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.error(
+            "Failed to materialize EMA snapshot; falling back to live checkpoint",
+            error=str(e),
+            exc_info=True,
+        )
+        return None
+
+
 def _prepare_checkpoint_for_commit(
     config,
     wallet,
     shared_state: SharedState,
-) -> ModelCheckpoint:
+) -> tuple[ModelCheckpoint, Path | None]:
     """Pick the latest local checkpoint, sign it, and publish the path to
     shared state.
+
+    When ``config.ema.commit_ema_snapshot=True`` and an ``ema_shadow.safetensors``
+    file exists alongside the latest checkpoint, the EMA shadow is staged in
+    a temporary directory and used as the submission target. The hash is
+    then computed from the EMA tensors so the signed hash and uploaded
+    files agree.
+
+    Returns ``(checkpoint, ema_temp_dir)`` — ``ema_temp_dir`` is non-None
+    only when an EMA staging dir was created and must be cleaned up by the
+    caller (see ``commit_worker``).
     """
     latest_checkpoint = select_best_checkpoint(
         primary_dir=config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt
@@ -208,12 +329,29 @@ def _prepare_checkpoint_for_commit(
         raise FileNotReadyError("Not checkpoint found, skip commit.")
 
     latest_checkpoint.expert_group = config.task.exp.group_id
+
+    ema_temp_dir: Path | None = None
+    if _ema_commit_enabled(config):
+        staged = _materialize_ema_snapshot_dir(
+            src_ckpt_dir=Path(latest_checkpoint.path),
+            expert_group_id=config.task.exp.group_id,
+        )
+        if staged is not None:
+            # Repoint the checkpoint at the EMA staging directory. The
+            # subsequent `sign_hash()` re-hashes from this new path, so
+            # the on-chain signed hash matches what we upload.
+            latest_checkpoint.path = staged
+            ema_temp_dir = staged
+            # `hash_model` lazily fills `model_hash` from `self.path`; clear
+            # any prior value so signing re-derives it from EMA tensors.
+            latest_checkpoint.model_hash = None
+
     latest_checkpoint.sign_hash(wallet=wallet)
 
     with shared_state.lock:
         shared_state.latest_checkpoint_path = latest_checkpoint.path
 
-    return latest_checkpoint
+    return latest_checkpoint, ema_temp_dir
 
 
 def _commit_signed_model_hash(
@@ -365,8 +503,11 @@ def commit_worker(
             commit_queue.task_done()
             logger.info(f"<{PhaseNames.miner_commit_1}> shutdown signal received.")
             return
+        ema_temp_dir: Path | None = None
         try:
-            latest_checkpoint = _prepare_checkpoint_for_commit(config, wallet, shared_state)
+            latest_checkpoint, ema_temp_dir = _prepare_checkpoint_for_commit(
+                config, wallet, shared_state,
+            )
             _commit_signed_model_hash(config, wallet, subtensor, latest_checkpoint)
             check_phase_expired(subtensor, job.phase_response)
 
@@ -390,6 +531,10 @@ def commit_worker(
             logger.error(f"<{PhaseNames.miner_commit_1}> Error while handling job", error=str(e), exc_info=True)
 
         finally:
+            # Clean up EMA staging dir if one was created. Done in finally
+            # so a mid-commit error doesn't leak temp directories.
+            if ema_temp_dir is not None:
+                shutil.rmtree(ema_temp_dir, ignore_errors=True)
             commit_queue.task_done()
 
 

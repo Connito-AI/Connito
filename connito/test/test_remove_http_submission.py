@@ -86,7 +86,9 @@ def test_miner_commit_cycle_never_issues_http_request_on_hf_success():
          patch.object(model_io, "wait_till", return_value=SimpleNamespace()), \
          patch("requests.post", side_effect=AssertionError("HTTP submission must not happen")), \
          patch("requests.get", side_effect=AssertionError("HTTP request must not happen")):
-        latest = model_io._prepare_checkpoint_for_commit(config, wallet, shared_state)
+        # `_prepare_checkpoint_for_commit` returns `(ModelCheckpoint, ema_temp_dir)`;
+        # the test only cares about the checkpoint itself.
+        latest, _ema_tmp = model_io._prepare_checkpoint_for_commit(config, wallet, shared_state)
         model_io._commit_signed_model_hash(config, wallet, subtensor, latest)
         hf_chain_repo_id, hf_revision = model_io._upload_checkpoint_to_hf_safe(config, latest)
         model_io._commit_model_hash(config, wallet, subtensor, latest, hf_chain_repo_id, hf_revision)

@@ -19,6 +19,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
+from connito.miner.ema_tracker import EMA_SHADOW_FILENAME, ModelEma
 from connito.miner.train_helper import free_cuda_models, get_status
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
@@ -44,6 +45,83 @@ from connito.shared.modeling.mycelia import get_base_tokenizer
 configure_logging()
 logger = structlog.get_logger(__name__)
 torch.autograd.set_detect_anomaly(True)
+
+
+def _build_ema_if_enabled(
+    config: "MinerConfig",
+    model: torch.nn.Module,
+    rank: int = 0,
+) -> ModelEma | None:
+    """Construct ModelEma when the opt-in flag is on; otherwise return None.
+
+    Only rank 0 builds the shadow — other ranks would waste VRAM/CPU memory
+    on a state that's never saved or read. (Per-rank shadows can't be
+    combined meaningfully across DP workers anyway, since only rank 0
+    writes the commit checkpoint.)
+    """
+    if rank != 0:
+        return None
+    if not getattr(config, "ema", None) or not config.ema.enabled:
+        return None
+    shadow_device = "cpu" if config.ema.shadow_on_cpu else None
+    return ModelEma(
+        model=model,
+        decay=config.ema.decay,
+        device=shadow_device,
+        only_trainable=config.ema.only_trainable_params,
+    )
+
+
+def _save_ema_shadow(ema: ModelEma | None, ckpt_dir: str) -> None:
+    """Persist EMA shadow weights as a safetensors file inside the checkpoint dir.
+
+    No-op when EMA is disabled. Uses safetensors for the same reasons the
+    expert-group shards do: no pickle code path, smaller files, and
+    cross-version stability.
+    """
+    if ema is None:
+        return
+    try:
+        from safetensors.torch import save_file
+        out_path = os.path.join(ckpt_dir, EMA_SHADOW_FILENAME)
+        # safetensors requires contiguous tensors; shadow tensors are
+        # always contiguous (clones / in-place ops preserve layout), but
+        # call .contiguous() defensively.
+        state = {k: v.detach().contiguous().cpu() for k, v in ema.state_dict().items()}
+        save_file(state, out_path)
+        logger.info("Saved EMA shadow", path=out_path, num_params=len(state))
+    except Exception as e:
+        # EMA shadow save is best-effort — if it fails, the regular
+        # checkpoint is still intact and the miner keeps training.
+        logger.warning("Failed to save EMA shadow; continuing", error=str(e), exc_info=True)
+
+
+def _try_load_ema_shadow(ema: ModelEma, ckpt_dir) -> None:
+    """Best-effort restore of the EMA shadow from disk.
+
+    Walks the supplied checkpoint directory for the standard EMA shadow
+    file. Silent no-op when the file is absent (first run, EMA opted-in
+    mid-cycle, etc.). Restoring matters because otherwise every miner
+    restart silently resets the EMA average back to the live weights and
+    we lose the long-horizon variance reduction that motivates EMA in
+    the first place.
+    """
+    shadow_path = os.path.join(str(ckpt_dir), EMA_SHADOW_FILENAME)
+    if not os.path.exists(shadow_path):
+        logger.info("No EMA shadow file at startup; starting EMA fresh", path=shadow_path)
+        return
+    try:
+        from safetensors.torch import load_file
+        state = load_file(shadow_path, device="cpu")
+        ema.load_state_dict(state)
+        logger.info("Restored EMA shadow from disk", path=shadow_path, num_params=len(state))
+    except Exception as e:
+        logger.warning(
+            "Failed to restore EMA shadow; starting EMA fresh",
+            path=shadow_path,
+            error=str(e),
+            exc_info=True,
+        )
 
 
 def _is_streaming_timeout_error(error: Exception) -> bool:
@@ -296,6 +374,17 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         current_model_meta,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
+    # === EMA tracker (opt-in; default off) ===
+    # Constructed after freeze_parameters has set requires_grad so that
+    # `only_trainable_params=True` correctly skips frozen backbone params.
+    # Only rank 0 holds the shadow — see `_build_ema_if_enabled`.
+    ema = _build_ema_if_enabled(config, model, rank=rank)
+    # On rank 0, try to restore EMA state from the latest local checkpoint
+    # so EMA history survives miner restarts (otherwise every restart
+    # silently resets the average to the live weights).
+    if ema is not None and current_model_meta is not None and current_model_meta.path is not None:
+        _try_load_ema_shadow(ema, current_model_meta.path)
+
     # === training ===
     precision = get_nested_attr(config, "model.precision", "fp16-mixed")
     if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
@@ -518,6 +607,26 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     )
                     raise FloatingPointError("Non-finite trainable parameters detected after optimizer step")
 
+                # === EMA update ===
+                # Only update on actually-applied optimizer steps; skipping
+                # when GradScaler skipped means the EMA shadow only ingests
+                # finite, valid parameter values. `update_every_n_steps`
+                # gates how often we touch the shadow (default 1 = every
+                # inner-opt step).
+                if (
+                    ema is not None
+                    and not step_skipped
+                    and (inner_opt_step % config.ema.update_every_n_steps == 0)
+                ):
+                    ema.update(model)
+                    if inner_opt_step % max(round(config.local_par.global_opt_interval * 0.02), 1) == 0:
+                        logger.info(
+                            "EMA shadow updated",
+                            inner_opt_step=inner_opt_step,
+                            decay=ema.decay,
+                            num_updates=ema.num_updates,
+                        )
+
                 training_time = time.time() - training_start_time
                 total_training_time += training_time
                 training_start_time = None
@@ -655,6 +764,12 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     active_expert_group_id=config.task.exp.group_id,
                 )
 
+                # Persist EMA shadow alongside the regular checkpoint so
+                # `commit_worker` can swap it in at commit time. Only
+                # rank 0 writes to avoid clobbering between DP workers.
+                if ema is not None and rank == 0:
+                    _save_ema_shadow(ema, ckpt_path)
+
                 if config.ckpt.checkpoint_topk is not None:
                     ckpt_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, config.ckpt.checkpoint_topk)
                     if ckpt_deleted:
@@ -698,6 +813,13 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         train_dataloader,
                         current_model_meta,
                     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
+                    # New model object means stale shadow refs; rebuild
+                    # EMA tracker against the freshly-loaded params. Re-init
+                    # from current weights is safe — the next decay updates
+                    # restart the EMA average from this point.
+                    ema = _build_ema_if_enabled(config, model, rank=rank)
+                    if ema is not None and current_model_meta is not None and current_model_meta.path is not None:
+                        _try_load_ema_shadow(ema, current_model_meta.path)
                 else:
                     logger.info(
                         "No need to reload model",

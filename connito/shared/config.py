@@ -322,6 +322,30 @@ class ScheduleCfg(BaseConfig):
     total_steps: PositiveInt = 88_000
 
 
+class EmaCfg(BaseConfig):
+    """Exponential moving average of trainable model weights.
+
+    Opt-in: when `enabled=True`, the miner maintains a shadow copy of
+    trainable weights updated as `θ_ema = decay * θ_ema + (1 - decay) * θ_live`.
+    When `commit_ema_snapshot=True`, the EMA snapshot is what gets uploaded
+    to HF / committed to chain at miner_commit time, instead of the live
+    last-step weights. Default off so existing behavior is unchanged.
+
+    See: connito/miner/ema_tracker.py and connito/validator/evaluator.py
+    (scoring formula `(baseline_loss - miner_val_loss) ** 1.2`).
+    """
+
+    enabled: bool = False
+    decay: float = Field(default=0.999, ge=0.0, le=1.0)
+    update_every_n_steps: PositiveInt = 1  # 1 = update every inner-optimizer step
+    only_trainable_params: bool = True
+    commit_ema_snapshot: bool = False  # if True, commit EMA weights instead of live
+    # If True, keep the EMA shadow on CPU (saves VRAM at the cost of a
+    # device-to-device copy each update). Off by default; turn on only when
+    # GPU memory is tight.
+    shadow_on_cpu: bool = False
+
+
 class CheckpointCfg(BaseConfig):
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
@@ -812,6 +836,7 @@ class WorkerConfig(BaseConfig):
 class MinerConfig(WorkerConfig):
     role: str = "miner"
     local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
+    ema: EmaCfg = Field(default_factory=EmaCfg)
 
     @model_validator(mode="after")
     def _derive_all(self):
