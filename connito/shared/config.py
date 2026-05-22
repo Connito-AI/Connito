@@ -192,10 +192,47 @@ class ModelCfg(BaseConfig):
     model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
     base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
     foundation: bool = True
+    # torch.compile defaults to disabled — operators must opt-in. When enabled,
+    # the training loop wraps the model in `torch.compile(...)` after construction
+    # and DDP wrapping, guarded by a try/except that falls back to eager mode if
+    # compile fails (e.g. unsupported op, dynamic shape graph break).
     torch_compile: bool = False
+    # Inductor compile mode. "reduce-overhead" captures CUDA graphs and is the
+    # right default for stable shapes (typical 10-20% speedup). "max-autotune"
+    # spends more on first-step compile in exchange for slightly faster steady
+    # state. "default" is the safest baseline.
+    torch_compile_mode: Literal[
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    ] = "reduce-overhead"
+    # Enable dynamic-shape compilation. More flexible (handles variable
+    # sequence lengths without recompiling) but more expensive at compile
+    # time and may disable CUDA graph capture. Off by default — training
+    # batches are fixed-shape.
+    torch_compile_dynamic: bool = False
     attn_implementation: str = "sdpa"
     precision: str = "fp16-mixed"
     device: str = "cuda"
+
+    @model_validator(mode="after")
+    def _validate_torch_compile(self):
+        # torch.compile is only stable starting with PyTorch 2.1. Warn (don't
+        # raise) so existing configs continue to load on older runtimes; the
+        # training loop will additionally try/except the actual compile call.
+        if self.torch_compile:
+            try:
+                torch_version = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+            except (ValueError, IndexError):
+                torch_version = (0, 0)
+            if torch_version < (2, 1):
+                logger.warning(
+                    "torch_compile=True but PyTorch < 2.1 detected; compile is not "
+                    "stable on this version and may fail at runtime",
+                    torch_version=torch.__version__,
+                )
+        return self
 
 
 class DatasetSourceCfg(BaseConfig):

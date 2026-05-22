@@ -306,8 +306,11 @@ def get_base_model(
                 group_ids=group_ids,
             )
 
-    if model is not None and get_nested_attr(config, "model.torch_compile", False):
-        model = torch.compile(model)
+    # torch.compile is now applied by the miner training loop in
+    # connito.miner.train after model construction (and DDP wrapping when
+    # applicable), using config.model.torch_compile_mode /
+    # torch_compile_dynamic. Compiling here would lose those knobs and
+    # double-compile if the caller also wraps later.
 
     return model
 

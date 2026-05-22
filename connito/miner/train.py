@@ -62,6 +62,55 @@ def _is_streaming_timeout_error(error: Exception) -> bool:
     return any(marker in error_msg for marker in timeout_markers)
 
 
+def maybe_torch_compile(model: torch.nn.Module, config: MinerConfig) -> torch.nn.Module:
+    """Optionally compile *model.forward* in place via `torch.compile`.
+
+    Opt-in only. When `config.model.torch_compile=True`, replaces
+    `model.forward` with a compiled version using the configured
+    `torch_compile_mode` and `torch_compile_dynamic` flags. Compile
+    failures (unsupported op, dynamo graph break that becomes a hard
+    error, missing inductor toolchain) are logged and the original eager
+    forward is left untouched — training proceeds uncompiled rather than
+    crashing.
+
+    Why compile `model.forward` instead of returning `torch.compile(model)`:
+    `torch.compile(model)` returns an `OptimizedModule` wrapper whose
+    `state_dict()` / `named_parameters()` keys are PREFIXED with
+    `_orig_mod.`. Downstream code (checkpoint sharding by expert group,
+    cross-validator hash comparison, the published checkpoint format) is
+    keyed on the un-prefixed parameter names. Compiling `.forward` keeps
+    `model` an instance of the original module class so every state-dict
+    key and accessor matches the eager path byte-for-byte — only the
+    forward computation path is replaced with the Inductor-compiled
+    artifact. This is the documented PyTorch pattern for opt-in compile
+    that needs to coexist with checkpointing.
+
+    The model is returned unchanged (same object); the return value is
+    purely for symmetry with the no-op branch.
+    """
+    if not getattr(config.model, "torch_compile", False):
+        return model
+
+    mode = getattr(config.model, "torch_compile_mode", "reduce-overhead")
+    dynamic = getattr(config.model, "torch_compile_dynamic", False)
+    try:
+        model.forward = torch.compile(model.forward, mode=mode, dynamic=dynamic)
+        logger.info(
+            "torch.compile enabled",
+            mode=mode,
+            dynamic=dynamic,
+            torch_version=torch.__version__,
+        )
+    except Exception as e:
+        logger.warning(
+            "torch.compile failed, falling back to eager",
+            mode=mode,
+            dynamic=dynamic,
+            error=str(e),
+        )
+    return model
+
+
 # this is for local DP only
 def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, backend: str = "nccl") -> None:
     """
@@ -295,6 +344,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         train_dataloader,
         current_model_meta,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+
+    # === torch.compile (opt-in via config.model.torch_compile) ===
+    # Applied after model construction (and DDP wrap, if any) per torch.compile
+    # composition guidance. Safe fallback on compile failure — see helper.
+    model = maybe_torch_compile(model, config)
 
     # === training ===
     precision = get_nested_attr(config, "model.precision", "fp16-mixed")
@@ -698,6 +752,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         train_dataloader,
                         current_model_meta,
                     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
+                    # Recompile after reload so the new model uses the configured
+                    # torch.compile mode/dynamic flags (and not the eager fallback
+                    # from a previous failed compile).
+                    model = maybe_torch_compile(model, config)
                 else:
                     logger.info(
                         "No need to reload model",
