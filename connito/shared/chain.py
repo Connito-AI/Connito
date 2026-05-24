@@ -409,6 +409,72 @@ def get_chain_commits(
     return parsed
 
 
+def get_validator_chain_commits(
+    config: WorkerConfig,
+    subtensor: bittensor.Subtensor,
+    *,
+    block: int | None = None,
+    signature_commit: bool = False,
+    metagraph=None,
+) -> list[tuple[ValidatorChainCommit | SignedModelHashChainCommit | None, "bittensor.Neuron"]]:
+    """Like ``get_chain_commits`` but only pulls commits for whitelisted
+    validators (per the owner API).
+
+    Saves a ``get_all_commitments(netuid=)`` over ~256 UIDs by issuing one
+    ``get_commitment(netuid=, uid=)`` per whitelisted validator instead.
+    Skips role-gating entirely (every hotkey we query is already known to
+    be a validator).
+
+    ``metagraph`` may be passed in (e.g. a lite metagraph already fetched
+    by the caller) to avoid a duplicate metagraph RPC. Hotkey→UID mapping
+    uses the supplied metagraph as-is; if you need historical UID
+    assignment, pass a metagraph fetched at ``block``.
+    """
+    from connito.shared.cycle import get_validator_whitelist_from_api  # lazy: avoids cycle import cycle
+
+    whitelist = get_validator_whitelist_from_api(config)
+    if not whitelist:
+        logger.warning("get_validator_chain_commits: empty validator whitelist")
+        return []
+
+    if metagraph is None:
+        metagraph = subtensor.metagraph(netuid=config.chain.netuid, lite=True)
+    hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
+
+    parsed: list[tuple[ValidatorChainCommit | SignedModelHashChainCommit | None, "bittensor.Neuron"]] = []
+    for hotkey in whitelist:
+        uid = hotkey_to_uid.get(hotkey)
+        if uid is None:
+            continue
+        try:
+            raw = subtensor.get_commitment(
+                netuid=config.chain.netuid, uid=uid, block=block,
+            )
+        except Exception as e:
+            logger.warning(
+                "get_validator_chain_commits: per-uid fetch failed",
+                uid=uid, hotkey=hotkey, error=str(e),
+            )
+            continue
+        if not raw:
+            continue
+        try:
+            status_dict = json.loads(raw)
+            if signature_commit:
+                chain_commit = SignedModelHashChainCommit.model_validate(status_dict)
+            else:
+                chain_commit = ValidatorChainCommit.model_validate(status_dict)
+        except Exception as e:
+            logger.debug(
+                "get_validator_chain_commits: parse failed",
+                uid=uid, hotkey=hotkey, error=str(e),
+            )
+            chain_commit = None
+        parsed.append((chain_commit, metagraph.neurons[uid]))
+
+    return parsed
+
+
 # --- setup chain worker ---
 def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
     """Create the chain connections this worker needs.
