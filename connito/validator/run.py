@@ -990,7 +990,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
 
             # === Wait till commit phase to submit random seed ===
-            phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
+            # block_offset=-5 (was -15) trims dead time at the top of the
+            # loop — finalize + submit only need a few blocks of headroom
+            # before MinerCommit1, not 15.
+            phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
             logger.info("Commit new seed for next validation")
 
             # === (4) Finalize round-K scoring and submit weights.

@@ -51,11 +51,11 @@ def _aggregator_with_history(
 ) -> MinerScoreAggregator:
     """Build an aggregator where:
 
-    * `uids_full_history`: 3 records each, including BOTH cur_rid and
-      cur_rid - cycle_length → clears the Group 1 gates.
-    * `uids_partial_history`: 2 records (cur_rid + cur_rid - cycle_length)
-      so they clear Group 2's `>= 2` gate but not Group 1's `>= 3`.
-    * `uids_one_record`: 1 record at cur_rid, clears neither gate.
+    * `uids_full_history`: 3 records at 3 distinct round_ids inside the
+      G1 window (`cur_rid - 5*cycle_length .. cur_rid`) → clears G1.
+    * `uids_partial_history`: 2 records at 2 distinct round_ids inside
+      the G1 window → also clears G1 (gate is ≥2 distinct round_ids).
+    * `uids_one_record`: 1 record at cur_rid only → fails G1's ≥2 gate.
     """
     agg = MinerScoreAggregator(max_points=8, max_history_points=64)
     ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -102,8 +102,8 @@ def test_no_cohort_state_falls_back_to_aggregator_avg():
 
 def test_cohort_path_emits_g1_g2_split_without_pending_round():
     """Helper accepts `cohort_state` directly — no Round wrapper required.
-    With full history on A∪B, applies the 98/2 top-3 / top-5 split with
-    the >= 3 records + last-2-rounds gate."""
+    With ≥2 distinct round_ids in the G1 window, applies the 98/2 top-3
+    / top-5 split."""
     cur_rid = 1000
     cycle_length = 100
     agg = _aggregator_with_history(
@@ -121,24 +121,60 @@ def test_cohort_path_emits_g1_g2_split_without_pending_round():
     )
     assert payload.cohort_emission is True
     assert payload.g1_redirected_to_uid_zero is False
+    # G1 picks top-3 by avg; uids 1/2/3 all have score >1.0 vs 4/5 at 0.5,
+    # so even though 4/5 also clear the ≥2 distinct round_ids gate they
+    # lose the top-N comparison.
     assert set(payload.weight_group_1) == {1, 2, 3}
     assert set(payload.weight_group_2) <= {4, 5, 6, 7}
     assert pytest.approx(sum(payload.uid_weights.values()), abs=1e-6) == 1.0
 
 
-def test_cohort_path_excludes_uids_missing_one_of_last_2_rounds():
-    """A UID with 3 records but missing `cur_rid - cycle_length` does
-    NOT clear the recency gate, even though `record_count >= 3`."""
+def test_cohort_path_g1_admits_uid_with_two_distinct_round_ids_in_window():
+    """The recency gate is now "≥2 distinct round_ids within
+    `5*cycle_length` blocks of `cur_rid`", not an exact (cur_rid,
+    cur_rid - cycle_length) pair. A UID scored at cur_rid and
+    cur_rid - 3*cycle_length still qualifies — earlier code rejected it."""
     cur_rid = 1000
     cycle_length = 100
     agg = MinerScoreAggregator(max_points=8, max_history_points=64)
     ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    # uid 1: 3 records, but the previous round is missing.
-    for i, rid in enumerate([cur_rid - 3 * cycle_length, cur_rid - 2 * cycle_length, cur_rid]):
+    # uid 1: two distinct round_ids inside the window, but NOT consecutive.
+    for i, rid in enumerate([cur_rid - 3 * cycle_length, cur_rid]):
         agg.add_score(uid=1, hotkey="hk1", score=1.0,
                       ts=ts.replace(microsecond=i + 1), round_id=rid)
-    # uid 2: full last-2-rounds history.
-    for i, rid in enumerate([cur_rid - 2 * cycle_length, cur_rid - cycle_length, cur_rid]):
+    # uid 2: one round_id only — fails the ≥2 gate.
+    agg.add_score(uid=2, hotkey="hk2", score=1.0, ts=ts, round_id=cur_rid)
+    # uid 3: a single round_id repeated twice — still 1 distinct → fails.
+    agg.add_score(uid=3, hotkey="hk3", score=0.5,
+                  ts=ts.replace(microsecond=20), round_id=cur_rid)
+    agg.add_score(uid=3, hotkey="hk3", score=0.7,
+                  ts=ts.replace(microsecond=21), round_id=cur_rid)
+
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1, 2, 3)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+    )
+    assert payload.cohort_emission is True
+    assert payload.weight_group_1 == (1,)
+
+
+def test_cohort_path_g1_excludes_uid_outside_window():
+    """A UID with 2 distinct round_ids, both OUTSIDE the
+    `5*cycle_length` window, does not qualify for G1."""
+    cur_rid = 1000
+    cycle_length = 100
+    # Window: [cur_rid - 500, cur_rid] = [500, 1000].
+    agg = MinerScoreAggregator(max_points=8, max_history_points=64)
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # uid 1: two distinct round_ids, both BELOW the window.
+    for i, rid in enumerate([cur_rid - 10 * cycle_length, cur_rid - 6 * cycle_length]):
+        agg.add_score(uid=1, hotkey="hk1", score=1.0,
+                      ts=ts.replace(microsecond=i + 1), round_id=rid)
+    # uid 2: two distinct round_ids, both INSIDE the window.
+    for i, rid in enumerate([cur_rid - 2 * cycle_length, cur_rid]):
         agg.add_score(uid=2, hotkey="hk2", score=1.0,
                       ts=ts.replace(microsecond=i + 10), round_id=rid)
 

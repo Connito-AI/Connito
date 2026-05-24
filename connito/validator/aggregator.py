@@ -522,6 +522,28 @@ class MinerScoreAggregator:
                         return True
             return seen == targets
 
+    def count_distinct_round_ids_in_range(
+        self, uid: int, min_round_id: int, max_round_id: int,
+    ) -> int:
+        """Distinct ``round_id``s in ``[min_round_id, max_round_id]`` for
+        which ``uid`` has at least one recorded score. Used by the G1
+        recency gate to approximate "scored in ≥2 of the last few rounds"
+        without pinning to an exact round_id step (which mis-fires when
+        the validator's loop spans multiple chain cycles per round)."""
+        uid = int(uid)
+        lo, hi = int(min_round_id), int(max_round_id)
+        with self._lock:
+            state = self._miners.get(uid)
+            if state is None:
+                return 0
+            seen: set[int] = set()
+            for _ts, _v, rid in state.series.points:
+                if rid is None:
+                    continue
+                if lo <= rid <= hi:
+                    seen.add(int(rid))
+            return len(seen)
+
     # ---------- Persistence ----------
     def to_json(self) -> str:
         """Serialize miners to JSON (schema v2: envelope + round_id per point)."""
