@@ -1,0 +1,40 @@
+# Optional override: ship validator container stdout to Grafana Cloud Loki.
+#
+# Activate by setting in connito/validator/docker/.env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.loki.override.yml
+#   LOKI_URL=https://<USER>:<TOKEN>@logs-prod-<region>.grafana.net/loki/api/v1/push
+#   HOTKEY_SS58=<your_validator_ss58>
+#   VALIDATOR_UID=<your_uid_on_subnet>
+#
+# Prerequisites on the host (one-time):
+#
+#   docker plugin install grafana/loki-docker-driver \
+#     --alias loki --grant-all-permissions
+#
+# See docs/validator-docker-operators.md for the full walkthrough.
+#
+# Notes on the options below:
+# - `mode: non-blocking` + `max-buffer-size` so a Loki outage cannot stall
+#   the validator's stdio. PID 1 keeps running even if the push backend is
+#   slow or unreachable; oldest queued lines are dropped first.
+# - `keep-file: "true"` mirrors logs to the default json-file driver on
+#   disk in parallel, so `docker compose logs validator` still works for
+#   local debugging and nothing is lost if Loki is unreachable.
+# - Labels stay low-cardinality (hotkey, uid, service, project, image_tag).
+#   Do not add per-request or timestamped fields here — Loki indexes
+#   labels and high-cardinality values blow up the stream count.
+
+services:
+  validator:
+    logging:
+      driver: loki
+      options:
+        loki-url: "${LOKI_URL:?set LOKI_URL in .env to enable Loki shipping}"
+        loki-external-labels: "service=validator,hotkey=${HOTKEY_SS58:?set HOTKEY_SS58 in .env},uid=${VALIDATOR_UID:?set VALIDATOR_UID in .env},project=${COMPOSE_PROJECT_NAME},image_tag=${IMAGE}"
+        loki-batch-size: "1024"
+        loki-retries: "5"
+        loki-timeout: "10s"
+        mode: "non-blocking"
+        max-buffer-size: "10m"
+        keep-file: "true"
