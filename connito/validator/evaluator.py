@@ -401,18 +401,19 @@ def build_submission_uid_weights(
 
     Inputs needed for cohort-style emission:
       * `cohort_state` — provides `validation_group_a/b/c`.
-      * `round_id` — anchor for the recency gate
-        (`{round_id, round_id - cycle_length}`).
-      * `cycle_length` — block-spacing between consecutive rounds.
+      * `round_id` — anchor for the recency gate.
+      * `cycle_length` — sizes the recency window (`5 * cycle_length`).
       * `eval_cfg` — reads `weight_group_*_size` and `weight_group_*_share`.
 
     Cohort emission rule (when all four are present):
       * Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
         of A∪B by aggregator avg, restricted to UIDs with
-        `record_count >= 2` AND a score recorded in BOTH the current
-        and previous rounds. Empty-G1 guard: if no UID clears,
-        redirect to `uid = 0` (subnet owner) so the validator stays
-        at full emission.
+        `record_count >= 2` AND scores recorded in at least 2 distinct
+        round_ids within the last `5 * cycle_length` blocks. The window
+        is intentionally loose so a UID that was in A∪B for only some of
+        the recent rounds still qualifies. Empty-G1 guard: if no UID
+        clears, redirect to `uid = 0` (subnet owner) so the validator
+        stays at full emission.
       * Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
         of A∪B∪C \\ G1 by aggregator avg, restricted to UIDs with
         `record_count >= 1` (no recency gate).
@@ -435,12 +436,14 @@ def build_submission_uid_weights(
     ab_uids = list(cohort_state.validation_group_a) + list(cohort_state.validation_group_b)
     abc_uids = ab_uids + list(cohort_state.validation_group_c)
     cur_rid = int(round_id)
-    g1_required_rids = (cur_rid, cur_rid - int(cycle_length))
+    g1_window_min_rid = cur_rid - 5 * int(cycle_length)
 
     ab_qualified = [
         u for u in ab_uids
         if score_aggregator.record_count(u) >= 2
-        and score_aggregator.has_round_ids(u, g1_required_rids)
+        and score_aggregator.count_distinct_round_ids_in_range(
+            u, g1_window_min_rid, cur_rid,
+        ) >= 2
     ]
     g1 = _rg.select_top_n_by_local_score(
         ab_qualified,
