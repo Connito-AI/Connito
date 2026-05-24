@@ -33,7 +33,6 @@ from connito.shared.chain import (
     SignedModelHashChainCommit,
     WorkerChainCommit,
     get_chain_commits,
-    get_validator_chain_commits,
 )
 from connito.shared.expert_manager import (
     ExpertManager,
@@ -742,18 +741,10 @@ def build_chain_checkpoints_from_previous_phase(
         )
 
         # --- Get commits from chain at the right blocks ---
-        # for_role="validator": skip the full-subnet `get_all_commitments`
-        # pass and only pull commits for whitelisted validators. The miner
-        # path still needs every commit since miner UIDs aren't whitelisted
-        # up front.
-        if for_role == "validator":
-            fetch_commits = get_validator_chain_commits
-        else:
-            fetch_commits = get_chain_commits
-        signed_hash_chain_commits: tuple[SignedModelHashChainCommit, bittensor.Neuron] = fetch_commits(
+        signed_hash_chain_commits: tuple[SignedModelHashChainCommit, bittensor.Neuron] = get_chain_commits(
             config, subtensor, block=commit_1_end_block, signature_commit=True
         )
-        hash_chain_commits: tuple[WorkerChainCommit, bittensor.Neuron] = fetch_commits(
+        hash_chain_commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(
             config, subtensor, block=commit_2_end_block
         )
         if not signed_hash_chain_commits or not hash_chain_commits:
