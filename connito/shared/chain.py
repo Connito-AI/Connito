@@ -420,10 +420,13 @@ def get_validator_chain_commits(
     """Like ``get_chain_commits`` but only pulls commits for whitelisted
     validators (per the owner API).
 
-    Saves a ``get_all_commitments(netuid=)`` over ~256 UIDs by issuing one
-    ``get_commitment(netuid=, uid=)`` per whitelisted validator instead.
-    Skips role-gating entirely (every hotkey we query is already known to
-    be a validator).
+    Avoids the full-subnet ``get_all_commitments`` + role-gating pass by
+    issuing one per-hotkey ``CommitmentOf`` substrate query per
+    whitelisted validator. Calls ``subtensor.get_commitment_metadata``
+    + ``decode_metadata`` directly rather than ``subtensor.get_commitment``
+    — the latter re-fetches the *full* metagraph on every call (see
+    bittensor SDK), which would more than negate the gain on a subnet
+    with N validators.
 
     ``metagraph`` may be passed in (e.g. a lite metagraph already fetched
     by the caller) to avoid a duplicate metagraph RPC. Hotkey→UID mapping
@@ -431,6 +434,9 @@ def get_validator_chain_commits(
     assignment, pass a metagraph fetched at ``block``.
     """
     from connito.shared.cycle import get_validator_whitelist_from_api  # lazy: avoids cycle import cycle
+    # The decoder lives in bittensor.core; import lazily to keep this
+    # module importable even if the SDK reshuffles internals.
+    from bittensor.core.chain_data.utils import decode_metadata
 
     whitelist = get_validator_whitelist_from_api(config)
     if not whitelist:
@@ -447,12 +453,22 @@ def get_validator_chain_commits(
         if uid is None:
             continue
         try:
-            raw = subtensor.get_commitment(
-                netuid=config.chain.netuid, uid=uid, block=block,
+            metadata = subtensor.get_commitment_metadata(
+                netuid=config.chain.netuid, hotkey_ss58=hotkey, block=block,
             )
         except Exception as e:
             logger.warning(
-                "get_validator_chain_commits: per-uid fetch failed",
+                "get_validator_chain_commits: per-hotkey CommitmentOf query failed",
+                uid=uid, hotkey=hotkey, error=str(e),
+            )
+            continue
+        if not metadata:
+            continue
+        try:
+            raw = decode_metadata(metadata)
+        except Exception as e:
+            logger.debug(
+                "get_validator_chain_commits: decode_metadata failed",
                 uid=uid, hotkey=hotkey, error=str(e),
             )
             continue
