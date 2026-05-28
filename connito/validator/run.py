@@ -177,11 +177,16 @@ from connito.validator.inter_validator_connection import (
 from connito.shared.telemetry import (
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
+    VALIDATOR_COHORT_EPOCH,
     VALIDATOR_CURRENT_ROUND_ID,
+    VALIDATOR_GLOBAL_OPT_STEP,
     VALIDATOR_HEARTBEAT_TOTAL,
     VALIDATOR_MINER_WEIGHT_SUBMITTED,
     VALIDATOR_ROUND_LIFECYCLE_STEP,
     SystemStatePoller,
+    set_miner_assignment_role,
+    set_miner_cohort_group,
+    set_miner_last_observed_commit_block,
     set_miner_score_snapshot,
     set_validator_identity,
     track_metagraph_sync_latency,
@@ -1281,6 +1286,43 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception:
                 pass
 
+            # Dashboard telemetry: publish per-miner cohort group, this
+            # validator's assignment role, and last-observed-commit block for
+            # the round we just froze. All values are read off `new_round` (no
+            # extra chain/RPC work) and emitted for EVERY metagraph uid so the
+            # gateway sees a fresh value per miner each round — stale group /
+            # assignment membership never lingers across cohort epochs. One
+            # broad try/except: telemetry must never break the round loop.
+            try:
+                _group_code_by_uid: dict[int, int] = {}
+                for _uid in new_round.validation_group_a:
+                    _group_code_by_uid[int(_uid)] = 1
+                for _uid in new_round.validation_group_b:
+                    _group_code_by_uid[int(_uid)] = 2
+                for _uid in new_round.validation_group_c:
+                    _group_code_by_uid[int(_uid)] = 3
+
+                _foreground_set = {int(u) for u in new_round.foreground_uids}
+                _background_set = {int(u) for u in new_round.background_uids}
+
+                for _uid in range(len(metagraph.hotkeys)):
+                    set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
+                    if _uid in _foreground_set:
+                        set_miner_assignment_role(_uid, 1)
+                    elif _uid in _background_set:
+                        set_miner_assignment_role(_uid, 2)
+                    else:
+                        set_miner_assignment_role(_uid, 0)
+
+                # Last block at which we confirmed a miner's valid chain commit.
+                for _uid, _ckpt in new_round.uid_to_chain_checkpoint.items():
+                    if getattr(_ckpt, "hf_repo_id", None) and getattr(_ckpt, "hf_revision", None):
+                        set_miner_last_observed_commit_block(int(_uid), new_round.round_id)
+
+                VALIDATOR_COHORT_EPOCH.set(float(new_round.cohort_epoch))
+            except Exception as _e:
+                logger.warning("Failed to emit dashboard round telemetry", error=str(_e))
+
             # Persist the (possibly newly advanced) cohort state to disk
             # BEFORE round_ref.swap so a crash between freeze and swap can
             # replay deterministically (the next process picks up the same
@@ -1626,6 +1668,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 model_ckpt.expert_group = config.task.exp.group_id
                 model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
+                # Dashboard telemetry: the model's global optimization version
+                # (chain-committed `global_ver`) is the "steps" the leaderboard
+                # charts plot against. Best-effort.
+                try:
+                    VALIDATOR_GLOBAL_OPT_STEP.set(float(model_ckpt.global_ver))
+                except Exception:
+                    pass
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
                 logger.info("Commit new signed_model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(SignedModelHashChainCommit(
