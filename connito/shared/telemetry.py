@@ -188,6 +188,46 @@ VALIDATOR_MINER_EVAL_STATUS = Gauge(
     ["miner_uid"],
 )
 
+# Dashboard-facing telemetry (validator-side emission for the leaderboard UI).
+# Model global optimization version this validator is training. Single value;
+# distinct from the loop's `global_opt_step` (which carries a block number).
+VALIDATOR_GLOBAL_OPT_STEP = Gauge(
+    "validator_global_opt_step",
+    "Model global optimization version (global_ver) this validator is training",
+)
+# Current cohort epoch index for the round-group construction scheme. Single
+# value; advances at each cohort boundary (every 8th cycle).
+VALIDATOR_COHORT_EPOCH = Gauge(
+    "validator_cohort_epoch",
+    "Current cohort epoch index for the round-group construction scheme",
+)
+# Per-miner cohort validation group for the active round. Integer-coded (like
+# eval_status) so the gateway renders the letter without label-cardinality
+# churn when a miner rotates groups. Reset for every metagraph uid each round
+# (0 for miners in no group) so stale membership never lingers across epochs.
+VALIDATOR_MINER_COHORT_GROUP = Gauge(
+    "validator_miner_cohort_group",
+    "Cohort validation group for a miner this round (see COHORT_GROUP_CODES)",
+    ["miner_uid"],
+)
+# Per-miner assignment role for THIS validator's roster this round. Each
+# validator emits its own slice; the gateway unions across validators by the
+# scrape instance label. Reset for every metagraph uid each round.
+VALIDATOR_MINER_ASSIGNMENT_ROLE = Gauge(
+    "validator_miner_assignment_role",
+    "This validator's assignment role for a miner this round (see ASSIGNMENT_ROLE_CODES)",
+    ["miner_uid"],
+)
+# Round (freeze) block at which this validator last observed a valid chain
+# commit for the miner. Answers "do validators see my submission?" — set to the
+# round_id of the most recent freeze where the miner had a valid (hf_repo_id,
+# hf_revision) commit.
+VALIDATOR_MINER_LAST_OBSERVED_COMMIT_BLOCK = Gauge(
+    "validator_miner_last_observed_commit_block",
+    "Round (freeze) block at which this validator last observed a valid chain commit for the miner",
+    ["miner_uid"],
+)
+
 # Per-round lifecycle (background submission validation)
 VALIDATOR_ROUND_LIFECYCLE_STEP = Gauge(
     "validator_round_lifecycle_step",
@@ -384,6 +424,44 @@ def set_miner_score_snapshot(
             VALIDATOR_MINER_SCORE_AVG.labels(miner_uid=str(miner_uid)).set(float(avg))
         if samples is not None:
             VALIDATOR_MINER_SCORE_SAMPLES.labels(miner_uid=str(miner_uid)).set(float(samples))
+    except Exception:
+        pass
+
+
+# CONTRACT: COHORT_GROUP_CODES and ASSIGNMENT_ROLE_CODES are mirrored by the
+# telemetry gateway (same pattern as EVAL_STATUS_CODES). Changing a code
+# retroactively reinterprets old Prometheus samples — extend, do not renumber.
+COHORT_GROUP_CODES: dict[int, str] = {0: "none", 1: "A", 2: "B", 3: "C"}
+ASSIGNMENT_ROLE_CODES: dict[int, str] = {0: "unassigned", 1: "foreground", 2: "background"}
+
+
+def set_miner_cohort_group(miner_uid: int | str, code: int) -> None:
+    """Set the per-miner cohort-group gauge (see COHORT_GROUP_CODES). Pass 0
+    for miners in no group this round. Best-effort — never raises.
+    """
+    try:
+        VALIDATOR_MINER_COHORT_GROUP.labels(miner_uid=str(miner_uid)).set(float(code))
+    except Exception:
+        pass
+
+
+def set_miner_assignment_role(miner_uid: int | str, code: int) -> None:
+    """Set this validator's per-miner assignment-role gauge (see
+    ASSIGNMENT_ROLE_CODES). Pass 0 for miners not on this validator's roster
+    this round. Best-effort — never raises.
+    """
+    try:
+        VALIDATOR_MINER_ASSIGNMENT_ROLE.labels(miner_uid=str(miner_uid)).set(float(code))
+    except Exception:
+        pass
+
+
+def set_miner_last_observed_commit_block(miner_uid: int | str, block: int | float) -> None:
+    """Record the round (freeze) block at which this validator last observed a
+    valid chain commit for the miner. Best-effort — never raises.
+    """
+    try:
+        VALIDATOR_MINER_LAST_OBSERVED_COMMIT_BLOCK.labels(miner_uid=str(miner_uid)).set(float(block))
     except Exception:
         pass
 
