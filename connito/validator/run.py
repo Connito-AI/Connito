@@ -405,6 +405,16 @@ def setup_training(
     )
 
 
+def _release_global_model_grads(model: nn.Module) -> None:
+    # populate_global_grads_from_local writes .grad on every param it iterates,
+    # not just those in outer_optimizer.param_groups, so optimizer.zero_grad()
+    # alone leaks the .grad storage for params with requires_grad=False. That
+    # residue is what was driving the VRAM baseline from 18 GB to 36 GB across
+    # rounds on the 48 GB validator.
+    for p in model.parameters():
+        p.grad = None
+
+
 async def aggregate_miner_gradient_change(
     config: ValidatorConfig,
     global_model: nn.Module,
@@ -484,10 +494,30 @@ async def aggregate_miner_gradient_change(
                     grad_delta=round(post_grad_sum - pre_grad_sum, 6),
                 )
                 merged_uids.append(str(job.uid))
+        except torch.cuda.OutOfMemoryError:
+            # populate_global_grads_from_local can OOM mid-iteration through
+            # parameters, leaving a partially-applied gradient. Drop the
+            # whole grad state so the caller's grad_is_valid check fails
+            # cleanly and the round is skipped without killing the process.
+            logger.error(
+                "aggregate_miner_gradient_change: CUDA OOM during populate — "
+                "discarding partial gradient and skipping merge this round",
+                uid=job.uid,
+            )
+            _release_global_model_grads(global_model)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # finally still runs and releases miner_model.
+            oom_abort = True
+        else:
+            oom_abort = False
         finally:
             del miner_model
             gc.collect()
             release_cpu_ram()
+
+        if oom_abort:
+            return []
 
     return merged_uids
 
@@ -631,7 +661,12 @@ def run_global_optimization(
     logger.debug("start syncing shared weights")
 
     outer_optimizer.step()
-    outer_optimizer.zero_grad()
+    outer_optimizer.zero_grad(set_to_none=True)
+    # Also release .grad on params not registered with the outer optimizer
+    # (requires_grad=False expert params get .grad populated by
+    # populate_global_grads_from_local). Without this, the storage pins
+    # ~model-size of VRAM across rounds.
+    _release_global_model_grads(global_model)
 
     new_shared_name, new_shared_sum = get_weight_sum(global_model, shared=True)
     new_expert_name, new_expert_sum = get_weight_sum(global_model, shared=False)
@@ -1477,16 +1512,31 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
             logger.info("Aggregating miner gradient change locally")
-            merged_uids = asyncio.run(
-                aggregate_miner_gradient_change(
-                    config=config,
-                    global_model=global_model,
-                    device=device,  # gradient aggregation runs on GPU
-                    rank=rank,
-                    outer_optimizer=outer_optimizer,
-                    miner_jobs=miner_jobs,
+            try:
+                merged_uids = asyncio.run(
+                    aggregate_miner_gradient_change(
+                        config=config,
+                        global_model=global_model,
+                        device=device,  # gradient aggregation runs on GPU
+                        rank=rank,
+                        outer_optimizer=outer_optimizer,
+                        miner_jobs=miner_jobs,
+                    )
                 )
-            )
+            except torch.cuda.OutOfMemoryError:
+                # Inner per-miner OOM is already handled by
+                # aggregate_miner_gradient_change. This outer guard catches
+                # OOM in surrounding bookkeeping (model load, sum reduction)
+                # so a single bad round can't kill the validator process.
+                logger.error(
+                    "aggregate_miner_gradient_change: CUDA OOM at call site — "
+                    "skipping merge/optimizer this round"
+                )
+                _release_global_model_grads(global_model)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                merged_uids = []
 
             grad_sum_after_aggregation = sum_model_gradients(global_model)
             # Use element-wise check: the sum can overflow bf16 to inf even
@@ -1514,7 +1564,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     merged_uids=merged_uids,
                     grad_sum=grad_sum_after_aggregation,
                 )
-                outer_optimizer.zero_grad()  # ensure clean state
+                outer_optimizer.zero_grad(set_to_none=True)
+                _release_global_model_grads(global_model)
 
             cleanup(global_model)
 
@@ -1606,7 +1657,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         # Sync was orphaned or skipped: don't run the outer
                         # optimizer (model.grad may be in an indeterminate
                         # state) and trigger the peer-resync path next
-                        # cycle via _participated_in_merge=False.
+                        # cycle via _participated_in_merge=False. Release
+                        # the aggregated-but-unused grads so they don't
+                        # accumulate into the next round's populate, and
+                        # so the storage isn't pinned through to next cycle.
+                        _release_global_model_grads(global_model)
                         _participated_in_merge = False
                 else:
                     logger.info(
