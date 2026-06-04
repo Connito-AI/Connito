@@ -110,7 +110,10 @@ def load_pretrained_model_low_mem(
     model = model_class.from_pretrained(
         model_path,
         config=moe_config,
-        dtype=model_dtype,
+        # `torch_dtype` (not `dtype`): transformers 4.x has no `dtype` alias for
+        # `from_pretrained`, so passing `dtype` there is silently ignored and the
+        # model loads at the default fp32 — doubling host RAM on this low-mem path.
+        torch_dtype=model_dtype,
         low_cpu_mem_usage=False,
         ignore_mismatched_sizes=True,
     )

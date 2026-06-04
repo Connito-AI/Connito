@@ -16,16 +16,23 @@ from transformers.utils import (
     WEIGHTS_NAME,
     cached_file,
 )
+# transformers 4.x (<5) compatibility:
+#   - `DeepseekV2Experts` does not exist on 4.x — experts there are an
+#     `nn.ModuleList` of MLPs. We keep our own fused 3D-tensor expert design
+#     (see `CustomDeepseekV2Experts`) and subclass `nn.Module` directly, so this
+#     symbol is intentionally not imported.
+#   - The MoE block is named `DeepseekV2MoE` on 4.x (vs `DeepseekV2Moe` on v5)
+#     and its `forward` uses a `DeepseekV2MoEGate` + ModuleList loop that would
+#     bypass our routing/fused experts. `CustomDeepseekV2Moe` therefore also
+#     subclasses `nn.Module` and defines its own `forward`.
 from transformers.models.deepseek_v2.modeling_deepseek_v2 import (
     ACT2FN,
     DeepseekV2Attention,
     DeepseekV2Config,
     DeepseekV2DecoderLayer,
-    DeepseekV2Experts,
     DeepseekV2ForCausalLM,
     DeepseekV2MLP,
     DeepseekV2Model,
-    DeepseekV2Moe,
     DeepseekV2PreTrainedModel,
     DeepseekV2RotaryEmbedding,
     DeepseekV2RMSNorm,
@@ -103,8 +110,13 @@ def _validate_assignment_bounds(
         )
 
 
-class CustomDeepseekV2Experts(DeepseekV2Experts):
-    """Collection of expert weights stored as 3D tensors."""
+class CustomDeepseekV2Experts(nn.Module):
+    """Collection of expert weights stored as 3D tensors.
+
+    Subclasses ``nn.Module`` (not transformers' ``DeepseekV2Experts``, which is
+    v5-only) so the fused ``gate_up_proj``/``down_proj`` design and its custom
+    state-dict serialization work identically on transformers 4.x and 5.x.
+    """
 
     def __init__(self, config, expert_indices):
         nn.Module.__init__(self)
@@ -324,7 +336,7 @@ class CustomDeepseekV2Experts(DeepseekV2Experts):
 
         return final_hidden_states
     
-class CustomDeepseekV2Moe(DeepseekV2Moe):
+class CustomDeepseekV2Moe(nn.Module):
     def __init__(self, config: DeepseekV2Config, layer_id: int | None = None):
         nn.Module.__init__(self)
         self.config = config
@@ -450,7 +462,26 @@ class CustomDeepseekV2Moe(DeepseekV2Moe):
 
         topk_weight = topk_weight * self.routed_scaling_factor
         return topk_idx, topk_weight
-    
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Explicit forward replicating transformers v5 `DeepseekV2Moe.forward`.
+        # On v5 this was inherited; on 4.x the base `DeepseekV2MoE.forward`
+        # routes via a `DeepseekV2MoEGate` + ModuleList loop and would bypass our
+        # masked routing and fused experts, so we define it ourselves to keep
+        # numerics identical across transformers versions.
+        residuals = hidden_states
+        orig_shape = hidden_states.shape
+        router_logits = nn.functional.linear(
+            hidden_states.type(torch.float32), self.gate.weight.type(torch.float32)
+        )
+        topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        if getattr(self, "shared_experts", None) is not None:
+            hidden_states = hidden_states + self.shared_experts(residuals)
+        return hidden_states
+
+
 class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, config: DeepseekV2Config, layer_idx: int):
         nn.Module.__init__(self)
