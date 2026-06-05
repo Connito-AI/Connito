@@ -20,9 +20,10 @@ multihash==0.1.1
 # -----------------------------
 # ML stack
 # -----------------------------
-transformers==5.4.0
+transformers>=4.45,<5
 datasets==3.0.0
-huggingface_hub==1.10.1
+huggingface_hub>=0.24,<1
+tokenizers>=0.20,<0.22
 safetensors==0.4.5
 torchdata==0.11.0
 scipy==1.15.3
