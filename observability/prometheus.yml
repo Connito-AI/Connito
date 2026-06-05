@@ -12,3 +12,10 @@ scrape_configs:
     static_configs:
       # Expecting miner 0 on 8100, miner 1 on 8101, etc.
       - targets: ['localhost:8100']
+
+  - job_name: 'mycelia_owner_eval'
+    static_configs:
+      # Standalone owner eval daemon (connito.owner_eval). Publishes owner_eval_*
+      # metrics on eval_pipeline.telemetry_port (default 8400). Point this at the
+      # host:port where the owner runs the daemon.
+      - targets: ['localhost:8400']
