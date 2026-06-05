@@ -278,7 +278,21 @@ def wait_till(
             blocks_remaining = blocks_till + block_offset
 
         if blocks_remaining <= 0:
-            break
+            if phase_response is not None:
+                break
+            # The cycle-phase API was unreachable this iteration (should_act →
+            # get_phase_from_api returned None, e.g. a transient DNS failure), so
+            # `blocks_remaining` here is derived only from the fallback
+            # `blocks_till` and we have NOT actually observed the target phase.
+            # Breaking would fall through to `phase_response.phase_name` below and
+            # crash wait_till with AttributeError, taking the whole validator down
+            # on a transient network blip. Keep polling on the fallback cadence
+            # until the API (and DNS) recover instead.
+            logger.warning(
+                "wait_till: cycle phase API unreachable while waiting for "
+                f"'{phase_name}' (block_offset={block_offset}); will keep polling"
+            )
+            blocks_remaining = poll_fallback_block
 
         sleep_sec = min(
             blocks_remaining,
@@ -332,10 +346,15 @@ def wait_till(
                 last_heartbeat_at = now
 
     if phase_response is None:
+        # Defensive: the loop above now only breaks once `phase_response` is
+        # non-None, so this should be unreachable. Guard it anyway and return
+        # without dereferencing, so no future change can re-introduce the
+        # AttributeError crash that dereferencing None here previously caused.
         logger.warning(
             f"wait_till: loop exited but phase_response is None for phase "
             f"'{phase_name}' (block_offset={block_offset})"
         )
+        return phase_response
     log_phase(
         f"<{phase_name}> reached (block_offset={block_offset}); "
         f"current phase=<{phase_response.phase_name}>, "
