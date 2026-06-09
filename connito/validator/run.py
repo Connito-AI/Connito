@@ -1340,6 +1340,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 _foreground_set = {int(u) for u in new_round.foreground_uids}
                 _background_set = {int(u) for u in new_round.background_uids}
 
+                # Tail = miners on this validator's roster (foreground or
+                # background) but outside the formal A/B/C tiers. Distinct
+                # from code 0 ("none"), which means the validator has no
+                # roster status for this miner at all. The dashboard uses
+                # this to render "evaluated opportunistically" instead of
+                # leaving these miners visually indistinguishable from
+                # unrostered ones.
+                for _uid in (_foreground_set | _background_set) - _group_code_by_uid.keys():
+                    _group_code_by_uid[_uid] = 4
+
                 for _uid in range(len(metagraph.hotkeys)):
                     set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
                     if _uid in _foreground_set:
