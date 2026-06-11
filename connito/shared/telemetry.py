@@ -497,7 +497,10 @@ def set_miner_score_snapshot(
 # CONTRACT: COHORT_GROUP_CODES and ASSIGNMENT_ROLE_CODES are mirrored by the
 # telemetry gateway (same pattern as EVAL_STATUS_CODES). Changing a code
 # retroactively reinterprets old Prometheus samples — extend, do not renumber.
-COHORT_GROUP_CODES: dict[int, str] = {0: "none", 1: "A", 2: "B", 3: "C"}
+# Code 4 ("tail") = miners on this validator's foreground/background roster but
+# outside the formal A/B/C tiers (the staleness pool). Distinct from 0 ("none"),
+# which means the validator has no roster status for this miner this round.
+COHORT_GROUP_CODES: dict[int, str] = {0: "none", 1: "A", 2: "B", 3: "C", 4: "tail"}
 ASSIGNMENT_ROLE_CODES: dict[int, str] = {0: "unassigned", 1: "foreground", 2: "background"}
 
 
