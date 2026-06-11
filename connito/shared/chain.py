@@ -58,7 +58,7 @@ _FALLBACK_TOP_N_PEERS: int = 3
 # uid=0 escalation path (all peers in even-weight state) already emits
 # 100% to uid=0 and is unaffected.
 SUBNET_OWNER_UID: int = 0
-SUBNET_OWNER_WEIGHT_SHARE: float = 0.05
+SUBNET_OWNER_WEIGHT_SHARE: float = 0.10
 
 
 def reserve_subnet_owner_share(
@@ -82,9 +82,9 @@ def reserve_subnet_owner_share(
 
     Note: this helper does NOT defend against ``top_k`` filtering on
     the downstream submitter — if ``top_k`` is set tightly enough that
-    ``owner_uid``'s 5% gets cut, the share is lost. The validator's
-    current ``ChainSubmitter`` uses ``top_k=None`` so this is fine in
-    production; reconsider if that changes.
+    ``owner_uid``'s reserved share gets cut, the share is lost. The
+    validator's current ``ChainSubmitter`` uses ``top_k=None`` so this
+    is fine in production; reconsider if that changes.
     """
     if share <= 0.0:
         return dict(uid_weights)
