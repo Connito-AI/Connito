@@ -28,6 +28,19 @@ def configure_logging() -> None:
     logging.getLogger("datasets").setLevel(logging.WARNING)
     logging.getLogger("datasets.builder").setLevel(logging.WARNING)
 
+    # Drop huggingface_hub's per-download "Could not set the permissions" warning.
+    # It fires from `file_download._chmod_and_move` when chmod loses a race with
+    # the `.incomplete` tmp file being cleaned up — harmless, but emits two
+    # multi-line warnings per fetched file. Over a validator's day that's tens
+    # of thousands of lines that drown the rest of the log. We target the
+    # specific message rather than silencing the whole logger so genuine HF
+    # warnings still surface.
+    class _HfPermissionsNoise(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "Could not set the permissions on the file" not in record.getMessage()
+
+    logging.getLogger("huggingface_hub.file_download").addFilter(_HfPermissionsNoise())
+
     # 2) structlog processors (common)
     timestamper = structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=use_utc)
     common = [
