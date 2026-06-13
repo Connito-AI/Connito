@@ -371,3 +371,156 @@ def download_checkpoint_from_hf_with_timeout(
         # the caller can move on. cancel_futures=True clears anything queued
         # (no-op here since max_workers=1 and we submitted one task).
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _download_child(
+    conn,
+    repo_id: str,
+    revision: str,
+    filenames: list[str],
+    dest_dir: str,
+    token: str | None,
+    token_env_var: str,
+) -> None:
+    # Entry point in the spawned child. Pickle boundary keeps args
+    # simple types (str/list); reconstruct Path inside the child.
+    try:
+        result = download_checkpoint_from_hf(
+            repo_id=repo_id,
+            revision=revision,
+            filenames=filenames,
+            dest_dir=Path(dest_dir),
+            token=token,
+            token_env_var=token_env_var,
+        )
+        conn.send(("ok", str(result)))
+    except BaseException as e:
+        import traceback as _tb
+        conn.send(("err", (type(e).__name__, str(e), _tb.format_exc())))
+    finally:
+        conn.close()
+
+
+def download_checkpoint_from_hf_subprocess(
+    *,
+    repo_id: str,
+    revision: str,
+    filenames: list[str],
+    dest_dir: Path,
+    token: str | None = None,
+    token_env_var: str = "HF_TOKEN",
+    timeout_sec: float | None,
+) -> Path:
+    """Run `download_checkpoint_from_hf` in a spawned child process.
+
+    Replaces `download_checkpoint_from_hf_with_timeout` for callers that
+    invoke many downloads from a long-running process. The thread-based
+    variant deliberately leaks the worker thread on timeout
+    (`executor.shutdown(wait=False, cancel_futures=True)`); over a
+    multi-day validator the leaked threads — plus
+    `huggingface_hub`'s xet backend which spins its own thread pool
+    per call — accumulate enough that the shared HF session pool
+    degrades. The observed symptom is a falling success rate even on
+    revisions that are present and downloadable from a fresh Python
+    interpreter in the same container with the same token — i.e. the
+    failure is in the parent process's accumulated state, not in HF
+    or the network. See
+    `/connito/test/test_download_checkpoint_subprocess.py` for the
+    invariants this helper pins.
+
+    A subprocess can be cleanly terminated on timeout, so this code
+    path leaves no residual state in the parent regardless of how
+    many timeouts occur. Spawn cost is ~200-500ms once the page
+    cache is warm, dominated by `huggingface_hub`'s own imports —
+    acceptable amortised over a 3-4 GB download and a per-cycle
+    download budget measured in tens of attempts.
+
+    Uses `spawn` (not `fork`) — the validator has CUDA initialized in
+    the parent, and a forked child inherits a half-initialized CUDA
+    context that segfaults on first use.
+
+    Raises:
+        TimeoutError: if the child does not finish within ``timeout_sec``.
+        RuntimeError: if the child crashed (no result sent) or raised
+            any other exception during the download. The original
+            exception's type name and stack trace are preserved in the
+            message so the caller can diagnose the cause.
+    """
+    if timeout_sec is None:
+        return download_checkpoint_from_hf(
+            repo_id=repo_id,
+            revision=revision,
+            filenames=filenames,
+            dest_dir=dest_dir,
+            token=token,
+            token_env_var=token_env_var,
+        )
+
+    import multiprocessing as _mp
+
+    ctx = _mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_download_child,
+        args=(
+            child_conn,
+            repo_id,
+            revision,
+            list(filenames),
+            str(dest_dir),
+            token,
+            token_env_var,
+        ),
+        name="hf-download-worker",
+    )
+    proc.start()
+    # Parent doesn't write — close its handle so the child sees EOF
+    # cleanly on its own copy of the read end if it ever inspects.
+    child_conn.close()
+
+    try:
+        proc.join(timeout=timeout_sec)
+        if proc.is_alive():
+            # Timed out: terminate, then escalate to kill if needed.
+            # SIGTERM gives the child a chance to flush its HF connection
+            # cleanly; SIGKILL is the fallback if it ignores SIGTERM (e.g.
+            # stuck inside a C extension that masks signals).
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            raise TimeoutError(
+                f"HF download subprocess exceeded {timeout_sec}s; killed"
+            )
+
+        # The child writes exactly one message before exiting; if it
+        # crashed before either `conn.send` (e.g. import failure, OOM,
+        # SIGSEGV inside a C extension) the pipe is either empty or
+        # closed. `poll()` returns False for the empty case but True
+        # for the closed-without-write case (the OS surfaces EOF as
+        # "data available"), and the subsequent `recv()` then raises
+        # `EOFError`. Both shapes mean the same thing: the child died
+        # silently. Translate both into a single RuntimeError that
+        # carries the exit code so an oncall can grep for it.
+        try:
+            if not parent_conn.poll():
+                raise RuntimeError(
+                    f"HF download subprocess exited without sending a result "
+                    f"(exitcode={proc.exitcode})"
+                )
+            tag, payload = parent_conn.recv()
+        except EOFError as e:
+            raise RuntimeError(
+                f"HF download subprocess exited without sending a result "
+                f"(exitcode={proc.exitcode})"
+            ) from e
+
+        if tag == "ok":
+            return Path(payload)
+        exc_type, exc_msg, exc_tb = payload
+        raise RuntimeError(
+            f"HF download subprocess failed: {exc_type}: {exc_msg}\n{exc_tb}"
+        )
+    finally:
+        parent_conn.close()
