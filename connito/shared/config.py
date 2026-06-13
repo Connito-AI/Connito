@@ -243,7 +243,7 @@ class DataCfg(BaseConfig):
     # same `combined_seed` — same brief consensus-divergence shape as
     # the recent block-hash seed mix-in. Operators who need to opt out
     # for memory reasons can set this to 0 in their config.
-    eval_source_shuffle_buffer: int = 50_000
+    eval_source_shuffle_buffer: int = 100_000
     # Per-source random read offset applied AFTER the buffer shuffle. When
     # > 0, each source is `ds.skip(rng.randrange(0, N))`-d so the validator
     # reads from a random DEPTH into the (already-randomly-chosen) lead
@@ -267,7 +267,7 @@ class DataCfg(BaseConfig):
     # predictability. Same coordinated-rollout discipline as
     # `eval_source_shuffle_buffer` — validators on different defaults
     # diverge for one round, then re-converge.
-    eval_source_skip_max: int = 50_000
+    eval_source_skip_max: int = 100_000
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
