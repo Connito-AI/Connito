@@ -747,19 +747,30 @@ def build_chain_checkpoints_from_previous_phase(
         hash_chain_commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(
             config, subtensor, block=commit_2_end_block
         )
+        # Log the source blocks at info: when two validators disagree on which
+        # miner revision to download (the chain-read divergence we saw in SN102
+        # validator/yuma logs around 2026-06-08, where the same UID produced
+        # different `hf_revision` per validator), the first thing to check is
+        # whether their substrate clients agreed on the historical block they
+        # pulled. Without these fields that information is unrecoverable after
+        # the fact.
         if not signed_hash_chain_commits or not hash_chain_commits:
             logger.warning(
                 "Chain commits fetched but some are missing",
                 for_role=for_role,
                 signed_hash_count=len(signed_hash_chain_commits),
                 hash_count=len(hash_chain_commits),
+                commit_1_end_block=commit_1_end_block,
+                commit_2_end_block=commit_2_end_block,
             )
         else:
-            logger.debug(
+            logger.info(
                 "Chain commits fetched",
                 for_role=for_role,
                 signed_hash_count=len(signed_hash_chain_commits),
                 hash_count=len(hash_chain_commits),
+                commit_1_end_block=commit_1_end_block,
+                commit_2_end_block=commit_2_end_block,
             )
 
     else:

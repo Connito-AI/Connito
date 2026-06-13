@@ -308,11 +308,29 @@ class BackgroundDownloadWorker(threading.Thread):
                         continue
 
                 if downloaded_filename is None:
+                    # Surface enough state for the "no candidate file" miss to be
+                    # diagnosable after the fact. The plain `str(last_error)` we
+                    # used to log was empty in ~80% of misses (HF's
+                    # `EntryNotFoundError.__str__` can return ""), which left no
+                    # way to tell apart "file genuinely absent at this revision"
+                    # from "auth error" or "network blip". Now we also emit the
+                    # exception type, its repr, and the (repo_id, revision)
+                    # pair the chain handed us, so cross-validator divergence
+                    # on the same UID can be traced back to which revision each
+                    # validator's substrate read returned.
+                    last_error_type = (
+                        type(last_error).__name__ if last_error is not None else None
+                    )
+                    last_error_repr = repr(last_error) if last_error is not None else None
                     logger.warning(
                         "bg-download: no candidate file found in HF repo",
                         uid=uid, hotkey=hotkey[:6],
                         candidates=candidate_filenames,
+                        repo_id=repo_id,
+                        revision=(revision[:8] if revision else None),
                         last_error=str(last_error) if last_error else None,
+                        last_error_type=last_error_type,
+                        last_error_repr=last_error_repr,
                     )
                     # HF-side or network-layer failures all surface here; bucket
                     # them under "rpc" so timeouts above stay distinguishable.
