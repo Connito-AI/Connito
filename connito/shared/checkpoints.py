@@ -414,8 +414,26 @@ class ChainCheckpoints(BaseModel):
         if not filtered:
             return ChainCheckpoints(checkpoints=[])
 
-        # reject checkpoints with global_ver outside the allowed range
-        if min_allowed_version is not None or max_allowed_version is not None:
+        # Skip the global_ver range filter for the miner role. The chain
+        # commit block can race against the allowed-version window by 1-2
+        # blocks (we observed ckpt_ver=8338209 vs max_allowed=8338208 in
+        # SN102 staging logs — a miner that committed one block after the
+        # window was excluded), which silently drops fresh, otherwise-valid
+        # miner submissions. Validators downstream do their own
+        # evaluation-driven gating, so excluding here is strictly
+        # pessimistic.
+        #
+        # The filter still applies when for_role == "validator" — validators
+        # cross-check each other's commits and the version range there
+        # protects the chosen majority hash from stale validator state.
+        if for_role == "miner":
+            logger.debug(
+                "filter_checkpoints: skipping version range gate (miner role)",
+                passed=len(filtered),
+                min_allowed_version=min_allowed_version,
+                max_allowed_version=max_allowed_version,
+            )
+        elif min_allowed_version is not None or max_allowed_version is not None:
             before_count = len(filtered)
             version_ok = []
             for ckpt in filtered:
