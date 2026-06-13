@@ -21,14 +21,13 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 import bittensor
 
 from connito.shared.app_logging import structlog
 from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, parse_dynamic_filename
-from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
+from connito.shared.hf_distribute import download_checkpoint_from_hf_subprocess
 from connito.shared.telemetry import (
     CHECKPOINT_DOWNLOAD_BYTES,
     VALIDATOR_BG_WORKER_PAUSED,
@@ -267,16 +266,21 @@ class BackgroundDownloadWorker(threading.Thread):
                     # from a missing-file failure can't pollute the next try.
                     shutil.rmtree(tmp_dir, ignore_errors=True)
                     try:
-                        # The inner helper owns the timeout via a private
-                        # ThreadPoolExecutor: when it fires, the orphaned HF
-                        # download thread is detached from that executor (it
-                        # may still be alive at the OS level, but no longer
-                        # holds a slot in the asyncio default pool). The
-                        # outer `asyncio.to_thread` here returns promptly on
-                        # timeout, so unrelated `to_thread` callers in the
-                        # validator are not starved by accumulating zombies.
+                        # Subprocess isolation: a fresh `spawn`ed child runs
+                        # `hf_hub_download` and is fully terminable on timeout.
+                        # Previously we ran the download in a private
+                        # ThreadPoolExecutor and deliberately leaked the worker
+                        # thread on timeout (`shutdown(wait=False)`); over a
+                        # multi-day validator that, combined with
+                        # `huggingface_hub`'s xet backend churning its own
+                        # internal worker pool, degraded the shared HF session
+                        # to the point that present-on-HF files began returning
+                        # spurious "no candidate file" (see PR description for
+                        # the per-(uid,repo,revision) comparison against yuma).
+                        # The child has no shared state with the parent, so
+                        # one bad download cannot poison the next.
                         await asyncio.to_thread(
-                            download_checkpoint_from_hf_with_timeout,
+                            download_checkpoint_from_hf_subprocess,
                             repo_id=repo_id,
                             revision=revision,
                             filenames=[candidate],
@@ -286,10 +290,14 @@ class BackgroundDownloadWorker(threading.Thread):
                         )
                         downloaded_filename = candidate
                         break
-                    except FuturesTimeoutError:
+                    except TimeoutError:
                         # Hard timeout means the validator's network is the
                         # problem, not a missing file — don't waste budget
-                        # retrying with a different suffix.
+                        # retrying with a different suffix. The subprocess
+                        # variant raises the builtin TimeoutError (the old
+                        # thread variant used concurrent.futures.TimeoutError);
+                        # both subclass nothing in common, so we explicitly
+                        # match builtin TimeoutError here.
                         logger.warning(
                             "bg-download: timeout",
                             uid=uid, hotkey=hotkey[:6], timeout_sec=timeout,
