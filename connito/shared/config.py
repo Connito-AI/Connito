@@ -279,8 +279,9 @@ class DataCfg(BaseConfig):
     #
     # See `connito/shared/eval_shard_pick.py` for the threat model,
     # consensus assumptions (revision pin per source, deterministic
-    # sort, shared row-count tables) and the policy registry that
-    # must contain an entry for every configured source.
+    # sort, per-source safe-floor + verified-spot-check policy) and
+    # the policy registry that must contain an entry for every
+    # configured source.
     #
     # Default OFF. Same coordinated-rollout discipline as the
     # earlier shuffle/skip bumps: flip together with all validators
