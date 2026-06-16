@@ -200,6 +200,27 @@ def _install_queue_listener_eof_suppressor() -> None:
     threading.excepthook = _hook
 
 
+def _disable_hf_progress_bars_in_child() -> None:
+    """Turn off `huggingface_hub`'s tqdm progress bars inside the child.
+
+    The xet backend writes per-chunk tqdm bars to stderr during both
+    `hf_hub_download` and `upload_folder`. A single 3.6 GB upload spills
+    ~55 lines like `el_expgroup_0.safetensors: 1% | ... / 3.60GB` plus
+    `Processing Files (N / M)`, all repainted via ANSI cursor moves. In
+    a non-tty log capture those control sequences flatten to a stream
+    of duplicated percentage lines that bury real log entries.
+
+    `huggingface_hub.utils.disable_progress_bars()` toggles the in-process
+    state — required, not just env-var-based, because HF caches the
+    progress-bar state after first import. Called from each child entry
+    point so the suppression follows the spawn boundary (parent-side
+    progress bars, if any operator wants them, are unaffected).
+    """
+    from huggingface_hub.utils import disable_progress_bars
+
+    disable_progress_bars()
+
+
 def _upload_child(
     conn,
     ckpt_dir: str,
@@ -212,6 +233,7 @@ def _upload_child(
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
     _install_queue_listener_eof_suppressor()
+    _disable_hf_progress_bars_in_child()
     try:
         revision = upload_checkpoint_to_hf(
             ckpt_dir=Path(ckpt_dir),
@@ -424,6 +446,7 @@ def _download_child(
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
     _install_queue_listener_eof_suppressor()
+    _disable_hf_progress_bars_in_child()
     try:
         result = download_checkpoint_from_hf(
             repo_id=repo_id,

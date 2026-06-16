@@ -26,7 +26,10 @@ import types
 
 import pytest
 
-from connito.shared.hf_distribute import _install_queue_listener_eof_suppressor
+from connito.shared.hf_distribute import (
+    _disable_hf_progress_bars_in_child,
+    _install_queue_listener_eof_suppressor,
+)
 
 
 @pytest.fixture
@@ -99,3 +102,30 @@ def test_eof_when_thread_is_none_still_surfaces(installed_hook):
     assert len(recorded) == 1
     assert recorded[0].exc_type is EOFError
     assert recorded[0].thread is None
+
+
+def test_disable_hf_progress_bars_in_child_actually_disables_them():
+    """Pin the contract: after the child entry point calls this helper,
+    `huggingface_hub.utils.are_progress_bars_disabled()` returns True.
+    Re-enable in teardown so we don't leak state to other tests.
+    """
+    from huggingface_hub.utils import (
+        are_progress_bars_disabled,
+        enable_progress_bars,
+    )
+
+    was_disabled_before = are_progress_bars_disabled()
+    try:
+        enable_progress_bars()
+        assert not are_progress_bars_disabled(), (
+            "precondition: progress bars should be enabled at test start"
+        )
+        _disable_hf_progress_bars_in_child()
+        assert are_progress_bars_disabled(), (
+            "_disable_hf_progress_bars_in_child must turn HF progress bars off"
+        )
+    finally:
+        if was_disabled_before:
+            _disable_hf_progress_bars_in_child()
+        else:
+            enable_progress_bars()
