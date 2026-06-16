@@ -162,6 +162,44 @@ def upload_checkpoint_to_hf(
     return revision
 
 
+def _install_queue_listener_eof_suppressor() -> None:
+    """Silence the QueueListener teardown EOFError that HF up/download
+    children spill onto the parent's inherited stderr.
+
+    `huggingface_hub`'s xet backend (and a few related HF subsystems)
+    start a `logging.handlers.QueueListener` inside the spawned child
+    to forward log records from its internal worker pool. When the
+    child exits, the workers tear down their multiprocessing queue
+    before the listener's `_monitor` thread is joined. `_monitor`
+    blocks in `queue.get()`, the queue closes underneath it, and
+    `_recv()` raises `EOFError`. Python's default `threading.excepthook`
+    then prints a ~20-line traceback to the child's stderr. The child
+    inherits stderr from the validator, so every spawn dumps that
+    traceback into the validator log — hundreds per cycle, with no
+    operational signal in it.
+
+    Suppression is intentionally narrow: only `EOFError` raised in a
+    thread whose name ends with `"(_monitor)"` (the QueueListener's
+    target function) is swallowed. Anything else flows through
+    `threading.__excepthook__` unchanged, so a real crash in any
+    other child thread still surfaces in full.
+    """
+    import threading
+
+    original = threading.__excepthook__
+
+    def _hook(args: threading.ExceptHookArgs) -> None:
+        if (
+            args.exc_type is EOFError
+            and args.thread is not None
+            and args.thread.name.endswith("(_monitor)")
+        ):
+            return
+        original(args)
+
+    threading.excepthook = _hook
+
+
 def _upload_child(
     conn,
     ckpt_dir: str,
@@ -173,6 +211,7 @@ def _upload_child(
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
+    _install_queue_listener_eof_suppressor()
     try:
         revision = upload_checkpoint_to_hf(
             ckpt_dir=Path(ckpt_dir),
@@ -384,6 +423,7 @@ def _download_child(
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
+    _install_queue_listener_eof_suppressor()
     try:
         result = download_checkpoint_from_hf(
             repo_id=repo_id,
