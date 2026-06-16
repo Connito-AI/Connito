@@ -162,6 +162,65 @@ def upload_checkpoint_to_hf(
     return revision
 
 
+def _install_queue_listener_eof_suppressor() -> None:
+    """Silence the QueueListener teardown EOFError that HF up/download
+    children spill onto the parent's inherited stderr.
+
+    `huggingface_hub`'s xet backend (and a few related HF subsystems)
+    start a `logging.handlers.QueueListener` inside the spawned child
+    to forward log records from its internal worker pool. When the
+    child exits, the workers tear down their multiprocessing queue
+    before the listener's `_monitor` thread is joined. `_monitor`
+    blocks in `queue.get()`, the queue closes underneath it, and
+    `_recv()` raises `EOFError`. Python's default `threading.excepthook`
+    then prints a ~20-line traceback to the child's stderr. The child
+    inherits stderr from the validator, so every spawn dumps that
+    traceback into the validator log — hundreds per cycle, with no
+    operational signal in it.
+
+    Suppression is intentionally narrow: only `EOFError` raised in a
+    thread whose name ends with `"(_monitor)"` (the QueueListener's
+    target function) is swallowed. Anything else flows through
+    `threading.__excepthook__` unchanged, so a real crash in any
+    other child thread still surfaces in full.
+    """
+    import threading
+
+    original = threading.__excepthook__
+
+    def _hook(args: threading.ExceptHookArgs) -> None:
+        if (
+            args.exc_type is EOFError
+            and args.thread is not None
+            and args.thread.name.endswith("(_monitor)")
+        ):
+            return
+        original(args)
+
+    threading.excepthook = _hook
+
+
+def _disable_hf_progress_bars_in_child() -> None:
+    """Turn off `huggingface_hub`'s tqdm progress bars inside the child.
+
+    The xet backend writes per-chunk tqdm bars to stderr during both
+    `hf_hub_download` and `upload_folder`. A single 3.6 GB upload spills
+    ~55 lines like `el_expgroup_0.safetensors: 1% | ... / 3.60GB` plus
+    `Processing Files (N / M)`, all repainted via ANSI cursor moves. In
+    a non-tty log capture those control sequences flatten to a stream
+    of duplicated percentage lines that bury real log entries.
+
+    `huggingface_hub.utils.disable_progress_bars()` toggles the in-process
+    state — required, not just env-var-based, because HF caches the
+    progress-bar state after first import. Called from each child entry
+    point so the suppression follows the spawn boundary (parent-side
+    progress bars, if any operator wants them, are unaffected).
+    """
+    from huggingface_hub.utils import disable_progress_bars
+
+    disable_progress_bars()
+
+
 def _upload_child(
     conn,
     ckpt_dir: str,
@@ -173,6 +232,8 @@ def _upload_child(
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
+    _install_queue_listener_eof_suppressor()
+    _disable_hf_progress_bars_in_child()
     try:
         revision = upload_checkpoint_to_hf(
             ckpt_dir=Path(ckpt_dir),
@@ -384,6 +445,8 @@ def _download_child(
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
+    _install_queue_listener_eof_suppressor()
+    _disable_hf_progress_bars_in_child()
     try:
         result = download_checkpoint_from_hf(
             repo_id=repo_id,
