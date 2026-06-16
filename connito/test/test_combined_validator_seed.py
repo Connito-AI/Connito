@@ -1,17 +1,23 @@
 """Regression tests for `get_combined_validator_seed`.
 
-The seed is derived by mixing TWO entropy sources:
-- validator-committed `miner_seed` values (existing, backward-compat
-  scheme; readable by miners during their commit window)
-- the block hash of the last block of MinerCommit2 (new, added in
-  the block-hash-mix-in PR — sealed before miners commit but
-  unpredictable in advance)
+After the block-hash-only cutover, the combined validator seed is
+`sha256(block_hash).hexdigest()`, where `block_hash` is the hash of
+the LAST block of the most recent completed MinerCommit2 phase.
 
-If block_hash is unavailable (phase API or chain RPC transient
-failure), it falls back to an empty string so the validator can
-continue through the cycle. A follow-up PR will harden the
-combined "no committed seeds AND no block_hash" case which currently
-produces sha256("") — a publicly-known constant.
+Validator-committed `miner_seed` values no longer contribute. The
+field is still present on `ValidatorChainCommit` for
+`get_validator_miner_assignment` (which uses it for deterministic
+validator → miner assignment, a separate concern from the
+collusion-resistant eval seed), but it is not mixed into the eval
+seed any longer because miners can read it on chain during their
+commit window — making any seed mix that includes it predictable to a
+colluding miner.
+
+If `_get_minercommit2_block_hash` returns None (phase API or chain
+RPC failure), `get_combined_validator_seed` MUST raise rather than
+falling back to `sha256("")`. The fallback was the known deficiency
+in the previous mixed-seed PR — a publicly-known constant that let
+miners win the round trivially during transient outages.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from __future__ import annotations
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from connito.shared.chain import ValidatorChainCommit
 from connito.shared.cycle import PhaseNames, get_combined_validator_seed
@@ -32,8 +40,9 @@ TEST_PHASE_END_BLOCK = 8_184_162
 
 
 class _StubSubtensor:
-    """Minimal subtensor stand-in. The `get_block_hash` attribute is
-    populated per-test via patching `_get_minercommit2_block_hash`."""
+    """Minimal subtensor stand-in. The block-hash helper is patched
+    per-test; `get_block_hash` is here only because the real subtensor
+    exposes one and a few non-seed paths inside cycle.py touch it."""
 
     def get_block_hash(self, block: int) -> str:
         return TEST_BLOCK_HASH
@@ -44,6 +53,10 @@ def _config_for_group(group_id: int = 0) -> SimpleNamespace:
 
 
 def _validator_commit(miner_seed: int | None, expert_group: int = 0) -> ValidatorChainCommit:
+    """Construct a chain commit. The `miner_seed` value is no longer
+    mixed into the combined seed, but the field remains on the chain
+    commit type — tests still need to instantiate it for the few
+    sibling paths (assignment, telemetry) that read the field."""
     return ValidatorChainCommit(miner_seed=miner_seed, expert_group=expert_group)
 
 
@@ -61,9 +74,11 @@ def _patch_block_hash(value: str | None):
     )
 
 
-def test_combined_seed_mixes_validator_seeds_and_block_hash():
-    """Happy path: combined seed is sha256 of (sorted validator seeds
-    concatenated) + block_hash. Both inputs contribute."""
+def test_combined_seed_is_sha256_of_block_hash():
+    """Happy path: combined seed is sha256(block_hash). Nothing else
+    contributes. Even when `commits` is passed and contains
+    validator-committed `miner_seed` values, those values must NOT
+    affect the result — that's the whole point of the cutover."""
     commits = [
         (_validator_commit(miner_seed=42, expert_group=0), _neuron("hk_z")),
         (_validator_commit(miner_seed=7, expert_group=0), _neuron("hk_a")),
@@ -74,72 +89,59 @@ def test_combined_seed_mixes_validator_seeds_and_block_hash():
             _config_for_group(), _StubSubtensor(), commits=commits,
         )
 
-    # Hotkey-sorted order: hk_a=7, hk_m=99, hk_z=42 → "79942"
-    # Then concat block_hash, then sha256.
-    expected = hashlib.sha256(("79942" + TEST_BLOCK_HASH).encode()).hexdigest()
+    expected = hashlib.sha256(TEST_BLOCK_HASH.encode()).hexdigest()
     assert out == expected
 
 
-def test_combined_seed_uses_only_block_hash_when_no_validator_seeds():
-    """Transition path: during partial rollout (or if no validators
-    publish miner_seed), the block-hash component alone determines
-    the combined seed. This is still secure because block_hash isn't
-    predictable in advance."""
-    with _patch_block_hash(TEST_BLOCK_HASH):
-        out = get_combined_validator_seed(
-            _config_for_group(), _StubSubtensor(), commits=[],
-        )
+def test_combined_seed_ignores_validator_committed_miner_seed():
+    """Same block hash, different per-validator `miner_seed`
+    commitments → IDENTICAL combined seed. Confirms the legacy
+    validator_seeds component has truly been removed from the seed
+    derivation (a half-finished refactor that still concatenated an
+    empty placeholder would break this)."""
+    block_hash = TEST_BLOCK_HASH
+    commits_a = [(_validator_commit(miner_seed=1, expert_group=0), _neuron("hk_a"))]
+    commits_b = [(_validator_commit(miner_seed=999_999, expert_group=0), _neuron("hk_a"))]
+    commits_empty: list[tuple[ValidatorChainCommit, SimpleNamespace]] = []
 
-    expected = hashlib.sha256(("" + TEST_BLOCK_HASH).encode()).hexdigest()
-    assert out == expected
+    with _patch_block_hash(block_hash):
+        a = get_combined_validator_seed(_config_for_group(), _StubSubtensor(), commits=commits_a)
+        b = get_combined_validator_seed(_config_for_group(), _StubSubtensor(), commits=commits_b)
+        empty = get_combined_validator_seed(_config_for_group(), _StubSubtensor(), commits=commits_empty)
+        no_commits = get_combined_validator_seed(_config_for_group(), _StubSubtensor())
+
+    assert a == b == empty == no_commits
 
 
-def test_combined_seed_falls_back_to_empty_when_block_hash_unavailable():
-    """If the block-hash component cannot be derived, fall back to
-    using an empty string for that component so the validator keeps
-    running through transient phase-API / chain-RPC outages.
-
-    During the fallback window the combined seed is sha256(committed_part)
-    only — same security level as the pre-PR scheme, which miners CAN
-    predict from chain reads. Acceptable as a brief transient.
-
-    NOTE: a follow-up PR will harden the combined "no committed seeds
-    AND no block_hash" case, which currently produces sha256("") (a
-    publicly-known constant). That gap is intentionally left open in
-    this PR.
-    """
-    commits = [
-        (_validator_commit(miner_seed=42, expert_group=0), _neuron("hk_a")),
-    ]
+def test_combined_seed_raises_when_block_hash_unavailable():
+    """The previous behaviour fell back to `sha256("")` — a publicly
+    known constant that let miners win the round trivially during
+    transient phase-API / chain-RPC outages. The cutover replaces
+    that fallback with a hard raise. The validator framework decides
+    whether to retry or skip the round upstream."""
     with _patch_block_hash(None):
-        out = get_combined_validator_seed(
-            _config_for_group(), _StubSubtensor(), commits=commits,
-        )
-
-    # block_hash falls back to "", combined = sha256("42" + "") = sha256("42")
-    expected = hashlib.sha256(b"42").hexdigest()
-    assert out == expected
+        with pytest.raises(RuntimeError, match="block hash unavailable"):
+            get_combined_validator_seed(
+                _config_for_group(), _StubSubtensor(), commits=[],
+            )
 
 
-def test_combined_seed_filters_by_expert_group():
-    """Validators commit per-expert-group; seeds from other groups
-    must not contaminate this group's combined seed."""
-    commits = [
-        (_validator_commit(miner_seed=42, expert_group=0), _neuron("hk_a")),
-        (_validator_commit(miner_seed=999, expert_group=1), _neuron("hk_b")),  # wrong group
-    ]
-    with _patch_block_hash(TEST_BLOCK_HASH):
-        out = get_combined_validator_seed(
-            _config_for_group(group_id=0), _StubSubtensor(), commits=commits,
-        )
-
-    expected = hashlib.sha256(("42" + TEST_BLOCK_HASH).encode()).hexdigest()
-    assert out == expected
+def test_combined_seed_raises_when_block_hash_empty_string():
+    """An empty-string block hash is treated the same as None — the
+    `if not block_hash:` guard catches both, so a chain returning ""
+    (defensive zero-value, unusual but possible) still raises rather
+    than producing a guessable seed."""
+    with _patch_block_hash(""):
+        with pytest.raises(RuntimeError, match="block hash unavailable"):
+            get_combined_validator_seed(
+                _config_for_group(), _StubSubtensor(), commits=[],
+            )
 
 
 def test_combined_seed_changes_when_block_hash_changes():
     """Different block hashes → different combined seeds. This is the
-    cycle-over-cycle rotation that makes the eval data slice fresh."""
+    cycle-over-cycle rotation that makes the eval data slice fresh
+    each round."""
     commits = [
         (_validator_commit(miner_seed=42, expert_group=0), _neuron("hk_a")),
     ]
@@ -157,18 +159,15 @@ def test_combined_seed_changes_when_block_hash_changes():
     assert seed_a != seed_b
 
 
-def test_combined_seed_changes_when_validator_seeds_change():
-    """Different validator seeds → different combined seeds. This
-    preserves the original entropy source's contribution during the
-    transition period when both components are mixed."""
+def test_combined_seed_is_deterministic_for_same_block_hash():
+    """Same input → same output, always. Required for every validator
+    on the network to score the same rows for the same seed; without
+    this, weight consensus breaks every round."""
     with _patch_block_hash(TEST_BLOCK_HASH):
-        seed_a = get_combined_validator_seed(
-            _config_for_group(), _StubSubtensor(),
-            commits=[(_validator_commit(miner_seed=42, expert_group=0), _neuron("hk_a"))],
-        )
-        seed_b = get_combined_validator_seed(
-            _config_for_group(), _StubSubtensor(),
-            commits=[(_validator_commit(miner_seed=43, expert_group=0), _neuron("hk_a"))],
-        )
-
-    assert seed_a != seed_b
+        a = get_combined_validator_seed(_config_for_group(), _StubSubtensor(), commits=[])
+        b = get_combined_validator_seed(_config_for_group(), _StubSubtensor(), commits=[])
+    assert a == b
+    # And cross-check: matches a hand-computed expected hash so a
+    # future refactor that subtly changes the hashing construction
+    # (e.g. switches separator, swaps inputs) fails loud.
+    assert a == hashlib.sha256(TEST_BLOCK_HASH.encode()).hexdigest()
