@@ -283,11 +283,11 @@ class DataCfg(BaseConfig):
     # the policy registry that must contain an entry for every
     # configured source.
     #
-    # Default OFF. Same coordinated-rollout discipline as the
+    # Default ON. Same coordinated-rollout discipline as the
     # earlier shuffle/skip bumps: flip together with all validators
     # at a gated chain epoch, otherwise losses diverge for the
     # transition round and weight consensus breaks.
-    eval_source_seeded_shard_pick: bool = False
+    eval_source_seeded_shard_pick: bool = True
     # Per-source HF commit SHA to pin shard listing + shard reads to.
     # Keys are the source `path` (e.g. `"allenai/c4"`), values are
     # 40-char SHAs. When omitted for a source, the policy's default
