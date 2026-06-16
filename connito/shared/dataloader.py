@@ -185,6 +185,37 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         def ensure_string(example: dict[str, Any], source_text_column: str):
             return {"text": str(example[source_text_column])}
 
+        # Convert string seed to integer. Reused as the
+        # shard-pick / in-shard offset hash input AND as the
+        # `interleave_datasets(seed=...)` argument, so the value must
+        # be available before the per-source load loop.
+        int_seed = int(str(seed)[:8], 16) if seed else 42
+
+        # Switch to seeded shard-pick when the operator has flipped the
+        # gate AND the caller passed a seed (i.e. validator eval, not
+        # miner training). See `connito/shared/eval_shard_pick.py` for
+        # the consensus assumptions; in particular, every configured
+        # source must have a registered policy and (ideally) a pinned
+        # revision SHA in `eval_source_revision_pin`.
+        seeded_pick_enabled = (
+            seed is not None
+            and bool(getattr(config.task.exp.data, "eval_source_seeded_shard_pick", False))
+        )
+        revision_pin_map = (
+            getattr(config.task.exp.data, "eval_source_revision_pin", None) or {}
+        )
+        if seeded_pick_enabled:
+            # Lazy import — avoids pulling the HF API stack into the
+            # legacy code path.
+            from connito.shared.eval_shard_pick import (
+                load_streaming_shard,
+                pick_shard_for_source,
+            )
+            logger.info(
+                "eval dataloader using seeded shard-pick path",
+                seed=seed, int_seed=int_seed,
+            )
+
         dataset_splits = []
         dataset_weights = []
 
@@ -201,21 +232,43 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             if weight <= 0:
                 raise ValueError(f"Dataset source {ds_name!r} must have a positive 'weight'.")
 
-            source_split = _load_streaming_split(ds_name, ds_config=ds_config)
+            pick = None
+            if seeded_pick_enabled:
+                pick = pick_shard_for_source(
+                    repo_id=ds_name,
+                    name=ds_config,
+                    int_seed=int_seed,
+                    revision_override=revision_pin_map.get(ds_name),
+                )
+                logger.info(
+                    "shard pick",
+                    repo_id=ds_name, name=ds_config,
+                    shard=pick.shard_path, revision=pick.revision,
+                    shard_rows=pick.shard_rows, offset=pick.in_shard_offset,
+                )
+                source_split = load_streaming_shard(pick, split_name=split_name)
+            else:
+                source_split = _load_streaming_split(ds_name, ds_config=ds_config)
+
             source_split = source_split.select_columns([text_column])
             source_split = source_split.map(
                 partial(ensure_string, source_text_column=text_column),
                 features=common_features,
             )
 
+            if pick is not None:
+                # In-shard offset goes here so the validator's read
+                # window lands at a random depth inside the chosen
+                # shard rather than at row 0. Bounded by the chosen
+                # shard's own row count — no min-across-sources to
+                # maintain, no over-skip risk past end-of-stream.
+                source_split = source_split.skip(pick.in_shard_offset)
+
             dataset_splits.append(source_split)
             dataset_weights.append(weight)
 
         if not dataset_splits:
             raise ValueError("No dataset sources were configured.")
-
-        # Convert string seed to integer for interleave_datasets if provided
-        int_seed = int(str(seed)[:8], 16) if seed else 42
 
         # Streaming-shuffle each source BEFORE interleave when the caller
         # passed a seed (validator eval path; miners pass seed=None so this
@@ -240,7 +293,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         shuffle_buffer = int(
             getattr(config.task.exp.data, "eval_source_shuffle_buffer", 0) or 0
         )
-        if seed is not None and shuffle_buffer > 0:
+        if seed is not None and not seeded_pick_enabled and shuffle_buffer > 0:
             logger.debug(
                 "Shuffling each source before interleave",
                 seed=seed, int_seed=int_seed, buffer_size=shuffle_buffer,
@@ -263,7 +316,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         skip_max = int(
             getattr(config.task.exp.data, "eval_source_skip_max", 0) or 0
         )
-        if seed is not None and skip_max > 0:
+        if seed is not None and not seeded_pick_enabled and skip_max > 0:
             skip_rng = random.Random(int_seed)
             offsets = [skip_rng.randrange(0, skip_max) for _ in dataset_splits]
             logger.debug(

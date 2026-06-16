@@ -268,6 +268,35 @@ class DataCfg(BaseConfig):
     # `eval_source_shuffle_buffer` — validators on different defaults
     # diverge for one round, then re-converge.
     eval_source_skip_max: int = 50_000
+    # Switch the validator eval path from the legacy
+    # `.shuffle(seed) + .skip(small)` window (reachable region capped
+    # at first ~`shuffle_buffer + skip_max` rows of every shard) to
+    # seeded shard-pick + hash-mod in-shard offset. When True, the
+    # reachable region per round is the WHOLE chosen shard; across
+    # rotating seeds, every shard × every row is eventually reachable.
+    # `eval_source_shuffle_buffer` and `eval_source_skip_max` are
+    # ignored on the new path.
+    #
+    # See `connito/shared/eval_shard_pick.py` for the threat model,
+    # consensus assumptions (revision pin per source, deterministic
+    # sort, per-source safe-floor + verified-spot-check policy) and
+    # the policy registry that must contain an entry for every
+    # configured source.
+    #
+    # Default ON. Same coordinated-rollout discipline as the
+    # earlier shuffle/skip bumps: flip together with all validators
+    # at a gated chain epoch, otherwise losses diverge for the
+    # transition round and weight consensus breaks.
+    eval_source_seeded_shard_pick: bool = True
+    # Per-source HF commit SHA to pin shard listing + shard reads to.
+    # Keys are the source `path` (e.g. `"allenai/c4"`), values are
+    # 40-char SHAs. When omitted for a source, the policy's default
+    # `revision` in `eval_shard_pick._KNOWN_SOURCES` is used.
+    #
+    # Required for genuine consensus safety — `"main"` is a moving
+    # target and a mid-rollout HF re-upload would cause two
+    # validators to pick different rows for the same seed.
+    eval_source_revision_pin: dict[str, str] | None = None
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
