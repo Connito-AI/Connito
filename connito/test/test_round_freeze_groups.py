@@ -114,6 +114,7 @@ def _freeze(
     cycle_index=8,
     cycle_length=100,
     round_id=800,
+    validator_seeds=None,
 ):
     chain_checkpoints = {hk: _ckpt_stub(hk) for hk in miners_with_checkpoint}
     assignment_result = SimpleNamespace(
@@ -121,10 +122,16 @@ def _freeze(
         miners_with_checkpoint=miners_with_checkpoint,
         chain_checkpoints_by_hotkey=chain_checkpoints,
     )
+    if validator_seeds is None:
+        validator_seeds = {}
     subtensor = _stub_subtensor(metagraph, block=round_id)
     with patch("connito.shared.chain.get_chain_commits", return_value=[]), \
          patch(
              "connito.shared.cycle.get_combined_validator_seed", return_value="seed"
+         ), \
+         patch(
+             "connito.shared.cycle.get_validator_seed_from_commit",
+             return_value=validator_seeds,
          ), \
          patch(
              "connito.shared.cycle.get_validator_miner_assignment",
@@ -456,6 +463,175 @@ def test_flag_on_carries_over_prev_round_group_ab_into_background():
             f"prev-A/B uid {uid} missing from background_uids "
             f"(new_roster={sorted(new_roster)}, bg={bg})"
         )
+
+
+def test_flag_on_splices_overlay_foreground_into_assignment():
+    """Overlay foreground UIDs must end up in
+    `validator_miner_assignment[my_hotkey]` so that
+    `gather_validation_job` recognizes their submission files as
+    assigned and the foreground eval loop actually scores them.
+
+    Regression for the rizzo03 incident on 2026-06-25: with the
+    overlay foreground disjoint from the legacy assignment slice,
+    every foreground submission was bucketed into
+    `unexpected_submissions` and dropped, so the validator's
+    foreground eval window scored zero miners that round.
+    """
+    n_total = 35
+    # v0..v3 only vote weights (they establish chain consensus for
+    # Group A); vme is the sole *qualified* validator (the only one
+    # in `assignment`), so the per-validator A∪B partition gives vme
+    # the full A∪B set as its foreground — deterministic regardless
+    # of the seed.
+    validator_hotkeys = ["v0", "v1", "v2", "v3", "vme"]
+    miner_hotkeys = [f"m{i}" for i in range(5, n_total)]
+    weights = []
+    for _v in range(4):
+        row = [0.0] * n_total
+        for j, m in enumerate([5, 6, 7]):
+            row[m] = 0.9 - j * 0.01
+        for m in range(21, 31):
+            row[m] = 0.05
+        weights.append(row)
+    metagraph = _metagraph(
+        n_total=n_total,
+        validator_hotkeys=validator_hotkeys,
+        miner_hotkeys=miner_hotkeys,
+        weight_matrix=weights,
+    )
+    config = _config(flag=True)
+    # Legacy assignment puts vme on m25..m34 — chain-consensus A∪B
+    # resolves to a subset of {m5,6,7,21,22}, so vme's overlay
+    # foreground cannot overlap with its legacy slice. This is the
+    # exact disjoint configuration the rizzo03 log captured.
+    legacy_vme_slice = [f"m{i}" for i in range(25, n_total)]
+    assignment = {
+        "v0": [f"m{i}" for i in range(5, 10)],
+        "v1": [f"m{i}" for i in range(10, 15)],
+        "v2": [f"m{i}" for i in range(15, 20)],
+        "v3": [f"m{i}" for i in range(20, 25)],
+        "vme": list(legacy_vme_slice),
+    }
+    miners = [f"m{i}" for i in range(5, n_total)]
+    # Non-empty validator seeds so the per-validator partition of A∪B
+    # actually runs (otherwise `_partition_pool` short-circuits and
+    # foreground is trivially empty — no splice to exercise).
+    seeds = {hk: i + 1 for i, hk in enumerate(["v0", "v1", "v2", "v3", "vme"])}
+
+    r = _freeze(
+        config=config,
+        metagraph=metagraph,
+        assignment=assignment,
+        miners_with_checkpoint=miners,
+        cohort_state=None,
+        cycle_index=0,
+        cycle_length=100,
+        round_id=0,
+        validator_seeds=seeds,
+    )
+
+    # Sanity: overlay foreground is non-empty and disjoint from the
+    # legacy slice, so the splice is actually being exercised.
+    assert r.foreground_uids, "expected non-empty overlay foreground for vme"
+    fg_hotkeys = {r.uid_to_hotkey[uid] for uid in r.foreground_uids}
+    assert fg_hotkeys.isdisjoint(legacy_vme_slice), (
+        "test fixture failed to construct a disjoint scenario; "
+        f"foreground={fg_hotkeys}, legacy={set(legacy_vme_slice)}"
+    )
+
+    # The fix: every overlay foreground hotkey is in
+    # `validator_miner_assignment[my_hotkey]`, which is what
+    # `gather_validation_job` reads for its `is_assigned` check.
+    stored = set(r.validator_miner_assignment.get("vme", []))
+    missing = fg_hotkeys - stored
+    assert not missing, (
+        "overlay foreground hotkeys not spliced into "
+        f"validator_miner_assignment[my_hotkey] (missing: {missing})"
+    )
+    # And the legacy slice is preserved (splice is additive).
+    assert set(legacy_vme_slice) <= stored, (
+        "legacy assignment slice was dropped by the splice"
+    )
+
+
+def test_flag_on_splice_does_not_mutate_caller_assignment_dict():
+    """The splice operates copy-on-write — the dict returned by
+    `get_validator_miner_assignment` is left untouched even though
+    `Round.validator_miner_assignment` carries the spliced view.
+    """
+    n_total = 35
+    validator_hotkeys = ["v0", "v1", "v2", "v3", "vme"]
+    miner_hotkeys = [f"m{i}" for i in range(5, n_total)]
+    weights = []
+    for _v in range(4):
+        row = [0.0] * n_total
+        for j, m in enumerate([5, 6, 7]):
+            row[m] = 0.9 - j * 0.01
+        for m in range(21, 31):
+            row[m] = 0.05
+        weights.append(row)
+    metagraph = _metagraph(
+        n_total=n_total,
+        validator_hotkeys=validator_hotkeys,
+        miner_hotkeys=miner_hotkeys,
+        weight_matrix=weights,
+    )
+    config = _config(flag=True)
+    original_vme_slice = [f"m{i}" for i in range(25, n_total)]
+    assignment = {
+        "v0": [f"m{i}" for i in range(5, 10)],
+        "v1": [f"m{i}" for i in range(10, 15)],
+        "v2": [f"m{i}" for i in range(15, 20)],
+        "v3": [f"m{i}" for i in range(20, 25)],
+        "vme": list(original_vme_slice),
+    }
+    miners = [f"m{i}" for i in range(5, n_total)]
+    seeds = {hk: i + 1 for i, hk in enumerate(["v0", "v1", "v2", "v3", "vme"])}
+
+    r = _freeze(
+        config=config,
+        metagraph=metagraph,
+        assignment=assignment,
+        miners_with_checkpoint=miners,
+        cohort_state=None,
+        cycle_index=0,
+        cycle_length=100,
+        round_id=0,
+        validator_seeds=seeds,
+    )
+
+    # Caller's dict is unchanged.
+    assert assignment["vme"] == original_vme_slice
+    # Round's stored dict is the spliced copy (a different object).
+    assert r.validator_miner_assignment is not assignment
+    assert r.validator_miner_assignment["vme"] is not assignment["vme"]
+    # Splice actually happened (otherwise this test would pass vacuously).
+    assert set(r.validator_miner_assignment["vme"]) > set(original_vme_slice)
+
+
+def test_flag_off_does_not_splice():
+    """Flag off → no overlay, no splice, assignment dict is returned
+    as-is. Belt-and-suspenders against the splice leaking outside
+    the overlay branch.
+    """
+    config = _config(flag=False)
+    metagraph = _metagraph(
+        n_total=15,
+        validator_hotkeys=["vme"],
+        miner_hotkeys=[f"m{i}" for i in range(5)],
+    )
+    original_slice = [f"m{i}" for i in range(5)]
+    assignment = {"vme": list(original_slice)}
+    miners = [f"m{i}" for i in range(5)]
+
+    r = _freeze(
+        config=config,
+        metagraph=metagraph,
+        assignment=assignment,
+        miners_with_checkpoint=miners,
+    )
+
+    assert r.validator_miner_assignment["vme"] == original_slice
 
 
 def test_flag_on_carry_over_is_noop_when_cohort_state_is_none():
