@@ -449,6 +449,31 @@ class Round:
                     if 0 <= uid < len(metagraph.hotkeys):
                         uid_to_hotkey[uid] = metagraph.hotkeys[uid]
 
+                # Splice overlay foreground hotkeys into our entry of the
+                # assignment dict. `gather_validation_job` (called by
+                # `evaluate_foreground_round`) reads
+                # `validator_miner_assignment[my_hotkey]` to decide
+                # `is_assigned` for each submission file on disk. Without
+                # this splice every overlay-foreground UID that fell
+                # outside the legacy full-pool slice is bucketed into
+                # `unexpected_submissions` and silently dropped, wasting
+                # the entire foreground eval window for that round. Copy-
+                # on-write so the dict returned by the chain helper is
+                # not mutated under callers that retained a reference.
+                my_hk = config.chain.hotkey_ss58
+                spliced_assignment: dict[str, list[str]] = {
+                    k: list(v) for k, v in assignment.items()
+                }
+                my_list = spliced_assignment.setdefault(my_hk, [])
+                _seen_my_assigned: set[str] = set(my_list)
+                for uid in foreground_uids:
+                    hk = uid_to_hotkey.get(uid)
+                    if hk is None or hk in _seen_my_assigned:
+                        continue
+                    my_list.append(hk)
+                    _seen_my_assigned.add(hk)
+                assignment = spliced_assignment
+
                 logger.info(
                     "Round.freeze: round-group overlay applied",
                     round_id=rid,
