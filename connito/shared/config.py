@@ -316,7 +316,7 @@ class MoECfg(BaseConfig):
     interleave: bool = True
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 1
+    partial_topk: PositiveInt = 6
     full_topk: PositiveInt = 2
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
