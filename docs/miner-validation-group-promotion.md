@@ -301,14 +301,17 @@ have additional history gates layered on top.
 The two ballots are emitted from
 `connito/validator/run.py` right after `finalize_round_scores`:
 
-**Weight Group 1 — `cfg.weight_group_1_share` (default 98 %), top-3 of A ∪ B by aggregator avg:**
+**Weight Group 1 — `cfg.weight_group_1_share` (default 98 %), top-`cfg.weight_group_1_size` (default 3) of A ∪ B by aggregator avg:**
 
 - Local score-aggregator avg ranking, restricted to `A ∪ B`.
 - Miner must have **≥ 3** score records in the aggregator.
-- Miner must have a score recorded in **both** of the last 2 rounds:
-  one tagged with `round_id = current_round_id` and one tagged with
-  `round_id = current_round_id − cycle_length`. Missing either round
-  drops the miner off the Group 1 ballot for this cycle.
+- Miner must have scores recorded under **≥ 3 distinct `round_id`s
+  within the last `5 × cycle_length` blocks** — i.e. scored in at
+  least **3 of the last 5 cycles**. The window is
+  `[current_round_id − 5 × cycle_length, current_round_id]`. Multiple
+  records at the same `round_id` count as 1; the gate is on distinct
+  round_ids. See `count_distinct_round_ids_in_range` on
+  `MinerScoreAggregator`.
 - **Empty-Group-1 guard:** if no UID clears the gates, the 98 % share
   is redirected to `uid = 0` (subnet owner) rather than dropped.
   This keeps the validator's total emission at 100 % so its
@@ -320,9 +323,9 @@ The two ballots are emitted from
 - Local score-aggregator avg ranking, restricted to
   `A ∪ B ∪ C` minus the miners already on this validator's
   Group 1 ballot.
-- Miner must have **≥ 2** score records in the aggregator.
+- Miner must have **≥ 1** score record in the aggregator.
 - No recency requirement — Group 2 is the slow-rotating reward tier
-  and a miner with two old records still qualifies.
+  and a miner with a single recorded score still qualifies.
 
 These two ballots are what other validators see next cycle when
 computing **their** chain-set tallies — the loop that drives the
@@ -357,7 +360,7 @@ Construction:
   is spare capacity left in the round.
 
 Effect on promotion: tail miners earn score records exactly like
-Group C miners do, which is what feeds the ≥ 2 / ≥ 3 record thresholds
+Group C miners do, which is what feeds the ≥ 1 / ≥ 3 record thresholds
 above and the rolling avg that drives the next cycle's chain-set
 ballots. Without the tail, a miner that drops out of every validator's
 A ∪ B ∪ C for a cycle would have no opportunity to accumulate history
@@ -375,17 +378,18 @@ the seeded Group C partition does not pick them.
   are not evaluated and earn no reward (`Round.freeze` step 3).
 - **Hotkey rotation.** When a UID's hotkey changes,
   `MinerScoreAggregator.add_score` resets that UID's history. The
-  miner must re-accumulate the ≥ 3 / ≥ 2 record thresholds before it
+  miner must re-accumulate the ≥ 3 / ≥ 1 record thresholds before it
   can re-appear in weight Group 1 / 2.
 - **Validation failure.** Hash, signature, expert-group, or NaN/Inf
   failures during eval flag the UID in `validation_failed_uids`;
   `finalize_round_scores` writes `score = 0` for that round.
   Repeated failures pull the avg down and eventually push the miner
   out of the upper tiers via the chain-set tally.
-- **Stale aggregator.** A miner that misses **either** of the last
-  2 rounds fails the Group 1 recency gate and drops off this
-  validator's top-3 ballot for the cycle. Group 2 has no recency gate —
-  it only requires ≥ 2 records.
+- **Stale aggregator.** A miner that fails to record scores under
+  **≥ 3 distinct round_ids within the last `5 × cycle_length` blocks**
+  (3 of the last 5 cycles) fails the Group 1 recency gate and drops
+  off this validator's top-`weight_group_1_size` ballot for the cycle.
+  Group 2 has no recency gate — it only requires ≥ 1 record.
 
 ---
 
