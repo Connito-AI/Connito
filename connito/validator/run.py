@@ -799,6 +799,23 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     max_points=score_window,
                     max_history_points=score_history_window,
                 )
+            # Sweep stale raw (non-rank) score points left on disk — orphans
+            # from a late background eval that landed after finalize, or from a
+            # round whose finalize never completed (e.g. a scoring failure +
+            # restart). These ride the rolling avg as illegal non-rank scores
+            # and inflate on-chain weights until they age out of the window.
+            _swept = score_aggregator.sweep_orphan_raw_scores()
+            if _swept:
+                logger.warning(
+                    "Dropped orphan raw (non-rank) score points on load",
+                    dropped=_swept,
+                )
+                try:
+                    score_aggregator.persist_atomic(score_path)
+                except Exception as e:
+                    logger.warning(
+                        "persist_atomic after orphan sweep failed", error=str(e),
+                    )
             _loaded_latest = score_aggregator.uid_score_pairs(how="latest")
             _loaded_avg = score_aggregator.uid_score_pairs(how="avg")
             logger.info(

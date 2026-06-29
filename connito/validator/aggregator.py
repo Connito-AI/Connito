@@ -15,6 +15,21 @@ from typing import Literal
 # so a restart mid-round can drop the in-flight round's partial scores.
 SCHEMA_VERSION = 2
 
+# The only score values a *finalized* round ever writes (see
+# `finalize_round_scores`): the geometric rank mapping 2.25/1.5/1.0 for the
+# top-3 plus 0.0 for everyone else. Any other value in the window is a *raw*
+# in-cycle score (`delta ** 1.2`) that finalize is supposed to replace via
+# `drop_round`. A raw value that outlives its round (an "orphan", e.g. from a
+# late background eval that landed after finalize, or a round whose finalize
+# never completed) rides the rolling avg as an illegal non-rank score and
+# distorts weights. `sweep_orphan_raw_scores` removes such stale points.
+_RANK_SCORE_VALUES: tuple[float, ...] = (0.0, 1.0, 1.5, 2.25)
+_RANK_SCORE_EPS: float = 1e-9
+
+
+def _is_rank_score(value: float) -> bool:
+    return any(abs(float(value) - r) <= _RANK_SCORE_EPS for r in _RANK_SCORE_VALUES)
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -476,6 +491,43 @@ class MinerScoreAggregator:
         with self._lock:
             for state in self._miners.values():
                 dropped += state.series.prune_before_round(min_round_id)
+        return dropped
+
+    def sweep_orphan_raw_scores(self) -> int:
+        """Drop every *raw* (non-rank) score point across all miners.
+
+        A finalized round only ever stores rank values (2.25/1.5/1.0/0.0).
+        Any other value is a raw in-cycle `delta ** 1.2` point that
+        `finalize_round_scores`'s `drop_round` was supposed to replace. One
+        that outlives its round is an orphan: it rides the rolling avg as an
+        illegal non-rank score and inflates the on-chain weight derived from
+        it (e.g. a single 5.179 point pinning a uid's avg at ~1.29).
+
+        Every non-rank point is dropped unconditionally — including one tagged
+        with the miner's highest round_id. We do NOT special-case a
+        "still in-flight" raw: this runs at startup right before the
+        round-journal recovery pass (see run.py), which replays any
+        unfinalized round through `finalize_round_scores`. That re-derives the
+        round's rank scores from the journal (`drop_round` + re-add), entirely
+        independent of the aggregator's pre-existing points, so a genuinely
+        in-flight raw is reconstructed there rather than preserved here.
+        Keeping the in-flight raw instead would leave a hole: an orphan that
+        happens to sit at the miner's newest round_id (e.g. a miner not
+        evaluated since) would never be swept.
+
+        Belt-and-suspenders cleanup for orphans persisted before the
+        finalized-round race fix landed. Returns the number of points dropped.
+        """
+        dropped = 0
+        with self._lock:
+            for state in self._miners.values():
+                pts = state.series.points
+                if not pts:
+                    continue
+                kept = [p for p in pts if _is_rank_score(p[1])]
+                if len(kept) != len(pts):
+                    dropped += len(pts) - len(kept)
+                    state.series.points = kept
         return dropped
 
     def record_count(self, uid: int) -> int:

@@ -93,6 +93,18 @@ class Round:
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
+    # Set True by `finalize_round_scores` (under `_lock`, atomically with its
+    # score snapshot) the instant it begins finalizing this round. Once set,
+    # `mark_scored` drops any further result for the round instead of
+    # recording it. This closes the late-eval race: a background eval that
+    # finishes after the eval window closed and `finalize_round_scores` has
+    # already run would otherwise write a *raw* in-cycle score
+    # (`delta ** 1.2`) to the aggregator tagged with this round_id. Finalize's
+    # `drop_round(round_id)` has already passed, so that point is never
+    # re-ranked — it survives as an illegal non-rank value in the rolling
+    # window, inflating the miner's `score_avg` and its on-chain weight for up
+    # to the full history window. See `finalize_round_scores` and `mark_scored`.
+    finalized: bool = False
 
     # Round-group construction scheme (gated by
     # `config.evaluation.enable_round_group_construction`). All default
@@ -622,6 +634,11 @@ class Round:
         """
         if self.score_aggregator is None:
             return
+        if self.finalized:
+            # Defense-in-depth: never feed the aggregator once the round is
+            # finalized. `mark_scored` already gates on this, but guard here
+            # too so any future caller cannot reintroduce an orphan raw point.
+            return
         try:
             self.score_aggregator.add_score(
                 uid=uid, hotkey=hotkey, score=float(score), round_id=self.round_id,
@@ -648,6 +665,21 @@ class Round:
         """
         score_f = float(score)
         with self._lock:
+            if self.finalized:
+                # The round was finalized (scores snapshotted, ranks written,
+                # drop_round already run) while this evaluation was still in
+                # flight. Recording it now would leave an un-ranked raw
+                # `delta ** 1.2` point in the aggregator that no drop_round
+                # ever removes — it would ride the rolling avg as an illegal
+                # non-rank score and inflate the miner's on-chain weight.
+                # Drop the stale result; release the claim so bookkeeping is
+                # consistent. The miner keeps its prior, correctly-ranked EMA.
+                self.claimed_uids.discard(uid)
+                logger.warning(
+                    "Round: dropping late score for finalized round",
+                    uid=uid, round_id=self.round_id, score=round(score_f, 6),
+                )
+                return
             self.scored_uids.add(uid)
             self.scores[uid] = score_f
             self.claimed_uids.discard(uid)
