@@ -101,12 +101,23 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
     ):
         split_name = "train" if train else "validation"
 
-        def _load_streaming_split(ds_name: str, ds_config: str | None = None):
+        def _load_streaming_split(
+            ds_name: str,
+            ds_config: str | None = None,
+            trust_remote_code: bool = False,
+        ):
             """Helper to load a dataset split safely, falling back to 'train' if 'validation' is missing."""
             try:
-                load_kwargs = {"streaming": True, "revision": "main"}
+                load_kwargs: dict[str, Any] = {"streaming": True, "revision": "main"}
                 if ds_config is not None:
                     load_kwargs["name"] = ds_config
+                if trust_remote_code:
+                    # Authorize HF to execute the dataset repo's custom
+                    # builder script. Opt-in per source via
+                    # DatasetSourceCfg.trust_remote_code; never on by
+                    # default. See config.DatasetSourceCfg for the
+                    # rationale.
+                    load_kwargs["trust_remote_code"] = True
 
                 ds = load_dataset(ds_name, **load_kwargs)
                 if split_name in ds:
@@ -224,6 +235,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             ds_config = _source_value(source, "name")
             text_column = _source_value(source, "text_column", "text")
             weight = float(_source_value(source, "weight", 1.0))
+            trust_remote_code = bool(_source_value(source, "trust_remote_code", False))
 
             if not ds_name:
                 raise ValueError("Each dataset source must define a non-empty 'path'.")
@@ -248,7 +260,11 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 )
                 source_split = load_streaming_shard(pick, split_name=split_name)
             else:
-                source_split = _load_streaming_split(ds_name, ds_config=ds_config)
+                source_split = _load_streaming_split(
+                    ds_name,
+                    ds_config=ds_config,
+                    trust_remote_code=trust_remote_code,
+                )
 
             source_split = source_split.select_columns([text_column])
             source_split = source_split.map(

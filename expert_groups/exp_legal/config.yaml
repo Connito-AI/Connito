@@ -6,6 +6,15 @@ data:
       name: "en_all"
       weight: 0.5
       text_column: "text"
+      # Required: Multi_Legal_Pile ships a custom builder script
+      # (joelniklaus/Multi_Legal_Pile/Multi_Legal_Pile.py) that HF
+      # refuses to execute without explicit opt-in. The flag is
+      # per-source (see config.DatasetSourceCfg comment) so only
+      # this dataset gets remote-code authorization; c4 below stays
+      # off. When seeded shard-pick is wired up for this source,
+      # also pin the revision via `eval_source_revision_pin` to
+      # bound the executed code to a reviewed SHA.
+      trust_remote_code: true
     - path: "allenai/c4"
       name: "en"
       weight: 0.5

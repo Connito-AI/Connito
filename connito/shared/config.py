@@ -203,6 +203,14 @@ class DatasetSourceCfg(BaseConfig):
     name: str | None = None
     weight: PositiveFloat = 1.0
     text_column: str = "text"
+    # Authorize HF's `load_dataset` to execute the dataset repo's custom
+    # builder script. Required for sources that ship a `<name>.py` loader
+    # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
+    # malicious dataset can't piggyback through a globally-enabled flag —
+    # operators consent to executing remote code one dataset at a time.
+    # Pin the source's revision via `eval_source_revision_pin` when
+    # turning this on to bound the surface to a reviewed SHA.
+    trust_remote_code: bool = False
 
     @model_validator(mode="after")
     def _validate_non_empty(self):
