@@ -17,6 +17,7 @@ if logging.root.level > logging.DEBUG:
     logging.getLogger("transformers.modeling_rope_utils").setLevel(logging.ERROR)
 
 from connito.shared.app_logging import structlog
+from connito.shared.helper import get_nested_attr
 from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import *
@@ -35,7 +36,16 @@ if MODEL_BACKEND == "deepseek_v2":
     )
 
     def get_moe_model_config(config, topk, group_ids, expert_manager, full = False):
-        return _get_moe_model_config_impl(config, topk, group_ids, expert_manager, full = full)
+        # Pipe through the 2Fnat knobs. Default routing_mode="masked_topk" keeps
+        # every existing paradigm (A / D / F16 / D-strict) numerically identical.
+        routing_mode = str(get_nested_attr(config, "task.routing_mode", "masked_topk"))
+        trainable_group_id = get_nested_attr(config, "task.exp.group_id", None)
+        return _get_moe_model_config_impl(
+            config, topk, group_ids, expert_manager,
+            full=full,
+            routing_mode=routing_mode,
+            trainable_group_id=trainable_group_id,
+        )
 
 elif MODEL_BACKEND == "qwen3_next":
     from connito.shared.modeling.custom_qwen3_next import (

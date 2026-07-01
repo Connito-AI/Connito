@@ -1,0 +1,16 @@
+group_id: 0
+# MetaMathQA-SFT ESFT-Token @ p=0.2
+# Auto-generated from ESFT-Token @ p=0.2 profiling.
+# Total experts across 26 MoE layers: 146
+data:
+  dataset_sources:
+    - path: "meta-math/MetaMathQA"
+      name: null
+      weight: 1.0
+      text_column: "text"
+  per_device_train_batch_size: 1
+  batch_size: 4
+  sequence_length: 4096
+  world_size: 10
+  rank: 1
+  dataset_class: null

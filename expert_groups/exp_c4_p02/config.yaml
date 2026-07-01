@@ -1,0 +1,16 @@
+group_id: 1
+# C4 (allenai/c4 en) ESFT-Token @ p=0.2 - frozen helpers
+# Auto-generated from ESFT-Token @ p=0.2 profiling.
+# Total experts across 26 MoE layers: 243
+data:
+  dataset_sources:
+    - path: "allenai/c4"
+      name: "en"
+      weight: 1.0
+      text_column: "text"
+  per_device_train_batch_size: 1
+  batch_size: 4
+  sequence_length: 4096
+  world_size: 10
+  rank: 1
+  dataset_class: null
