@@ -900,6 +900,23 @@ class EvalCfg(BaseConfig):
     validation_group_c_size: int = 17
     group_a_min_consensus: int = 1               # ≥ 1 qualified validator
     group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
+    # When a miner's committed HF repo/revision/file is definitively not
+    # retrievable (deleted, private, gated, revision rewritten) AND an
+    # unauthenticated probe confirms it is not publicly fetchable, treat
+    # the miss as the miner's fault: record score=0 for the round instead
+    # of preserving the prior rolling average. Closes the
+    # "delete-your-model-and-keep-earning" hole; set False to restore the
+    # legacy EMA-preserving behavior.
+    repo_unavailable_is_miner_fault: bool = True
+    # Near-duplicate submission detection. Every evaluated submission gets
+    # a seeded coordinate-sample sketch of its weight delta vs the round's
+    # base model; at finalize, scored miners whose delta sketches exceed
+    # the cosine threshold are treated like the existing exact-val_loss
+    # ties — all members of the cluster get score=0 for the round. Extends
+    # the exact-equality duplicate rule to copy-then-perturb submissions.
+    near_duplicate_detection_enabled: bool = True
+    near_duplicate_cos_threshold: float = 0.95
+    near_duplicate_sketch_budget: int = 32768    # total sampled coordinates per sketch
 
 
 class ValidatorConfig(WorkerConfig):

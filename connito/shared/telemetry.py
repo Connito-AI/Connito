@@ -331,6 +331,8 @@ EvalFailureReason = Literal[
     "non_finite_loss",
     "download_failed",
     "statedict_parse_failed",
+    "repo_unavailable",
+    "duplicate_submission",
 ]
 _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
@@ -338,6 +340,7 @@ _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "no_chain_commit", "signature_invalid", "hash_mismatch",
     "expert_group_or_nan", "non_finite_loss",
     "download_failed", "statedict_parse_failed",
+    "repo_unavailable", "duplicate_submission",
 })
 
 # Stable integer codes surfaced by VALIDATOR_MINER_EVAL_STATUS. Treat as a
@@ -357,6 +360,8 @@ EVAL_STATUS_CODES: dict[int, str] = {
     9: "timeout",
     10: "deadline_exceeded",
     11: "rpc_error",
+    12: "repo_unavailable",
+    13: "duplicate_submission",
     99: "unknown",
 }
 _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
@@ -371,6 +376,8 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "timeout": 9,
     "deadline": 10,
     "rpc": 11,
+    "repo_unavailable": 12,
+    "duplicate_submission": 13,
     # Legacy aliases — fold into the closest miner-facing code so old
     # call sites continue producing meaningful status values.
     "corrupt": 2,
