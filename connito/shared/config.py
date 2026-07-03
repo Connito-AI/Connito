@@ -455,6 +455,13 @@ class TaskCfg(BaseConfig):
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
+    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
+    # is the default: base gate runs unmasked, natural picks landing in the
+    # trainable set are kept as-is, non-trainable picks get replaced by the
+    # token's top-scoring helper. Falls back to masked-topk automatically when
+    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
+    # to force the pre-2Fnat behavior.
+    routing_mode: str = "natural_with_fallback"
 
 
 # ---------------------------
