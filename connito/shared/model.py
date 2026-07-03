@@ -192,18 +192,23 @@ def get_model_from_checkpoint(
     # are returned as-is; mid-cycle peer resync via `reload_model_inplace`
     # is unaffected.
     resume = get_nested_attr(config, "ckpt.resume_from_ckpt", False) and load_global_checkpoint
-    group_ids = [config.task.exp.group_id] if partial else None
+    group_ids_trainable = [config.task.exp.group_id] if partial else None
+    # Helper groups are not yet sourced from config; when wired, populate
+    # from e.g. config.task.exp.helper_group_ids so 2Fnat routing activates.
+    group_ids_helper: list | None = None
     logger.info(
         "Loading base model for checkpoint",
         mode="partial" if partial else "full",
-        group_ids=group_ids or "all",
+        group_ids_trainable=group_ids_trainable or "all",
+        group_ids_helper=group_ids_helper,
         load_global_checkpoint=load_global_checkpoint,
     )
     # get base model
     model = get_base_model(
         config,
         expert_manager=expert_manager,
-        group_ids=group_ids,
+        group_ids_trainable=group_ids_trainable,
+        group_ids_helper=group_ids_helper,
         partial=partial,
     )
 

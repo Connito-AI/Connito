@@ -345,29 +345,37 @@ class CustomDeepseekV2Moe(nn.Module):
         full_mode = bool(getattr(config, "full", False))
 
         # --- Determine allowed experts ---
-        # `allowed_expert_id` is the UNION across all active groups — used by the
-        # default masked-topk routing. When `routing_mode == "natural_with_fallback"`
-        # we additionally split the union into trainable_expert_id (the single
-        # group whose experts receive gradient) + helper_expert_id (all other
-        # visible groups), so the routing rule can preserve natural picks that
-        # land in the trainable set and substitute helpers for the rest.
+        # Trainable and helper group sets are supplied independently on the
+        # config (see get_moe_model_config). `allowed_expert_id` is their union
+        # — used by masked-topk routing. `trainable_expert_id` / `helper_expert_id`
+        # remain split so the natural-with-fallback routing rule can preserve
+        # natural picks that land in the trainable set and substitute helpers
+        # for the rest.
         trainable_expert_id: list[int] = []
         helper_expert_id: list[int] = []
         if full_mode:
             allowed_expert_id = list(range(config.n_routed_experts))
         elif config.expert_group_assignment is not None:
-            group_ids = config.group_ids if config.group_ids is not None else config.expert_group_assignment.keys()
-            trainable_group_id = getattr(config, "trainable_group_id", None)
-            allowed_expert_id = []
-            for group_id in group_ids:
-                group_id = int(group_id)
-                layer_assignments = config.expert_group_assignment[group_id].get(layer_id, [])
-                layer_experts = [int(org_expert_id) for _, org_expert_id in layer_assignments]
-                allowed_expert_id += layer_experts
-                if trainable_group_id is not None and group_id == int(trainable_group_id):
-                    trainable_expert_id += layer_experts
-                else:
-                    helper_expert_id += layer_experts
+            trainable_group_ids = getattr(config, "group_ids_trainable", None)
+            helper_group_ids = getattr(config, "group_ids_helper", None)
+            # When neither is set explicitly, treat every assigned group as
+            # trainable (matches the pre-split default of loading everything).
+            if trainable_group_ids is None and helper_group_ids is None:
+                trainable_group_ids = list(config.expert_group_assignment.keys())
+                helper_group_ids = []
+            trainable_group_ids = list(trainable_group_ids or [])
+            helper_group_ids = list(helper_group_ids or [])
+
+            def _collect(group_ids: list) -> list[int]:
+                out: list[int] = []
+                for group_id in group_ids:
+                    layer_assignments = config.expert_group_assignment[int(group_id)].get(layer_id, [])
+                    out += [int(org_expert_id) for _, org_expert_id in layer_assignments]
+                return out
+
+            trainable_expert_id = _collect(trainable_group_ids)
+            helper_expert_id = _collect(helper_group_ids)
+            allowed_expert_id = trainable_expert_id + helper_expert_id
         else:
             total_experts = getattr(config, "num_experts", None)
             if total_experts is None:
@@ -383,13 +391,16 @@ class CustomDeepseekV2Moe(nn.Module):
         if invalid_experts:
             raise ValueError(
                 "Detected out-of-range expert ids in allowed_expert_id for layer routing. "
-                f"layer_id={layer_id}, group_ids={config.group_ids}, "
+                f"layer_id={layer_id}, "
+                f"group_ids_trainable={getattr(config, 'group_ids_trainable', None)}, "
+                f"group_ids_helper={getattr(config, 'group_ids_helper', None)}, "
                 f"invalid={invalid_experts[:10]}"
             )
         if len(available_experts) == 0:
             raise ValueError(
                 f"No routed experts assigned for layer_id={layer_id}. "
-                f"group_ids={config.group_ids}"
+                f"group_ids_trainable={getattr(config, 'group_ids_trainable', None)}, "
+                f"group_ids_helper={getattr(config, 'group_ids_helper', None)}"
             )
         if full_mode and len(available_experts) != config.n_routed_experts:
             raise ValueError(
@@ -972,12 +983,12 @@ def stream_safetensors_to_partial_model(
 def get_moe_model_config(
     config: MinerConfig,
     topk: int,
-    group_ids: list | None,
+    group_ids_trainable: list | None,
     expert_manager: ExpertManager,
     org_model_config: AutoConfig = None,
     full: bool = False,
     routing_mode: str = "masked_topk",
-    trainable_group_id: int | None = None,
+    group_ids_helper: list | None = None,
 ) -> PretrainedConfig:
     # Load the hub config for its field values, then re-construct using the
     # installed DeepseekV2Config so that __init__ sets derived fields like head_dim.
@@ -999,11 +1010,18 @@ def get_moe_model_config(
 
     num_routed_experts = int(hub_dict.get("n_routed_experts", 16))
     num_hidden_layers = int(getattr(base_config, "num_hidden_layers", 0))
+    # Validate every group we plan to load (union of trainable + helper). If
+    # both are None the validator falls back to all-groups.
+    _merged_group_ids: list | None
+    if group_ids_trainable is None and group_ids_helper is None:
+        _merged_group_ids = None
+    else:
+        _merged_group_ids = list(group_ids_trainable or []) + list(group_ids_helper or [])
     _validate_assignment_bounds(
         expert_group_assignment=expert_manager.expert_group_assignment,
         num_experts=num_routed_experts,
         num_hidden_layers=num_hidden_layers,
-        group_ids=group_ids,
+        group_ids=_merged_group_ids,
     )
 
     # merge our subnet config to the base config
@@ -1019,10 +1037,8 @@ def get_moe_model_config(
     base_config.norm_topk_prob = True
     base_config.max_position_embeddings = config.task.exp.data.sequence_length
     base_config.expert_group_assignment = expert_manager.expert_group_assignment
-    base_config.group_ids = group_ids
+    base_config.group_ids_trainable = list(group_ids_trainable) if group_ids_trainable is not None else None
+    base_config.group_ids_helper = list(group_ids_helper) if group_ids_helper is not None else None
     base_config.routing_mode = str(routing_mode)
-    base_config.trainable_group_id = (
-        int(trainable_group_id) if trainable_group_id is not None else None
-    )
 
     return base_config

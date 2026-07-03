@@ -181,7 +181,8 @@ def main() -> int:
     model = get_base_model(
         config=config,
         expert_manager=expert_manager,
-        group_ids=None,
+        group_ids_trainable=None,
+        group_ids_helper=None,
         partial=False,
     )
     target_device, target_dtype = get_target_device_and_dtype(config)

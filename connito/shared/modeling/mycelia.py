@@ -35,20 +35,19 @@ if MODEL_BACKEND == "deepseek_v2":
         stream_safetensors_to_partial_model as _stream_safetensors_to_partial_impl,
     )
 
-    def get_moe_model_config(config, topk, group_ids, expert_manager, full = False):
+    def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = False):
         # Pipe through the 2Fnat knobs. Default routing_mode="natural_with_fallback"
-        # for the miner/validator path — the branch self-gates on trainable_ids
-        # and helper_ids both being non-empty, so single-group loads (today's
-        # miner/validator, only their own group) silently fall through to
-        # masked-topk with byte-identical numerics. When a helper group is also
-        # loaded, 2Fnat activates automatically without any config change.
+        # for the miner/validator path — the routing branch self-gates on
+        # trainable_ids and helper_ids both being non-empty, so single-group
+        # loads (only the trainable group; group_ids_helper=None) silently fall
+        # through to masked-topk with byte-identical numerics. When helper
+        # groups are also loaded, 2Fnat activates automatically.
         routing_mode = str(get_nested_attr(config, "task.routing_mode", "natural_with_fallback"))
-        trainable_group_id = get_nested_attr(config, "task.exp.group_id", None)
         return _get_moe_model_config_impl(
-            config, topk, group_ids, expert_manager,
+            config, topk, group_ids_trainable, expert_manager,
             full=full,
             routing_mode=routing_mode,
-            trainable_group_id=trainable_group_id,
+            group_ids_helper=group_ids_helper,
         )
 
 elif MODEL_BACKEND == "qwen3_next":
@@ -62,8 +61,11 @@ elif MODEL_BACKEND == "qwen3_next":
     _stream_pretrained_to_partial_impl = None
     _stream_safetensors_to_partial_impl = None
 
-    def get_moe_model_config(config, topk, group_ids, expert_manager):
-        return _get_moe_model_config_impl(config, topk, group_ids, expert_manager)
+    def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager):
+        return _get_moe_model_config_impl(
+            config, topk, group_ids_trainable, expert_manager,
+            group_ids_helper=group_ids_helper,
+        )
 
 else:
     raise ValueError(f"Unknown MODEL_BACKEND: {MODEL_BACKEND!r}")
@@ -160,7 +162,8 @@ def load_pretrained_model_low_mem(
 def get_base_model(
     config: MinerConfig | ValidatorConfig,
     expert_manager: ExpertManager,
-    group_ids: list | None = None,
+    group_ids_trainable: list | None = None,
+    group_ids_helper: list | None = None,
     partial=False,
 ) -> nn.Module | None:
     """
@@ -179,7 +182,9 @@ def get_base_model(
     topk = config.moe.partial_topk if partial else config.moe.full_topk
     model_path = config.model.model_path.lower()
     
-    moe_config = get_moe_model_config(config, topk, group_ids, expert_manager, full = not partial)
+    moe_config = get_moe_model_config(
+        config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = not partial,
+    )
         
     is_validator = config.role == "validator"
     use_quantization = get_nested_attr(config, "model.use_quantization", False) and is_validator
@@ -272,55 +277,67 @@ def get_base_model(
             target_device = "cpu"
 
         model = _CausalLMClass(moe_config)
-        if _stream_safetensors_to_partial_impl is not None and group_ids:
-            target_group = group_ids[0]
+        # Streaming initializes expert slices from pretrained; do it for the
+        # trainable group AND any helper groups that were also loaded. Each
+        # target_group call only touches its own expert slots, so passes are
+        # independent.
+        stream_targets: list[int] = []
+        for gid in (group_ids_trainable or []):
+            stream_targets.append(int(gid))
+        for gid in (group_ids_helper or []):
+            stream_targets.append(int(gid))
+
+        if _stream_safetensors_to_partial_impl is not None and stream_targets:
             model = model.to(device=target_device, dtype=model_dtype)
-            model = _stream_safetensors_to_partial_impl(
-                partial_model=model,
-                model_path=config.model.model_path,
-                expert_group_assignment=expert_manager.expert_group_assignment,
-                target_group=target_group,
-                dtype=model_dtype,
-            )
-            gc.collect()
-            logger.info(
-                "Streamed pretrained safetensors directly into partial model",
-                target_group=target_group,
-                device=str(target_device),
-                dtype=str(model_dtype),
-            )
-        elif _stream_pretrained_to_partial_impl is not None and group_ids:
+            for target_group in stream_targets:
+                model = _stream_safetensors_to_partial_impl(
+                    partial_model=model,
+                    model_path=config.model.model_path,
+                    expert_group_assignment=expert_manager.expert_group_assignment,
+                    target_group=target_group,
+                    dtype=model_dtype,
+                )
+                gc.collect()
+                logger.info(
+                    "Streamed pretrained safetensors directly into partial model",
+                    target_group=target_group,
+                    device=str(target_device),
+                    dtype=str(model_dtype),
+                )
+        elif _stream_pretrained_to_partial_impl is not None and stream_targets:
             # Backend has a state-dict streaming helper but no
             # safetensors-direct path. Higher CPU peak (~30 GB for
             # DeepSeek-V2-Lite) but still better than the legacy
-            # full-model-on-CPU approach.
-            target_group = group_ids[0]
+            # full-model-on-CPU approach. Re-load the state dict per
+            # target group since the impl consumes it.
             model = model.to(device=target_device, dtype=model_dtype)
-            pretrained_sd = load_pretrained_state_dict(
-                config.model.model_path, dtype=model_dtype,
-            )
-            try:
-                model = _stream_pretrained_to_partial_impl(
-                    partial_model=model,
-                    state_dict=pretrained_sd,
-                    expert_group_assignment=expert_manager.expert_group_assignment,
-                    target_group=target_group,
+            for target_group in stream_targets:
+                pretrained_sd = load_pretrained_state_dict(
+                    config.model.model_path, dtype=model_dtype,
                 )
-            finally:
-                del pretrained_sd
-                gc.collect()
-            logger.info(
-                "Streamed pretrained backbone + owned-expert slices into partial model",
-                target_group=target_group,
-                device=str(target_device),
-                dtype=str(model_dtype),
-            )
+                try:
+                    model = _stream_pretrained_to_partial_impl(
+                        partial_model=model,
+                        state_dict=pretrained_sd,
+                        expert_group_assignment=expert_manager.expert_group_assignment,
+                        target_group=target_group,
+                    )
+                finally:
+                    del pretrained_sd
+                    gc.collect()
+                logger.info(
+                    "Streamed pretrained backbone + owned-expert slices into partial model",
+                    target_group=target_group,
+                    device=str(target_device),
+                    dtype=str(model_dtype),
+                )
         else:
             logger.warning(
                 "Partial model returned with random weights — no pretrained-state-dict "
-                "streaming helper available for this backend or `group_ids` missing",
+                "streaming helper available for this backend or no groups provided",
                 backend=MODEL_BACKEND,
-                group_ids=group_ids,
+                group_ids_trainable=group_ids_trainable,
+                group_ids_helper=group_ids_helper,
             )
 
     if model is not None and get_nested_attr(config, "model.torch_compile", False):

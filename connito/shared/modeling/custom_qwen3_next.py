@@ -86,15 +86,17 @@ class SparseMoeBlock(Qwen3NextSparseMoeBlock):
         super().__init__(config)
 
         if config.expert_group_assignment is not None:
-            if config.group_ids is None:
-                group_ids = config.expert_group_assignment.keys()
+            trainable_group_ids = getattr(config, "group_ids_trainable", None)
+            helper_group_ids = getattr(config, "group_ids_helper", None)
+            if trainable_group_ids is None and helper_group_ids is None:
+                merged_group_ids = list(config.expert_group_assignment.keys())
             else:
-                group_ids = config.group_ids
+                merged_group_ids = list(trainable_group_ids or []) + list(helper_group_ids or [])
 
             allowed_expert_id = []
-            for group_id in group_ids:
+            for group_id in merged_group_ids:
                 allowed_expert_id += [
-                    my_expert_id for my_expert_id, org_expert_id in config.expert_group_assignment[group_id][layer_id]
+                    my_expert_id for my_expert_id, org_expert_id in config.expert_group_assignment[int(group_id)][layer_id]
                 ]
         else:
             allowed_expert_id = list(range(config.num_experts))
@@ -196,14 +198,22 @@ class CustomQwen3NextForCausalLM(Qwen3NextForCausalLM):
 
 
 def get_moe_model_config(
-    config: MinerConfig, topk: int, group_ids: list | None, expert_manager: ExpertManager
+    config: MinerConfig,
+    topk: int,
+    group_ids_trainable: list | None,
+    expert_manager: ExpertManager,
+    group_ids_helper: list | None = None,
 ) -> PretrainedConfig:
     # get the base config from qwen model
     base_config = AutoConfig.from_pretrained(config.model.model_path)
 
     # full/partial dependent configuration
     base_config.num_experts_per_tok = int(topk)
-    base_config.group_ids = group_ids  # in list, cause you may load a partial model that contains multiple group id
+    # Trainable + helper group sets are consumed independently by SparseMoeBlock;
+    # the qwen3_next backend has no routing-mode split yet, so their union
+    # defines the allowed experts.
+    base_config.group_ids_trainable = list(group_ids_trainable) if group_ids_trainable is not None else None
+    base_config.group_ids_helper = list(group_ids_helper) if group_ids_helper is not None else None
 
     # merge our subnet config to the base config
     base_config.n_group = config.moe.num_worker_groups
