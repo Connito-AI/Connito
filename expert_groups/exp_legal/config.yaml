@@ -2,8 +2,18 @@ group_id: 2
 expert_group_name: "exp_legal"
 data:
   dataset_sources:
+    # `all_all` is the multilingual union of every language/document-type
+    # subset in Multi_Legal_Pile (33 shards, ~500 MB compressed vs
+    # `en_all`'s 2 shards, ~30 MB). We deliberately choose the wider
+    # scope over English-only for anti-memorization: `en_all` totals
+    # only ~36 k rows, which a miner can memorize inside a day of
+    # continuous training. `all_all` gives the validator a much larger
+    # eval pool and lets miners specialize on legal patterns that
+    # generalize across jurisdictions rather than overfit to one
+    # corpus. DeepSeek-V2-Lite handles multilingual text well; the MoE
+    # router will distribute language-specific routing across experts.
     - path: "joelniklaus/Multi_Legal_Pile"
-      name: "en_all"
+      name: "all_all"
       weight: 0.5
       text_column: "text"
       # Required: Multi_Legal_Pile ships a custom builder script
@@ -25,10 +35,11 @@ data:
   world_size: 10
   rank: 1
   dataset_class: "expert_groups.exp_legal.dataset:StreamingTorchDataset"
-  # TODO(exp-legal-launch): register (joelniklaus/Multi_Legal_Pile, en_all)
+  # TODO(exp-legal-launch): register (joelniklaus/Multi_Legal_Pile, all_all)
   # in connito/shared/eval_shard_pick.py:_KNOWN_SOURCES with verified
-  # shard rows, then flip this back to true. Until then, the validator's
-  # legacy head-of-stream eval path is used for this group; consensus
-  # determinism across validators is weaker than the seeded-pick guarantee
-  # exp_math already enjoys. See docs/exp-legal-migration-plan.md §2.
+  # shard rows for all 33 files, then flip this back to true. Until then,
+  # the validator's legacy head-of-stream eval path is used for this
+  # group; consensus determinism across validators is weaker than the
+  # seeded-pick guarantee exp_math already enjoys. See
+  # docs/exp-legal-migration-plan.md §2.
   eval_source_seeded_shard_pick: false
