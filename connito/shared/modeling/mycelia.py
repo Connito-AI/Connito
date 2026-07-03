@@ -36,9 +36,13 @@ if MODEL_BACKEND == "deepseek_v2":
     )
 
     def get_moe_model_config(config, topk, group_ids, expert_manager, full = False):
-        # Pipe through the 2Fnat knobs. Default routing_mode="masked_topk" keeps
-        # every existing paradigm (A / D / F16 / D-strict) numerically identical.
-        routing_mode = str(get_nested_attr(config, "task.routing_mode", "masked_topk"))
+        # Pipe through the 2Fnat knobs. Default routing_mode="natural_with_fallback"
+        # for the miner/validator path — the branch self-gates on trainable_ids
+        # and helper_ids both being non-empty, so single-group loads (today's
+        # miner/validator, only their own group) silently fall through to
+        # masked-topk with byte-identical numerics. When a helper group is also
+        # loaded, 2Fnat activates automatically without any config change.
+        routing_mode = str(get_nested_attr(config, "task.routing_mode", "natural_with_fallback"))
         trainable_group_id = get_nested_attr(config, "task.exp.group_id", None)
         return _get_moe_model_config_impl(
             config, topk, group_ids, expert_manager,
