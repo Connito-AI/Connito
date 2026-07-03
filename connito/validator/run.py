@@ -1059,7 +1059,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     round_obj=pending_round,
                     score_aggregator=score_aggregator,
                     score_path=score_path,
-                    config=config,
                 )
                 # Drop history older than 8 cycle lengths so the aggregator
                 # only carries the recent window the cohort election + weight

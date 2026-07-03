@@ -5,7 +5,7 @@ import copy
 import gc
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import bittensor
@@ -165,7 +165,6 @@ def finalize_round_scores(
     round_obj,  # connito.validator.round.Round
     score_aggregator,
     score_path=None,
-    config=None,  # ValidatorConfig; None (journal-recovery path) disables near-dup detection
 ) -> dict[int, float]:
     """Replace this round's per-miner aggregator entries with rank-based
     scores derived from `round.scores` (the delta-based per-round signal
@@ -183,11 +182,6 @@ def finalize_round_scores(
         scored miner's: score 0 — a tied val_loss is evidence of a
         duplicated submission, so both sides are penalized regardless
         of where they would have ranked.
-      - Any UIDs whose weight-delta sketch is near-parallel to another
-        scored miner's (copy-then-perturb; see `submission_fingerprint`):
-        score 0 for every member of the cluster, same as an exact tie.
-        Requires `config` — the journal-recovery path passes None and
-        skips this.
       - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf, or a
         committed HF checkpoint confirmed not publicly retrievable):
         score 0.
@@ -241,64 +235,7 @@ def finalize_round_scores(
     for _, s in positive:
         score_counts[s] = score_counts.get(s, 0) + 1
     tied_uids = {uid for uid, s in positive if score_counts[s] > 1}
-
-    # Near-duplicate detection: the exact-equality rule above is defeated
-    # by any perturbation of a copied submission (the val_loss shifts in
-    # the last decimals and the scores become distinct). Compare the
-    # weight-delta sketches recorded at eval time instead — submissions
-    # whose deltas vs the base model are near-parallel are copies of one
-    # another, so every member of a flagged cluster is zeroed exactly like
-    # an exact tie. Wrapped broadly: detection must never block finalize.
-    near_dup_uids: set[int] = set()
-    if config is not None and getattr(
-        config.evaluation, "near_duplicate_detection_enabled", False,
-    ):
-        try:
-            fingerprints = dict(getattr(round_obj, "fingerprints", {}) or {})
-            fingerprints = {u: fp for u, fp in fingerprints.items() if u in scored}
-            if len(fingerprints) >= 2:
-                from connito.validator.submission_fingerprint import (
-                    find_near_duplicate_clusters,
-                )
-                clusters = find_near_duplicate_clusters(
-                    fingerprints,
-                    cos_threshold=float(getattr(
-                        config.evaluation, "near_duplicate_cos_threshold", 0.95,
-                    )),
-                )
-                for cluster in clusters:
-                    near_dup_uids |= cluster
-                if len(fingerprints) < len(scored):
-                    logger.info(
-                        "finalize_round_scores: some scored uids have no "
-                        "fingerprint (recovered round or sketch failure) — "
-                        "duplicate detection covered a subset",
-                        round_id=round_obj.round_id,
-                        with_fingerprint=len(fingerprints),
-                        scored=len(scored),
-                    )
-                try:
-                    from connito.shared.telemetry import (
-                        inc_eval_failure as _inc_failure,
-                        set_miner_eval_status as _set_dup_status,
-                    )
-                    for uid in near_dup_uids:
-                        _inc_failure(int(uid), "duplicate_submission")
-                        _set_dup_status(int(uid), "duplicate_submission")
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(
-                "finalize_round_scores: near-duplicate detection failed — "
-                "continuing without it",
-                round_id=round_obj.round_id, error=str(e),
-            )
-
-    tied_uids |= {uid for uid, _ in positive if uid in near_dup_uids}
-    unique_positive = [
-        (uid, s) for uid, s in positive
-        if score_counts[s] == 1 and uid not in near_dup_uids
-    ]
+    unique_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
     unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
 
     written: dict[int, float] = {}
@@ -425,7 +362,6 @@ def finalize_round_scores(
         },
         scored_count=len(scored),
         tied_count=len(tied_uids),
-        near_duplicate_count=len(near_dup_uids),
         validation_failed_count=len(validation_failed),
         freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )
@@ -641,11 +577,6 @@ class MinerEvalJob:
     model_path: str
     step: int
     score: float = 0.0
-    # Weight-delta sketch vs the round's base model (see
-    # `submission_fingerprint`). None when detection is disabled or the
-    # sketch could not be computed; excluded from eq/hash — two jobs for
-    # the same eval are the same job regardless of sketch availability.
-    fingerprint: "torch.Tensor | None" = field(default=None, compare=False)
 
 
 # -------------------------- Pipeline Config -----------------------------------
@@ -662,20 +593,12 @@ EVAL_MAX_BATCHES = 50
 #     return model.to(device)
 
 @track_model_load_latency()
-def load_model_from_path(
-    path: str,
-    base_model: nn.Module,
-    device: torch.device,
-    sd: dict | None = None,
-) -> nn.Module:
+def load_model_from_path(path: str, base_model: nn.Module, device: torch.device) -> nn.Module:
     # `path` points to a miner-controlled checkpoint downloaded from HF.
     # `load_state_dict_from_path` accepts `.safetensors` (preferred — no
     # pickle path) or `.pt` (gated by `weights_only=True` so a malicious
     # `__reduce__` payload cannot execute on the validator host).
-    # Callers that already parsed the file (e.g. to fingerprint it) pass
-    # `sd` to skip the second disk read.
-    if sd is None:
-        sd = load_state_dict_from_path(path)
+    sd = load_state_dict_from_path(path)
 
     if len(sd) == 0:
         raise ValueError(f"Checkpoint at {path} has empty model_state_dict")
@@ -839,35 +762,7 @@ def evaluate_one_miner_sync(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Parse the checkpoint once; the same dict feeds the fingerprint
-        # sketch and the model build. Parse errors here land in the same
-        # (ValueError/RuntimeError/EOFError) handler that used to catch
-        # them inside `load_model_from_path`.
-        sd = load_state_dict_from_path(str(model_path))
-
-        # Weight-delta sketch for near-duplicate detection at finalize.
-        # Best-effort — a sketch failure must never take down the eval.
-        fingerprint = None
-        if getattr(config.evaluation, "near_duplicate_detection_enabled", False):
-            try:
-                from connito.validator.submission_fingerprint import sketch_state_dict
-                fingerprint = sketch_state_dict(
-                    sd,
-                    base_model.state_dict(),
-                    seed=str(combined_seed),
-                    budget=int(getattr(
-                        config.evaluation, "near_duplicate_sketch_budget", 32768,
-                    )),
-                )
-            except Exception as e:
-                logger.warning(
-                    "evaluate_one_miner: fingerprint sketch failed — "
-                    "duplicate detection will skip this uid",
-                    uid=int(uid), error=str(e),
-                )
-
-        miner_model = load_model_from_path(str(model_path), base_model, device, sd=sd)
-        del sd
+        miner_model = load_model_from_path(str(model_path), base_model, device)
 
         try:
             metrics = _evaluate_on_fresh_loader_sync(
@@ -930,7 +825,6 @@ def evaluate_one_miner_sync(
             model_path=str(model_path),
             step=int(step),
             score=float(score),
-            fingerprint=fingerprint,
         )
     except EvalDeadlineExceeded as e:
         logger.warning(
@@ -1243,7 +1137,7 @@ async def evaluate_foreground_round(
                     round_obj=round_obj,
                 )
                 continue
-            round_obj.mark_scored(uid, evaluated.score, fingerprint=evaluated.fingerprint)
+            round_obj.mark_scored(uid, evaluated.score)
             completed.append(evaluated)
             _prune_non_top_after_eval(
                 config=config,

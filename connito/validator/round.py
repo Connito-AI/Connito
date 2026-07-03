@@ -94,11 +94,6 @@ class Round:
     # (which only covers roster miners with a valid checkpoint).
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
-    # Per-uid weight-delta sketches recorded by `mark_scored` and consumed
-    # by finalize's near-duplicate detection. Memory-only (never journaled):
-    # ~128 KB per miner, and a mid-round restart merely narrows detection
-    # to post-restart evals.
-    fingerprints: dict[int, "torch.Tensor"] = field(default_factory=dict, repr=False, compare=False)
     weights_submitted: bool = False
 
     # Round-group construction scheme (gated by
@@ -641,18 +636,11 @@ class Round:
                 error=str(e), uid=uid, round_id=self.round_id,
             )
 
-    def mark_scored(self, uid: int, score: float = 0.0, fingerprint=None) -> None:
+    def mark_scored(self, uid: int, score: float = 0.0) -> None:
         """Record a successful evaluation. `score` is this-round's score
         (e.g. ``delta ** 1.2`` from `evaluate_one_miner`); it is stored
         in `self.scores` so per-round ranking — used by post-eval
         submission cleanup — never has to consult the global aggregator.
-
-        `fingerprint` is the submission's weight-delta sketch (a 1-D CPU
-        tensor from `submission_fingerprint.sketch_state_dict`), used by
-        `finalize_round_scores` to zero near-duplicate submissions. It is
-        memory-only — NOT persisted to the journal — so a restart
-        mid-round degrades duplicate detection to the UIDs evaluated
-        after the restart rather than blocking recovery.
 
         Also writes to the per-round journal and (if configured) the
         score aggregator with the raw delta tagged with this round_id,
@@ -664,8 +652,6 @@ class Round:
         with self._lock:
             self.scored_uids.add(uid)
             self.scores[uid] = score_f
-            if fingerprint is not None:
-                self.fingerprints[uid] = fingerprint
             self.claimed_uids.discard(uid)
             hotkey = self.uid_to_hotkey.get(uid)
         self._persist_journal()

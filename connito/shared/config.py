@@ -908,15 +908,6 @@ class EvalCfg(BaseConfig):
     # "delete-your-model-and-keep-earning" hole; set False to restore the
     # legacy EMA-preserving behavior.
     repo_unavailable_is_miner_fault: bool = True
-    # Near-duplicate submission detection. Every evaluated submission gets
-    # a seeded coordinate-sample sketch of its weight delta vs the round's
-    # base model; at finalize, scored miners whose delta sketches exceed
-    # the cosine threshold are treated like the existing exact-val_loss
-    # ties — all members of the cluster get score=0 for the round. Extends
-    # the exact-equality duplicate rule to copy-then-perturb submissions.
-    near_duplicate_detection_enabled: bool = True
-    near_duplicate_cos_threshold: float = 0.95
-    near_duplicate_sketch_budget: int = 32768    # total sampled coordinates per sketch
 
 
 class ValidatorConfig(WorkerConfig):
