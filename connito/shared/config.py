@@ -489,10 +489,16 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
+    # `expert_group_name` is locked so operators can't drift back to
+    # `exp_math` after the subnet-wide switch to the legal expert group —
+    # `auto_update_config` resets any non-default value on load and logs a
+    # one-time reset warning (see docs/exp-legal-migration-plan.md for the
+    # activation checklist). `helper_group_id` and `routing_mode` stay
+    # locked for the natural-routing (2Fnat) consensus contract.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "expert_group_name", "helper_group_id", "routing_mode",
     })
-    expert_group_name: str = "exp_math"
+    expert_group_name: str = "exp_legal"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None

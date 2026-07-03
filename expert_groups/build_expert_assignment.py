@@ -47,10 +47,10 @@ def parse_args() -> argparse.Namespace:
         ),
         help="Path to miner config.yaml",
     )
-    parser.add_argument("--task", default="exp_math", help="Expert group task name")
+    parser.add_argument("--task", default="exp_legal", help="Expert group task name")
     parser.add_argument(
         "--output",
-        default=str(REPO_ROOT / "expert_groups" / "exp_math" / "expert_assignment.generated.json"),
+        default=str(REPO_ROOT / "expert_groups" / "exp_legal" / "expert_assignment.generated.json"),
         help="Output path for generated assignment JSON",
     )
     parser.add_argument("--num-batches", type=int, default=20, help="Number of inference batches to process")
