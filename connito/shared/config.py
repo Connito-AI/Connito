@@ -447,6 +447,11 @@ class OwnerCheckpointCfg(CheckpointCfg):
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
     group_id: int = 0
+    # Peer expert groups loaded alongside `group_id` as frozen helpers for the
+    # 2Fnat routing rule. Non-trainable natural top-k picks get replaced by the
+    # token's top-scoring helper. Empty (default) → single-group load; the
+    # routing branch self-gates and falls through to masked-topk.
+    helper_group_ids: list[int] = Field(default_factory=list)
 
 
 class TaskCfg(BaseConfig):
