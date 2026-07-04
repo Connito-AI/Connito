@@ -1,4 +1,4 @@
-group_id: 1
+group_id: 2
 # C4 (allenai/c4 en) ESFT-Token @ p=0.2 - frozen helpers
 # Auto-generated from ESFT-Token @ p=0.2 profiling.
 # Total experts across 26 MoE layers: 243

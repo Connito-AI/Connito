@@ -1,4 +1,4 @@
-group_id: 0
+group_id: None
 # MetaMathQA-SFT ESFT-Token @ p=0.2
 # Auto-generated from ESFT-Token @ p=0.2 profiling.
 # Total experts across 26 MoE layers: 146
