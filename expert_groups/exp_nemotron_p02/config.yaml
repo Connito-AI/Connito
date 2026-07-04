@@ -1,4 +1,4 @@
-group_id: None
+group_id: -1  # sentinel: not assigned to a functioning slot (would clash with exp_math=0 if left at the default)
 # Nemotron-CC-Math-v1 (config=4plus) ESFT-Token @ p=0.2
 # Calibrated on 500 batches of nvidia/Nemotron-CC-Math-v1 with the DeepSeek-V2-Lite
 # native router, then selected via ESFT paper cumulative-threshold (p=0.2) per layer.

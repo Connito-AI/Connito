@@ -446,7 +446,11 @@ class OwnerCheckpointCfg(CheckpointCfg):
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    group_id: int = 0
+    # -1 signals "not assigned to a functioning slot" — the group is defined
+    # (has an expert_assignment.json) but is not yet mapped to a stable
+    # runtime slot. Default -1 avoids silent clashes with an already-in-use
+    # slot (e.g. exp_math permanently owns 0) when the field is forgotten.
+    group_id: int = -1
 
 
 class TaskCfg(BaseConfig):
