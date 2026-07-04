@@ -363,6 +363,12 @@ class CheckpointCfg(BaseConfig):
     # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
     # but older configs may still include this field.
     download_concurrency: PositiveInt = 1
+    # When True, skip the chain-fetch of the validator's latest checkpoint
+    # AND the on-disk overlay in get_model_from_checkpoint. The model returns
+    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
+    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
+    # backbone). Overrides resume_from_ckpt.
+    use_pretrained_only: bool = False
 
 
 class HfCfg(BaseConfig):

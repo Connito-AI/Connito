@@ -191,7 +191,12 @@ def get_model_from_checkpoint(
     # expert state. The pretrained backbone + experts from `get_base_model`
     # are returned as-is; mid-cycle peer resync via `reload_model_inplace`
     # is unaffected.
-    resume = get_nested_attr(config, "ckpt.resume_from_ckpt", False) and load_global_checkpoint
+    use_pretrained_only = bool(get_nested_attr(config, "ckpt.use_pretrained_only", False))
+    resume = (
+        get_nested_attr(config, "ckpt.resume_from_ckpt", False)
+        and load_global_checkpoint
+        and not use_pretrained_only
+    )
     group_ids_trainable = [config.task.exp.group_id] if partial else None
     # Helper group is a peer of the trainable group on TaskCfg (see
     # TaskCfg.helper_group_id). Only used in partial mode; the full model
@@ -276,20 +281,28 @@ def load_model(
     """
     # download new model from chain into file
 
-    if current_checkpoint is None:
-        current_checkpoint = select_best_checkpoint(
-            primary_dir=config.ckpt.validator_checkpoint_path,
-            secondary_dir=config.ckpt.checkpoint_path,
-        )
+    use_pretrained_only = bool(get_nested_attr(config, "ckpt.use_pretrained_only", False))
 
-    fetch_model_from_chain_validator(
-        current_model_meta=current_checkpoint,
-        config=config,
-        subtensor=subtensor,
-        wallet=wallet,
-        expert_group_ids=[config.task.exp.group_id],
-        expert_group_assignment=expert_manager.expert_group_assignment
-    )
+    if use_pretrained_only:
+        logger.info(
+            "ckpt.use_pretrained_only=True — skipping chain fetch + on-disk overlay; "
+            "returning model with pretrained DeepSeek-V2-Lite weights only",
+        )
+    else:
+        if current_checkpoint is None:
+            current_checkpoint = select_best_checkpoint(
+                primary_dir=config.ckpt.validator_checkpoint_path,
+                secondary_dir=config.ckpt.checkpoint_path,
+            )
+
+        fetch_model_from_chain_validator(
+            current_model_meta=current_checkpoint,
+            config=config,
+            subtensor=subtensor,
+            wallet=wallet,
+            expert_group_ids=[config.task.exp.group_id],
+            expert_group_assignment=expert_manager.expert_group_assignment
+        )
 
     return get_model_from_checkpoint(
         rank=rank, config=config, expert_manager=expert_manager,
