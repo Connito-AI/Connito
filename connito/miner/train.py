@@ -43,7 +43,6 @@ from connito.shared.modeling.mycelia import get_base_tokenizer
 
 configure_logging()
 logger = structlog.get_logger(__name__)
-torch.autograd.set_detect_anomaly(True)
 
 
 def _is_streaming_timeout_error(error: Exception) -> bool:
@@ -782,7 +781,12 @@ def run_distributed_training() -> None:
     if args.debug:
         import logging
         logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Verbose debug logging enabled!")
+        # Autograd anomaly detection is a debug-only tool. On fp16-mixed it
+        # raises RuntimeError on transient overflows that GradScaler is
+        # designed to catch at unscale_() — leaving it on in production
+        # antagonizes the scaler and crashes the miner on the first NaN.
+        torch.autograd.set_detect_anomaly(True)
+        logger.debug("Verbose debug logging + autograd anomaly detection enabled")
 
     if args.path:
         config = MinerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
