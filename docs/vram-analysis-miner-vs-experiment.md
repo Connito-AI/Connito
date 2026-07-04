@@ -23,30 +23,24 @@ DeepSeek-V2-Lite: `hidden_size=2048`, `moe_intermediate=1408`, `n_routed_experts
 
 Per expert (fp16): `gate_up_proj` = `2 × 1408 × 2048 × 2 B` ≈ 11.5 MB, `down_proj` = `1408 × 2048 × 2 B` ≈ 5.8 MB → **~17.3 MB / expert / layer**.
 
-### Experiment (metamath ESFT-token @ p=0.2, `--esft-classic`)
-
-- Loaded experts: 146 across 26 layers (avg ~5.6/layer, from the assignment JSON)
-- Backbone (attn + shared MLPs + embed + lm_head) bf16: ~2 GB
-- **Model VRAM (bf16): ~4.5 GB**
-- Trainable: 146 experts × ~8.65 M = ~1.26 B params
-- Grads (bf16): ~2.5 GB
-- fp32 AdamW state (`exp_avg` + `exp_avg_sq`): ~10 GB
-- Activations at `seq=1024, batch=1, grad-ckpt`: ~0.5–1 GB
-- **Total ≈ 17 GB** (nvidia-smi shows current usage ~6.7 GB — headroom includes CUDA workspace/reservations not yet touched)
-
-### Connito miner (exp_math trainable + exp_c4_p02 helper)
-
-- Loaded experts: 7 (exp_math) + 12 (exp_c4_p02) = **19 per layer** × 26 = **494 experts** — **3.4× more than experiment**
-- Backbone (fp16): ~2 GB
-- **Model VRAM (fp16): ~10.5 GB** (~8.5 GB experts + 2 GB backbone)
-- Trainable params: 7 × 26 = 182 experts × ~8.65 M ≈ **1.57 B** (comparable to experiment)
-- `freeze_parameters(upcast_trainable=True)` promotes these 1.57 B params to fp32 → **+3 GB shadow** on top of the fp16 copy in the model
-- Grads (fp32 for unscale_): ~6.2 GB
-- fp32 AdamW state: ~12.4 GB (this is the alloc that OOM'd)
-- 8-bit AdamW state (bnb): ~3.1 GB (`optim_bits=8` uses int8 blockwise-quantized `exp_avg` + `exp_avg_sq` + a few bytes/block of quantization stats)
-- Activations at `seq=4096, batch=1, grad-ckpt`: ~4–8 GB
-- **Total with fp32 AdamW ≈ ~46–50 GB → OOM** (observed: 47.36 GB / 47.4 GB total)
-- **Total with AdamW8bit ≈ ~37–41 GB → fits comfortably**
+| Component | Experiment (metamath ESFT `--esft-classic`) | Connito miner (exp_math + exp_c4_p02 helper) |
+|---|---|---|
+| Loaded experts / layer | 146 total / 26 layers ≈ **5.6 avg** | 7 trainable + 12 helper = **19 / layer** |
+| Loaded experts (all layers) | **146** | **494** (3.4× the experiment) |
+| Sequence length | **1024** | **4096** |
+| Batch × grad-accum | 1 × 128 (effective 128) | 1 × 4 |
+| Precision | bf16 autocast, no GradScaler | fp16-mixed autocast + GradScaler |
+| Trainable param dtype | bf16 (native) | **fp32** (`freeze_parameters(upcast_trainable=True)`) |
+| Grad dtype | bf16 | fp32 (required by `GradScaler.unscale_`) |
+| Model params in VRAM | backbone bf16 ~2 GB + 146 experts bf16 ~2.5 GB = **~4.5 GB** | backbone fp16 ~2 GB + 494 experts fp16 ~8.5 GB = **~10.5 GB** |
+| Trainable params | 146 × 8.65 M ≈ **1.26 B** | 182 × 8.65 M ≈ **1.57 B** |
+| fp32 shadow of trainable params | — (bf16 native) | **~3 GB** (fp32 upcast) |
+| Gradients | bf16 ~2.5 GB | fp32 **~6.2 GB** |
+| fp32 AdamW state | ~10 GB | **~12.4 GB** (this is the alloc that OOM'd) |
+| 8-bit AdamW state (bnb `optim_bits=8`) | not used | **~3.1 GB** |
+| Activations (grad-ckpt on) | ~0.5–1 GB | ~4–8 GB |
+| **Total (fp32 AdamW)** | **~17 GB** ✅ | **~46–50 GB → OOM** ❌ (observed 47.36 / 47.4 GB) |
+| **Total (AdamW8bit)** | (not needed) | **~37–41 GB** ✅ |
 
 ## Where the ~30 GB delta actually goes
 
