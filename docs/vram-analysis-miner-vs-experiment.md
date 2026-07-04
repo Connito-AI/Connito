@@ -1,21 +1,34 @@
 # VRAM analysis — Connito miner (2Fnat) vs. experiment repo (2Fnat)
 
-Why the Connito miner needed `MINER_ADAMW_OPTIM_BITS=8` (bnb `AdamW8bit`) to fit on a 47 GB A6000, while the experiment repo's **same-paradigm** 2Fnat runs (e.g. `scripts/tier5_2Fnat_code_lr1e-4.sh` — DeepSeek-V2-Lite, `--routing-mode natural_with_fallback`, `--frozen-kept-assignment-path` c4-p02 helpers) fit comfortably with `torch.optim.AdamW` at full fp32 state.
+Why the Connito miner needed `MINER_ADAMW_OPTIM_BITS=8` (bnb `AdamW8bit`) to fit on a 47 GB A6000, while the experiment repo's **same-paradigm** 2Fnat runs (e.g. `scripts/tier4_2Fnat_lr1e-4_500.sh` — DeepSeek-V2-Lite, `--routing-mode natural_with_fallback`, `--frozen-kept-assignment-path` c4-p02 helpers) fit comfortably with `torch.optim.AdamW` at full fp32 state.
 
 Both runs use the same base model, the same routing rule (2Fnat), and the same c4-p02 helper set — so helper cost is a wash, not a delta. Both run on the same GPU (A6000 47.4 GB), same host, and both set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 ## TL;DR
 
-Two independent knobs push the miner ~15–25 GB above the 2Fnat experiment's footprint. Both need to be fixed (or one of them plus 8-bit AdamW) for the miner to fit in 47.4 GB:
+The dominant fit delta is precision: fp16-mixed + `upcast_trainable=True` + fp32 grads adds ~7 GB of persistent state on top of the 2Fnat experiment's bf16-native footprint. Sequence length and the reload path each contribute at most a few hundred MiB at the AdamW-alloc site — not the fit delta.
 
-| # | Delta | Approx cost |
-|---|---|---|
-| 1 | Miner runs at **`sequence_length=4096`**, 2Fnat experiment at **`1024`** | ~3–8 GB activations (grad-ckpt on both, but attention scratch scales with seq²) |
-| 2 | Miner uses **fp16-mixed + `freeze_parameters(upcast_trainable=True)` + fp32 grads for `GradScaler.unscale_`**. 2Fnat experiment uses bf16 native — no shadow fp32 param copy, grads stay bf16 | ~3 GB shadow fp32 params + ~3.7 GB fp32-vs-bf16 grad delta = ~7 GB |
+| Delta | Present at `optimizer.step` alloc? | Approx cost | Fit impact |
+|---|---|---|---|
+| **fp16-mixed + `freeze_parameters(upcast_trainable=True)` + fp32 grads for `GradScaler.unscale_`** vs bf16 native | Yes — params + grads are persistent, not freed after backward | ~3 GB shadow fp32 params + ~3.7 GB fp32-vs-bf16 grad delta = **~7 GB** | **This is the fit delta.** |
+| `sequence_length=4096` vs `1024` | No — activations are transient, freed before `optimizer.step` runs | ~3–8 GB during forward/backward peak | Zero at the AdamW alloc site — empirically confirmed (seq_len=1024 + fp32 AdamW still OOMs at the exact same 176 MiB `exp_avg_sq`) |
+| Model rebuild every inner-opt step (`reload_model_inplace` before `ckpt.enable_peer_resync=false`) | Only through fragmentation | ~470 MiB reserved-but-unallocated slack | Marginal — `exp_avg` alloc goes from failing to succeeding when disabled, but `exp_avg_sq` still fails |
 
-A third knob was initially suspected to matter — the **model rebuild every inner-opt step** in `reload_model_inplace` (before `ckpt.enable_peer_resync=false`). Empirical test confirms it wasn't the fit delta: disabling the reload buys back only ~470 MiB of fragmentation (`exp_avg` alloc goes from failing to succeeding, but `exp_avg_sq` still OOMs on the same run). fp32 AdamW state is simply too big for this setup — the reload path was just adding noise on top of an already-over-capacity fit.
+The three "no fit impact" rows still matter for other reasons — seq_len bounds context, reload wipes optimizer state — but they aren't what's OOMing the AdamW alloc.
 
 2Fnat routing itself contributes 0 GB — it's a compute-only scatter/gather + topk. The helper group loading is present in *both* runs, so it cancels out of the comparison.
+
+### Empirical A/B/C
+
+Same GPU (A6000 47.4 GB), same helper set (c4-p02), same expandable_segments env, all three variants failed at the same allocation site:
+
+| Variant | Reload | seq_len | fp32 AdamW alloc result |
+|---|---|---|---|
+| A: default (pre-fix) | on | 4096 | `exp_avg` **352 MiB fails** (255 MiB free, 1018 MiB fragmented) |
+| B: reload gated off | off | 4096 | `exp_avg` succeeds, `exp_avg_sq` **176 MiB fails** (31 MiB free, 549 MiB fragmented) |
+| C: reload off + seq 1024 | off | 1024 | `exp_avg` succeeds, `exp_avg_sq` **176 MiB fails** (31 MiB free, 549 MiB fragmented) — identical to B |
+
+**Only precision is left as an actionable fit fix.** Everything else is downstream of "fp32 AdamW state (~12 GB) + upcasted trainable fp32 shadow (~3 GB) + fp32 grads (~6 GB) doesn't leave enough room."
 
 ## Component-by-component footprint
 
@@ -23,10 +36,10 @@ DeepSeek-V2-Lite: `hidden_size=2048`, `moe_intermediate=1408`, `n_routed_experts
 
 Per expert (fp16): `gate_up_proj` = `2 × 1408 × 2048 × 2 B` ≈ 11.5 MB, `down_proj` = `1408 × 2048 × 2 B` ≈ 5.8 MB → **~17.3 MB / expert / layer**.
 
-| Component | 2Fnat experiment (`tier5_2Fnat_code_lr1e-4.sh` style) | Connito miner (exp_math + exp_c4_p02 helper) |
+| Component | 2Fnat experiment (`tier4_2Fnat_lr1e-4_500.sh` style) | Connito miner (exp_math + exp_c4_p02 helper) |
 |---|---|---|
 | Routing rule | `natural_with_fallback` (2Fnat) | `natural_with_fallback` (2Fnat) — same |
-| Trainable expert set | codealpaca-p02 (or metamath-p02): 146 experts, ~5.6/layer | exp_math: 182 experts, 7/layer |
+| Trainable expert set | metamath-p02 (ESFT-token @ p=0.2): 146 experts, ~5.6/layer | exp_math: 182 experts, 7/layer |
 | Helper expert set | c4-p02: ~243 experts, ~9.4/layer | exp_c4_p02: ~312 experts, ~12/layer — same source, slight assignment difference |
 | Loaded experts (all layers) | ~389 | 494 (~27% more, minor delta) |
 | Sequence length | **1024** | **4096** — 4× |
