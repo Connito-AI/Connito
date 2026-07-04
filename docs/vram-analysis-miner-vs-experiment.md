@@ -6,13 +6,14 @@ Both runs use the same base model, the same routing rule (2Fnat), and the same c
 
 ## TL;DR
 
-Three independent knobs together push the miner ~30 GB above the 2Fnat experiment's footprint:
+Two independent knobs push the miner ~15–25 GB above the 2Fnat experiment's footprint. Both need to be fixed (or one of them plus 8-bit AdamW) for the miner to fit in 47.4 GB:
 
 | # | Delta | Approx cost |
 |---|---|---|
 | 1 | Miner runs at **`sequence_length=4096`**, 2Fnat experiment at **`1024`** | ~3–8 GB activations (grad-ckpt on both, but attention scratch scales with seq²) |
 | 2 | Miner uses **fp16-mixed + `freeze_parameters(upcast_trainable=True)` + fp32 grads for `GradScaler.unscale_`**. 2Fnat experiment uses bf16 native — no shadow fp32 param copy, grads stay bf16 | ~3 GB shadow fp32 params + ~3.7 GB fp32-vs-bf16 grad delta = ~7 GB |
-| 3 | Miner rebuilt the model + fresh AdamW state **on every inner-opt step** (`reload_model_inplace`, before `ckpt.enable_peer_resync=false`), so the fp32 AdamW alloc happened against fragmented VRAM every time | Not a size delta but a fit delta — makes the same allocation OOM that would otherwise succeed |
+
+A third knob was initially suspected to matter — the **model rebuild every inner-opt step** in `reload_model_inplace` (before `ckpt.enable_peer_resync=false`). Empirical test confirms it wasn't the fit delta: disabling the reload buys back only ~470 MiB of fragmentation (`exp_avg` alloc goes from failing to succeeding, but `exp_avg_sq` still OOMs on the same run). fp32 AdamW state is simply too big for this setup — the reload path was just adding noise on top of an already-over-capacity fit.
 
 2Fnat routing itself contributes 0 GB — it's a compute-only scatter/gather + topk. The helper group loading is present in *both* runs, so it cancels out of the comparison.
 
@@ -40,7 +41,7 @@ Per expert (fp16): `gate_up_proj` = `2 × 1408 × 2048 × 2 B` ≈ 11.5 MB, `dow
 | fp32 AdamW state | ~10 GB | **~12.4 GB** (this is the alloc that OOM'd) |
 | 8-bit AdamW state (bnb `optim_bits=8`) | not used | **~3.1 GB** |
 | Activations (grad-ckpt on) | ~0.5–1 GB (seq 1024) | ~4–8 GB (seq 4096) |
-| Model rebuild per inner-opt step | no | yes (before `enable_peer_resync=false` fix) — fragments VRAM |
+| Model rebuild per inner-opt step | no | yes (before `enable_peer_resync=false` fix) — buys back ~470 MiB when disabled, but not the fit delta |
 | **Total (fp32 AdamW)** | **~24 GB** ✅ | **~46–50 GB → OOM** ❌ (observed 47.36 / 47.4 GB) |
 | **Total (AdamW8bit)** | (not needed) | **~37–41 GB** ✅ |
 
@@ -55,9 +56,11 @@ Starting from the 2Fnat experiment's ~24 GB and getting to the miner's ~46–50 
 +  3.7  grads fp32 vs bf16 delta (1.57B × 2 bytes)
 +  2.4  fp32 AdamW state grows with the trainable count (1.57B vs 1.26B)
 +  3.0–7.0  activation delta from seq_len 4096 vs 1024 (attention scratch scales with seq², FFN with seq)
-+  ~2   fragmentation / reserved-but-unallocated on the pre-fix reload path
++  ~0.5  fragmentation / reserved-but-unallocated on the pre-fix reload path (empirically ~470 MiB)
 = ~40 – 44 GB with fp32 AdamW … which is exactly where the OOM lands (47.36/47.4 observed)
 ```
+
+**Empirical confirmation** (run 7, `MINER_ADAMW_OPTIM_BITS=32` + `enable_peer_resync=false`): fp32 AdamW `_init_group` gets `exp_avg` (352 MiB) through cleanly this time, but still OOMs on `exp_avg_sq` (176 MiB) with 31 MiB free + 549 MiB reserved-but-unallocated. Disabling the reload alone doesn't buy enough headroom — the precision + seq-len deltas dominate.
 
 ## The compounding effect
 
