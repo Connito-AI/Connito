@@ -180,7 +180,22 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    inner_optimizer = torch.optim.AdamW(trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95))
+    # Optional: bitsandbytes AdamW8bit stores optimizer state (exp_avg,
+    # exp_avg_sq) as 8-bit tensors (~4× smaller than fp32 AdamW). Useful on
+    # tight-VRAM setups like a 47 GB A6000 running DeepSeek-V2-Lite with
+    # helper groups loaded (2Fnat), where the fp32 state alloc OOMs.
+    # Opt in via env var to keep the default behavior identical for anyone
+    # who was working before.
+    if os.environ.get("MINER_ADAMW8BIT") == "1":
+        from bitsandbytes.optim import AdamW8bit
+        inner_optimizer = AdamW8bit(
+            trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95),
+        )
+        logger.info("optimizer: bitsandbytes AdamW8bit (8-bit state)")
+    else:
+        inner_optimizer = torch.optim.AdamW(
+            trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95),
+        )
 
     # === scheduler === (for inner optimizer)
     logger.debug("init - scheduler")
