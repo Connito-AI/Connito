@@ -454,6 +454,9 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "expert_group_name", "helper_group_id", "routing_mode",
+    })
     expert_group_name: str = "exp_math"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
@@ -621,7 +624,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
     def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
