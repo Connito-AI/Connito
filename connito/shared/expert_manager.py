@@ -157,6 +157,25 @@ class ExpertManager:
             # Load per-task config (to get expert_group_id)
             expert_config = ExpertCfg.from_path(task_folder / "config.yaml")
 
+            # Sentinel -1 (or any negative id) = "not assigned to a functioning
+            # slot" — skip in bulk load_all sweeps so it never becomes a real
+            # key in expert_group_assignment. If it's the ACTIVE task, that's
+            # a misconfiguration — raise clearly instead of silently keying
+            # the assignment dict at -1.
+            if expert_config.group_id < 0:
+                if load_all:
+                    logger.info(
+                        "Skipping expert group with sentinel group_id (not assigned to a functioning slot)",
+                        group_id=expert_config.group_id,
+                        task_folder=str(task_folder),
+                    )
+                    continue
+                raise ValueError(
+                    f"Active task folder {task_folder} has sentinel group_id="
+                    f"{expert_config.group_id} — assign a real (non-negative) "
+                    f"group_id in its config.yaml before using it as a trainable task."
+                )
+
             # Load raw JSON assignment
             with open(task_folder / "expert_assignment.json", encoding="utf-8") as f:
                 raw_assignment = json.load(f)
