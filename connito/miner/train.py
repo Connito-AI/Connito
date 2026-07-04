@@ -702,7 +702,12 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 # dist.barrier(device_ids=[rank])
 
             # === reload model ===
-            if is_inner_optimizer_step:
+            # Gated by ckpt.enable_peer_resync (default True). Standalone
+            # smoke/train runs — especially under use_pretrained_only=True —
+            # want this off, otherwise a stale validator_checkpoint dir on
+            # disk triggers a full setup_training rebuild every inner-opt
+            # step and optimizer state gets wiped.
+            if is_inner_optimizer_step and get_nested_attr(config, "ckpt.enable_peer_resync", True):
                 logger.info("(5) Reload Model")
 
                 newest_checkpoint = select_best_checkpoint(

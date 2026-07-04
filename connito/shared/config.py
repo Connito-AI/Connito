@@ -369,6 +369,14 @@ class CheckpointCfg(BaseConfig):
     # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
     # backbone). Overrides resume_from_ckpt.
     use_pretrained_only: bool = False
+    # When True (default) the miner's inner-opt-step loop calls the
+    # "(5) Reload Model" branch that re-runs setup_training if it finds a
+    # newer checkpoint on disk. Under use_pretrained_only=True this reload
+    # rebuilds from pretrained every step and discards optimizer progress,
+    # so val_loss stays flat. Set to False for standalone smoke/train runs
+    # where you don't want the miner reacting to on-disk validator
+    # checkpoints. Production miners should leave this True.
+    enable_peer_resync: bool = True
 
 
 class HfCfg(BaseConfig):
