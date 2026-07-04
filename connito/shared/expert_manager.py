@@ -127,6 +127,28 @@ class ExpertManager:
         self.validate_expert_layers()
 
     # ---- loading ----
+    @staticmethod
+    def _resolve_task_folder_by_group_id(
+        base_path: Path, group_id: int, exclude: Path | None = None,
+    ) -> Path | None:
+        """Scan `base_path` for the first task folder whose config.yaml declares
+        the requested `group_id`. Returns None if not found. `exclude` skips a
+        specific folder (typically the active task's folder, to avoid picking
+        it as its own helper)."""
+        for folder in sorted(base_path.iterdir()):
+            if not folder.is_dir() or (exclude is not None and folder == exclude):
+                continue
+            cfg_path = folder / "config.yaml"
+            if not cfg_path.exists():
+                continue
+            try:
+                expert_config = ExpertCfg.from_path(cfg_path)
+            except Exception:
+                continue
+            if expert_config.group_id == group_id:
+                return folder
+        return None
+
     def load_expert_group_assignment(self, config) -> ExpertAssignments:
         base_path: Path = config.task.base_path
         load_all = bool(getattr(config.task, "load_all_expert_groups", False))
@@ -145,9 +167,27 @@ class ExpertManager:
             if not task_path.is_dir():
                 raise FileNotFoundError(f"Active task folder not found: {task_path}")
             task_folders = [task_path]
+            # If a helper group is configured, also load its assignment folder
+            # (matched by scanning base_path for the folder whose ExpertCfg has
+            # the requested group_id). Without this the streaming/validation
+            # path would look up expert_group_assignment[helper_group_id] and
+            # crash with "group=N missing from expert_group_assignment".
+            helper_group_id = getattr(config.task, "helper_group_id", None)
+            if helper_group_id is not None:
+                helper_folder = self._resolve_task_folder_by_group_id(
+                    base_path, int(helper_group_id), exclude=task_path,
+                )
+                if helper_folder is None:
+                    raise FileNotFoundError(
+                        f"task.helper_group_id={helper_group_id} is set but no task folder "
+                        f"under {base_path} has that group_id in its config.yaml"
+                    )
+                task_folders.append(helper_folder)
             logger.info(
-                "Loading expert assignment for active task only",
+                "Loading expert assignment for active task + helper",
                 task_path=str(task_path),
+                helper_group_id=helper_group_id,
+                helper_task_path=str(task_folders[-1]) if helper_group_id is not None else None,
             )
 
         expert_assignments: ExpertAssignments = {}
