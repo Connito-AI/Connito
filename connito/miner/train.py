@@ -180,21 +180,36 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    # Optional: bitsandbytes AdamW8bit stores optimizer state (exp_avg,
-    # exp_avg_sq) as 8-bit tensors (~4× smaller than fp32 AdamW). Useful on
-    # tight-VRAM setups like a 47 GB A6000 running DeepSeek-V2-Lite with
-    # helper groups loaded (2Fnat), where the fp32 state alloc OOMs.
-    # Opt in via env var to keep the default behavior identical for anyone
-    # who was working before.
-    if os.environ.get("MINER_ADAMW8BIT") == "1":
-        from bitsandbytes.optim import AdamW8bit
-        inner_optimizer = AdamW8bit(
-            trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95),
+    # Optimizer state precision — env var MINER_ADAMW_OPTIM_BITS picks how
+    # exp_avg + exp_avg_sq are stored:
+    #   unset / "32": torch.optim.AdamW (fp32 state, default, 8 bytes/param).
+    #   "8":          bitsandbytes AdamW with optim_bits=8 — 8-bit blockwise-
+    #                 quantized state, 4× smaller than fp32. Well-tested for
+    #                 LLM fine-tuning (QLoRA/PEFT default).
+    # Note: bitsandbytes does NOT support 16-bit AdamW state — it errors at
+    # init_state with NotImplementedError. Only 8 and 32 are valid. fp16-mixed
+    # autocast is orthogonal — it changes compute precision, not optimizer
+    # state.
+    optim_bits_env = os.environ.get("MINER_ADAMW_OPTIM_BITS", "32").strip()
+    if optim_bits_env == "8":
+        import bitsandbytes as _bnb
+        inner_optimizer = _bnb.optim.AdamW(
+            trainable_params,
+            lr=config.opt.lr,
+            weight_decay=0.1,
+            betas=(0.9, 0.95),
+            optim_bits=8,
         )
-        logger.info("optimizer: bitsandbytes AdamW8bit (8-bit state)")
-    else:
+        logger.info("optimizer: bitsandbytes AdamW (8-bit state)")
+    elif optim_bits_env == "32":
         inner_optimizer = torch.optim.AdamW(
             trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95),
+        )
+    else:
+        raise ValueError(
+            f"MINER_ADAMW_OPTIM_BITS={optim_bits_env!r} is not a supported value. "
+            f"Use '8' (bitsandbytes AdamW8bit) or '32' (torch.optim.AdamW). "
+            f"bitsandbytes has no 16-bit AdamW state."
         )
 
     # === scheduler === (for inner optimizer)
