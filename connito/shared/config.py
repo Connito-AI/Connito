@@ -470,9 +470,10 @@ class TaskCfg(BaseConfig):
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
     # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
     # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
-    # the token's top-scoring helper. None (default) → single-group load; the
-    # routing branch self-gates and falls through to masked-topk.
-    helper_group_id: int | None = None
+    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
+    # frozen-helper slot). Set to None to disable the pairing — the routing
+    # branch self-gates and falls through to masked-topk.
+    helper_group_id: int | None = 2
     # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
     # is the default: base gate runs unmasked, natural picks landing in the
     # trainable set are kept as-is, non-trainable picks get replaced by the
