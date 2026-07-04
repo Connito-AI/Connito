@@ -31,6 +31,7 @@ if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
+        merge_group_assignments_for_streaming as _merge_group_assignments_for_streaming_impl,
         stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
         stream_safetensors_to_partial_model as _stream_safetensors_to_partial_impl,
     )
@@ -60,6 +61,7 @@ elif MODEL_BACKEND == "qwen3_next":
     # backend until one is added.
     _stream_pretrained_to_partial_impl = None
     _stream_safetensors_to_partial_impl = None
+    _merge_group_assignments_for_streaming_impl = None
 
     def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager):
         return _get_moe_model_config_impl(
@@ -277,60 +279,65 @@ def get_base_model(
             target_device = "cpu"
 
         model = _CausalLMClass(moe_config)
-        # Streaming initializes expert slices from pretrained; do it for the
-        # trainable group AND any helper groups that were also loaded. Each
-        # target_group call only touches its own expert slots, so passes are
-        # independent.
-        stream_targets: list[int] = []
-        for gid in (group_ids_trainable or []):
-            stream_targets.append(int(gid))
-        for gid in (group_ids_helper or []):
-            stream_targets.append(int(gid))
+        # Merge every loaded group's per-layer expert assignment into a single
+        # mapping whose my_expert_ids match the merged partial model's local
+        # slot layout (sorted-by-org_expert_id). This lets us stream pretrained
+        # weights in ONE pass instead of once per group — no overlapping writes
+        # from per-group my_expert_ids that both start at 0.
+        stream_targets: list[int] = [
+            *(int(gid) for gid in (group_ids_trainable or [])),
+            *(int(gid) for gid in (group_ids_helper or [])),
+        ]
 
-        if _stream_safetensors_to_partial_impl is not None and stream_targets:
+        if stream_targets and _merge_group_assignments_for_streaming_impl is not None:
+            merged_assignments = _merge_group_assignments_for_streaming_impl(
+                expert_manager.expert_group_assignment,
+                stream_targets,
+            )
+        else:
+            merged_assignments = None
+
+        if _stream_safetensors_to_partial_impl is not None and merged_assignments is not None:
             model = model.to(device=target_device, dtype=model_dtype)
-            for target_group in stream_targets:
-                model = _stream_safetensors_to_partial_impl(
+            model = _stream_safetensors_to_partial_impl(
+                partial_model=model,
+                model_path=config.model.model_path,
+                assignments=merged_assignments,
+                dtype=model_dtype,
+            )
+            gc.collect()
+            logger.info(
+                "Streamed pretrained safetensors directly into partial model",
+                stream_targets=stream_targets,
+                num_layers=len(merged_assignments),
+                device=str(target_device),
+                dtype=str(model_dtype),
+            )
+        elif _stream_pretrained_to_partial_impl is not None and merged_assignments is not None:
+            # Backend has a state-dict streaming helper but no safetensors-direct
+            # path. Higher CPU peak (~30 GB for DeepSeek-V2-Lite) but still
+            # better than the legacy full-model-on-CPU approach. Load once and
+            # consume in one pass.
+            model = model.to(device=target_device, dtype=model_dtype)
+            pretrained_sd = load_pretrained_state_dict(
+                config.model.model_path, dtype=model_dtype,
+            )
+            try:
+                model = _stream_pretrained_to_partial_impl(
                     partial_model=model,
-                    model_path=config.model.model_path,
-                    expert_group_assignment=expert_manager.expert_group_assignment,
-                    target_group=target_group,
-                    dtype=model_dtype,
+                    state_dict=pretrained_sd,
+                    assignments=merged_assignments,
                 )
+            finally:
+                del pretrained_sd
                 gc.collect()
-                logger.info(
-                    "Streamed pretrained safetensors directly into partial model",
-                    target_group=target_group,
-                    device=str(target_device),
-                    dtype=str(model_dtype),
-                )
-        elif _stream_pretrained_to_partial_impl is not None and stream_targets:
-            # Backend has a state-dict streaming helper but no
-            # safetensors-direct path. Higher CPU peak (~30 GB for
-            # DeepSeek-V2-Lite) but still better than the legacy
-            # full-model-on-CPU approach. Re-load the state dict per
-            # target group since the impl consumes it.
-            model = model.to(device=target_device, dtype=model_dtype)
-            for target_group in stream_targets:
-                pretrained_sd = load_pretrained_state_dict(
-                    config.model.model_path, dtype=model_dtype,
-                )
-                try:
-                    model = _stream_pretrained_to_partial_impl(
-                        partial_model=model,
-                        state_dict=pretrained_sd,
-                        expert_group_assignment=expert_manager.expert_group_assignment,
-                        target_group=target_group,
-                    )
-                finally:
-                    del pretrained_sd
-                    gc.collect()
-                logger.info(
-                    "Streamed pretrained backbone + owned-expert slices into partial model",
-                    target_group=target_group,
-                    device=str(target_device),
-                    dtype=str(model_dtype),
-                )
+            logger.info(
+                "Streamed pretrained backbone + owned-expert slices into partial model",
+                stream_targets=stream_targets,
+                num_layers=len(merged_assignments),
+                device=str(target_device),
+                dtype=str(model_dtype),
+            )
         else:
             logger.warning(
                 "Partial model returned with random weights — no pretrained-state-dict "

@@ -850,11 +850,33 @@ def _apply_pretrained_tensor_to_partial(
         loaded_counts["sliced"] += 1
 
 
+def merge_group_assignments_for_streaming(
+    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
+    group_ids: list[int],
+) -> dict[int, list[tuple[int, int]]]:
+    """Union the per-layer expert assignments across `group_ids` and
+    recompute my_expert_id as the position in the sorted merged org_expert_id
+    set. This matches CustomDeepseekV2Moe's local-slot layout
+    (`expert_indices = sorted(unique org_expert_ids)`), so streaming can
+    write once into the merged partial model without collisions between
+    per-group my_expert_ids that both start at 0."""
+    per_layer_orgs: dict[int, set[int]] = {}
+    for group_id in group_ids:
+        layer_assignments = expert_group_assignment.get(int(group_id), {})
+        for layer_id, mappings in layer_assignments.items():
+            per_layer_orgs.setdefault(int(layer_id), set()).update(
+                int(org) for _, org in mappings
+            )
+    return {
+        layer_id: [(idx, org) for idx, org in enumerate(sorted(orgs))]
+        for layer_id, orgs in per_layer_orgs.items()
+    }
+
+
 def stream_pretrained_state_dict_to_partial_model(
     partial_model: CustomDeekSeekMoE,
     state_dict: dict[str, torch.Tensor],
-    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
-    target_group: int,
+    assignments: dict[int, list[tuple[int, int]]],
 ) -> CustomDeekSeekMoE:
     """Stream a pretrained state dict into a partial model, popping
     each source entry from `state_dict` as it lands so its host RAM is
@@ -868,10 +890,11 @@ def stream_pretrained_state_dict_to_partial_model(
     (CPU) and the partial parameters (GPU) live in separate memory
     pools, avoiding the previous full+partial-on-CPU peak.
 
+    `assignments` is `{layer_id: [(my_expert_id, org_expert_id), ...]}`
+    for the merged partial (see `merge_group_assignments_for_streaming`).
     The caller's `state_dict` is consumed: it ends empty.
     """
     partial_state = partial_model.state_dict()
-    assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0}
     gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -890,7 +913,7 @@ def stream_pretrained_state_dict_to_partial_model(
     logger.info(
         "Streamed pretrained state dict into partial model",
         loaded_counts=loaded_counts,
-        target_group=target_group,
+        num_layers=len(assignments),
     )
     return partial_model
 
@@ -898,8 +921,7 @@ def stream_pretrained_state_dict_to_partial_model(
 def stream_safetensors_to_partial_model(
     partial_model: CustomDeekSeekMoE,
     model_path: str,
-    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
-    target_group: int,
+    assignments: dict[int, list[tuple[int, int]]],
     dtype: torch.dtype,
 ) -> CustomDeekSeekMoE:
     """Stream a pretrained checkpoint directly from its safetensors shards
@@ -946,7 +968,6 @@ def stream_safetensors_to_partial_model(
         shard_filenames = [SAFE_WEIGHTS_NAME]
 
     partial_state = partial_model.state_dict()
-    assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0}
     gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -974,7 +995,7 @@ def stream_safetensors_to_partial_model(
     logger.info(
         "Streamed pretrained safetensors shards into partial model",
         loaded_counts=loaded_counts,
-        target_group=target_group,
+        num_layers=len(assignments),
         shards=len(shard_filenames),
     )
     return partial_model
