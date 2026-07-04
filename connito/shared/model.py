@@ -193,11 +193,11 @@ def get_model_from_checkpoint(
     # is unaffected.
     resume = get_nested_attr(config, "ckpt.resume_from_ckpt", False) and load_global_checkpoint
     group_ids_trainable = [config.task.exp.group_id] if partial else None
-    # Helper groups source from the same task/expert config as group_id (see
-    # ExpertCfg.helper_group_ids). Only used in partial mode; the full model
+    # Helper group is a peer of the trainable group on TaskCfg (see
+    # TaskCfg.helper_group_id). Only used in partial mode; the full model
     # already includes every routed expert.
-    helper_ids_raw = get_nested_attr(config, "task.exp.helper_group_ids", None) if partial else None
-    group_ids_helper: list | None = list(helper_ids_raw) if helper_ids_raw else None
+    helper_id = get_nested_attr(config, "task.helper_group_id", None) if partial else None
+    group_ids_helper: list | None = [int(helper_id)] if helper_id is not None else None
     logger.info(
         "Loading base model for checkpoint",
         mode="partial" if partial else "full",

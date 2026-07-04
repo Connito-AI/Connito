@@ -447,11 +447,6 @@ class OwnerCheckpointCfg(CheckpointCfg):
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
     group_id: int = 0
-    # Peer expert groups loaded alongside `group_id` as frozen helpers for the
-    # 2Fnat routing rule. Non-trainable natural top-k picks get replaced by the
-    # token's top-scoring helper. Empty (default) → single-group load; the
-    # routing branch self-gates and falls through to masked-topk.
-    helper_group_ids: list[int] = Field(default_factory=list)
 
 
 class TaskCfg(BaseConfig):
@@ -460,6 +455,11 @@ class TaskCfg(BaseConfig):
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
+    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
+    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
+    # the token's top-scoring helper. None (default) → single-group load; the
+    # routing branch self-gates and falls through to masked-topk.
+    helper_group_id: int | None = None
     # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
     # is the default: base gate runs unmasked, natural picks landing in the
     # trainable set are kept as-is, non-trainable picks get replaced by the
