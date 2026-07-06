@@ -62,7 +62,7 @@ def _is_streaming_timeout_error(error: Exception) -> bool:
 
 
 # this is for local DP only
-def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, backend: str = "nccl") -> None:
+def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, test_mode: bool = False, backend: str = "nccl") -> None:
     """
     Initializes the process for distributed training.
 
@@ -70,11 +70,17 @@ def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: call
         rank (int): The rank of the process.
         world_size (int): The total number of processes.
         fn (callable): The function to run for the process.
+        test_mode (bool): If True, enable cycle test mode (wait_till short-circuits).
         backend (str): The backend to use for distributed training.
 
     Returns:
         None
     """
+    # world_size>1 spawns fresh processes, so cycle._TEST_MODE must be re-set
+    # inside each worker — not just the parent — for --test to take effect.
+    if test_mode:
+        from connito.shared.cycle import set_test_mode
+        set_test_mode(True)
     if local_rank == 0:
         print(config)
 
@@ -839,11 +845,11 @@ def run_distributed_training() -> None:
     if config.local_par.world_size > 1:
         mp.spawn(
             init_process,
-            args=(config, config.local_par.world_size, train_worker),
+            args=(config, config.local_par.world_size, train_worker, args.test),
             nprocs=config.local_par.world_size,
         )
     else:
-        init_process(0, config, config.local_par.world_size, train_worker)
+        init_process(0, config, config.local_par.world_size, train_worker, test_mode=args.test)
 
 
 if __name__ == "__main__":
