@@ -24,7 +24,6 @@ from connito.shared.helper import *
 # ── Model backend selection ──────────────────────────────────────────────────
 # Change MODEL_BACKEND to swap implementations:
 #   "deepseek_v2"  → connito.shared.modeling.custom_deepseek_v2_lite
-#   "qwen3_next"   → connito.shared.modeling.custom_qwen3_next
 MODEL_BACKEND = "deepseek_v2"
 
 if MODEL_BACKEND == "deepseek_v2":
@@ -48,24 +47,6 @@ if MODEL_BACKEND == "deepseek_v2":
             config, topk, group_ids_trainable, expert_manager,
             full=full,
             routing_mode=routing_mode,
-            group_ids_helper=group_ids_helper,
-        )
-
-elif MODEL_BACKEND == "qwen3_next":
-    from connito.shared.modeling.custom_qwen3_next import (
-        CustomQwen3NextForCausalLM as _CausalLMClass,
-        get_moe_model_config as _get_moe_model_config_impl,
-    )
-    # qwen3_next backend has no full→partial streaming helper yet;
-    # `get_base_model(partial=True)` falls back to random init for this
-    # backend until one is added.
-    _stream_pretrained_to_partial_impl = None
-    _stream_safetensors_to_partial_impl = None
-    _merge_group_assignments_for_streaming_impl = None
-
-    def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager):
-        return _get_moe_model_config_impl(
-            config, topk, group_ids_trainable, expert_manager,
             group_ids_helper=group_ids_helper,
         )
 
