@@ -175,6 +175,21 @@ VALIDATOR_MINER_SCORE_SAMPLES = Gauge(
     "Number of score samples retained for a miner within the aggregator window",
     ["miner_uid"],
 )
+# Unix-seconds timestamp of the moment this validator last published a score
+# snapshot for the miner. Set by `set_miner_score_snapshot` alongside
+# VALIDATOR_MINER_SCORE_LATEST/_AVG/_SAMPLES, so it advances exactly once per
+# cycle at the chain-submit boundary. The gateway computes "score age" as
+# `time() - validator_miner_score_latest_emitted_at` — `timestamp(score_latest)`
+# alone is misleading because Prometheus updates the sample-timestamp on every
+# scrape (every ~5s) even when the underlying value hasn't changed, making the
+# score look freshly emitted when in fact it hasn't been updated for almost a
+# whole cycle. This gauge is the "value last changed" signal the dashboard
+# needs to render meaningful "scored Xm ago" labels.
+VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT = Gauge(
+    "validator_miner_score_latest_emitted_at",
+    "Unix seconds when this validator last published a score_latest snapshot for the miner",
+    ["miner_uid"],
+)
 # Last-known per-miner eval outcome on THIS validator. Integer-coded so the
 # gateway can render miner-facing strings without label cardinality blowing
 # up (one series per miner_uid, value = code from EVAL_STATUS_CODES below).
@@ -416,10 +431,19 @@ def set_miner_score_snapshot(
     """Publish the aggregator's per-miner snapshot (latest / avg / sample
     count) to Prometheus. Each arg is independent — pass ``None`` to skip
     that gauge for this uid. Best-effort.
+
+    Also stamps ``VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT`` with the current
+    wall-clock time whenever ``latest`` is published, so the gateway can
+    derive a meaningful "score age" from the value's last-change time
+    rather than Prometheus's scrape time (which advances every ~5s even
+    when the gauge value hasn't changed).
     """
     try:
+        now_ts: float | None = None
         if latest is not None:
+            now_ts = time.time()
             VALIDATOR_MINER_SCORE_LATEST.labels(miner_uid=str(miner_uid)).set(float(latest))
+            VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT.labels(miner_uid=str(miner_uid)).set(now_ts)
         if avg is not None:
             VALIDATOR_MINER_SCORE_AVG.labels(miner_uid=str(miner_uid)).set(float(avg))
         if samples is not None:
