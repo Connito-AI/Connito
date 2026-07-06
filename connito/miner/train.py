@@ -180,18 +180,17 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    # Optimizer state precision — env var MINER_ADAMW_OPTIM_BITS picks how
+    # Optimizer state precision — config.opt.adamw_optim_bits picks how
     # exp_avg + exp_avg_sq are stored:
-    #   unset / "32": torch.optim.AdamW (fp32 state, default, 8 bytes/param).
-    #   "8":          bitsandbytes AdamW with optim_bits=8 — 8-bit blockwise-
-    #                 quantized state, 4× smaller than fp32. Well-tested for
-    #                 LLM fine-tuning (QLoRA/PEFT default).
+    #   32: torch.optim.AdamW (fp32 state, 8 bytes/param).
+    #    8: bitsandbytes AdamW with optim_bits=8 — 8-bit blockwise-quantized
+    #       state, 4× smaller than fp32. Well-tested for LLM fine-tuning
+    #       (QLoRA/PEFT default) and required to fit this config on a 47GB A6000.
     # Note: bitsandbytes does NOT support 16-bit AdamW state — it errors at
     # init_state with NotImplementedError. Only 8 and 32 are valid. fp16-mixed
-    # autocast is orthogonal — it changes compute precision, not optimizer
-    # state.
-    optim_bits_env = os.environ.get("MINER_ADAMW_OPTIM_BITS", "32").strip()
-    if optim_bits_env == "8":
+    # autocast is orthogonal — it changes compute precision, not optimizer state.
+    optim_bits = int(getattr(config.opt, "adamw_optim_bits", 8))
+    if optim_bits == 8:
         import bitsandbytes as _bnb
         inner_optimizer = _bnb.optim.AdamW(
             trainable_params,
@@ -201,14 +200,14 @@ def setup_training(
             optim_bits=8,
         )
         logger.info("optimizer: bitsandbytes AdamW (8-bit state)")
-    elif optim_bits_env == "32":
+    elif optim_bits == 32:
         inner_optimizer = torch.optim.AdamW(
             trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95),
         )
     else:
         raise ValueError(
-            f"MINER_ADAMW_OPTIM_BITS={optim_bits_env!r} is not a supported value. "
-            f"Use '8' (bitsandbytes AdamW8bit) or '32' (torch.optim.AdamW). "
+            f"config.opt.adamw_optim_bits={optim_bits!r} is not supported. "
+            f"Use 8 (bitsandbytes AdamW8bit) or 32 (torch.optim.AdamW); "
             f"bitsandbytes has no 16-bit AdamW state."
         )
 

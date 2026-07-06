@@ -325,9 +325,15 @@ class MoECfg(BaseConfig):
 
 
 class OptimizerCfg(BaseConfig):
-    lr: float = 1e-5
+    lr: float = 1e-4
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
+    # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
+    #   8  -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller
+    #         than fp32; fits DeepSeek-V2-Lite 2Fnat on a 47GB A6000).
+    #   32 -> torch.optim.AdamW, fp32 state (~8 bytes/param; OOMs on the above).
+    # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
+    adamw_optim_bits: int = 8
 
 
 class ParallelismCfg(BaseConfig):
