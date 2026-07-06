@@ -214,7 +214,7 @@ class DatasetSourceCfg(BaseConfig):
 
 
 class DataCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir"})
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir", "sequence_length"})
     dataset_name: str = "allenai/c4"
     data_dir: str | None = 'en'
     dataset_sources: list[DatasetSourceCfg] | None = None
