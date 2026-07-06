@@ -27,13 +27,19 @@ import bittensor
 
 from connito.shared.app_logging import structlog
 from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, parse_dynamic_filename
-from connito.shared.hf_distribute import download_checkpoint_from_hf_subprocess
+from connito.shared.hf_distribute import (
+    HFFileMissingError,
+    HFRepoUnavailableError,
+    check_file_publicly_fetchable,
+    download_checkpoint_from_hf_subprocess,
+)
 from connito.shared.telemetry import (
     CHECKPOINT_DOWNLOAD_BYTES,
     VALIDATOR_BG_WORKER_PAUSED,
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
     inc_eval_failure,
+    set_miner_eval_status,
 )
 from connito.validator.round import RoundRef
 
@@ -260,6 +266,12 @@ class BackgroundDownloadWorker(threading.Thread):
 
             downloaded_filename: str | None = None
             last_error: Exception | None = None
+            # Count candidates whose failure was definitively
+            # miner-attributable (repo/revision gone, file absent at the
+            # committed revision) — as opposed to network trouble. Only when
+            # EVERY candidate missed this way do we consider blaming the
+            # miner below.
+            definitive_misses = 0
             try:
                 for candidate in candidate_filenames:
                     # Clear tmp_dir between attempts so a partial download
@@ -306,16 +318,78 @@ class BackgroundDownloadWorker(threading.Thread):
                         round_obj.mark_failed(uid)
                         self._record_failure_metric(round_obj)
                         return
-                    except Exception as e:
+                    except HFRepoUnavailableError as e:
+                        # Repo-level miss (deleted / private / gated /
+                        # revision rewritten) — affects every candidate, so
+                        # don't waste round-trips on the rest.
                         last_error = e
+                        definitive_misses = len(candidate_filenames)
+                        break
+                    except HFFileMissingError as e:
+                        last_error = e
+                        definitive_misses += 1
                         logger.debug(
                             "bg-download: candidate not present, trying next",
                             uid=uid, hotkey=hotkey[:6],
                             candidate=candidate, error=str(e),
                         )
                         continue
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(
+                            "bg-download: candidate failed, trying next",
+                            uid=uid, hotkey=hotkey[:6],
+                            candidate=candidate, error=str(e),
+                        )
+                        continue
 
                 if downloaded_filename is None:
+                    # Miner-fault attribution: the download stack said the
+                    # repo/revision/file is definitively gone (typed HF
+                    # errors, not network trouble) for EVERY candidate. Before
+                    # blaming the miner, get a second opinion from an
+                    # unauthenticated probe — if the file is publicly
+                    # fetchable without our token, the failure was on our
+                    # side (expired token, proxy, HF session state) and the
+                    # miner must keep its prior average. Both signals have to
+                    # agree before we zero anyone.
+                    if (
+                        definitive_misses >= len(candidate_filenames)
+                        and getattr(
+                            self.config.evaluation,
+                            "repo_unavailable_is_miner_fault",
+                            False,
+                        )
+                    ):
+                        publicly_fetchable = await asyncio.to_thread(
+                            check_file_publicly_fetchable,
+                            repo_id=repo_id,
+                            revision=revision,
+                            filename=candidate_filenames[0],
+                        )
+                        if publicly_fetchable is False:
+                            logger.warning(
+                                "bg-download: committed checkpoint is not publicly "
+                                "retrievable (repo deleted/private/gated or file "
+                                "gone) — miner fault, will record score=0 at finalize",
+                                uid=uid, hotkey=hotkey[:6],
+                                repo_id=repo_id,
+                                revision=(revision[:8] if revision else None),
+                                last_error=str(last_error) if last_error else None,
+                            )
+                            inc_eval_failure(int(uid), "repo_unavailable")
+                            set_miner_eval_status(int(uid), "repo_unavailable")
+                            round_obj.mark_validation_failed(uid)
+                            self._record_failure_metric(round_obj)
+                            return
+                        logger.warning(
+                            "bg-download: typed HF miss but public probe did not "
+                            "confirm — treating as operational (validator-side)",
+                            uid=uid, hotkey=hotkey[:6],
+                            repo_id=repo_id,
+                            probe_result=publicly_fetchable,
+                            last_error=str(last_error) if last_error else None,
+                        )
                     # Surface enough state for the "no candidate file" miss to be
                     # diagnosable after the fact. The plain `str(last_error)` we
                     # used to log was empty in ~80% of misses (HF's

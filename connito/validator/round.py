@@ -79,13 +79,15 @@ class Round:
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
     # UIDs the miner is at fault for: explicit validation failures
-    # (hash/signature/expert_group/NaN-Inf/no_chain_commit) or freeze-time
+    # (hash/signature/expert_group/NaN-Inf/no_chain_commit), a committed
+    # HF checkpoint that is no longer publicly retrievable (repo deleted/
+    # private/gated — confirmed by an unauthenticated probe), or freeze-time
     # invalid checkpoints. These get score=0 in the aggregator at finalize.
     # `failed_uids ⊃ validation_failed_uids` — operational failures
-    # (timeout/OOM/exception/download failure) are in `failed_uids` only
-    # and intentionally receive *no* aggregator entry, so the miner keeps
-    # its prior EMA. The validator's lack of compute/bandwidth must not
-    # dock a miner's reward.
+    # (timeout/OOM/exception/network-layer download failure) are in
+    # `failed_uids` only and intentionally receive *no* aggregator entry,
+    # so the miner keeps its prior EMA. The validator's lack of
+    # compute/bandwidth must not dock a miner's reward.
     validation_failed_uids: set[int] = field(default_factory=set)
     # Freeze-time invalid-checkpoint penalties. Hotkey map is captured
     # alongside because these UIDs may not appear in `uid_to_hotkey`
@@ -449,6 +451,31 @@ class Round:
                     if 0 <= uid < len(metagraph.hotkeys):
                         uid_to_hotkey[uid] = metagraph.hotkeys[uid]
 
+                # Splice overlay foreground hotkeys into our entry of the
+                # assignment dict. `gather_validation_job` (called by
+                # `evaluate_foreground_round`) reads
+                # `validator_miner_assignment[my_hotkey]` to decide
+                # `is_assigned` for each submission file on disk. Without
+                # this splice every overlay-foreground UID that fell
+                # outside the legacy full-pool slice is bucketed into
+                # `unexpected_submissions` and silently dropped, wasting
+                # the entire foreground eval window for that round. Copy-
+                # on-write so the dict returned by the chain helper is
+                # not mutated under callers that retained a reference.
+                my_hk = config.chain.hotkey_ss58
+                spliced_assignment: dict[str, list[str]] = {
+                    k: list(v) for k, v in assignment.items()
+                }
+                my_list = spliced_assignment.setdefault(my_hk, [])
+                _seen_my_assigned: set[str] = set(my_list)
+                for uid in foreground_uids:
+                    hk = uid_to_hotkey.get(uid)
+                    if hk is None or hk in _seen_my_assigned:
+                        continue
+                    my_list.append(hk)
+                    _seen_my_assigned.add(hk)
+                assignment = spliced_assignment
+
                 logger.info(
                     "Round.freeze: round-group overlay applied",
                     round_id=rid,
@@ -663,9 +690,11 @@ class Round:
         self._persist_journal()
 
     def mark_validation_failed(self, uid: int) -> None:
-        """Mark a UID as failed because its on-disk submission is off-spec
-        (hash/signature/expert_group/NaN-Inf mismatch detected by
-        `validate_miner_submission`). Lands in both `failed_uids` and
+        """Mark a UID as failed through the miner's own fault: an off-spec
+        on-disk submission (hash/signature/expert_group/NaN-Inf mismatch
+        detected by `validate_miner_submission`) or a committed HF
+        checkpoint that is confirmed not publicly retrievable (repo
+        deleted/private/gated). Lands in both `failed_uids` and
         `validation_failed_uids`; finalize records score=0 for it.
         """
         with self._lock:

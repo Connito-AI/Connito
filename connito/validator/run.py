@@ -1171,10 +1171,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # the round's weights on chain. If the round's submit fails, next
             # cycle's stale-weights check catches it (no race that cycle).
             max_weight_age = int(config.cycle.cycle_length)
-            # `lite=False` so `metagraph.weights` is populated for
-            # `Round.freeze`'s chain-weight prepend (segment (a)). The
-            # heavier payload is fetched once per cycle and reused for
-            # the fallback-weights check below as well as `Round.freeze`.
+            # `lite=False` so `metagraph.weights` is populated, matching the
+            # shape we re-fetch below right before `Round.freeze`. This fetch
+            # is only used for the fallback-weights staleness check that
+            # follows; the freeze-time fetch is refreshed separately because
+            # ~80 blocks of phases pass between here and Submission.
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
@@ -1285,6 +1286,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         path=str(cohort_state_path),
                     )
                     current_cohort_state = None
+
+            # Refresh metagraph immediately before freezing. The earlier
+            # fetch happened during MinerCommit1 (~80 blocks ago), so its
+            # `last_update` / `weights` view is stale by a full submission
+            # period. Re-fetching here gives `Round.freeze` the most recent
+            # chain-weight and staleness signals available.
+            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
 
             # (0) Lock and prioritize: build the round roster (stalest miners
             # first within both foreground and background — see Round.freeze),

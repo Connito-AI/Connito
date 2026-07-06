@@ -316,7 +316,7 @@ class MoECfg(BaseConfig):
     interleave: bool = True
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 1
+    partial_topk: PositiveInt = 6
     full_topk: PositiveInt = 2
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
@@ -900,6 +900,14 @@ class EvalCfg(BaseConfig):
     validation_group_c_size: int = 17
     group_a_min_consensus: int = 1               # ≥ 1 qualified validator
     group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
+    # When a miner's committed HF repo/revision/file is definitively not
+    # retrievable (deleted, private, gated, revision rewritten) AND an
+    # unauthenticated probe confirms it is not publicly fetchable, treat
+    # the miss as the miner's fault: record score=0 for the round instead
+    # of preserving the prior rolling average. Closes the
+    # "delete-your-model-and-keep-earning" hole; set False to restore the
+    # legacy EMA-preserving behavior.
+    repo_unavailable_is_miner_fault: bool = True
 
 
 class ValidatorConfig(WorkerConfig):

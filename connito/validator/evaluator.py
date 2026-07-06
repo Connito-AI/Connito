@@ -182,7 +182,9 @@ def finalize_round_scores(
         scored miner's: score 0 — a tied val_loss is evidence of a
         duplicated submission, so both sides are penalized regardless
         of where they would have ranked.
-      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf): score 0.
+      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf, or a
+        committed HF checkpoint confirmed not publicly retrievable):
+        score 0.
       - `freeze_zero_uids` (no/invalid chain commit at freeze): score 0.
 
     Operational failures (download timeout, eval timeout, OOM, unexpected
@@ -408,10 +410,11 @@ def build_submission_uid_weights(
     Cohort emission rule (when all four are present):
       * Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
         of A∪B by aggregator avg, restricted to UIDs with
-        `record_count >= 2` AND scores recorded in at least 2 distinct
-        round_ids within the last `5 * cycle_length` blocks. The window
-        is intentionally loose so a UID that was in A∪B for only some of
-        the recent rounds still qualifies. Empty-G1 guard: if no UID
+        `record_count >= 3` AND scores recorded in at least 3 distinct
+        round_ids within the last `5 * cycle_length` blocks — i.e.
+        scored in at least 3 of the last 5 cycles. Tightens the prior
+        2-of-5 gate so a miner needs sustained participation to anchor
+        the validator's top-N ballot. Empty-G1 guard: if no UID
         clears, redirect to `uid = 0` (subnet owner) so the validator
         stays at full emission.
       * Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
@@ -440,10 +443,10 @@ def build_submission_uid_weights(
 
     ab_qualified = [
         u for u in ab_uids
-        if score_aggregator.record_count(u) >= 2
+        if score_aggregator.record_count(u) >= 3
         and score_aggregator.count_distinct_round_ids_in_range(
             u, g1_window_min_rid, cur_rid,
-        ) >= 2
+        ) >= 3
     ]
     g1 = _rg.select_top_n_by_local_score(
         ab_qualified,

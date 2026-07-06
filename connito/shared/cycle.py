@@ -485,7 +485,12 @@ def _get_minercommit2_block_hash(
     attack that the publicly-committed `miner_seed` scheme allowed.
 
     Returns the 0x-prefixed hex hash string, or None if the phase API
-    or chain RPC is unavailable (caller treats None as a hard failure).
+    or chain RPC is unavailable. After the block-hash-only seed
+    cutover, `get_combined_validator_seed` treats None as a hard
+    failure and raises rather than silently producing a publicly-
+    known sha256("") — letting the validator framework retry / skip
+    the round upstream instead of running a round on a guessable
+    seed.
     """
     previous_phase_range = get_blocks_from_previous_phase_from_api(config)
     if previous_phase_range is None:
@@ -527,65 +532,69 @@ def get_combined_validator_seed(
     commits: list[tuple[WorkerChainCommit, bittensor.Neuron]] | None = None,
 ) -> str:
     """
-    Deterministically combine validator seeds into a single hex string.
+    Deterministically derive the combined validator seed from chain entropy.
 
-    Two entropy sources are mixed:
-      1. The per-validator `miner_seed` values committed on chain
-         (existing scheme — kept for backward compatibility during
-         rollout; readable by miners during their commit window, so
-         this alone is exploitable).
-      2. The block hash of the LAST block of the most recent completed
-         `MinerCommit2` phase (added per PR #N — block is sealed before
-         miners' commit window closes but its hash is unpredictable in
-         advance; no validator controls block production, so this
-         component is robust against validator-miner collusion).
+    The seed is `sha256(block_hash).hexdigest()`, where `block_hash` is
+    the hash of the LAST block of the most recent completed
+    `MinerCommit2` phase (`_get_minercommit2_block_hash`).
 
-    After this PR lands network-wide, (2) dominates security and (1)
-    can be removed in a follow-up that drops the `miner_seed` chain-
-    commit field entirely.
+    Why block-hash-only (not mixed with validator-committed seeds):
+      * The validator-committed `miner_seed` values are publicly
+        readable on chain during the miners' commit window, so a
+        miner-validator collusion could let miners learn the
+        combined seed and pre-fit on the predictable eval slice.
+      * The block hash is sealed before miners' commit window closes
+        but its value is unpredictable in advance — no party controls
+        block production. So block_hash alone provides
+        collusion-resistant entropy with strictly less attack surface
+        than mixing in a chain-readable component.
 
-    If `block_hash` is unavailable (phase API or chain RPC failure),
-    fall back to using an empty string for that component — the cycle
-    continues with only the validator-committed seeds contributing
-    entropy (equivalent to pre-PR security level for that cycle).
-    A follow-up PR will tighten this: the combined "no committed
-    seeds AND no block_hash" case still produces sha256("") which is
-    publicly known; that needs a hard guard. Left as a known
-    deficiency for now per the reviewer's preference to keep the
-    program running through transient failures.
+    The previous scheme mixed both inputs as a backward-compatible
+    transition; that transition is complete. The `miner_seed` field
+    remains on the `ValidatorChainCommit` for `get_validator_miner_assignment`
+    (which uses it to derive a deterministic validator → miner
+    assignment from sorted per-validator integers) but it no longer
+    contributes to the eval seed.
 
-    We sort validator IDs so the result is independent of dict iteration order.
+    Failure model:
+      * If `_get_minercommit2_block_hash` returns None (phase API or
+        chain RPC failure), this function raises `RuntimeError`. The
+        previous behavior — falling back to `sha256("")`, a publicly
+        known constant — let miners win the round trivially during
+        transient outages. Raising lets the validator framework
+        retry / skip the round upstream instead.
 
-    `commits` is the head-block result of `get_chain_commits(config,
-    subtensor)`. Pass it explicitly when the caller has already fetched it
-    (e.g. inside `Round.freeze`, where the same head-block fetch is shared
-    with `get_validator_miner_assignment`) to avoid duplicating a slow
-    archive RPC.
+    `commits` is accepted for API compatibility with prior callers
+    that pre-fetched chain commits to avoid a duplicate archive RPC,
+    but is no longer read here. The argument is kept (and accepted)
+    so call sites in `Round.freeze` and tests need not change.
     """
-    if commits is None:
-        commits = get_chain_commits(config, subtensor)
+    # `commits` is no longer needed for the seed itself (the legacy
+    # validator_seeds mix is gone) — but the parameter is preserved so
+    # callers that share a head-block commits fetch with sibling
+    # helpers like `get_validator_miner_assignment` don't have to
+    # change their signature.
+    _ = commits
 
-    validator_seeds = get_validator_seed_from_commit(config, commits)
     block_hash = _get_minercommit2_block_hash(config, subtensor)
     if not block_hash:
-        block_hash = ""
+        # Hard guard. The previous fallback (`sha256("")`) was the
+        # known deficiency flagged in the original mixed-seed PR; it
+        # let miners win the round trivially whenever the phase API
+        # or chain RPC blipped. Raise so the validator framework
+        # retries / skips the round instead of running on a guessable
+        # seed.
+        raise RuntimeError(
+            "Cannot derive combined validator seed: MinerCommit2 "
+            "block hash unavailable (phase API or chain RPC failure). "
+            "Skipping seed derivation rather than producing a "
+            "publicly-known sha256('') — caller should retry or skip "
+            "the round."
+        )
 
-    logger.info(
-        "Combined validator seed inputs",
-        validator_seeds=validator_seeds,
-        block_hash=block_hash,
-    )
+    logger.info("Combined validator seed input", block_hash=block_hash)
 
-    # Validator-committed component: deterministic from sorted seeds.
-    # May be empty during the transition before all operators have
-    # upgraded; in that state the block-hash component (when present)
-    # supplies the entropy.
-    committed_part = "".join(
-        str(validator_seeds[v]) for v in sorted(validator_seeds.keys())
-    ) if validator_seeds else ""
-
-    combined_seed_str = committed_part + block_hash
-    return hashlib.sha256(combined_seed_str.encode()).hexdigest()
+    return hashlib.sha256(block_hash.encode()).hexdigest()
 
 
 def get_validator_miner_assignment(

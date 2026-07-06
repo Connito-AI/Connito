@@ -6,11 +6,30 @@ from functools import lru_cache
 from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 
 from connito.shared.app_logging import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+class HFRepoUnavailableError(RuntimeError):
+    """The repo or revision is definitively not retrievable: deleted,
+    private, gated, or the committed revision no longer exists. Distinct
+    from network-layer failures — callers use this to attribute the miss
+    to the repo owner rather than to the validator's connectivity.
+    """
+
+
+class HFFileMissingError(RuntimeError):
+    """The repo and revision resolve but the requested file is not
+    present at that revision.
+    """
 
 # Metadata (HEAD) request timeout passed explicitly to `hf_hub_download` so a
 # stuck etag lookup can't extend our wall-clock budget. HF's chunk-fetch
@@ -162,6 +181,65 @@ def upload_checkpoint_to_hf(
     return revision
 
 
+def _install_queue_listener_eof_suppressor() -> None:
+    """Silence the QueueListener teardown EOFError that HF up/download
+    children spill onto the parent's inherited stderr.
+
+    `huggingface_hub`'s xet backend (and a few related HF subsystems)
+    start a `logging.handlers.QueueListener` inside the spawned child
+    to forward log records from its internal worker pool. When the
+    child exits, the workers tear down their multiprocessing queue
+    before the listener's `_monitor` thread is joined. `_monitor`
+    blocks in `queue.get()`, the queue closes underneath it, and
+    `_recv()` raises `EOFError`. Python's default `threading.excepthook`
+    then prints a ~20-line traceback to the child's stderr. The child
+    inherits stderr from the validator, so every spawn dumps that
+    traceback into the validator log — hundreds per cycle, with no
+    operational signal in it.
+
+    Suppression is intentionally narrow: only `EOFError` raised in a
+    thread whose name ends with `"(_monitor)"` (the QueueListener's
+    target function) is swallowed. Anything else flows through
+    `threading.__excepthook__` unchanged, so a real crash in any
+    other child thread still surfaces in full.
+    """
+    import threading
+
+    original = threading.__excepthook__
+
+    def _hook(args: threading.ExceptHookArgs) -> None:
+        if (
+            args.exc_type is EOFError
+            and args.thread is not None
+            and args.thread.name.endswith("(_monitor)")
+        ):
+            return
+        original(args)
+
+    threading.excepthook = _hook
+
+
+def _disable_hf_progress_bars_in_child() -> None:
+    """Turn off `huggingface_hub`'s tqdm progress bars inside the child.
+
+    The xet backend writes per-chunk tqdm bars to stderr during both
+    `hf_hub_download` and `upload_folder`. A single 3.6 GB upload spills
+    ~55 lines like `el_expgroup_0.safetensors: 1% | ... / 3.60GB` plus
+    `Processing Files (N / M)`, all repainted via ANSI cursor moves. In
+    a non-tty log capture those control sequences flatten to a stream
+    of duplicated percentage lines that bury real log entries.
+
+    `huggingface_hub.utils.disable_progress_bars()` toggles the in-process
+    state — required, not just env-var-based, because HF caches the
+    progress-bar state after first import. Called from each child entry
+    point so the suppression follows the spawn boundary (parent-side
+    progress bars, if any operator wants them, are unaffected).
+    """
+    from huggingface_hub.utils import disable_progress_bars
+
+    disable_progress_bars()
+
+
 def _upload_child(
     conn,
     ckpt_dir: str,
@@ -173,6 +251,8 @@ def _upload_child(
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
+    _install_queue_listener_eof_suppressor()
+    _disable_hf_progress_bars_in_child()
     try:
         revision = upload_checkpoint_to_hf(
             ckpt_dir=Path(ckpt_dir),
@@ -306,8 +386,17 @@ def download_checkpoint_from_hf(
                 etag_timeout=_HF_ETAG_TIMEOUT_SEC,
             )
     except RepositoryNotFoundError as e:
-        raise RuntimeError(
+        # Covers GatedRepoError too (subclass): deleted, private, or gated.
+        raise HFRepoUnavailableError(
             f"HF repo not found or unauthorized: {repo_id}@{revision}"
+        ) from e
+    except RevisionNotFoundError as e:
+        raise HFRepoUnavailableError(
+            f"HF revision not found: {repo_id}@{revision}"
+        ) from e
+    except EntryNotFoundError as e:
+        raise HFFileMissingError(
+            f"HF file missing at revision: {repo_id}@{revision}: {filenames}"
         ) from e
 
     logger.debug(
@@ -384,6 +473,8 @@ def _download_child(
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
+    _install_queue_listener_eof_suppressor()
+    _disable_hf_progress_bars_in_child()
     try:
         result = download_checkpoint_from_hf(
             repo_id=repo_id,
@@ -519,8 +610,70 @@ def download_checkpoint_from_hf_subprocess(
         if tag == "ok":
             return Path(payload)
         exc_type, exc_msg, exc_tb = payload
+        # Re-type the two miner-attributable failure classes across the
+        # pickle boundary (the child sends only the exception's type name)
+        # so callers can distinguish "repo/file gone" from network trouble.
+        if exc_type in ("HFRepoUnavailableError", "RepositoryNotFoundError",
+                        "GatedRepoError", "RevisionNotFoundError"):
+            raise HFRepoUnavailableError(
+                f"HF download subprocess failed: {exc_type}: {exc_msg}"
+            )
+        if exc_type in ("HFFileMissingError", "EntryNotFoundError"):
+            raise HFFileMissingError(
+                f"HF download subprocess failed: {exc_type}: {exc_msg}"
+            )
         raise RuntimeError(
             f"HF download subprocess failed: {exc_type}: {exc_msg}\n{exc_tb}"
         )
     finally:
         parent_conn.close()
+
+
+def check_file_publicly_fetchable(
+    *,
+    repo_id: str,
+    revision: str | None,
+    filename: str,
+    timeout_sec: float = 10.0,
+) -> bool | None:
+    """Deliberately *unauthenticated* HEAD against the HF resolve endpoint.
+
+    The subnet contract is that a miner's committed checkpoint must be
+    publicly downloadable; this probe encodes exactly that. It is used as
+    a second opinion before attributing a download miss to the miner, so
+    a validator-side problem (expired token, DNS, proxy) can never zero
+    an innocent miner:
+
+      - ``True``  — anonymous request resolves (2xx/redirect): the file is
+        publicly fetchable, so a failed authenticated download was OUR
+        problem, not the miner's.
+      - ``False`` — 401/403/404: repo deleted, private, gated, revision
+        rewritten, or file absent. Miner-attributable.
+      - ``None``  — anything else (5xx, timeout, connection error): HF or
+        the network is unwell; indeterminate, treat as operational.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = (
+        f"https://huggingface.co/{repo_id}/resolve/"
+        f"{revision or 'main'}/{filename}"
+    )
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return bool(200 <= resp.status < 400)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403, 404):
+            return False
+        logger.warning(
+            "check_file_publicly_fetchable: indeterminate HTTP status",
+            repo_id=repo_id, revision=revision, status=e.code,
+        )
+        return None
+    except Exception as e:
+        logger.warning(
+            "check_file_publicly_fetchable: probe failed",
+            repo_id=repo_id, revision=revision, error=str(e),
+        )
+        return None
