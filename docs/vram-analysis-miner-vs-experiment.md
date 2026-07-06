@@ -56,7 +56,7 @@ Per expert (fp16): `gate_up_proj` = `2 × 1408 × 2048 × 2 B` ≈ 11.5 MB, `dow
 | Activations (grad-ckpt on) | ~0.5–1 GB (seq 1024) | ~4–8 GB (seq 4096) |
 | Model rebuild per inner-opt step | no | yes (before `enable_peer_resync=false` fix) — buys back ~470 MiB when disabled, but not the fit delta |
 | **Total (fp32 AdamW)** | **~24 GB** ✅ | **~46–50 GB → OOM** ❌ (observed 47.36 / 47.4 GB) |
-| **Total (AdamW8bit)** | (not needed) | **~37–41 GB** ✅ |
+| **Total (AdamW8bit)** | (not needed) | **~37–41 GB** ✅ — measured ~38.4 GB peak / ~23.9 GB steady on GPU 2 (see runtime confirmation) |
 
 ## Where the ~22–26 GB delta actually goes
 
@@ -88,6 +88,40 @@ None of these are strictly needed for training to work (8-bit works), but any on
 3. **Both of the above** → miner behaves like the experiment on VRAM and fp32 AdamW state is comfortably in-budget.
 
 Doing *neither* is why the miner needs `MINER_ADAMW_OPTIM_BITS=8`.
+
+## This branch (`feat/tier4-natural-routing`) vs `main`
+
+The **core VRAM footprint is identical on both branches.** `main` (at `7a84c9d`) and this branch load the same fp16 model, apply the same `freeze_parameters(upcast_trainable=True)` fp32 shadow, carry the same fp32 grads, and use the same `seq_len=4096` + `fp16-mixed`. Both allocate the same ~46–50 GB with fp32 AdamW. What this branch adds is the **ability to fit** (an 8-bit optimizer path) plus minor fragmentation relief — not a smaller base footprint. The ~7 GB precision delta vs the bf16 experiment lives in `model.py`/the fp16-mixed default, which neither branch changed.
+
+| VRAM-relevant knob | `main` (`7a84c9d`) | this branch (`feat/tier4-natural-routing`) |
+|---|---|---|
+| Base footprint (params / grads / activations / precision) | ~46–50 GB with fp32 AdamW | ~46–50 GB — **identical** |
+| Optimizer-state options | `torch.optim.AdamW`, fp32 state only (~12.4 GB) | `MINER_ADAMW_OPTIM_BITS` ∈ {`32`→fp32 ~12.4 GB, **`8`**→bnb 8-bit ~3.1 GB} (commits `91453ee`, `1992530`) |
+| Escape hatch on OOM | **none** — fp32 is the only path | `=8` → fits at ~38 GB peak |
+| Mid-training model reload | always on (no gate) → ~470 MiB reserved-but-unallocated churn at the alloc site | gated by `ckpt.enable_peer_resync` (default True), set **false** in this config → reclaims ~470 MiB (commit `63d3ed8`) |
+| Defrag before first `optimizer.step` | none | `gc.collect()` + `torch.cuda.empty_cache()` before `inner_scaler.step` (commit `c7abdca`) |
+| **Net fit on a 47 GB A6000 (this miner config)** | ❌ **OOMs, unrecoverable** | ✅ fits with `=8`; still OOMs with `=32` |
+
+Net: on `main` this exact config cannot train on a single 47 GB A6000 (no 8-bit path, no reload gate). This branch makes it fit and trims the reload/fragmentation slack — but the precision delta that *causes* the tight fit is the same on both.
+
+## Runtime confirmation (2026-07-04, GPU 2, `hk2/pr-188`)
+
+Live reproduction on a fully-free A6000 (GPU 2, 47.4 GB), config `checkpoints/miner/connito-puppet/hk2/pr-188/config.yaml` (exp_math trainable + exp_c4_p02 helper, `seq_len=4096`, `fp16-mixed`, `enable_peer_resync=false`). Three launches matched the analysis to the MiB:
+
+| Run | Optimizer | `PYTORCH_CUDA_ALLOC_CONF` | Result |
+|---|---|---|---|
+| 1 | fp32 AdamW (`=32`) | default | OOM at `_init_group` **`exp_avg` 352 MiB** — 339.69 MiB free, 1018.93 MiB reserved-but-unallocated (process at 47.06 GiB) |
+| 2 | fp32 AdamW (`=32`) | `expandable_segments:True` | `exp_avg` succeeds, OOM at **`exp_avg_sq` 176 MiB** — 31.69 MiB free, 549.93 MiB reserved-but-unallocated (process at 47.36 GiB) |
+| 3 | **bnb AdamW8bit (`=8`)** | `expandable_segments:True` | ✅ **fits** — cleared `_init_group`, ran 6 h+ |
+
+Run 2 reproduces the "run 7" datapoint above *exactly* (176 MiB `exp_avg_sq`, 31 MiB free, 549 MiB fragmented). Run 1 (no `expandable_segments`) shows the earlier `exp_avg` 352 MiB failure with a bit more slack (340 MiB free vs the 255 MiB in variant A) — expected, since the fragmentation state at the alloc site varies run to run.
+
+Measured VRAM on the successful 8-bit run (`nvidia-smi -i 2`):
+- **~38.4 GB** at the forward/backward + first-optimizer-step peak (`38446 MiB`, sampled at `Start epoch training`)
+- **~23.9 GB** steady-state once the step frees activations (`23884 MiB`)
+- **~44.5 GB** transient during checkpoint save (`44522 MiB`; each expert-group shard is `size_mb=3382.5`)
+
+This lands inside the estimated ~37–41 GB AdamW8bit envelope and leaves ~10 GB of headroom at the alloc site that fp32 lacked (31 MiB). Sustained health: `val_loss` 2.29 → 1.93 over ~6 h, checkpoint every 80 steps, 0 NaN batches, 1 benign non-finite-grad warning (dropped by design).
 
 ## Fix summary in this branch
 
