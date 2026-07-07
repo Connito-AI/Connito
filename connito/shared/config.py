@@ -359,6 +359,12 @@ class ScheduleCfg(BaseConfig):
 
 
 class CheckpointCfg(BaseConfig):
+    # Locked so every validator resumes local training state on restart —
+    # uniform behavior across the fleet. On load it is auto-reset to the
+    # default (True); an operator who needs a clean cold-start (e.g. recovering
+    # from a corrupt/incompatible checkpoint) should point at a fresh, empty
+    # checkpoint_path rather than disabling resume, which is no longer honored.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
     base_checkpoint_path: Path = Path("checkpoints/miner")
