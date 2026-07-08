@@ -43,7 +43,6 @@ from connito.shared.modeling.mycelia import get_base_tokenizer
 
 configure_logging()
 logger = structlog.get_logger(__name__)
-torch.autograd.set_detect_anomaly(True)
 
 
 def _is_streaming_timeout_error(error: Exception) -> bool:
@@ -63,7 +62,7 @@ def _is_streaming_timeout_error(error: Exception) -> bool:
 
 
 # this is for local DP only
-def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, backend: str = "nccl") -> None:
+def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, test_mode: bool = False, backend: str = "nccl") -> None:
     """
     Initializes the process for distributed training.
 
@@ -71,11 +70,17 @@ def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: call
         rank (int): The rank of the process.
         world_size (int): The total number of processes.
         fn (callable): The function to run for the process.
+        test_mode (bool): If True, enable cycle test mode (wait_till short-circuits).
         backend (str): The backend to use for distributed training.
 
     Returns:
         None
     """
+    # world_size>1 spawns fresh processes, so cycle._TEST_MODE must be re-set
+    # inside each worker — not just the parent — for --test to take effect.
+    if test_mode:
+        from connito.shared.cycle import set_test_mode
+        set_test_mode(True)
     if local_rank == 0:
         print(config)
 
@@ -181,7 +186,36 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    inner_optimizer = torch.optim.AdamW(trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95))
+    # Optimizer state precision — config.opt.adamw_optim_bits picks how
+    # exp_avg + exp_avg_sq are stored:
+    #   32: torch.optim.AdamW (fp32 state, 8 bytes/param).
+    #    8: bitsandbytes AdamW with optim_bits=8 — 8-bit blockwise-quantized
+    #       state, 4× smaller than fp32. Well-tested for LLM fine-tuning
+    #       (QLoRA/PEFT default) and required to fit this config on a 47GB A6000.
+    # Note: bitsandbytes does NOT support 16-bit AdamW state — it errors at
+    # init_state with NotImplementedError. Only 8 and 32 are valid. fp16-mixed
+    # autocast is orthogonal — it changes compute precision, not optimizer state.
+    optim_bits = int(getattr(config.opt, "adamw_optim_bits", 8))
+    if optim_bits == 8:
+        import bitsandbytes as _bnb
+        inner_optimizer = _bnb.optim.AdamW(
+            trainable_params,
+            lr=config.opt.lr,
+            weight_decay=0.1,
+            betas=(0.9, 0.95),
+            optim_bits=8,
+        )
+        logger.info("optimizer: bitsandbytes AdamW (8-bit state)")
+    elif optim_bits == 32:
+        inner_optimizer = torch.optim.AdamW(
+            trainable_params, lr=config.opt.lr, weight_decay=0.1, betas=(0.9, 0.95),
+        )
+    else:
+        raise ValueError(
+            f"config.opt.adamw_optim_bits={optim_bits!r} is not supported. "
+            f"Use 8 (bitsandbytes AdamW8bit) or 32 (torch.optim.AdamW); "
+            f"bitsandbytes has no 16-bit AdamW state."
+        )
 
     # === scheduler === (for inner optimizer)
     logger.debug("init - scheduler")
@@ -469,6 +503,15 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
                 scale_after = None
+                # Defrag before the FIRST optimizer.step(): AdamW lazily
+                # allocates exp_avg + exp_avg_sq (2× fp32 per trainable param,
+                # hundreds of MiB on DeepSeek-V2-Lite) inside optimizer.step,
+                # and it OOMs against ~1 GiB of reserved-but-unallocated
+                # fragmentation on a fresh A6000. `empty_cache` is cheap
+                # (~a few ms) and always safe here since we've just finished
+                # backward.
+                gc.collect()
+                torch.cuda.empty_cache()
                 if inner_scaler.is_enabled():
                     inner_scaler.step(inner_optimizer)
                     inner_scaler.update()
@@ -664,7 +707,12 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 # dist.barrier(device_ids=[rank])
 
             # === reload model ===
-            if is_inner_optimizer_step:
+            # Gated by ckpt.enable_peer_resync (default True). Standalone
+            # smoke/train runs — especially under use_pretrained_only=True —
+            # want this off, otherwise a stale validator_checkpoint dir on
+            # disk triggers a full setup_training rebuild every inner-opt
+            # step and optimizer state gets wiped.
+            if is_inner_optimizer_step and get_nested_attr(config, "ckpt.enable_peer_resync", True):
                 logger.info("(5) Reload Model")
 
                 newest_checkpoint = select_best_checkpoint(
@@ -782,7 +830,12 @@ def run_distributed_training() -> None:
     if args.debug:
         import logging
         logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Verbose debug logging enabled!")
+        # Autograd anomaly detection is a debug-only tool. On fp16-mixed it
+        # raises RuntimeError on transient overflows that GradScaler is
+        # designed to catch at unscale_() — leaving it on in production
+        # antagonizes the scaler and crashes the miner on the first NaN.
+        torch.autograd.set_detect_anomaly(True)
+        logger.debug("Verbose debug logging + autograd anomaly detection enabled")
 
     if args.path:
         config = MinerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
@@ -792,11 +845,11 @@ def run_distributed_training() -> None:
     if config.local_par.world_size > 1:
         mp.spawn(
             init_process,
-            args=(config, config.local_par.world_size, train_worker),
+            args=(config, config.local_par.world_size, train_worker, args.test),
             nprocs=config.local_par.world_size,
         )
     else:
-        init_process(0, config, config.local_par.world_size, train_worker)
+        init_process(0, config, config.local_par.world_size, train_worker, test_mode=args.test)
 
 
 if __name__ == "__main__":

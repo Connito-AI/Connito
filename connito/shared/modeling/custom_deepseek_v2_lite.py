@@ -345,15 +345,37 @@ class CustomDeepseekV2Moe(nn.Module):
         full_mode = bool(getattr(config, "full", False))
 
         # --- Determine allowed experts ---
+        # Trainable and helper group sets are supplied independently on the
+        # config (see get_moe_model_config). `allowed_expert_id` is their union
+        # — used by masked-topk routing. `trainable_expert_id` / `helper_expert_id`
+        # remain split so the natural-with-fallback routing rule can preserve
+        # natural picks that land in the trainable set and substitute helpers
+        # for the rest.
+        trainable_expert_id: list[int] = []
+        helper_expert_id: list[int] = []
         if full_mode:
             allowed_expert_id = list(range(config.n_routed_experts))
         elif config.expert_group_assignment is not None:
-            group_ids = config.group_ids if config.group_ids is not None else config.expert_group_assignment.keys()
-            allowed_expert_id = []
-            for group_id in group_ids:
-                group_id = int(group_id)
-                layer_assignments = config.expert_group_assignment[group_id].get(layer_id, [])
-                allowed_expert_id += [int(org_expert_id) for _, org_expert_id in layer_assignments]
+            trainable_group_ids = getattr(config, "group_ids_trainable", None)
+            helper_group_ids = getattr(config, "group_ids_helper", None)
+            # When neither is set explicitly, treat every assigned group as
+            # trainable (matches the pre-split default of loading everything).
+            if trainable_group_ids is None and helper_group_ids is None:
+                trainable_group_ids = list(config.expert_group_assignment.keys())
+                helper_group_ids = []
+            trainable_group_ids = list(trainable_group_ids or [])
+            helper_group_ids = list(helper_group_ids or [])
+
+            def _collect(group_ids: list) -> list[int]:
+                out: list[int] = []
+                for group_id in group_ids:
+                    layer_assignments = config.expert_group_assignment[int(group_id)].get(layer_id, [])
+                    out += [int(org_expert_id) for _, org_expert_id in layer_assignments]
+                return out
+
+            trainable_expert_id = _collect(trainable_group_ids)
+            helper_expert_id = _collect(helper_group_ids)
+            allowed_expert_id = trainable_expert_id + helper_expert_id
         else:
             total_experts = getattr(config, "num_experts", None)
             if total_experts is None:
@@ -369,13 +391,16 @@ class CustomDeepseekV2Moe(nn.Module):
         if invalid_experts:
             raise ValueError(
                 "Detected out-of-range expert ids in allowed_expert_id for layer routing. "
-                f"layer_id={layer_id}, group_ids={config.group_ids}, "
+                f"layer_id={layer_id}, "
+                f"group_ids_trainable={getattr(config, 'group_ids_trainable', None)}, "
+                f"group_ids_helper={getattr(config, 'group_ids_helper', None)}, "
                 f"invalid={invalid_experts[:10]}"
             )
         if len(available_experts) == 0:
             raise ValueError(
                 f"No routed experts assigned for layer_id={layer_id}. "
-                f"group_ids={config.group_ids}"
+                f"group_ids_trainable={getattr(config, 'group_ids_trainable', None)}, "
+                f"group_ids_helper={getattr(config, 'group_ids_helper', None)}"
             )
         if full_mode and len(available_experts) != config.n_routed_experts:
             raise ValueError(
@@ -385,6 +410,22 @@ class CustomDeepseekV2Moe(nn.Module):
 
         self.expert_indices = available_experts
         self.register_buffer("allowed_ids", torch.tensor(self.expert_indices, dtype=torch.long), persistent=False)
+
+        # Separate buffers for the natural-with-fallback routing mode. When the
+        # mode is not enabled these are unused but still present (harmless, small).
+        _trainable = sorted({int(e) for e in trainable_expert_id})
+        _helper = sorted({int(e) for e in helper_expert_id if int(e) not in _trainable})
+        self.register_buffer(
+            "trainable_ids",
+            torch.tensor(_trainable, dtype=torch.long) if _trainable else torch.zeros(0, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "helper_ids",
+            torch.tensor(_helper, dtype=torch.long) if _helper else torch.zeros(0, dtype=torch.long),
+            persistent=False,
+        )
+        self.routing_mode = str(getattr(config, "routing_mode", "masked_topk"))
 
         first_moe_layer = int(getattr(config, "first_k_dense_replace", 0))
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
@@ -428,6 +469,50 @@ class CustomDeepseekV2Moe(nn.Module):
         batch_size, seq_len, hidden_dim = router_logits.shape
         router_logits = router_logits.view(-1, hidden_dim)
         router_logits = router_logits.softmax(dim=-1, dtype=torch.float32)
+
+        # ── natural-with-fallback (2Fnat) ──
+        # The base gate ranks all n_routed_experts natively (no masking). Slots
+        # in the natural top-k that land on a trainable expert are kept as-is
+        # (the trainable expert receives that token with its natural gate
+        # weight). Slots that land on a non-trainable expert get REPLACED by the
+        # token's top-scoring helper expert (ranked by the same gate over the
+        # helper subset). Net effect: trainable experts only ever see tokens the
+        # base gate naturally routes to them (exact train-eval alignment), and
+        # non-trainable demand is absorbed by frozen helpers.
+        if (
+            self.routing_mode == "natural_with_fallback"
+            and self.trainable_ids.numel() > 0
+            and self.helper_ids.numel() > 0
+            and self.topk_method == "greedy"
+        ):
+            n_tokens = router_logits.size(0)
+            device = router_logits.device
+            trainable_ids = self.trainable_ids.to(device=device)
+            helper_ids = self.helper_ids.to(device=device)
+
+            # Natural top-k over ALL experts, no masking
+            natural_w, natural_idx = torch.topk(router_logits, k=self.top_k, dim=-1, sorted=False)
+
+            # Which of each token's natural picks landed in the trainable set?
+            is_trainable = torch.isin(natural_idx, trainable_ids)  # [n_tokens, top_k] bool
+
+            # Helper-only masked scores → top-k helpers per token
+            helper_masked = torch.full_like(router_logits, -1e4)
+            helper_masked.scatter_(
+                1,
+                helper_ids.unsqueeze(0).expand(n_tokens, -1),
+                router_logits.gather(1, helper_ids.unsqueeze(0).expand(n_tokens, -1)),
+            )
+            fb_w, fb_idx = torch.topk(helper_masked, k=self.top_k, dim=-1, sorted=False)
+
+            # For each of the k slots, pick natural if trainable else next-fallback
+            # cumsum over ~is_trainable gives 1-indexed position within fallback list
+            fb_pos = ((~is_trainable).long().cumsum(-1) - 1).clamp(min=0)
+            final_idx = torch.where(is_trainable, natural_idx, fb_idx.gather(1, fb_pos))
+            final_w = torch.where(is_trainable, natural_w, fb_w.gather(1, fb_pos))
+
+            return final_idx, final_w * self.routed_scaling_factor
+        # ── end 2Fnat branch ──
 
         if self.allowed_ids is not None and self.allowed_ids.numel() > 0 and self.allowed_ids.numel() < router_logits.size(-1):
             allowed_ids = self.allowed_ids.to(device=router_logits.device)
@@ -765,11 +850,33 @@ def _apply_pretrained_tensor_to_partial(
         loaded_counts["sliced"] += 1
 
 
+def merge_group_assignments_for_streaming(
+    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
+    group_ids: list[int],
+) -> dict[int, list[tuple[int, int]]]:
+    """Union the per-layer expert assignments across `group_ids` and
+    recompute my_expert_id as the position in the sorted merged org_expert_id
+    set. This matches CustomDeepseekV2Moe's local-slot layout
+    (`expert_indices = sorted(unique org_expert_ids)`), so streaming can
+    write once into the merged partial model without collisions between
+    per-group my_expert_ids that both start at 0."""
+    per_layer_orgs: dict[int, set[int]] = {}
+    for group_id in group_ids:
+        layer_assignments = expert_group_assignment.get(int(group_id), {})
+        for layer_id, mappings in layer_assignments.items():
+            per_layer_orgs.setdefault(int(layer_id), set()).update(
+                int(org) for _, org in mappings
+            )
+    return {
+        layer_id: [(idx, org) for idx, org in enumerate(sorted(orgs))]
+        for layer_id, orgs in per_layer_orgs.items()
+    }
+
+
 def stream_pretrained_state_dict_to_partial_model(
     partial_model: CustomDeekSeekMoE,
     state_dict: dict[str, torch.Tensor],
-    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
-    target_group: int,
+    assignments: dict[int, list[tuple[int, int]]],
 ) -> CustomDeekSeekMoE:
     """Stream a pretrained state dict into a partial model, popping
     each source entry from `state_dict` as it lands so its host RAM is
@@ -783,10 +890,11 @@ def stream_pretrained_state_dict_to_partial_model(
     (CPU) and the partial parameters (GPU) live in separate memory
     pools, avoiding the previous full+partial-on-CPU peak.
 
+    `assignments` is `{layer_id: [(my_expert_id, org_expert_id), ...]}`
+    for the merged partial (see `merge_group_assignments_for_streaming`).
     The caller's `state_dict` is consumed: it ends empty.
     """
     partial_state = partial_model.state_dict()
-    assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0}
     gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -805,7 +913,7 @@ def stream_pretrained_state_dict_to_partial_model(
     logger.info(
         "Streamed pretrained state dict into partial model",
         loaded_counts=loaded_counts,
-        target_group=target_group,
+        num_layers=len(assignments),
     )
     return partial_model
 
@@ -813,8 +921,7 @@ def stream_pretrained_state_dict_to_partial_model(
 def stream_safetensors_to_partial_model(
     partial_model: CustomDeekSeekMoE,
     model_path: str,
-    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
-    target_group: int,
+    assignments: dict[int, list[tuple[int, int]]],
     dtype: torch.dtype,
 ) -> CustomDeekSeekMoE:
     """Stream a pretrained checkpoint directly from its safetensors shards
@@ -861,7 +968,6 @@ def stream_safetensors_to_partial_model(
         shard_filenames = [SAFE_WEIGHTS_NAME]
 
     partial_state = partial_model.state_dict()
-    assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0}
     gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
 
@@ -889,7 +995,7 @@ def stream_safetensors_to_partial_model(
     logger.info(
         "Streamed pretrained safetensors shards into partial model",
         loaded_counts=loaded_counts,
-        target_group=target_group,
+        num_layers=len(assignments),
         shards=len(shard_filenames),
     )
     return partial_model
@@ -898,10 +1004,12 @@ def stream_safetensors_to_partial_model(
 def get_moe_model_config(
     config: MinerConfig,
     topk: int,
-    group_ids: list | None,
+    group_ids_trainable: list | None,
     expert_manager: ExpertManager,
     org_model_config: AutoConfig = None,
     full: bool = False,
+    routing_mode: str = "masked_topk",
+    group_ids_helper: list | None = None,
 ) -> PretrainedConfig:
     # Load the hub config for its field values, then re-construct using the
     # installed DeepseekV2Config so that __init__ sets derived fields like head_dim.
@@ -923,11 +1031,18 @@ def get_moe_model_config(
 
     num_routed_experts = int(hub_dict.get("n_routed_experts", 16))
     num_hidden_layers = int(getattr(base_config, "num_hidden_layers", 0))
+    # Validate every group we plan to load (union of trainable + helper). If
+    # both are None the validator falls back to all-groups.
+    _merged_group_ids: list | None
+    if group_ids_trainable is None and group_ids_helper is None:
+        _merged_group_ids = None
+    else:
+        _merged_group_ids = list(group_ids_trainable or []) + list(group_ids_helper or [])
     _validate_assignment_bounds(
         expert_group_assignment=expert_manager.expert_group_assignment,
         num_experts=num_routed_experts,
         num_hidden_layers=num_hidden_layers,
-        group_ids=group_ids,
+        group_ids=_merged_group_ids,
     )
 
     # merge our subnet config to the base config
@@ -943,6 +1058,8 @@ def get_moe_model_config(
     base_config.norm_topk_prob = True
     base_config.max_position_embeddings = config.task.exp.data.sequence_length
     base_config.expert_group_assignment = expert_manager.expert_group_assignment
-    base_config.group_ids = group_ids
+    base_config.group_ids_trainable = list(group_ids_trainable) if group_ids_trainable is not None else None
+    base_config.group_ids_helper = list(group_ids_helper) if group_ids_helper is not None else None
+    base_config.routing_mode = str(routing_mode)
 
     return base_config

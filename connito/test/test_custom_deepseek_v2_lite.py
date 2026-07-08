@@ -68,7 +68,8 @@ def test_full_to_partial_save_and_reload(tmp_path: Path) -> None:
     if not hasattr(full_cfg, "num_experts"):
         full_cfg.num_experts = int(getattr(full_cfg, "n_routed_experts"))
     full_cfg.expert_group_assignment = None
-    full_cfg.group_ids = None
+    full_cfg.group_ids_trainable = None
+    full_cfg.group_ids_helper = None
 
     full_model = CustomDeekSeekMoE.from_pretrained(
         MODEL_ID,
@@ -85,7 +86,8 @@ def test_full_to_partial_save_and_reload(tmp_path: Path) -> None:
 
     partial_cfg = deepcopy(full_model.config)
     partial_cfg.expert_group_assignment = expert_group_assignment
-    partial_cfg.group_ids = [GROUP_ID]
+    partial_cfg.group_ids_trainable = [GROUP_ID]
+    partial_cfg.group_ids_helper = None
     if not hasattr(partial_cfg, "num_experts"):
         partial_cfg.num_experts = int(getattr(partial_cfg, "n_routed_experts"))
 
@@ -130,7 +132,8 @@ def test_partial_model_forward() -> None:
     if not hasattr(full_cfg, "num_experts"):
         full_cfg.num_experts = int(getattr(full_cfg, "n_routed_experts"))
     full_cfg.expert_group_assignment = None
-    full_cfg.group_ids = None
+    full_cfg.group_ids_trainable = None
+    full_cfg.group_ids_helper = None
 
     full_model = CustomDeekSeekMoE.from_pretrained(
         MODEL_ID,
@@ -146,7 +149,8 @@ def test_partial_model_forward() -> None:
 
     partial_cfg = deepcopy(full_model.config)
     partial_cfg.expert_group_assignment = expert_group_assignment
-    partial_cfg.group_ids = [GROUP_ID]
+    partial_cfg.group_ids_trainable = [GROUP_ID]
+    partial_cfg.group_ids_helper = None
     if not hasattr(partial_cfg, "num_experts"):
         partial_cfg.num_experts = int(getattr(partial_cfg, "n_routed_experts"))
 

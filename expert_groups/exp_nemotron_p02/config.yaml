@@ -1,0 +1,18 @@
+group_id: -1  # sentinel: not assigned to a functioning slot (would clash with exp_math=0 if left at the default)
+# Nemotron-CC-Math-v1 (config=4plus) ESFT-Token @ p=0.2
+# Calibrated on 500 batches of nvidia/Nemotron-CC-Math-v1 with the DeepSeek-V2-Lite
+# native router, then selected via ESFT paper cumulative-threshold (p=0.2) per layer.
+# Ported from experiment/expert_assignments/expert_assignment_esft_token_math_b500_p02.json.
+# Total experts across 26 MoE layers: 187 (avg 7.2/layer)
+data:
+  dataset_sources:
+    - path: "nvidia/Nemotron-CC-Math-v1"
+      name: "4plus"
+      weight: 1.0
+      text_column: "text"
+  per_device_train_batch_size: 1
+  batch_size: 4
+  sequence_length: 4096
+  world_size: 10
+  rank: 1
+  dataset_class: null
