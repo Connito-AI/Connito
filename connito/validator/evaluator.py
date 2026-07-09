@@ -207,12 +207,24 @@ def finalize_round_scores(
     """
     # Snapshot all sets under the round's lock so the worker threads
     # cannot race a mark_scored / mark_failed against the read.
-    scored, _failed = round_obj.processed_uids_snapshot()
+    # Mark the round finalized FIRST, atomically with snapshotting its
+    # scores. `mark_scored` checks `round.finalized` under this same lock and
+    # drops any later (e.g. background) eval result, so no in-flight eval can
+    # add a fresh raw point to the aggregator after the `drop_round` below.
+    # Without this gate a late bg-eval writes a raw `delta ** 1.2` tagged with
+    # this round_id *after* drop_round has run; the point is never re-ranked
+    # and rides the rolling avg as an illegal non-rank score (the root cause
+    # of the inflated `validator_miner_score_avg` / weight distortion).
+    # `_RecoveryRound` (startup replay) has no `finalized` field; setattr
+    # just creates it, and recovery is single-threaded so the gate is a no-op
+    # there.
     # `round.scores` is mutated under the same lock; copy it explicitly
     # rather than alias.
     with round_obj._lock:  # noqa: SLF001 — same module family
+        round_obj.finalized = True
         round_scores = dict(round_obj.scores)
         validation_failed = set(round_obj.validation_failed_uids)
+    scored, _failed = round_obj.processed_uids_snapshot()
     freeze_zero = set(round_obj.freeze_zero_uids)
     freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
 
