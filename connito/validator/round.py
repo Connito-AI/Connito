@@ -658,6 +658,16 @@ class Round:
         if hotkey is not None:
             self._record_in_cycle_score(uid, hotkey, score_f)
 
+    def scores_snapshot(self) -> dict[int, float]:
+        """Lock-guarded copy of this round's per-miner delta scores.
+
+        For readers outside the round's module family (e.g. the dedup
+        shadow pass) that need a consistent view without reaching into
+        `_lock` — same pattern `finalize_round_scores` uses internally.
+        """
+        with self._lock:
+            return dict(self.scores)
+
     def top_scored_uids_this_round(self, top_k: int) -> set[int]:
         """Top-`top_k` UIDs by *this round's* score. Returns every scored
         UID when fewer than `top_k` have been scored. Ties are broken

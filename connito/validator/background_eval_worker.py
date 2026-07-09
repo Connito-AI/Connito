@@ -15,6 +15,9 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import copy
+import gc
+import math
 import threading
 import time
 from pathlib import Path
@@ -23,19 +26,31 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.helper import load_state_dict_from_path
 from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
+    VALIDATOR_DEDUP_PAIRS_EVALUATED_TOTAL,
+    VALIDATOR_DEDUP_WOULD_FLAG_TOTAL,
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
     VALIDATOR_ROUND_MINERS_SCORED,
+)
+from connito.validator.dedup import (
+    average_state_dicts,
+    delta_cosine,
+    find_submission_path,
+    recover_val_loss,
+    select_pairs,
+    shadow_report,
 )
 from connito.validator.evaluator import (
     EVAL_MAX_BATCHES,
     cleanup_non_top_submissions,
     evaluate_one_miner_sync,
+    retention_top_k,
 )
 from connito.validator.round import RoundRef
 
@@ -117,6 +132,18 @@ class BackgroundEvalWorker(threading.Thread):
         # `_eval_base_model` reference and re-park; the next foreground
         # eval re-seeds us via `set_eval_base_model`.
         self._stuck_lock_streak: int = 0
+        # Dedup shadow-pass state. Keyed by `_dedup_round_id` — NOT by
+        # `_loaded_round_id`, which the stuck-lock recycler nulls for the
+        # SAME round; keying dedup state to it would re-evaluate pairs
+        # after a recycle. Reset only when a genuinely new round arrives
+        # (see `_reset_dedup_state_if_new_round`).
+        self._dedup_round_id: int | None = None
+        self._scored_paths: dict[int, Path] = {}
+        self._scored_val_loss: dict[int, float] = {}
+        self._dedup_pairs_done: set[frozenset[int]] = set()
+        self._dedup_budget_used: int = 0
+        self._dedup_pairs_skipped: int = 0
+        self._dedup_summary_emitted: bool = False
 
     # ---------------- Public lifecycle ----------------
     def stop(self) -> None:
@@ -223,6 +250,13 @@ class BackgroundEvalWorker(threading.Thread):
                             round_stats=stats,
                         )
                     idle_ticks += 1
+                    # Dedup shadow pass: spend idle GPU time measuring
+                    # merged-pair losses over the round's top scorers.
+                    # One pair per idle tick, and only after a short
+                    # quiescence (>= 2 ticks), so freshly-landed
+                    # downloads always win the GPU over shadow work.
+                    if idle_ticks >= 2:
+                        await self._maybe_run_dedup_shadow(round_obj)
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
 
@@ -258,6 +292,10 @@ class BackgroundEvalWorker(threading.Thread):
             merge_phase_active=self.merge_phase_active.is_set(),
             eval_window_active=self.eval_window_active.is_set(),
         )
+        # Entering a gated stretch usually means the eval window closed
+        # (or Merge started) — a natural point to summarize the round's
+        # shadow pass. Idempotent via `_dedup_summary_emitted`.
+        self._emit_dedup_summary(reason="gated")
         while not self.stop_event.is_set():
             round_obj = self.round_ref.current
             if (
@@ -286,6 +324,8 @@ class BackgroundEvalWorker(threading.Thread):
         # datasets/pandas chain at module-import time (helps tests).
         from connito.shared.dataloader import get_dataloader, materialize_batches
         from connito.shared.evaluate import evaluate_model
+
+        self._reset_dedup_state_if_new_round(round_obj)
 
         # Drop any previous round's cached batches before loading the new
         # round's. The CPU-side tensor list can run to several hundred MB
@@ -520,6 +560,15 @@ class BackgroundEvalWorker(threading.Thread):
             return
 
         round_obj.mark_scored(uid, evaluated.score)
+        # Dedup shadow bookkeeping: remember where this miner's file
+        # lives (pop_downloaded above removed the only uid→path map) and
+        # its exact val_loss, so shadow pairs don't have to re-derive
+        # either. Read-only breadcrumbs — never fed back into scoring.
+        if round_obj.round_id == self._dedup_round_id:
+            self._scored_paths[uid] = Path(path)
+            ev_loss = getattr(evaluated, "val_loss", float("nan"))
+            if isinstance(ev_loss, float) and math.isfinite(ev_loss):
+                self._scored_val_loss[uid] = ev_loss
         logger.info(
             "bg-eval: success",
             round_id=round_obj.round_id,
@@ -609,7 +658,9 @@ class BackgroundEvalWorker(threading.Thread):
             deleted = cleanup_non_top_submissions(
                 round_obj=round_obj,
                 submission_dir=Path(self.config.ckpt.miner_submission_path),
-                top_k=int(self.config.evaluation.top_k_miners_to_reward),
+                # Widened to dedup_top_k while the dedup filter is active
+                # so the shadow pass can still read the files it pairs.
+                top_k=retention_top_k(self.config),
             )
         except Exception as e:
             logger.warning("bg-eval: post-eval submission cleanup failed", error=str(e))
@@ -621,6 +672,205 @@ class BackgroundEvalWorker(threading.Thread):
                 deleted=len(deleted),
                 files=deleted,
             )
+
+    # ---------------- Dedup shadow pass ----------------
+    def _reset_dedup_state_if_new_round(self, round_obj) -> None:
+        """Reset dedup bookkeeping when a genuinely NEW round arrives.
+
+        Called from `_load_round_snapshot`, which also re-runs after a
+        stuck-lock recycle for the SAME round — hence the explicit
+        round-id key instead of piggybacking on `_loaded_round_id`.
+        Emits the previous round's summary first (idempotent).
+        """
+        if self._dedup_round_id == round_obj.round_id:
+            return
+        self._emit_dedup_summary(reason="round_transition")
+        self._dedup_round_id = round_obj.round_id
+        self._scored_paths = {}
+        self._scored_val_loss = {}
+        self._dedup_pairs_done = set()
+        self._dedup_budget_used = 0
+        self._dedup_pairs_skipped = 0
+        self._dedup_summary_emitted = False
+
+    def _emit_dedup_summary(self, *, reason: str) -> None:
+        """One `dedup-shadow: round summary` line per round (best effort)."""
+        if self._dedup_summary_emitted or self._dedup_round_id is None:
+            return
+        if self._dedup_budget_used == 0 and self._dedup_pairs_skipped == 0:
+            return  # nothing ran (mode off, or <2 positive miners) — stay quiet
+        self._dedup_summary_emitted = True
+        logger.info(
+            "dedup-shadow: round summary",
+            round_id=self._dedup_round_id,
+            pairs_evaluated=len(self._dedup_pairs_done) - self._dedup_pairs_skipped,
+            pairs_skipped=self._dedup_pairs_skipped,
+            budget_used=self._dedup_budget_used,
+            budget_max=int(getattr(self.config.evaluation, "dedup_max_pairs", 0)),
+            reason=reason,
+        )
+
+    def _resolve_submission_path(self, round_obj, uid: int) -> Path | None:
+        """uid → on-disk submission file, best effort.
+
+        Bg-scored miners were captured in `_scored_paths`; foreground-
+        scored miners never transit this worker, so fall back to the
+        filename convention (hotkey + block inside the round's submission
+        window). Either way the file may have been pruned since —
+        callers treat None / missing file as "skip pair".
+        """
+        path = self._scored_paths.get(uid)
+        if path is not None and path.exists():
+            return path
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            return None
+        return find_submission_path(
+            Path(self.config.ckpt.miner_submission_path),
+            hotkey,
+            getattr(round_obj, "submission_block_range", None),
+        )
+
+    async def _maybe_run_dedup_shadow(self, round_obj) -> None:
+        """Evaluate at most ONE merged pair of top submissions, then yield.
+
+        Shadow mode: measurement + logging only. This method never calls
+        `mark_scored`/`mark_failed`/`claim_for_eval`/`pop_downloaded` and
+        never writes to the aggregator or journal — it cannot affect any
+        miner's score or the round's lifecycle. One pair per idle tick
+        keeps real miner evals strictly ahead of shadow work.
+        """
+        cfg = self.config.evaluation
+        if getattr(cfg, "dedup_filter_mode", "off") != "shadow":
+            return
+        if self._dedup_round_id != round_obj.round_id:
+            return  # snapshot load (which resets dedup state) hasn't run yet
+        max_pairs = int(getattr(cfg, "dedup_max_pairs", 0))
+        if self._dedup_budget_used >= max_pairs:
+            return
+        # Same gates as a real eval, re-checked immediately before work.
+        if (
+            self.round_ref.current is not round_obj
+            or self._loaded_round_id != round_obj.round_id
+            or self._eval_base_model is None
+            or self._cached_batches is None
+            or self.merge_phase_active.is_set()
+            or not self.eval_window_active.is_set()
+        ):
+            return
+
+        pairs = select_pairs(
+            round_obj.scores_snapshot(),
+            top_k=int(getattr(cfg, "dedup_top_k", 0)),
+            max_pairs=max_pairs - self._dedup_budget_used,
+            exclude=self._dedup_pairs_done,
+        )
+        if not pairs:
+            return
+        uid_a, uid_b = pairs[0]
+        # Mark the pair consumed up-front: a pair that fails (missing
+        # file, eval error) is not retried — its files are only going to
+        # get *less* available as pruning proceeds.
+        self._dedup_pairs_done.add(frozenset((uid_a, uid_b)))
+        self._dedup_budget_used += 1
+
+        path_a = self._resolve_submission_path(round_obj, uid_a)
+        path_b = self._resolve_submission_path(round_obj, uid_b)
+        if path_a is None or path_b is None:
+            self._dedup_pairs_skipped += 1
+            logger.info(
+                "dedup-shadow: pair skipped — submission file unavailable",
+                round_id=round_obj.round_id,
+                uid_a=uid_a, uid_b=uid_b,
+                has_a=path_a is not None, has_b=path_b is not None,
+            )
+            return
+
+        baseline = (
+            self._loaded_baseline_loss
+            if self._loaded_baseline_loss is not None
+            else 100.0
+        )
+        scores = round_obj.scores_snapshot()
+
+        def _side_loss(uid: int) -> tuple[float, str]:
+            exact = self._scored_val_loss.get(uid)
+            if exact is not None:
+                return exact, "bg_exact"
+            # Foreground-scored miners: invert score = delta**1.2. Their
+            # delta was computed against the FOREGROUND baseline (same
+            # snapshot + seed, different loader instance), so a small
+            # offset vs our measurement of loss_avg is possible — tagged
+            # so the what-if analysis can segment.
+            return recover_val_loss(scores.get(uid, 0.0), baseline), "recovered"
+
+        timeout = float(cfg.per_miner_eval_timeout_sec)
+        deadline = time.monotonic() + timeout
+        outer_timeout = timeout + EVAL_DEADLINE_GRACE_SEC
+
+        def _run_pair() -> tuple[float, float, int, int]:
+            # CPU work (load, cosine, average) outside the GPU lock —
+            # the lock-yielding invariant wants the narrowest scope.
+            from connito.shared.evaluate import evaluate_model
+
+            sd_a = load_state_dict_from_path(path_a)
+            sd_b = load_state_dict_from_path(path_b)
+            cosine, n_keys = delta_cosine(sd_a, sd_b, round_obj.model_snapshot_cpu)
+            merged_sd, asymmetric = average_state_dicts(sd_a, sd_b)
+            del sd_a, sd_b
+            with self.gpu_eval_lock:
+                # Deepcopy per pair — NEVER mutate `_eval_base_model` in
+                # place: real miner evals interleave between pairs and
+                # deepcopy it assuming pristine round-snapshot weights.
+                merged_model = copy.deepcopy(self._eval_base_model)
+                try:
+                    merged_model.load_state_dict(merged_sd, strict=False)
+                    metrics = evaluate_model(
+                        0, merged_model, self._cached_batches,
+                        self.device, EVAL_MAX_BATCHES, None,
+                        deadline_monotonic=deadline,
+                    )
+                finally:
+                    del merged_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            return float(metrics.get("val_loss", float("inf"))), cosine, n_keys, asymmetric
+
+        try:
+            loss_avg, cosine, n_keys, asymmetric = await asyncio.wait_for(
+                asyncio.to_thread(_run_pair), timeout=outer_timeout,
+            )
+        except Exception as e:
+            self._dedup_pairs_skipped += 1
+            logger.warning(
+                "dedup-shadow: pair eval failed",
+                round_id=round_obj.round_id,
+                uid_a=uid_a, uid_b=uid_b, error=str(e),
+            )
+            return
+
+        loss_a, source_a = _side_loss(uid_a)
+        loss_b, source_b = _side_loss(uid_b)
+        report = shadow_report(
+            loss_a=loss_a, loss_b=loss_b, loss_avg=loss_avg,
+            baseline=baseline, cosine=cosine,
+        )
+        logger.info(
+            "dedup-shadow: pair result",
+            round_id=round_obj.round_id,
+            uid_a=uid_a, uid_b=uid_b,
+            loss_source_a=source_a, loss_source_b=source_b,
+            n_keys=n_keys, asymmetric_keys=asymmetric,
+            **report,
+        )
+        try:
+            VALIDATOR_DEDUP_PAIRS_EVALUATED_TOTAL.inc()
+            for threshold, flagged in report["would_flag_not_better"].items():
+                if flagged:
+                    VALIDATOR_DEDUP_WOULD_FLAG_TOTAL.labels(threshold=threshold).inc()
+        except Exception:
+            pass
 
     @staticmethod
     def _record_metrics(round_obj, *, scored_inc: bool) -> None:

@@ -484,6 +484,21 @@ def build_submission_uid_weights(
     )
 
 
+def retention_top_k(config) -> int:
+    """How many top submissions to keep on disk after each eval.
+
+    Normally `top_k_miners_to_reward`; while the dedup filter is active
+    the shadow pass needs the top `dedup_top_k` files to survive pruning
+    long enough to build merged pairs, so keep the max of the two. Used
+    by BOTH prune sites (foreground `_prune_non_top_after_eval` here and
+    the background worker's `_prune_non_top`).
+    """
+    keep = int(config.evaluation.top_k_miners_to_reward)
+    if getattr(config.evaluation, "dedup_filter_mode", "off") != "off":
+        keep = max(keep, int(getattr(config.evaluation, "dedup_top_k", 0)))
+    return keep
+
+
 def _prune_non_top_after_eval(
     *,
     config,
@@ -496,7 +511,7 @@ def _prune_non_top_after_eval(
         deleted = cleanup_non_top_submissions(
             round_obj=round_obj,
             submission_dir=Path(config.ckpt.miner_submission_path),
-            top_k=int(config.evaluation.top_k_miners_to_reward),
+            top_k=retention_top_k(config),
         )
     except Exception as e:
         logger.warning("foreground eval: post-eval cleanup failed", error=str(e))
@@ -577,6 +592,10 @@ class MinerEvalJob:
     model_path: str
     step: int
     score: float = 0.0
+    # Raw validation loss behind `score` (= max(0, baseline - val_loss) ** 1.2).
+    # NaN default keeps every existing constructor call site working; consumers
+    # (the dedup shadow pass) fall back to inverting `score` when absent.
+    val_loss: float = float("nan")
 
 
 # -------------------------- Pipeline Config -----------------------------------
@@ -825,6 +844,7 @@ def evaluate_one_miner_sync(
             model_path=str(model_path),
             step=int(step),
             score=float(score),
+            val_loss=float(val_loss),
         )
     except EvalDeadlineExceeded as e:
         logger.warning(
