@@ -1023,6 +1023,20 @@ class EvalCfg(BaseConfig):
     # "delete-your-model-and-keep-earning" hole; set False to restore the
     # legacy EMA-preserving behavior.
     repo_unavailable_is_miner_fault: bool = True
+    # Duplicate-submission ("entropy") filter. "shadow" runs a merge-loss
+    # measurement pass over pairs of the round's top positive-scoring
+    # submissions and LOGS the results (loss of the averaged pair vs each
+    # side, plus delta-cosine similarity) without affecting any score,
+    # weight, or journal entry. Deliberately NOT a locked field while in
+    # shadow: auto_update_config resets locked fields to their defaults on
+    # every start, which would force "off" fleet-wide and make per-host
+    # opt-in impossible. Lock it when an enforcing mode ships.
+    dedup_filter_mode: Literal["off", "shadow"] = "off"
+    # Compare the top-K positive-delta miners of the round...
+    dedup_top_k: int = 5
+    # ...but never spend more than this many merged-pair GPU evals per
+    # round (each costs about one miner eval).
+    dedup_max_pairs: int = 10
 
 
 class ValidatorConfig(WorkerConfig):
