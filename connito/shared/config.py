@@ -214,12 +214,12 @@ class DatasetSourceCfg(BaseConfig):
 
 
 class DataCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir"})
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir", "sequence_length"})
     dataset_name: str = "allenai/c4"
     data_dir: str | None = 'en'
     dataset_sources: list[DatasetSourceCfg] | None = None
     batch_size: PositiveInt = 4
-    sequence_length: PositiveInt = 4096
+    sequence_length: PositiveInt = 1024
     per_device_train_batch_size: PositiveInt = 1
     world_size: int = 10
     rank: int = 1
@@ -325,9 +325,16 @@ class MoECfg(BaseConfig):
 
 
 class OptimizerCfg(BaseConfig):
-    lr: float = 1e-5
+    lr: float = 1e-4
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
+    # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
+    #   32 -> torch.optim.AdamW, fp32 state (default). Fits DeepSeek-V2-Lite
+    #         2Fnat on a 47GB A6000 at sequence_length 1024.
+    #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
+    #         an alternative when running fp32 at a larger sequence_length.
+    # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
+    adamw_optim_bits: int = 32
 
 
 class ParallelismCfg(BaseConfig):
@@ -352,6 +359,12 @@ class ScheduleCfg(BaseConfig):
 
 
 class CheckpointCfg(BaseConfig):
+    # Locked so every validator resumes local training state on restart —
+    # uniform behavior across the fleet. On load it is auto-reset to the
+    # default (True); an operator who needs a clean cold-start (e.g. recovering
+    # from a corrupt/incompatible checkpoint) should point at a fresh, empty
+    # checkpoint_path rather than disabling resume, which is no longer honored.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
     base_checkpoint_path: Path = Path("checkpoints/miner")
@@ -363,6 +376,20 @@ class CheckpointCfg(BaseConfig):
     # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
     # but older configs may still include this field.
     download_concurrency: PositiveInt = 1
+    # When True, skip the chain-fetch of the validator's latest checkpoint
+    # AND the on-disk overlay in get_model_from_checkpoint. The model returns
+    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
+    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
+    # backbone). Overrides resume_from_ckpt.
+    use_pretrained_only: bool = False
+    # When True (default) the miner's inner-opt-step loop calls the
+    # "(5) Reload Model" branch that re-runs setup_training if it finds a
+    # newer checkpoint on disk. Under use_pretrained_only=True this reload
+    # rebuilds from pretrained every step and discards optimizer progress,
+    # so val_loss stays flat. Set to False for standalone smoke/train runs
+    # where you don't want the miner reacting to on-disk validator
+    # checkpoints. Production miners should leave this True.
+    enable_peer_resync: bool = True
 
 
 class HfCfg(BaseConfig):
@@ -446,15 +473,35 @@ class OwnerCheckpointCfg(CheckpointCfg):
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    group_id: int = 0
+    # -1 signals "not assigned to a functioning slot" — the group is defined
+    # (has an expert_assignment.json) but is not yet mapped to a stable
+    # runtime slot. Default -1 avoids silent clashes with an already-in-use
+    # slot (e.g. exp_math permanently owns 0) when the field is forgotten.
+    group_id: int = -1
 
 
 class TaskCfg(BaseConfig):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "expert_group_name", "helper_group_id", "routing_mode",
+    })
     expert_group_name: str = "exp_math"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
+    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
+    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
+    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
+    # frozen-helper slot). Set to None to disable the pairing — the routing
+    # branch self-gates and falls through to masked-topk.
+    helper_group_id: int | None = 2
+    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
+    # is the default: base gate runs unmasked, natural picks landing in the
+    # trainable set are kept as-is, non-trainable picks get replaced by the
+    # token's top-scoring helper. Falls back to masked-topk automatically when
+    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
+    # to force the pre-2Fnat behavior.
+    routing_mode: str = "natural_with_fallback"
 
 
 # ---------------------------
@@ -605,7 +652,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
     def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
@@ -900,6 +947,14 @@ class EvalCfg(BaseConfig):
     validation_group_c_size: int = 17
     group_a_min_consensus: int = 1               # ≥ 1 qualified validator
     group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
+    # When a miner's committed HF repo/revision/file is definitively not
+    # retrievable (deleted, private, gated, revision rewritten) AND an
+    # unauthenticated probe confirms it is not publicly fetchable, treat
+    # the miss as the miner's fault: record score=0 for the round instead
+    # of preserving the prior rolling average. Closes the
+    # "delete-your-model-and-keep-earning" hole; set False to restore the
+    # legacy EMA-preserving behavior.
+    repo_unavailable_is_miner_fault: bool = True
 
 
 class ValidatorConfig(WorkerConfig):

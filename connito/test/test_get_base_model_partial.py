@@ -263,7 +263,8 @@ def main() -> int:
     partial_model = get_base_model(
         config=config,
         expert_manager=expert_manager,
-        group_ids=[args.group_id],
+        group_ids_trainable=[args.group_id],
+        group_ids_helper=None,
         partial=True,
     )
     _assert(partial_model is not None, "get_base_model returned a model")

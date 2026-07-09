@@ -58,7 +58,7 @@ _FALLBACK_TOP_N_PEERS: int = 3
 # uid=0 escalation path (all peers in even-weight state) already emits
 # 100% to uid=0 and is unaffected.
 SUBNET_OWNER_UID: int = 0
-SUBNET_OWNER_WEIGHT_SHARE: float = 0.10
+SUBNET_OWNER_WEIGHT_SHARE: float = 0.25
 
 
 def reserve_subnet_owner_share(

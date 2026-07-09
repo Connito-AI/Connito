@@ -106,9 +106,11 @@ services:
       # Validator config YAML — bind mount so you can edit on the host
       # without rebuilding the image.
       - ${CONFIG_PATH:?set CONFIG_PATH in .env}:/data/configs/validator.yaml
-      # Expert group configs — shipped with the repo, mounted read-only so
-      # the code can load them at /app/expert_groups/<group>/config.yaml.
-      - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
+      # Expert group configs are now baked into the image at /app/expert_groups
+      # (see the Dockerfile COPY expert_groups line). If you need to iterate on
+      # an assignment JSON locally without rebuilding, uncomment and set
+      # EXPERT_GROUPS_PATH in .env:
+      # - ${EXPERT_GROUPS_PATH:-../../../expert_groups}:/app/expert_groups:ro
 
     command: ["--path", "/data/configs/validator.yaml"]
 

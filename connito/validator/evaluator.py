@@ -182,7 +182,9 @@ def finalize_round_scores(
         scored miner's: score 0 — a tied val_loss is evidence of a
         duplicated submission, so both sides are penalized regardless
         of where they would have ranked.
-      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf): score 0.
+      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf, or a
+        committed HF checkpoint confirmed not publicly retrievable):
+        score 0.
       - `freeze_zero_uids` (no/invalid chain commit at freeze): score 0.
 
     Operational failures (download timeout, eval timeout, OOM, unexpected

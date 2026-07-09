@@ -79,13 +79,15 @@ class Round:
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
     # UIDs the miner is at fault for: explicit validation failures
-    # (hash/signature/expert_group/NaN-Inf/no_chain_commit) or freeze-time
+    # (hash/signature/expert_group/NaN-Inf/no_chain_commit), a committed
+    # HF checkpoint that is no longer publicly retrievable (repo deleted/
+    # private/gated — confirmed by an unauthenticated probe), or freeze-time
     # invalid checkpoints. These get score=0 in the aggregator at finalize.
     # `failed_uids ⊃ validation_failed_uids` — operational failures
-    # (timeout/OOM/exception/download failure) are in `failed_uids` only
-    # and intentionally receive *no* aggregator entry, so the miner keeps
-    # its prior EMA. The validator's lack of compute/bandwidth must not
-    # dock a miner's reward.
+    # (timeout/OOM/exception/network-layer download failure) are in
+    # `failed_uids` only and intentionally receive *no* aggregator entry,
+    # so the miner keeps its prior EMA. The validator's lack of
+    # compute/bandwidth must not dock a miner's reward.
     validation_failed_uids: set[int] = field(default_factory=set)
     # Freeze-time invalid-checkpoint penalties. Hotkey map is captured
     # alongside because these UIDs may not appear in `uid_to_hotkey`
@@ -688,9 +690,11 @@ class Round:
         self._persist_journal()
 
     def mark_validation_failed(self, uid: int) -> None:
-        """Mark a UID as failed because its on-disk submission is off-spec
-        (hash/signature/expert_group/NaN-Inf mismatch detected by
-        `validate_miner_submission`). Lands in both `failed_uids` and
+        """Mark a UID as failed through the miner's own fault: an off-spec
+        on-disk submission (hash/signature/expert_group/NaN-Inf mismatch
+        detected by `validate_miner_submission`) or a committed HF
+        checkpoint that is confirmed not publicly retrievable (repo
+        deleted/private/gated). Lands in both `failed_uids` and
         `validation_failed_uids`; finalize records score=0 for it.
         """
         with self._lock:

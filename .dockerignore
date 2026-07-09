@@ -31,10 +31,14 @@ notebooks
 
 # Local persistent state — must come from a bind mount, not the image
 checkpoints
-expert_groups
 wandb
 metrics
 bittensor_subnetinfo_daily
+# NOTE: expert_groups/ is intentionally NOT excluded here — it's the
+# static per-task config + expert_assignment.json set that ships with the
+# code. The Dockerfile COPYs it in so validators/miners always have the
+# same versioned assignments as the connito/ package they're paired with.
+# ~120 KB total; negligible image bloat.
 
 # Big binary blobs that must not bloat the build context
 *.pt
