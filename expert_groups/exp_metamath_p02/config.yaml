@@ -1,4 +1,4 @@
-group_id: -1  # sentinel: not assigned to a functioning slot (would clash with exp_math=0 if left at the default)
+group_id: 3  # active trainable slot for the MetaMathQA expert group (distinct from exp_math=0, helper exp_c4_p02=2)
 # MetaMathQA-SFT ESFT-Token @ p=0.2
 # Auto-generated from ESFT-Token @ p=0.2 profiling.
 # Total experts across 26 MoE layers: 146
