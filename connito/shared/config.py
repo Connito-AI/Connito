@@ -484,7 +484,7 @@ class TaskCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "expert_group_name", "helper_group_id", "routing_mode",
     })
-    expert_group_name: str = "exp_math"
+    expert_group_name: str = "exp_metamath_p02"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
