@@ -15,7 +15,9 @@ ranking quality. The multilingual mix is ~500 MB compressed across
 learn cross-jurisdictional legal patterns rather than overfit to one
 corpus.
 
-**Chain `group_id`: `2`** (parallel to `exp_math=0`, `exp_dummy=1`).
+**Chain `group_id`: `3`** (parallel to `exp_math=0`, `exp_dummy=1`,
+`exp_c4_p02=2` — the frozen natural-routing helper slot, which loads
+alongside exp_legal via `TaskCfg.helper_group_id=2`).
 
 Plan and rationale: [docs/exp-legal-migration-plan.md](../../docs/exp-legal-migration-plan.md).
 

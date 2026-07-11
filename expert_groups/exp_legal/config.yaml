@@ -1,4 +1,8 @@
-group_id: 2
+# group_id 3: 0=exp_math, 1=exp_dummy, 2=exp_c4_p02 (the standing frozen
+# helper slot loaded alongside every active task via TaskCfg.helper_group_id).
+# exp_legal originally claimed 2, before exp_c4_p02 took that slot on master —
+# reusing it would collide in load_expert_group_assignment.
+group_id: 3
 expert_group_name: "exp_legal"
 data:
   dataset_sources:
@@ -31,7 +35,11 @@ data:
       text_column: "text"
   per_device_train_batch_size: 1
   batch_size: 4
-  sequence_length: 4096
+  # 1024 matches the current fleet paradigm (see exp_math + the locked
+  # DataCfg.sequence_length default): the VRAM envelope miners/validators
+  # are sized for under natural routing. Legal documents are long, but
+  # context length is a paradigm-wide knob, not a per-group one.
+  sequence_length: 1024
   world_size: 10
   rank: 1
   dataset_class: "expert_groups.exp_legal.dataset:StreamingTorchDataset"

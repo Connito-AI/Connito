@@ -34,7 +34,9 @@ Validators and miners individually opt-in by editing their config's
 
 - `exp_math` keeps `group_id=0`
 - `exp_dummy` keeps `group_id=1`
-- `exp_legal` gets `group_id=2`
+- `exp_c4_p02` keeps `group_id=2` (the frozen natural-routing helper slot,
+  loaded alongside every active task via `TaskCfg.helper_group_id=2`)
+- `exp_legal` gets `group_id=3`
 
 This avoids a coordinated cutover, keeps chain commits backward-compatible, and
 lets us A/B compare loss curves before retiring `exp_math`.
@@ -84,7 +86,7 @@ expert_groups/exp_legal/
 **`config.yaml`** (mirror `exp_math/config.yaml`, adjust for chosen subset):
 
 ```yaml
-group_id: 2
+group_id: 3
 expert_group_name: "exp_legal"
 data:
   dataset_sources:
@@ -94,7 +96,7 @@ data:
       text_column: "text"
   per_device_train_batch_size: 1
   batch_size: 4
-  sequence_length: 4096
+  sequence_length: 1024   # fleet paradigm (locked DataCfg default); was 4096 pre-tier4
   world_size: 10
   rank: 1
   dataset_class: "expert_groups.exp_legal.dataset:StreamingTorchDataset"
@@ -147,7 +149,7 @@ routing through 1, the dataset wasn't representative enough; increase
    set `task.expert_group_name: "exp_legal"`.
 2. Restart miner. It loads `expert_groups/exp_legal/config.yaml`, points the
    dataloader at MultiLegalPile, trains the appropriate experts.
-3. Miner's chain commits will now carry `expert_group=2`.
+3. Miner's chain commits will now carry `expert_group=3`.
 
 The only file references worth re-verifying as a sanity check:
 
@@ -282,9 +284,9 @@ this class of validator divergence.
 - [ ] (If full path) `_KNOWN_SOURCES` entry for MultiLegalPile added, with
       verified shard rows; module-load `_validate_policy` passes
 - [ ] At least one owner validator running `exp_legal` for ≥1 full cycle, with
-      `baseline_loss` finite and miners on `group_id=2` actually getting scored
+      `baseline_loss` finite and miners on `group_id=3` actually getting scored
 - [ ] At least one miner running `exp_legal`, with chain commit showing
-      `expert_group=2`, downloaded + scored by the test validator
+      `expert_group=3`, downloaded + scored by the test validator
 - [ ] Tests in `connito/test/` still pass (no regression in cohort, round,
       assignment logic)
 - [ ] Migration announcement posted in Discord with copy-paste config snippet
@@ -295,8 +297,8 @@ this class of validator divergence.
 
 - Should the dashboard API differentiate `exp_math` vs `exp_legal` miners in
   the leaderboard? Currently the leaderboard is per-cycle and doesn't
-  distinguish by `expert_group`. A miner on `group_id=2` will be scored only
-  by validators also on `group_id=2`, so their `score_avg` will be lower
+  distinguish by `expert_group`. A miner on `group_id=3` will be scored only
+  by validators also on `group_id=3`, so their `score_avg` will be lower
   during transition simply because fewer validators evaluated them. Worth
   considering a `cohort_group_label` field that includes the expert group.
 - The `_specs/` directory referenced in multiple files (`round.py`,
