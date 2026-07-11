@@ -172,10 +172,29 @@ restart.
   switches groups mid-cohort, the existing cohort state file will mismatch.
   **Action:** delete the validator's `cohort_state.json` after the group switch
   (or it'll log a warning and rebuild).
+- **Checkpoints — use a FRESH state directory (learned live on the pioneer
+  validator, 2026-07-11).** Under natural routing the group switch changes the
+  model architecture (different trainable expert set), so exp_math-era
+  `globalver_*` checkpoints must NOT be resumed: the pioneer validator's first
+  exp_legal boot found them, logged `resumed=True`, and overlaid
+  exp_math-trained state into the group-3 model (suspect cause of an
+  anomalously high baseline). **Action:** bump `run.run_name` (e.g.
+  `foundation` → `foundation-legal`) — do NOT edit `ckpt.checkpoint_path`
+  directly; `_refresh_paths()` re-derives it as
+  `base/<coldkey>/<hotkey>/<run_name>` on every load and silently reverts
+  manual edits. The first boot on the new dir must log `resumed=False`.
 
 **Subtlety:** when a validator switches to `exp_legal`, it ignores miners
 committing `exp_math` and vice versa. So during transition, a validator on
 `exp_legal` will see fewer miners until the miner fleet migrates.
+
+**Deregistration hazard (observed 2026-07-11):** a miner that switches to
+`exp_legal` while the stake-majority validators are still on `exp_math`
+becomes invisible to them (filtered by `e`), receives no weights, and is
+deregistered at the next registration wave — the original uid-121 test miner
+was pruned exactly this way. Miners must NOT switch before the validator
+majority has; test miners should plan to complete a full commit→score cycle
+within their immunity window.
 
 ### 1.5 Subnet owner (`connito/sn_owner/`)
 
