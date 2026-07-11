@@ -56,6 +56,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-batches", type=int, default=20, help="Number of inference batches to process")
     parser.add_argument("--experts-per-layer", type=int, default=8, help="Experts to keep per routed layer")
     parser.add_argument(
+        "--min-share",
+        type=float,
+        default=None,
+        help=(
+            "Share-threshold selection: keep every expert whose share of the "
+            "layer's router mass is >= this value (variable per-layer counts, "
+            "the tier4 natural-routing method; 0.02 matches the live "
+            "assignments). --experts-per-layer becomes the per-layer floor. "
+            "Omit for the legacy fixed top-N behaviour."
+        ),
+    )
+    parser.add_argument(
         "--selection-metric",
         choices=["weight", "count"],
         default="weight",
@@ -148,7 +160,22 @@ def build_assignment(
     weights_per_layer: dict[int, dict[int, float]],
     experts_per_layer: int,
     selection_metric: str,
+    min_share: float | None = None,
 ) -> dict[str, list[list[int]]]:
+    """Select experts per routed layer from recorded router statistics.
+
+    Two selection modes:
+
+    - fixed (``min_share is None``): keep exactly ``experts_per_layer``
+      experts, ranked by the selection metric — the original behaviour.
+    - share threshold (``min_share`` set): keep every expert whose share
+      of the layer's total metric mass is >= ``min_share``, giving a
+      VARIABLE per-layer count. This mirrors how the live tier4
+      natural-routing assignments were produced (exp_math 5-9/layer,
+      exp_c4_p02 8-12/layer — the ``_p02`` suffix = 2% share threshold).
+      ``experts_per_layer`` acts as a floor so a peaky router can't
+      produce a degenerate 1-2 expert layer.
+    """
     assignment: dict[str, list[list[int]]] = {}
 
     for layer_id in routed_layers:
@@ -158,13 +185,23 @@ def build_assignment(
         else:
             ranked = sorted(counts_per_layer.get(layer_id, {}).items(), key=lambda item: (-item[1], item[0]))
 
-        if len(ranked) < experts_per_layer:
-            raise ValueError(
-                f"Layer {layer_id} only observed {len(ranked)} experts; need {experts_per_layer}. "
-                "Increase --num-batches or switch metric."
-            )
+        if min_share is not None:
+            total = sum(score for _, score in ranked)
+            if total <= 0:
+                raise ValueError(f"Layer {layer_id} observed no router mass; increase --num-batches.")
+            above = [(expert_id, score) for expert_id, score in ranked if score / total >= min_share]
+            # Floor at experts_per_layer so thin layers stay trainable.
+            selected = above if len(above) >= experts_per_layer else ranked[:experts_per_layer]
+            if len(selected) > len(ranked):
+                selected = ranked
+        else:
+            if len(ranked) < experts_per_layer:
+                raise ValueError(
+                    f"Layer {layer_id} only observed {len(ranked)} experts; need {experts_per_layer}. "
+                    "Increase --num-batches or switch metric."
+                )
+            selected = ranked[:experts_per_layer]
 
-        selected = ranked[:experts_per_layer]
         assignment[str(layer_id)] = [[local_idx, int(expert_id)] for local_idx, (expert_id, _) in enumerate(selected)]
 
     return assignment
@@ -234,6 +271,7 @@ def main() -> int:
         weights_per_layer=weights_per_layer,
         experts_per_layer=args.experts_per_layer,
         selection_metric=args.selection_metric,
+        min_share=args.min_share,
     )
 
     output_path = Path(args.output)
