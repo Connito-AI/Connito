@@ -675,7 +675,25 @@ class WorkerConfig(BaseConfig):
             data = yaml.safe_load(f) or {}
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
+        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
+        # Locked-field enforcement may have just reset task.expert_group_name
+        # (the exp_legal activation path: a YAML still saying exp_math gets
+        # reset to the locked default). task.path / task.exp were derived at
+        # construction from the PRE-reset name, so re-derive them — otherwise
+        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
+        # (wrong group_id on chain commits) until a second restart. Observed
+        # live on the pioneer validator, 2026-07-11 11:49 UTC.
+        if instance.task.expert_group_name != pre_lock_group:
+            logger.info(
+                "Locked-field reset changed the active task — re-deriving task config",
+                old_task=pre_lock_group,
+                new_task=instance.task.expert_group_name,
+            )
+            # Pass the name explicitly: the no-arg form of _update_by_task
+            # reloads task.exp from the STALE task.path before refreshing
+            # paths, so the exp config would still be the old group's.
+            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
         return instance
 
     def _prompt_new_fields(
