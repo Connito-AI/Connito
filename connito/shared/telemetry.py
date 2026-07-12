@@ -305,6 +305,35 @@ MINER_STEP_TIME_HOURS = Gauge("miner_step_time_hours", "Wall-clock time of the l
 MINER_TOTAL_TRAINING_TIME_HOURS = Gauge("miner_total_training_time_hours", "Total accumulated training time (hours)")
 MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of expert parameter values (health check)")
 
+# Owner standalone eval pipeline (connito.owner_eval) — benchmarks the latest
+# merged full model every N cycles. One generic gauge labeled by metric name so
+# new evaluators don't require new metric definitions; cardinality is bounded by
+# the fixed set of registered metric keys.
+OWNER_EVAL_METRIC = Gauge(
+    "owner_eval_metric",
+    "Latest owner eval-suite scalar result, labeled by metric name",
+    ["metric"],
+)
+OWNER_EVAL_STATUS = Gauge(
+    "owner_eval_status",
+    "1 if the named evaluator's last run succeeded, 0 if it raised",
+    ["metric"],
+)
+OWNER_EVAL_LAST_RUN_TS = Gauge(
+    "owner_eval_last_run_timestamp",
+    "Unix timestamp of the most recent completed owner eval run",
+)
+# Run identity (model revision + cycle) as an Info so labelset cardinality stays
+# bounded — Info.info() atomically replaces the single labelset each run.
+OWNER_EVAL_RUN_INFO = Info(
+    "owner_eval_run",
+    "Identity of the latest owner eval run (model revision + cycle index)",
+)
+OWNER_EVAL_HEARTBEAT_TOTAL = Counter(
+    "owner_eval_loop_heartbeat_total",
+    "Owner eval daemon poll iterations; alert on rate()->0",
+)
+
 # Histograms (Latency & Sizes)
 EVAL_LATENCY_SECONDS = Histogram("validator_eval_latency_seconds", "Latency of run_evaluation()")
 MODEL_LOAD_LATENCY_SECONDS = Histogram("validator_model_load_latency_seconds", "Latency of load_model_from_path()")
@@ -421,6 +450,43 @@ def set_miner_eval_status(miner_uid: int | str, reason: EvalFailureReason | str 
         else:
             code = _EVAL_REASON_TO_STATUS_CODE.get(str(reason), 99)
         VALIDATOR_MINER_EVAL_STATUS.labels(miner_uid=str(miner_uid)).set(float(code))
+    except Exception:
+        pass
+
+
+def set_owner_eval_metric(metric: str, value: float) -> None:
+    """Publish one owner eval scalar result. Best-effort — never raises."""
+    try:
+        OWNER_EVAL_METRIC.labels(metric=str(metric)).set(float(value))
+    except Exception:
+        pass
+
+
+def set_owner_eval_status(metric: str, ok: bool) -> None:
+    """Mark whether the named evaluator's last run succeeded. Best-effort."""
+    try:
+        OWNER_EVAL_STATUS.labels(metric=str(metric)).set(1.0 if ok else 0.0)
+    except Exception:
+        pass
+
+
+def set_owner_eval_run_info(model_revision: str, cycle_index: int | str) -> None:
+    """Stamp the latest run's model revision + cycle and bump the run timestamp.
+    Best-effort — telemetry must never break the eval loop."""
+    try:
+        OWNER_EVAL_RUN_INFO.info({
+            "model_revision": str(model_revision),
+            "cycle_index": str(cycle_index),
+        })
+        OWNER_EVAL_LAST_RUN_TS.set(time.time())
+    except Exception:
+        pass
+
+
+def set_owner_eval_heartbeat() -> None:
+    """Increment the daemon poll-loop heartbeat. Best-effort."""
+    try:
+        OWNER_EVAL_HEARTBEAT_TOTAL.inc()
     except Exception:
         pass
 

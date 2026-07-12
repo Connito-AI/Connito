@@ -999,6 +999,46 @@ class EvalCfg(BaseConfig):
     repo_unavailable_is_miner_fault: bool = True
 
 
+class EvalPipelineCfg(BaseConfig):
+    """Config for the standalone owner-run evaluation pipeline
+    (``connito.owner_eval``). The owner runs this independently of any miner or
+    validator to benchmark the latest merged full model every N cycles and emit
+    the results as Prometheus metrics."""
+
+    # Metric names that the runner evaluates, in order. Each must be registered
+    # in connito.owner_eval.registry.REGISTRY (see connito/owner_eval/metrics/).
+    # Where the model under test comes from. "chain" (production) fetches the
+    # latest merged full model a validator published to HF. "base" loads the
+    # pretrained base model directly — no wallet/subtensor needed — for canary /
+    # plumbing tests of the publish->scrape->API path.
+    model_source: Literal["chain", "base"] = "chain"
+    enabled_metrics: list[str] = ["gsm8k_ppl", "gsm8k_task", "mmlu"]
+    # Per-metric sample counts; metrics fall back to default_n_samples when absent.
+    n_samples_per_metric: dict[str, int] = {
+        "gsm8k_ppl": 100,
+        "gsm8k_task": 100,
+        "mmlu": 100,
+    }
+    default_n_samples: PositiveInt = 100
+    # Run the suite when cycle_index % eval_interval_cycles == 0.
+    eval_interval_cycles: PositiveInt = 5
+    poll_interval_sec: PositiveInt = 60
+    telemetry_port: PositiveInt = 8400
+    # gsm8k_task generation settings.
+    gsm8k_max_new_tokens: PositiveInt = 256
+    gsm8k_few_shot: int = 0
+    # mmlu length-normalises per-choice log-likelihood before argmax.
+    mmlu_length_normalize: bool = True
+    # Seed for representative subsampling (e.g. MMLU spans 57 subjects ordered
+    # alphabetically, so a fixed seed shuffles before selecting n to avoid an
+    # alphabetical-subject bias). Held constant so run-to-run deltas reflect the
+    # model, not a different question sample.
+    sample_seed: int = 0
+    # Tokenisation/eval batching shared by the LM-loss metrics.
+    eval_batch_size: PositiveInt = 1
+    eval_seq_length: PositiveInt = 2048
+
+
 class ValidatorConfig(WorkerConfig):
     role: str = "validator"
     ckpt: ValidatorCheckpointCfg = Field(default_factory=ValidatorCheckpointCfg)
@@ -1054,6 +1094,17 @@ class ValidatorConfig(WorkerConfig):
 class OwnerConfig(WorkerConfig):
     role: str = "owner"
     ckpt: OwnerCheckpointCfg = Field(default_factory=OwnerCheckpointCfg)
+
+
+class OwnerEvalConfig(ValidatorConfig):
+    """Config for the owner-run eval pipeline daemon. Subclasses
+    ``ValidatorConfig`` so it inherits the validator checkpoint paths and the
+    chain-fetch wiring used to pull the latest merged full model
+    (``fetch_model_from_chain_validator`` resolves *validator* commits). The
+    owner supplies their own wallet via ``chain.*``."""
+
+    role: str = "owner_eval"
+    eval_pipeline: EvalPipelineCfg = Field(default_factory=EvalPipelineCfg)
 
 
 # ---------------------------

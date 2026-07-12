@@ -1,0 +1,31 @@
+# Canary config for the owner eval daemon — validates the publish -> scrape ->
+# API path end to end with minimal cost. NOT for production.
+#
+#   Quick one-shot (fires immediately, no cycle wait, no wallet):
+#     CUDA_VISIBLE_DEVICES=5 .venv/bin/python -m connito.owner_eval.run \
+#         --path owner_eval.canary.yaml --once
+#
+#   Continuous, gated on the live cycle API (fires every cycle):
+#     CUDA_VISIBLE_DEVICES=5 .venv/bin/python -m connito.owner_eval.run \
+#         --path owner_eval.canary.yaml
+#
+# Then: curl localhost:8400/metrics | grep owner_eval
+#       and confirm the 'mycelia_owner_eval' Prometheus target is UP.
+
+model:
+  device: cuda
+  precision: bf16-mixed
+
+eval_pipeline:
+  model_source: base            # canary: pretrained base model, no chain/wallet
+  enabled_metrics: ["gsm8k_ppl", "gsm8k_task", "mmlu"]
+  n_samples_per_metric:
+    gsm8k_ppl: 2
+    gsm8k_task: 2
+    mmlu: 2
+  eval_interval_cycles: 1       # fire every cycle (continuous mode)
+  poll_interval_sec: 30
+  telemetry_port: 8400
+  gsm8k_max_new_tokens: 32
+  eval_seq_length: 512
+  sample_seed: 0

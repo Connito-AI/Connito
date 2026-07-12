@@ -32,6 +32,7 @@ Issues = "https://github.com/CrucibleAILabs/subnet-MoE/issues"
 [project.scripts]
 weightnet-miner = "connito.miner.cli:main"
 weightnet-validator = "connito.validator.cli:main"
+weightnet-owner-eval = "connito.owner_eval.cli:main"
 
 # Hatch build config — package only our src tree
 [tool.hatch.build.targets.wheel]
