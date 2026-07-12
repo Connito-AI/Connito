@@ -203,6 +203,14 @@ class DatasetSourceCfg(BaseConfig):
     name: str | None = None
     weight: PositiveFloat = 1.0
     text_column: str = "text"
+    # Authorize HF's `load_dataset` to execute the dataset repo's custom
+    # builder script. Required for sources that ship a `<name>.py` loader
+    # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
+    # malicious dataset can't piggyback through a globally-enabled flag —
+    # operators consent to executing remote code one dataset at a time.
+    # Pin the source's revision via `eval_source_revision_pin` when
+    # turning this on to bound the surface to a reviewed SHA.
+    trust_remote_code: bool = False
 
     @model_validator(mode="after")
     def _validate_non_empty(self):
@@ -481,10 +489,16 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
+    # `expert_group_name` is locked so operators can't drift back to
+    # `exp_math` after the subnet-wide switch to the legal expert group —
+    # `auto_update_config` resets any non-default value on load and logs a
+    # one-time reset warning (see docs/exp-legal-migration-plan.md for the
+    # activation checklist). `helper_group_id` and `routing_mode` stay
+    # locked for the natural-routing (2Fnat) consensus contract.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "expert_group_name", "helper_group_id", "routing_mode",
     })
-    expert_group_name: str = "exp_math"
+    expert_group_name: str = "exp_legal"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
@@ -569,8 +583,18 @@ class WorkerConfig(BaseConfig):
         # ckpt paths — always start from the class default (relative)
         base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
         self.ckpt.base_checkpoint_path = base_ckpt
+        # Include expert_group_name in the leaf so switching the active expert
+        # group automatically writes/resumes from a fresh, group-isolated
+        # directory — no run_name bump needed, and no risk of resuming another
+        # group's (incompatible) checkpoints. Re-derived after locked-field
+        # reset via _update_by_task -> _refresh_paths, so the path always
+        # tracks the *effective* group.
         self.ckpt.checkpoint_path = (
-            base_ckpt / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
+            base_ckpt
+            / self.chain.coldkey_name
+            / self.chain.hotkey_name
+            / self.run.run_name
+            / self.task.expert_group_name
         )
         self.ckpt.validator_checkpoint_path = (
             base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
@@ -661,7 +685,25 @@ class WorkerConfig(BaseConfig):
             data = yaml.safe_load(f) or {}
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
+        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
+        # Locked-field enforcement may have just reset task.expert_group_name
+        # (the exp_legal activation path: a YAML still saying exp_math gets
+        # reset to the locked default). task.path / task.exp were derived at
+        # construction from the PRE-reset name, so re-derive them — otherwise
+        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
+        # (wrong group_id on chain commits) until a second restart. Observed
+        # live on the pioneer validator, 2026-07-11 11:49 UTC.
+        if instance.task.expert_group_name != pre_lock_group:
+            logger.info(
+                "Locked-field reset changed the active task — re-deriving task config",
+                old_task=pre_lock_group,
+                new_task=instance.task.expert_group_name,
+            )
+            # Pass the name explicitly: the no-arg form of _update_by_task
+            # reloads task.exp from the STALE task.path before refreshing
+            # paths, so the exp config would still be the old group's.
+            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
         return instance
 
     def _prompt_new_fields(
