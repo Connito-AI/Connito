@@ -583,8 +583,18 @@ class WorkerConfig(BaseConfig):
         # ckpt paths — always start from the class default (relative)
         base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
         self.ckpt.base_checkpoint_path = base_ckpt
+        # Include expert_group_name in the leaf so switching the active expert
+        # group automatically writes/resumes from a fresh, group-isolated
+        # directory — no run_name bump needed, and no risk of resuming another
+        # group's (incompatible) checkpoints. Re-derived after locked-field
+        # reset via _update_by_task -> _refresh_paths, so the path always
+        # tracks the *effective* group.
         self.ckpt.checkpoint_path = (
-            base_ckpt / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
+            base_ckpt
+            / self.chain.coldkey_name
+            / self.chain.hotkey_name
+            / self.run.run_name
+            / self.task.expert_group_name
         )
         self.ckpt.validator_checkpoint_path = (
             base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)

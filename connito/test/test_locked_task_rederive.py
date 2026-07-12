@@ -50,6 +50,13 @@ def test_locked_reset_rederives_task_path(tmp_path: Path) -> None:
         "(exp_math=0): check_and_prompt_locked reset the name without "
         "re-deriving task.path/task.exp"
     )
+    # ...including the checkpoint path, which is group-scoped so the switch
+    # writes/resumes from a fresh dir instead of the prior group's checkpoints.
+    assert config.ckpt.checkpoint_path is not None
+    assert config.ckpt.checkpoint_path.name == "exp_legal", (
+        f"checkpoint_path leaf must track the effective group, got "
+        f"{config.ckpt.checkpoint_path}"
+    )
     # And the persisted YAML matches what the process actually runs.
     persisted = yaml.safe_load(cfg_path.read_text())
     assert persisted["task"]["expert_group_name"] == "exp_legal"

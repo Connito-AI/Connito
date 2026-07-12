@@ -172,17 +172,17 @@ restart.
   switches groups mid-cohort, the existing cohort state file will mismatch.
   **Action:** delete the validator's `cohort_state.json` after the group switch
   (or it'll log a warning and rebuild).
-- **Checkpoints — use a FRESH state directory (learned live on the pioneer
-  validator, 2026-07-11).** Under natural routing the group switch changes the
-  model architecture (different trainable expert set), so exp_math-era
-  `globalver_*` checkpoints must NOT be resumed: the pioneer validator's first
-  exp_legal boot found them, logged `resumed=True`, and overlaid
-  exp_math-trained state into the group-3 model (suspect cause of an
-  anomalously high baseline). **Action:** bump `run.run_name` (e.g.
-  `foundation` → `foundation-legal`) — do NOT edit `ckpt.checkpoint_path`
-  directly; `_refresh_paths()` re-derives it as
-  `base/<coldkey>/<hotkey>/<run_name>` on every load and silently reverts
-  manual edits. The first boot on the new dir must log `resumed=False`.
+- **Checkpoints are isolated per expert group automatically — no action
+  needed.** `_refresh_paths()` now derives the checkpoint path as
+  `base/<coldkey>/<hotkey>/<run_name>/<expert_group_name>` (re-derived after
+  any locked-field reset), so switching the active group writes to and resumes
+  from a fresh, group-scoped directory. exp_math-era `globalver_*` checkpoints
+  live under `.../<run_name>/exp_math` and are never resumed by an exp_legal
+  boot (which uses `.../<run_name>/exp_legal`); the first boot on a new group
+  logs `resumed=False`. No `run_name` bump required.
+  (Historical note: before this isolation, the pioneer validator's first
+  exp_legal boot on 2026-07-11 resumed exp_math `globalver_*` into the group-3
+  model — the incident that motivated group-scoping this path.)
 
 **Subtlety:** when a validator switches to `exp_legal`, it ignores miners
 committing `exp_math` and vice versa. So during transition, a validator on
