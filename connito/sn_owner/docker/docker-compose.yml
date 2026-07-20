@@ -20,7 +20,7 @@ services:
     network_mode: "host"
 
     # Match the entrypoint style: exec the module, pass through args.
-    entrypoint: ["/bin/sh", "-c", "exec python -m connito.sn_owner.run \"$@\"", "--"]
+    entrypoint: ["/bin/sh", "-c", "exec python -m connito.sn_owner.phase_service \"$@\"", "--"]
 
     # environment:
     #   WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
