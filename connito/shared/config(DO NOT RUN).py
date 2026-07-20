@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, ClassVar, Iterable, Literal
+from typing import Any, ClassVar, Iterable
 
 import bittensor
 import fsspec
@@ -165,6 +165,7 @@ class CycleCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "cycle_length", "distribute_period", "train_period", "commit_period",
         "submission_period", "validate_period", "merge_period", "owner_url",
+        "max_miners_per_validator",
     })
     cycle_length: int = 448 # 1.5 hr
     distribute_period: int = 20 # 4 mins
@@ -175,10 +176,11 @@ class CycleCfg(BaseConfig):
     merge_period: int = 50 # 10 mins
 
     owner_url: str = "https://cycle-api.connito.ai:443"
+    max_miners_per_validator: int = 10  # max miners assigned to each validator
     version_range_cycles: int = 3  # how many cycles back to accept checkpoints
     # Owner-node API retry policy
     api_timeout_sec: int = 10
-    api_retries: int = 5
+    api_retries: int = 3
     api_backoff_sec: int = 2
 
 
@@ -203,14 +205,6 @@ class DatasetSourceCfg(BaseConfig):
     name: str | None = None
     weight: PositiveFloat = 1.0
     text_column: str = "text"
-    # Authorize HF's `load_dataset` to execute the dataset repo's custom
-    # builder script. Required for sources that ship a `<name>.py` loader
-    # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
-    # malicious dataset can't piggyback through a globally-enabled flag —
-    # operators consent to executing remote code one dataset at a time.
-    # Pin the source's revision via `eval_source_revision_pin` when
-    # turning this on to bound the surface to a reviewed SHA.
-    trust_remote_code: bool = False
 
     @model_validator(mode="after")
     def _validate_non_empty(self):
@@ -222,89 +216,17 @@ class DatasetSourceCfg(BaseConfig):
 
 
 class DataCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir", "sequence_length"})
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir"})
     dataset_name: str = "allenai/c4"
     data_dir: str | None = 'en'
     dataset_sources: list[DatasetSourceCfg] | None = None
     batch_size: PositiveInt = 4
-    sequence_length: PositiveInt = 1024
+    sequence_length: PositiveInt = 4096
     per_device_train_batch_size: PositiveInt = 1
     world_size: int = 10
     rank: int = 1
     dataset_class: str | None = None
     vali_fraction: float = 0.1
-    # Per-source streaming-shuffle buffer used ONLY when a seed is passed
-    # (i.e. validator eval; miners pass seed=None and are unaffected). When
-    # > 0, each source is `ds.shuffle(seed=int_seed, buffer_size=N)`-d
-    # before interleave + fractional filter, which (a) shuffles HF shard
-    # order with the seed and (b) buffer-shuffles within the active read
-    # window. Without this, every eval round only reaches the head of each
-    # source's stream (~first few thousand rows), which is small enough to
-    # memorize and turns "score on validation" into "score on a fixed
-    # public subset."
-    #
-    # Default 50_000 (~200 MB RAM per source × 2 sources ≈ 400 MB total
-    # working set during eval) enables the protection out of the box.
-    # During the auto-upgrade rollout window, validators on the new
-    # default and validators still on the old default will draw
-    # different eval batches and produce non-comparable losses for the
-    # same `combined_seed` — same brief consensus-divergence shape as
-    # the recent block-hash seed mix-in. Operators who need to opt out
-    # for memory reasons can set this to 0 in their config.
-    eval_source_shuffle_buffer: int = 50_000
-    # Per-source random read offset applied AFTER the buffer shuffle. When
-    # > 0, each source is `ds.skip(rng.randrange(0, N))`-d so the validator
-    # reads from a random DEPTH into the (already-randomly-chosen) lead
-    # shard, not always from row 0.
-    #
-    # Why both this and `eval_source_shuffle_buffer` are needed:
-    #   - `.shuffle(seed, buffer_size=B)` permutes which shard leads each
-    #     round AND buffer-shuffles within a B-wide window. But the
-    #     validator only consumes ~5,000 positions per round, so the read
-    #     never advances past the first ~B rows of the lead shard. Across
-    #     seeds you get different shards' HEADS — not different rows of
-    #     the same shard's body.
-    #   - `.skip(N)` slides the buffer window N rows deep into the lead
-    #     shard, so the reachable pool spans the BODY of each shard. The
-    #     reachable set then grows along two axes: (shard permuted to lead)
-    #     and (offset into that shard).
-    #
-    # Cost: `.skip(N)` on a streaming dataset is O(N) decode-and-discard,
-    # paid once per source per round at eval start. 50_000 adds a few
-    # seconds per round. Tune down if too slow; tune up for even less
-    # predictability. Same coordinated-rollout discipline as
-    # `eval_source_shuffle_buffer` — validators on different defaults
-    # diverge for one round, then re-converge.
-    eval_source_skip_max: int = 50_000
-    # Switch the validator eval path from the legacy
-    # `.shuffle(seed) + .skip(small)` window (reachable region capped
-    # at first ~`shuffle_buffer + skip_max` rows of every shard) to
-    # seeded shard-pick + hash-mod in-shard offset. When True, the
-    # reachable region per round is the WHOLE chosen shard; across
-    # rotating seeds, every shard × every row is eventually reachable.
-    # `eval_source_shuffle_buffer` and `eval_source_skip_max` are
-    # ignored on the new path.
-    #
-    # See `connito/shared/eval_shard_pick.py` for the threat model,
-    # consensus assumptions (revision pin per source, deterministic
-    # sort, per-source safe-floor + verified-spot-check policy) and
-    # the policy registry that must contain an entry for every
-    # configured source.
-    #
-    # Default ON. Same coordinated-rollout discipline as the
-    # earlier shuffle/skip bumps: flip together with all validators
-    # at a gated chain epoch, otherwise losses diverge for the
-    # transition round and weight consensus breaks.
-    eval_source_seeded_shard_pick: bool = True
-    # Per-source HF commit SHA to pin shard listing + shard reads to.
-    # Keys are the source `path` (e.g. `"allenai/c4"`), values are
-    # 40-char SHAs. When omitted for a source, the policy's default
-    # `revision` in `eval_shard_pick._KNOWN_SOURCES` is used.
-    #
-    # Required for genuine consensus safety — `"main"` is a moving
-    # target and a mid-rollout HF re-upload would cause two
-    # validators to pick different rows for the same seed.
-    eval_source_revision_pin: dict[str, str] | None = None
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
@@ -321,10 +243,11 @@ class MoECfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
     })
+    my_expert_group_id: int = 1
     interleave: bool = True
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 6
+    partial_topk: PositiveInt = 1
     full_topk: PositiveInt = 2
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
@@ -333,16 +256,9 @@ class MoECfg(BaseConfig):
 
 
 class OptimizerCfg(BaseConfig):
-    lr: float = 1e-4
+    lr: float = 1e-5
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
-    # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
-    #   32 -> torch.optim.AdamW, fp32 state (default). Fits DeepSeek-V2-Lite
-    #         2Fnat on a 47GB A6000 at sequence_length 1024.
-    #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
-    #         an alternative when running fp32 at a larger sequence_length.
-    # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
-    adamw_optim_bits: int = 32
 
 
 class ParallelismCfg(BaseConfig):
@@ -367,12 +283,6 @@ class ScheduleCfg(BaseConfig):
 
 
 class CheckpointCfg(BaseConfig):
-    # Locked so every validator resumes local training state on restart —
-    # uniform behavior across the fleet. On load it is auto-reset to the
-    # default (True); an operator who needs a clean cold-start (e.g. recovering
-    # from a corrupt/incompatible checkpoint) should point at a fresh, empty
-    # checkpoint_path rather than disabling resume, which is no longer honored.
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
     base_checkpoint_path: Path = Path("checkpoints/miner")
@@ -381,73 +291,6 @@ class CheckpointCfg(BaseConfig):
     full_validation_interval: PositiveInt | None = None
     checkpoint_topk: PositiveInt = 2
     validator_checkpoint_path: Path = Path("validator_checkpoint")
-    # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
-    # but older configs may still include this field.
-    download_concurrency: PositiveInt = 1
-    # When True, skip the chain-fetch of the validator's latest checkpoint
-    # AND the on-disk overlay in get_model_from_checkpoint. The model returns
-    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
-    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
-    # backbone). Overrides resume_from_ckpt.
-    use_pretrained_only: bool = False
-    # When True (default) the miner's inner-opt-step loop calls the
-    # "(5) Reload Model" branch that re-runs setup_training if it finds a
-    # newer checkpoint on disk. Under use_pretrained_only=True this reload
-    # rebuilds from pretrained every step and discards optimizer progress,
-    # so val_loss stays flat. Set to False for standalone smoke/train runs
-    # where you don't want the miner reacting to on-disk validator
-    # checkpoints. Production miners should leave this True.
-    enable_peer_resync: bool = True
-
-
-class HfCfg(BaseConfig):
-    # HuggingFace Hub is the checkpoint transport: validators upload the
-    # checkpoint directory, commit the revision SHA to the Bittensor chain,
-    # and miners download from the returned repo@revision.
-    #
-    # checkpoint_repo: the HF repo the validator pushes to. Must exist and
-    # be writable by the HF_TOKEN. If omitted, runtime will derive
-    # {authenticated_hf_user}/{default_repo_name}. The on-chain advertised
-    # repo can diverge from this upload target; validator code currently
-    # derives the advertised repo as {owner}/cycle from the upload repo.
-    checkpoint_repo: str | None = None
-    default_repo_name: str = "co"
-    # Read from HF_TOKEN env at runtime — not stored in config YAML.
-    # Validators need write access; miners need read access (or public repo).
-    token_env_var: str = "HF_TOKEN"
-
-    @staticmethod
-    def _normalize_checkpoint_repo_value(value: str | None) -> str | None:
-        checkpoint_repo = (value or "").strip()
-        if checkpoint_repo and "/" not in checkpoint_repo:
-            raise ValueError("hf.checkpoint_repo must be '<namespace>/<repo>'")
-        return checkpoint_repo or None
-
-    @staticmethod
-    def _normalize_default_repo_name(value: str) -> str:
-        default_repo_name = value.strip()
-        if not default_repo_name:
-            raise ValueError("hf.default_repo_name cannot be empty")
-        if "/" in default_repo_name:
-            raise ValueError("hf.default_repo_name must be a repo name, not '<namespace>/<repo>'")
-        return default_repo_name
-
-    def resolve_upload_repo(self, derived_repo: str | None = None) -> str | None:
-        return self.checkpoint_repo or self._normalize_checkpoint_repo_value(derived_repo)
-
-    def advertised_repo_id(self, upload_repo: str | None) -> str | None:
-        if not upload_repo:
-            return None
-        return upload_repo
-
-    def uses_explicit_checkpoint_repo(self) -> bool:
-        return self.checkpoint_repo is not None
-
-    @model_validator(mode="after")
-    def _validate_hf_repo_settings(self):
-        self.checkpoint_repo = self._normalize_checkpoint_repo_value(self.checkpoint_repo)
-        self.default_repo_name = self._normalize_default_repo_name(self.default_repo_name)
-        return self
 
 
 class LoggingCfg(BaseConfig):
@@ -462,13 +305,22 @@ class LoggingCfg(BaseConfig):
 
 
 class ValidatorCheckpointCfg(CheckpointCfg):
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"max_submission_bytes", "max_submission_bytes_per_expert"})
     base_checkpoint_path: Path = Path("checkpoints/validator")
     miner_submission_path: Path = Path("miner_submission")
+    max_submission_bytes: int = 8 * 1024**3
+    max_submission_bytes_per_expert: int | None = None
     miner_submission_archive_path: Path = Path("miner_submission_archive")
     archive_submissions: bool = False
-    cleanup_stale_temporary_checkpoints: bool = True
-    miner_submission_max_age_cycles: PositiveFloat = 1.5
-    miner_submission_archive_max_files: PositiveInt = 5
+    # Max concurrent /get-checkpoint serves. During Distribute bursts 20+ peers
+    # hit the server in seconds; uncapped they each get link_capacity/N
+    # (≈3 MiB/s on a 1 Gbps uplink split 40 ways). Queuing them keeps each
+    # active transfer at full line rate.
+    download_concurrency: int = 4
+    # Max concurrent /submit-checkpoint streams. Protects the server downlink
+    # and disk write throughput from N parallel 3.35 GiB uploads dragging each
+    # other under the 11.5 MiB/s floor that would trip SUBMISSION_TIMEOUT_SEC.
+    submission_concurrency: int = 2
 
 
 class DhtCfg(BaseConfig):
@@ -481,41 +333,15 @@ class OwnerCheckpointCfg(CheckpointCfg):
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    # -1 signals "not assigned to a functioning slot" — the group is defined
-    # (has an expert_assignment.json) but is not yet mapped to a stable
-    # runtime slot. Default -1 avoids silent clashes with an already-in-use
-    # slot (e.g. exp_math permanently owns 0) when the field is forgotten.
-    group_id: int = -1
+    group_id: int = 0
 
 
 class TaskCfg(BaseConfig):
-    # `expert_group_name` is locked so operators can't drift back to
-    # `exp_math` after the subnet-wide switch to the legal expert group —
-    # `auto_update_config` resets any non-default value on load and logs a
-    # one-time reset warning (see docs/exp-legal-migration-plan.md for the
-    # activation checklist). `helper_group_id` and `routing_mode` stay
-    # locked for the natural-routing (2Fnat) consensus contract.
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "expert_group_name", "helper_group_id", "routing_mode",
-    })
-    expert_group_name: str = "exp_legal"
+    expert_group_name: str = "exp_math"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
-    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
-    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
-    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
-    # frozen-helper slot). Set to None to disable the pairing — the routing
-    # branch self-gates and falls through to masked-topk.
-    helper_group_id: int | None = 2
-    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
-    # is the default: base gate runs unmasked, natural picks landing in the
-    # trainable set are kept as-is, non-trainable picks get replaced by the
-    # token's top-scoring helper. Falls back to masked-topk automatically when
-    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
-    # to force the pre-2Fnat behavior.
-    routing_mode: str = "natural_with_fallback"
 
 
 # ---------------------------
@@ -536,7 +362,6 @@ class WorkerConfig(BaseConfig):
     model: ModelCfg = Field(default_factory=ModelCfg)
     moe: MoECfg = Field(default_factory=MoECfg)
     ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
-    hf: HfCfg = Field(default_factory=HfCfg)
     sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
     log: LoggingCfg = Field(default_factory=LoggingCfg)
     opt: OptimizerCfg = Field(default_factory=OptimizerCfg)
@@ -583,18 +408,8 @@ class WorkerConfig(BaseConfig):
         # ckpt paths — always start from the class default (relative)
         base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
         self.ckpt.base_checkpoint_path = base_ckpt
-        # Include expert_group_name in the leaf so switching the active expert
-        # group automatically writes/resumes from a fresh, group-isolated
-        # directory — no run_name bump needed, and no risk of resuming another
-        # group's (incompatible) checkpoints. Re-derived after locked-field
-        # reset via _update_by_task -> _refresh_paths, so the path always
-        # tracks the *effective* group.
         self.ckpt.checkpoint_path = (
-            base_ckpt
-            / self.chain.coldkey_name
-            / self.chain.hotkey_name
-            / self.run.run_name
-            / self.task.expert_group_name
+            base_ckpt / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
         )
         self.ckpt.validator_checkpoint_path = (
             base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
@@ -676,7 +491,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation")
 
     @classmethod
     def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
@@ -685,25 +500,7 @@ class WorkerConfig(BaseConfig):
             data = yaml.safe_load(f) or {}
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
-        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
-        # Locked-field enforcement may have just reset task.expert_group_name
-        # (the exp_legal activation path: a YAML still saying exp_math gets
-        # reset to the locked default). task.path / task.exp were derived at
-        # construction from the PRE-reset name, so re-derive them — otherwise
-        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
-        # (wrong group_id on chain commits) until a second restart. Observed
-        # live on the pioneer validator, 2026-07-11 11:49 UTC.
-        if instance.task.expert_group_name != pre_lock_group:
-            logger.info(
-                "Locked-field reset changed the active task — re-deriving task config",
-                old_task=pre_lock_group,
-                new_task=instance.task.expert_group_name,
-            )
-            # Pass the name explicitly: the no-arg form of _update_by_task
-            # reloads task.exp from the STALE task.path before refreshing
-            # paths, so the exp config would still be the old group's.
-            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
         return instance
 
     def _prompt_new_fields(
@@ -961,42 +758,11 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window",
     })
-    top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
+    top_k_miners_to_merge: int = 3    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
-    score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
-    foreground_top_n: PositiveInt = 5
-    background_worker_enabled: bool = True
-    per_miner_download_timeout_sec: PositiveInt = 180
-    per_miner_eval_timeout_sec: PositiveInt = 300
-    # Round-group construction scheme. When true, Round.freeze() partitions
-    # the roster into validation Groups A (3) / B (10) / C (17) with
-    # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1
-    # (98%) / Group 2 (2%). Default ON; set False to opt back into the
-    # legacy foreground/background construction (kept as a rollback path
-    # until the new scheme is validated on mainnet for several cohorts).
-    # Spec: _specs/round-group-construction-scheme.md.
-    enable_round_group_construction: bool = True
-    cohort_state_filename: str = "cohort_state.json"
-    cohort_window_cycles: int = 8                # 8-cycle hold per spec
-    weight_group_1_size: int = 3
-    weight_group_1_share: float = 0.98
-    weight_group_2_size: int = 5
-    weight_group_2_share: float = 0.02
-    validation_group_a_size: int = 3
-    validation_group_ab_total: int = 13          # |A| + |B| invariant
-    validation_group_c_size: int = 17
-    group_a_min_consensus: int = 1               # ≥ 1 qualified validator
-    group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
-    # When a miner's committed HF repo/revision/file is definitively not
-    # retrievable (deleted, private, gated, revision rewritten) AND an
-    # unauthenticated probe confirms it is not publicly fetchable, treat
-    # the miss as the miner's fault: record score=0 for the round instead
-    # of preserving the prior rolling average. Closes the
-    # "delete-your-model-and-keep-earning" hole; set False to restore the
-    # legacy EMA-preserving behavior.
-    repo_unavailable_is_miner_fault: bool = True
+    score_window: int = 16            # max number of phases (points) retained per miner in MinerScoreAggregator
 
 
 class ValidatorConfig(WorkerConfig):
@@ -1030,20 +796,13 @@ class ValidatorConfig(WorkerConfig):
             f"CONFIG_PATH={self.ckpt.checkpoint_path / 'config.yaml'}",
             f"EXPERT_GROUPS_PATH={expert_groups_path}",
             f"VALIDATOR_GPU_ID=0",
+            f"SERVER_GPU_ID=0",
             f"HF_TOKEN=",
             f"WANDB_API_KEY=",
             f"WANDB_MODE=online",
             f"WATCHTOWER_POLL_INTERVAL=300",
             f"WATCHTOWER_NOTIFICATIONS=",
             f"WATCHTOWER_NOTIFICATION_SLACK_HOOK_URL=",
-            f"",
-            f"# --- Central log aggregation (opt-in; see docs/validator-docker-operators.md) ---",
-            f"# Uncomment COMPOSE_FILE and fill the three values below to ship validator",
-            f"# stdout to Grafana Cloud Loki. Credentials are issued by the subnet owner.",
-            f"# COMPOSE_FILE=docker-compose.yml:docker-compose.loki.override.yml",
-            f"# LOKI_URL=",
-            f"# HOTKEY_SS58=",
-            f"# VALIDATOR_UID=",
         ]
 
         env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1090,11 +849,6 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite current config with on-disk one.")
     parser.add_argument("--no_bump", action="store_true", help="Do not bump run_name on config diff.")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Test mode: wait_till() short-circuits without sleeping or polling the chain.",
-    )
     return parser.parse_args()
 
 
