@@ -2,7 +2,7 @@ from typing import Any
 
 from transformers import PreTrainedTokenizerBase
 
-from connito.shared.dataloader import DefaultStreamingTorchDataset
+from connito.shared.dataloader import DefaultStreamingTorchDataset, tokenize_windowed
 
 
 # -------------------------------------------------------------
@@ -20,19 +20,16 @@ class StreamingTorchDataset(DefaultStreamingTorchDataset):
         Processes raw text for Continuous Pre-Training (CPT).
         Bypasses the chat template since Multi_Legal_Pile and C4 are raw
         text corpora, not conversational data.
+
+        Long documents get a content-hash-derived window instead of the
+        prefix: legal filings front-load their most templated text
+        (headers, procedural boilerplate), so always scoring the first
+        `sequence_length` tokens let template-memorizing miners reach
+        near-zero eval loss. See `tokenize_windowed` for the mechanism
+        and its consensus properties.
         """
-        # 1) Safely extract the raw text we aligned in dataloader.py
         text = str(example.get("text", ""))
-
-        # 2) Tokenize text directly (no chat template)
-        toks = tokenizer(
-            text,
-            truncation=True,
-            max_length=sequence_length,
-            padding="max_length",
-            add_special_tokens=True, # Important: Ensures BOS/EOS tokens are added
-        )
-
+        toks = tokenize_windowed(text, tokenizer, sequence_length)
         return {
             "input_ids": toks["input_ids"],
             "attention_mask": toks["attention_mask"],

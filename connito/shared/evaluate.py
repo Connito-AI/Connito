@@ -117,7 +117,12 @@ def evaluate_model(
             if max_eval_batches is not None and batch_step >= max_eval_batches:
                 break
 
-        logger.debug(
+        # INFO, not debug: `nan_batches` is the only production-visible
+        # signal distinguishing "miner scored on all batches" from
+        # "miner's average silently excludes NaN batches" (degenerate
+        # eval rows and overflow-on-OOD submissions both land here).
+        # Ops must be able to read this off a live validator's logs.
+        logger.info(
             "eval loss",
             loss_sum=round(loss_sum, 4),
             aux_loss_sum=round(aux_loss_sum, 4),
