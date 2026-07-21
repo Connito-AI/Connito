@@ -142,10 +142,25 @@ class _SourceShardPolicy:
     path_prefix: str
     path_suffix: tuple[str, ...]
     revision: str
-    row_count_source: str  # "constant" | "parquet_footer"
+    row_count_source: str  # "constant" | "parquet_footer" | "verified_table"
     safe_floor_rows: int | None = None
     min_headroom_rows: int = 10_000
     verified_shard_rows: dict[str, int] = field(default_factory=dict)
+    # Override for `_SHARD_NAME_FILTER` when a source's data files don't
+    # follow the `train`/`part_` leaf naming convention (e.g.
+    # Multi_Legal_Pile ships `data/<lang>/<type>/<source>.jsonl.xz`).
+    # Only consulted for listing-based policies; `verified_table`
+    # policies take their shard list from the table and skip name
+    # filtering entirely.
+    leaf_name_pattern: str | None = None
+    # When set (e.g. "json"), `load_streaming_shard` loads the shard via
+    # the named generic builder against a resolved `hf_hub_url` instead
+    # of `load_dataset(repo_id, data_files=...)`. Required for repos
+    # that ship a custom loading script: passing the repo id would
+    # execute the script (defeating both the shard pick and the
+    # `trust_remote_code` opt-out), while the generic builder reads the
+    # raw file directly.
+    load_builder: str | None = None
 
 
 # Known sources. Add new entries here, NOT via config — the consensus
@@ -184,6 +199,61 @@ _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
         # count per shard at pick time.
         min_headroom_rows=10_000,
     ),
+    ("joelniklaus/Multi_Legal_Pile", "all_all"): _SourceShardPolicy(
+        # The repo's NATIVE data files. Deliberately NOT the `all_all`
+        # builder-script mix: the script streams additional files from
+        # external repos (joelito/eurlex_resources, legal-mc4, …) that
+        # can't be pinned or row-counted here, and executing it requires
+        # `trust_remote_code`. The eval pool is therefore a (large)
+        # subset of the miner-training distribution — acceptable: eval ⊆
+        # train, and the native corpus is tens of GB.
+        path_prefix="data/",
+        path_suffix=(".jsonl.xz",),
+        # Pinned at registration time (2026-07-21). Bump together with a
+        # re-count of the table if the dataset is ever re-uploaded.
+        revision="911e1d214162fd11d2c78d3f1428cbfcbe07782c",
+        row_count_source="verified_table",
+        min_headroom_rows=10_000,
+        # `.jsonl.xz` has no footer — rows counted once offline (full
+        # decompress of every shard at the pinned revision, 2026-07-21)
+        # and frozen here. The table doubles as the allowlist; four
+        # shards with ≤10k rows (denmark_ddsc caselaw 4 442,
+        # en switzerland_lexfind 147, belgium_jurportal 2 221,
+        # it switzerland_lexfind 5 642) are deliberately left out — no
+        # safe offset exists above the headroom floor.
+        load_builder="json",
+        verified_shard_rows={
+            "data/bg/legislation/bulgaria_marcell.jsonl.xz": 29_549,
+            "data/cs/caselaw/czechia_constitutional_court.jsonl.xz": 73_086,
+            "data/cs/caselaw/czechia_supreme_administrative_court.jsonl.xz": 52_660,
+            "data/cs/caselaw/czechia_supreme_court.jsonl.xz": 111_977,
+            "data/da/legislation/denmark_ddsc.jsonl.xz": 64_043,
+            "data/de/caselaw/germany_openlegaldata.jsonl.xz": 201_676,
+            "data/de/caselaw/switzerland_entscheidsuche.jsonl.xz": 308_612,
+            "data/de/legislation/germany_openlegaldata.jsonl.xz": 52_918,
+            "data/de/legislation/switzerland_lexfind.jsonl.xz": 16_981,
+            "data/en/legislation/uk_uk_lex.jsonl.xz": 36_499,
+            "data/fr/caselaw/france_cass.jsonl.xz": 113_844,
+            "data/fr/caselaw/luxembourg_judoc.jsonl.xz": 37_902,
+            "data/fr/caselaw/switzerland_entscheidsuche.jsonl.xz": 237_734,
+            "data/fr/legislation/belgium_ejustice.jsonl.xz": 10_613,
+            "data/fr/legislation/switzerland_lexfind.jsonl.xz": 10_680,
+            "data/hu/legislation/hungary_marcell.jsonl.xz": 26_821,
+            "data/it/caselaw/switzerland_entscheidsuche.jsonl.xz": 69_653,
+            "data/nl/legislation/belgium_ejustice.jsonl.xz": 10_556,
+            "data/pl/legislation/poland_marcell.jsonl.xz": 27_485,
+            "data/pt/caselaw/brazil_cjpg_0.jsonl.xz": 3_489_624,
+            "data/pt/caselaw/brazil_cjpg_1.jsonl.xz": 3_213_178,
+            "data/pt/caselaw/brazil_cjpg_2.jsonl.xz": 3_094_216,
+            "data/pt/caselaw/brazil_cjpg_3.jsonl.xz": 3_019_375,
+            "data/pt/caselaw/brazil_cjpg_4.jsonl.xz": 1_252_241,
+            "data/pt/caselaw/brazil_creta.jsonl.xz": 3_128_292,
+            "data/pt/caselaw/brazil_rulingbr.jsonl.xz": 10_623,
+            "data/ro/legislation/romania_marcell.jsonl.xz": 163_264,
+            "data/sk/legislation/slovakia_marcell.jsonl.xz": 13_055,
+            "data/sl/legislation/slovenia_marcell.jsonl.xz": 24_445,
+        },
+    ),
 }
 
 
@@ -199,7 +269,7 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
     biased samples or collapses rounds.
     """
     repo_id, name = key
-    if policy.row_count_source not in {"constant", "parquet_footer"}:
+    if policy.row_count_source not in {"constant", "parquet_footer", "verified_table"}:
         raise ValueError(
             f"Policy {repo_id}/{name}: unknown row_count_source "
             f"{policy.row_count_source!r}"
@@ -208,6 +278,33 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
         raise ValueError(
             f"Policy {repo_id}/{name}: min_headroom_rows must be > 0"
         )
+    if policy.row_count_source == "verified_table":
+        # The table IS the shard allowlist: every listed shard must have
+        # a row count that leaves at least one valid offset after the
+        # headroom is reserved. Shards too small for the eval pipeline's
+        # per-round consumption must be left out of the table, not
+        # zero-bounded at pick time.
+        if not policy.verified_shard_rows:
+            raise ValueError(
+                f"Policy {repo_id}/{name}: row_count_source='verified_table' "
+                f"requires a non-empty verified_shard_rows table (it doubles "
+                f"as the shard allowlist)"
+            )
+        for shard_path, rows in policy.verified_shard_rows.items():
+            if rows <= policy.min_headroom_rows:
+                raise ValueError(
+                    f"Policy {repo_id}/{name}: verified shard {shard_path!r} "
+                    f"has {rows} rows ≤ min_headroom_rows "
+                    f"({policy.min_headroom_rows}); no safe offset exists. "
+                    f"Remove it from the table."
+                )
+            if not shard_path.startswith(policy.path_prefix) or not shard_path.endswith(
+                policy.path_suffix
+            ):
+                raise ValueError(
+                    f"Policy {repo_id}/{name}: table entry {shard_path!r} does "
+                    f"not match path_prefix/path_suffix — typo in the table?"
+                )
     if policy.row_count_source == "constant":
         if policy.safe_floor_rows is None or policy.safe_floor_rows <= 0:
             raise ValueError(
@@ -296,7 +393,19 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
     the same revision gets the same tuple.
     """
     policy = _policy_for(repo_id, name)
+    if policy.row_count_source == "verified_table":
+        # The frozen table doubles as the shard allowlist. Listing from
+        # the HF API here would re-introduce the consensus hazard the
+        # table exists to remove (a re-uploaded repo changing the list
+        # under our feet); the pinned revision + table are the source
+        # of truth.
+        return tuple(sorted(policy.verified_shard_rows))
     info = HfApi().dataset_info(repo_id, revision=revision)
+    name_filter = (
+        re.compile(policy.leaf_name_pattern, re.IGNORECASE)
+        if policy.leaf_name_pattern
+        else _SHARD_NAME_FILTER
+    )
     filtered = []
     for f in info.siblings:
         rf = f.rfilename
@@ -309,7 +418,7 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
         # (e.g. metadata, sidecar files). The "train" / "part_" check
         # is per-source-format and intentionally narrow.
         leaf = rf.split("/")[-1]
-        if not _SHARD_NAME_FILTER.search(leaf):
+        if not name_filter.search(leaf):
             continue
         filtered.append(rf)
     if not filtered:
@@ -366,6 +475,13 @@ def _resolve_offset_bound(
         assert policy.safe_floor_rows is not None
         return policy.safe_floor_rows
 
+    if policy.row_count_source == "verified_table":
+        # Module-load validation guarantees the shard is in the table
+        # with rows > min_headroom_rows (the table is the allowlist
+        # `_list_shards` picks from).
+        rows = policy.verified_shard_rows[shard_path]
+        return rows - policy.min_headroom_rows
+
     if policy.row_count_source == "parquet_footer":
         actual_rows = _shard_rows_via_parquet_footer(repo_id, revision, shard_path)
         bound = actual_rows - policy.min_headroom_rows
@@ -406,6 +522,9 @@ class ShardPick:
     offset_bound: int
     shard_rows: int  # for the constant path this equals offset_bound (we don't know the true count)
     in_shard_offset: int
+    # Propagated from the policy: when set, `load_streaming_shard` loads
+    # via this generic builder against a resolved URL (script-bypass).
+    load_builder: str | None = None
 
 
 def pick_shard_for_source(
@@ -456,8 +575,8 @@ def pick_shard_for_source(
     # For constant policies we don't know the actual shard size;
     # surface `offset_bound` as `shard_rows` so older callers (notebook
     # / tests) that check "offset < shard_rows" still see the right
-    # invariant. The parquet path can fill in the real count.
-    if policy.row_count_source == "parquet_footer":
+    # invariant. The parquet and verified-table paths know the real count.
+    if policy.row_count_source in {"parquet_footer", "verified_table"}:
         actual_shard_rows = offset_bound + policy.min_headroom_rows
     else:
         actual_shard_rows = offset_bound
@@ -470,6 +589,7 @@ def pick_shard_for_source(
         offset_bound=offset_bound,
         shard_rows=actual_shard_rows,
         in_shard_offset=offset,
+        load_builder=policy.load_builder,
     )
 
 
@@ -495,14 +615,30 @@ def load_streaming_shard(
     # helps unit tests.
     from datasets import load_dataset
 
-    load_kwargs: dict[str, Any] = {
-        "data_files": [pick.shard_path],
-        "streaming": True,
-        "revision": pick.revision,
-    }
-    if extra_load_kwargs:
-        load_kwargs.update(extra_load_kwargs)
-    ds = load_dataset(pick.repo_id, **load_kwargs)
+    if pick.load_builder:
+        # Script-bypass path: the repo ships a custom loading script, so
+        # `load_dataset(repo_id, ...)` would execute it (and for
+        # Multi_Legal_Pile, stream entirely different files from external
+        # repos). Loading the raw file through a generic builder reads
+        # exactly the picked shard and needs no `trust_remote_code`.
+        from huggingface_hub import hf_hub_url
+
+        url = hf_hub_url(
+            pick.repo_id, pick.shard_path, repo_type="dataset", revision=pick.revision
+        )
+        load_kwargs = {"data_files": [url], "streaming": True}
+        if extra_load_kwargs:
+            load_kwargs.update(extra_load_kwargs)
+        ds = load_dataset(pick.load_builder, **load_kwargs)
+    else:
+        load_kwargs = {
+            "data_files": [pick.shard_path],
+            "streaming": True,
+            "revision": pick.revision,
+        }
+        if extra_load_kwargs:
+            load_kwargs.update(extra_load_kwargs)
+        ds = load_dataset(pick.repo_id, **load_kwargs)
     if split_name in ds:
         return ds[split_name]
     # `data_files=` with a single file lands the rows under "train" by
