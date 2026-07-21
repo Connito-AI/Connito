@@ -11,7 +11,8 @@ structlog==24.1.0
 prometheus-client==0.20.0
 psutil==6.1.1
 PyYAML==6.0.1
-typer==0.24.1
+# btcli 9.23 requires typer~=0.26 (fresh-resolve conflict; bumped with the bittensor 10.5 move)
+typer==0.26.0
 python-dotenv==1.1.0
 cryptography==46.0.5
 varint==1.0.2
@@ -35,7 +36,8 @@ unsloth @ git+https://github.com/unslothai/unsloth.git; platform_system == "Linu
 # -----------------------------
 fastapi==0.110.1
 uvicorn[standard]==0.30.0
-requests==2.32.3
+# bittensor 10.5 requires requests>=2.33 (fresh-resolve conflict caught by CI 2026-07-21)
+requests==2.33.0
 aiofiles==25.1.0
 python-multipart==0.0.22
 
