@@ -575,6 +575,8 @@ class Round:
         """
         if self.journal_path is None:
             return None
+        from connito.validator.round_journal import commit_map_from_checkpoints
+
         return {
             "round_id": self.round_id,
             "uid_to_hotkey": dict(self.uid_to_hotkey),
@@ -584,6 +586,7 @@ class Round:
             "validation_failed_uids": tuple(sorted(self.validation_failed_uids)),
             "freeze_zero_uids": tuple(sorted(self.freeze_zero_uids)),
             "freeze_zero_hotkeys": dict(self.freeze_zero_hotkeys),
+            "uid_to_commit": commit_map_from_checkpoints(self.uid_to_chain_checkpoint),
             "finalized": False,
         }
 

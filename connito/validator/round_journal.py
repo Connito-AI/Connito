@@ -25,7 +25,11 @@ import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+# v2 adds `uid_to_commit` (uid -> (hf_repo_id, hf_revision)) so the
+# journal-recovery finalize can re-publish evaluated-commit telemetry.
+# `from_json` accepts v1 files (missing map -> empty) so leftover journals
+# written by an older build still recover.
+SCHEMA_VERSION = 2
 JOURNAL_DIR_NAME = "round_journal"
 JOURNAL_FILENAME_PREFIX = "round_"
 JOURNAL_FILENAME_SUFFIX = ".json"
@@ -52,6 +56,9 @@ class RoundJournal:
     validation_failed_uids: tuple[int, ...] = ()
     freeze_zero_uids: tuple[int, ...] = ()
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
+    # v2: uid -> (hf_repo_id, hf_revision) evaluated for the round. Only
+    # uids whose chain checkpoint carried BOTH values are recorded.
+    uid_to_commit: dict[int, tuple[str, str]] = field(default_factory=dict)
     finalized: bool = False
     schema_version: int = SCHEMA_VERSION
 
@@ -65,16 +72,23 @@ class RoundJournal:
         payload["failed_uids"] = list(self.failed_uids)
         payload["validation_failed_uids"] = list(self.validation_failed_uids)
         payload["freeze_zero_uids"] = list(self.freeze_zero_uids)
+        payload["uid_to_commit"] = {
+            str(k): [str(v[0]), str(v[1])] for k, v in self.uid_to_commit.items()
+        }
         return json.dumps(payload)
 
     @classmethod
     def from_json(cls, data: str) -> "RoundJournal":
         raw = json.loads(data)
         version = int(raw.get("schema_version", 1))
-        if version != SCHEMA_VERSION:
+        # Accept every version up to the current one: v1 files simply lack
+        # `uid_to_commit` (defaults to empty). Reject only FUTURE versions —
+        # fields this build doesn't understand could change recovery
+        # semantics silently.
+        if version > SCHEMA_VERSION:
             raise ValueError(
                 f"Unsupported RoundJournal schema_version={version}; "
-                f"expected {SCHEMA_VERSION}"
+                f"this build supports <= {SCHEMA_VERSION}"
             )
         return cls(
             round_id=int(raw["round_id"]),
@@ -87,9 +101,29 @@ class RoundJournal:
             freeze_zero_hotkeys={
                 int(k): str(v) for k, v in raw.get("freeze_zero_hotkeys", {}).items()
             },
+            uid_to_commit={
+                int(k): (str(v[0]), str(v[1]))
+                for k, v in raw.get("uid_to_commit", {}).items()
+                if isinstance(v, (list, tuple)) and len(v) == 2
+            },
             finalized=bool(raw.get("finalized", False)),
             schema_version=version,
         )
+
+
+def commit_map_from_checkpoints(
+    uid_to_chain_checkpoint: dict[int, object],
+) -> dict[int, tuple[str, str]]:
+    """Extract the journal's `uid_to_commit` map from a round's
+    `uid_to_chain_checkpoint`. Skips uids missing either field.
+    """
+    out: dict[int, tuple[str, str]] = {}
+    for uid, ckpt in (uid_to_chain_checkpoint or {}).items():
+        repo = getattr(ckpt, "hf_repo_id", None)
+        rev = getattr(ckpt, "hf_revision", None)
+        if repo and rev:
+            out[int(uid)] = (str(repo), str(rev))
+    return out
 
 
 def journal_dir(checkpoint_path: str | os.PathLike) -> Path:
@@ -179,10 +213,17 @@ class _RecoveryRound:
     freeze_zero_hotkeys: dict[int, str]
     uid_to_hotkey: dict[int, str]
     journal_path: Path
+    # Same shape finalize reads off a live Round: objects exposing
+    # `.hf_repo_id` / `.hf_revision`. Hydrated from the journal's v2
+    # `uid_to_commit` map (empty for v1 journals) so a recovered finalize
+    # re-publishes evaluated-commit telemetry too.
+    uid_to_chain_checkpoint: dict[int, object] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @classmethod
     def from_journal(cls, journal: "RoundJournal", journal_path: str | os.PathLike) -> "_RecoveryRound":
+        from types import SimpleNamespace
+
         return cls(
             round_id=int(journal.round_id),
             scores=dict(journal.scores),
@@ -193,6 +234,10 @@ class _RecoveryRound:
             freeze_zero_hotkeys=dict(journal.freeze_zero_hotkeys),
             uid_to_hotkey=dict(journal.uid_to_hotkey),
             journal_path=Path(journal_path),
+            uid_to_chain_checkpoint={
+                int(uid): SimpleNamespace(hf_repo_id=repo, hf_revision=rev)
+                for uid, (repo, rev) in journal.uid_to_commit.items()
+            },
         )
 
     def processed_uids_snapshot(self) -> tuple[set[int], set[int]]:

@@ -344,6 +344,9 @@ def finalize_round_scores(
                     validation_failed_uids=tuple(sorted(validation_failed)),
                     freeze_zero_uids=tuple(sorted(freeze_zero)),
                     freeze_zero_hotkeys=dict(freeze_hotkeys),
+                    uid_to_commit=_rj.commit_map_from_checkpoints(
+                        getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
+                    ),
                     finalized=True,
                 ),
             )
@@ -352,6 +355,54 @@ def finalize_round_scores(
                 "finalize_round_scores: journal flip-to-finalized failed",
                 round_id=round_obj.round_id, error=str(e),
             )
+
+    # --- Cycle-consistent per-miner telemetry (dashboard contract). -------
+    # Emitted HERE — not from run.py's weight loop — for two reasons:
+    # (1) the weight loop only iterates weight recipients, so the dashboard
+    #     previously saw score snapshots for ~1 uid; every verdict uid gets
+    #     one now; (2) the journal-recovery replay calls this function too,
+    #     so a restart re-publishes the series without waiting for a fresh
+    #     round. Best-effort throughout — telemetry must never block
+    #     finalize or scoring.
+    try:
+        from connito.shared.telemetry import (
+            set_miner_evaluated_commit,
+            set_miner_last_scored_round,
+            set_miner_round_delta,
+            set_miner_score_snapshot,
+        )
+
+        _rid = int(round_obj.round_id)
+        try:
+            _latest_scores = score_aggregator.uid_score_pairs(how="latest")
+            _avg_scores = score_aggregator.uid_score_pairs(how="avg")
+        except Exception:
+            _latest_scores, _avg_scores = {}, {}
+        for uid in written:
+            set_miner_last_scored_round(int(uid), _rid)
+            try:
+                _samples = score_aggregator.record_count(int(uid))
+            except Exception:
+                _samples = None
+            set_miner_score_snapshot(
+                int(uid),
+                latest=_latest_scores.get(int(uid)),
+                avg=_avg_scores.get(int(uid)),
+                samples=_samples,
+            )
+        for uid in scored:
+            set_miner_round_delta(int(uid), float(round_scores.get(uid, 0.0)))
+        _ckpt_map = getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
+        for uid, _ckpt in _ckpt_map.items():
+            _repo = getattr(_ckpt, "hf_repo_id", None)
+            _rev = getattr(_ckpt, "hf_revision", None)
+            if _repo and _rev:
+                set_miner_evaluated_commit(int(uid), str(_repo), str(_rev), _rid)
+    except Exception as e:
+        logger.warning(
+            "finalize_round_scores: telemetry emission failed",
+            round_id=round_obj.round_id, error=str(e),
+        )
 
     logger.info(
         "finalize_round_scores: round scored by rank",
