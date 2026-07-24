@@ -305,6 +305,25 @@ class DataCfg(BaseConfig):
     # target and a mid-rollout HF re-upload would cause two
     # validators to pick different rows for the same seed.
     eval_source_revision_pin: dict[str, str] | None = None
+    # --- Eval-stream data-quality gates (validator eval path only; the
+    # miner training stream passes seed=None and is unaffected). Both
+    # are deterministic, so all validators on the same version keep
+    # identical eval batches. Same coordinated-rollout discipline as
+    # the other eval_source_* knobs.
+    #
+    # Drop rows whose text is shorter than this many characters after
+    # strip(). Motivated by Multi_Legal_Pile all_all, where 38% of
+    # streamed rows have empty text: those tokenize to all-padding
+    # sequences whose loss is NaN, silently shrinking the scored eval
+    # sample. 0 disables.
+    eval_min_text_chars: int = 200
+    # Keep only the first row per distinct text prefix of this many
+    # characters. Templated corpora repeat opening boilerplate across
+    # documents (measured: 75% of non-empty Multi_Legal_Pile rows share
+    # an identical 200-char prefix); scoring duplicates hands
+    # template-memorizing miners near-zero loss on "unseen" rows.
+    # 0 disables.
+    eval_dedup_prefix_chars: int = 200
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):

@@ -31,6 +31,7 @@ from connito.shared.telemetry import (
     VALIDATOR_ROUND_MINERS_FAILED,
     VALIDATOR_ROUND_MINERS_PENDING,
     VALIDATOR_ROUND_MINERS_SCORED,
+    note_round_series,
 )
 from connito.validator.evaluator import (
     EVAL_MAX_BATCHES,
@@ -503,6 +504,7 @@ class BackgroundEvalWorker(threading.Thread):
                 round_id=round_obj.round_id,
             )
             try:
+                note_round_series(round_obj.round_id)
                 VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL.labels(
                     round_id=str(round_obj.round_id)
                 ).inc()
@@ -626,6 +628,7 @@ class BackgroundEvalWorker(threading.Thread):
     def _record_metrics(round_obj, *, scored_inc: bool) -> None:
         try:
             stats = round_obj.stats()
+            note_round_series(round_obj.round_id)
             VALIDATOR_ROUND_MINERS_SCORED.labels(round_id=str(round_obj.round_id)).set(stats["scored"])
             VALIDATOR_ROUND_MINERS_FAILED.labels(round_id=str(round_obj.round_id)).set(stats["failed"])
             VALIDATOR_ROUND_MINERS_PENDING.labels(round_id=str(round_obj.round_id)).set(stats["pending"])

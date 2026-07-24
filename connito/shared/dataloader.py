@@ -45,6 +45,90 @@ def _fractional_index_filter(_example, idx: int, seed: str | int, threshold: int
     return score <= threshold
 
 
+def _min_text_chars_filter(example: dict[str, Any], min_chars: int) -> bool:
+    """Drop rows whose text is empty or trivially short.
+
+    Eval-path only. Empirically (Multi_Legal_Pile all_all, 2026-07-21)
+    38% of streamed rows carry a completely empty `text`; those rows
+    tokenize to all-padding sequences whose labels are fully masked, so
+    they produce NaN eval loss and silently drop out of the scored-batch
+    divisor — shrinking an already tiny eval sample. The distribution is
+    bimodal (0 chars or ≥200), so a low threshold removes exactly the
+    degenerate rows without biasing content selection.
+    """
+    return len(str(example.get("text", "")).strip()) >= min_chars
+
+
+class _PrefixDedupFilter:
+    """Keep only the first row for each distinct text prefix.
+
+    Eval-path only, and only sound single-worker: the `seen` set lives in
+    this instance, so the eval dataloader must iterate the stream in one
+    process (the eval loader runs `num_workers<=1`; see `get_dataloader`).
+
+    Rationale: templated corpora repeat their opening boilerplate across
+    documents — measured 75% of non-empty Multi_Legal_Pile rows sharing an
+    identical 200-char prefix. Scoring many near-identical rows lets a
+    miner fine-tuned on the template reach near-zero loss on "unseen"
+    documents. Deduplicating by prefix keeps one representative per
+    template instead of a batch full of copies. Deterministic given a
+    deterministic input stream (same seed → same order → same survivors).
+    """
+
+    def __init__(self, prefix_chars: int):
+        self.prefix_chars = int(prefix_chars)
+        # Exact prefixes, not `hash()` digests: builtin str hashing is
+        # per-process randomized, so two validators could disagree on a
+        # collision. The eval stream retains only ~thousands of rows, so
+        # exact storage is a few hundred KB at worst.
+        self.seen: set[str] = set()
+
+    def __call__(self, example: dict[str, Any]) -> bool:
+        prefix = str(example.get("text", ""))[: self.prefix_chars]
+        if prefix in self.seen:
+            return False
+        self.seen.add(prefix)
+        return True
+
+
+def tokenize_windowed(
+    text: str, tokenizer: PreTrainedTokenizerBase, sequence_length: int
+) -> dict[str, list]:
+    """Tokenize `text`, sampling a deterministic window from long documents.
+
+    The previous behavior (`truncation=True`) always scored/trained on a
+    document's FIRST `sequence_length` tokens. For templated corpora
+    (legal filings, papers) the prefix is the most boilerplate-heavy,
+    most predictable region of the document — document bodies never
+    entered the pipeline at all. This helper instead:
+
+    - short documents (≤ sequence_length tokens): pad to length, as before;
+    - long documents: take a `sequence_length` window whose start is
+      derived from the text's own content hash — deterministic for every
+      validator (consensus-safe: no RNG, no config), uniform-ish across
+      the document, and not influenceable by the validator.
+
+    The raw text is capped at `sequence_length * 40` chars before
+    tokenizing to bound tokenizer cost on pathological documents (real
+    corpora run 3–8 chars/token, so the cap only bites degenerate input).
+    """
+    capped = str(text)[: sequence_length * 40]
+    ids = tokenizer(capped, truncation=False, add_special_tokens=True)["input_ids"]
+    if len(ids) > sequence_length:
+        span = len(ids) - sequence_length
+        start = h256_int("token_window", capped) % (span + 1)
+        window = ids[start : start + sequence_length]
+        return {"input_ids": window, "attention_mask": [1] * sequence_length}
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    n = len(ids)
+    return {
+        "input_ids": ids + [pad_id] * (sequence_length - n),
+        "attention_mask": [1] * n + [0] * (sequence_length - n),
+    }
+
+
 # -----------------------------
 # Dataset
 # -----------------------------
@@ -86,7 +170,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         example: dict[str, str], tokenizer: PreTrainedTokenizerBase, sequence_length: int
     ) -> dict[str, list]:
         text = example.get("text", "")
-        return tokenizer(text, truncation=True, max_length=sequence_length, padding="max_length")  # type: ignore
+        return tokenize_windowed(text, tokenizer, sequence_length)
 
     @classmethod
     def get_tokenised_dataset(
@@ -272,6 +356,20 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 features=common_features,
             )
 
+            # Eval-path data-quality gate (seed is None on the miner
+            # training path, which stays byte-identical). Applied
+            # per-source and before interleave so the source weights
+            # keep describing *usable* rows — an unfiltered source with
+            # 38% empty rows would otherwise contribute 38% NaN batches
+            # at its configured weight.
+            eval_min_text_chars = int(
+                getattr(config.task.exp.data, "eval_min_text_chars", 0) or 0
+            )
+            if seed is not None and eval_min_text_chars > 0:
+                source_split = source_split.filter(
+                    partial(_min_text_chars_filter, min_chars=eval_min_text_chars)
+                )
+
             if pick is not None:
                 # In-shard offset goes here so the validator's read
                 # window lands at a random depth inside the chosen
@@ -350,6 +448,18 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             probabilities = [weight / total_weight for weight in dataset_weights]
             logger.debug("Interleaving dataset sources", probabilities=probabilities)
             split = interleave_datasets(dataset_splits, probabilities=probabilities, seed=int_seed)
+
+        # Eval-path template dedup: drop rows repeating an already-seen
+        # text prefix (templated corpora open millions of documents with
+        # the same boilerplate — see `_PrefixDedupFilter`). Runs after
+        # interleave so the dedup window spans the whole eval stream, and
+        # before the fractional filter so surviving indices stay
+        # deterministic for every validator.
+        eval_dedup_prefix_chars = int(
+            getattr(config.task.exp.data, "eval_dedup_prefix_chars", 0) or 0
+        )
+        if seed is not None and eval_dedup_prefix_chars > 0:
+            split = split.filter(_PrefixDedupFilter(eval_dedup_prefix_chars))
 
         # Optional deterministic subsampling based on (seed, fraction)
         # Applied *before* sharding on the streaming iterable.

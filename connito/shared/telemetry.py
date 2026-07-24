@@ -243,6 +243,39 @@ VALIDATOR_MINER_LAST_OBSERVED_COMMIT_BLOCK = Gauge(
     ["miner_uid"],
 )
 
+# --- Cycle-consistent per-miner attribution (dashboard contract) -----------
+# The gateway attributes every per-miner sample to the exact evaluation
+# round via these three families. All are set from `finalize_round_scores`
+# (including its journal-recovery replay path) so a validator restart
+# re-publishes them without waiting for a fresh round.
+VALIDATOR_MINER_LAST_SCORED_ROUND_ID = Gauge(
+    "validator_miner_last_scored_round_id",
+    "round_id of the last round in which this validator wrote a finalize "
+    "verdict (scored, tie-zeroed, validation-failed, or freeze-zero) for the miner",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_ROUND_DELTA = Gauge(
+    "validator_miner_round_delta",
+    "Raw per-round improvement signal ((baseline - val_loss) ** 1.2, >= 0) "
+    "from the miner's most recent evaluated round. Distinct from "
+    "validator_miner_score_latest, which is the finalized podium rank score.",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_EVALUATED_COMMIT_INFO = Gauge(
+    "validator_miner_evaluated_commit_info",
+    "round_id in which the labeled (hf_repo_id, hf_revision) was frozen and "
+    "evaluated for the miner. At most one labelset per miner_uid (old "
+    "labelsets are evicted on change).",
+    ["miner_uid", "hf_repo_id", "hf_revision"],
+)
+# uid -> (hf_repo_id, hf_revision) currently exposed on
+# VALIDATOR_MINER_EVALUATED_COMMIT_INFO. Guarded by _COMMIT_INFO_LOCK; used
+# to evict the previous labelset when a miner's commit changes, keeping the
+# "<= 1 labelset per uid" invariant. After a restart both this dict and the
+# registry start empty, so correctness holds without persistence.
+_COMMIT_INFO_LOCK = threading.Lock()
+_COMMIT_INFO_LABELS: dict[str, tuple[str, str]] = {}
+
 # Per-round lifecycle (background submission validation)
 VALIDATOR_ROUND_LIFECYCLE_STEP = Gauge(
     "validator_round_lifecycle_step",
@@ -264,6 +297,13 @@ VALIDATOR_ROUND_MINERS_FAILED = Gauge(
     "Roster miners that failed download/eval for the round",
     ["round_id"],
 )
+# round_id label values ever emitted on the per-round families above (and on
+# VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL). Call sites register via
+# `note_round_series`; `evict_round_series_before` removes stale labelsets on
+# the same cutoff run.py already uses to prune journals/aggregator entries —
+# without this, every round leaves four-plus permanent series behind.
+_ROUND_SERIES_LOCK = threading.Lock()
+_EMITTED_ROUND_IDS: set[int] = set()
 VALIDATOR_BG_WORKER_PAUSED = Gauge(
     "validator_bg_worker_paused",
     "1 while a background worker is paused on merge_phase_active / eval_window / download_window",
@@ -423,6 +463,114 @@ def set_miner_eval_status(miner_uid: int | str, reason: EvalFailureReason | str 
         VALIDATOR_MINER_EVAL_STATUS.labels(miner_uid=str(miner_uid)).set(float(code))
     except Exception:
         pass
+
+
+def set_miner_last_scored_round(miner_uid: int | str, round_id: int) -> None:
+    """Record the round_id of the last finalize verdict for this miner.
+
+    Best-effort — never raises. Telemetry must not influence scoring.
+    """
+    try:
+        VALIDATOR_MINER_LAST_SCORED_ROUND_ID.labels(miner_uid=str(miner_uid)).set(
+            float(int(round_id))
+        )
+    except Exception:
+        pass
+
+
+def set_miner_round_delta(miner_uid: int | str, delta: float) -> None:
+    """Record the raw per-round improvement signal for an evaluated miner.
+
+    Best-effort — never raises.
+    """
+    try:
+        VALIDATOR_MINER_ROUND_DELTA.labels(miner_uid=str(miner_uid)).set(float(delta))
+    except Exception:
+        pass
+
+
+def set_miner_evaluated_commit(
+    miner_uid: int | str, hf_repo_id: str, hf_revision: str, round_id: int
+) -> None:
+    """Expose which (hf_repo_id, hf_revision) was frozen + evaluated for the
+    miner, valued with the round_id it belongs to.
+
+    Enforces at most ONE labelset per miner_uid: when the commit changes, the
+    previous labelset is removed from the registry before the new one is set,
+    so the gateway never sees two competing commit rows for a uid. The
+    KeyError guard covers the post-restart case (tracking dict repopulated
+    while the registry series was already re-created) and double-eviction.
+
+    Best-effort — never raises.
+    """
+    try:
+        uid = str(miner_uid)
+        repo = str(hf_repo_id or "")
+        rev = str(hf_revision or "")
+        if not repo or not rev:
+            return
+        with _COMMIT_INFO_LOCK:
+            prev = _COMMIT_INFO_LABELS.get(uid)
+            if prev is not None and prev != (repo, rev):
+                try:
+                    VALIDATOR_MINER_EVALUATED_COMMIT_INFO.remove(uid, prev[0], prev[1])
+                except KeyError:
+                    pass
+            VALIDATOR_MINER_EVALUATED_COMMIT_INFO.labels(
+                miner_uid=uid, hf_repo_id=repo, hf_revision=rev
+            ).set(float(int(round_id)))
+            _COMMIT_INFO_LABELS[uid] = (repo, rev)
+    except Exception:
+        pass
+
+
+def note_round_series(round_id: int) -> None:
+    """Register a round_id whose label value was emitted on a per-round
+    family, so `evict_round_series_before` can remove it later.
+
+    Best-effort — never raises.
+    """
+    try:
+        with _ROUND_SERIES_LOCK:
+            _EMITTED_ROUND_IDS.add(int(round_id))
+    except Exception:
+        pass
+
+
+def evict_round_series_before(min_round_id: int) -> int:
+    """Remove per-round labelsets for every tracked round_id below the
+    cutoff. Called from run.py's journal/aggregator prune block with the
+    same cutoff, so metric retention matches on-disk retention.
+
+    Only rounds emitted by THIS process are tracked (the set is in-memory);
+    series left over from a previous process incarnation don't exist in the
+    fresh registry either, so nothing is leaked across restarts.
+
+    Returns the number of round_ids evicted. Best-effort — never raises.
+    """
+    removed = 0
+    try:
+        cutoff = int(min_round_id)
+        with _ROUND_SERIES_LOCK:
+            stale = [r for r in _EMITTED_ROUND_IDS if r < cutoff]
+            for r in stale:
+                rid = str(r)
+                for family in (
+                    VALIDATOR_ROUND_LIFECYCLE_STEP,
+                    VALIDATOR_ROUND_MINERS_PENDING,
+                    VALIDATOR_ROUND_MINERS_SCORED,
+                    VALIDATOR_ROUND_MINERS_FAILED,
+                    VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
+                ):
+                    try:
+                        family.remove(rid)
+                    except KeyError:
+                        pass
+                _EMITTED_ROUND_IDS.discard(r)
+                removed += 1
+    except Exception:
+        return removed
+    return removed
 
 
 def set_miner_score_snapshot(

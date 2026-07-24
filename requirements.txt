@@ -11,7 +11,8 @@ structlog==24.1.0
 prometheus-client==0.20.0
 psutil==6.1.1
 PyYAML==6.0.1
-typer==0.24.1
+# btcli 9.23 requires typer~=0.26 (fresh-resolve conflict; bumped with the bittensor 10.5 move)
+typer==0.26.0
 python-dotenv==1.1.0
 cryptography==46.0.5
 varint==1.0.2
@@ -35,7 +36,8 @@ unsloth @ git+https://github.com/unslothai/unsloth.git; platform_system == "Linu
 # -----------------------------
 fastapi==0.110.1
 uvicorn[standard]==0.30.0
-requests==2.32.3
+# bittensor 10.5 requires requests>=2.33 (fresh-resolve conflict caught by CI 2026-07-21)
+requests==2.33.0
 aiofiles==25.1.0
 python-multipart==0.0.22
 
@@ -53,12 +55,15 @@ fsspec==2024.6.1
 # -----------------------------
 # Blockchain
 # -----------------------------
-bittensor==10.1.0
-bittensor-cli==9.18.0
-# Pinned to pre-cyscale release. Newer async-substrate-interface versions
-# migrated scalecodec → cyscale and added an import-time check that fails
-# when bittensor-cli's transitive substrate-interface also pulls scalecodec.
-async-substrate-interface==1.6.4
+# 10.1 predates the chain's multi-mechanism runtime migration: its storage-key
+# encoding sends netuid as a bare int where the runtime now expects the NetUid
+# newtype, so metagraph()/btcli-overview fail against live finney+archive.
+bittensor==10.5.0
+bittensor-cli==9.23.2
+# Both pins above require the cyscale-based async-substrate-interface 2.x,
+# which fails at import if py-scale-codec is also installed — do not
+# reintroduce a scalecodec pin alongside these.
+async-substrate-interface==2.2.1
 
 # -----------------------------
 # Observability
