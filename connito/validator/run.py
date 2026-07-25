@@ -1118,6 +1118,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         weight_group_1=list(payload.weight_group_1),
                         weight_group_2=list(payload.weight_group_2),
                     )
+                if payload.g1_stale_excluded:
+                    logger.info(
+                        "(4) g1 freshness gate — dropped stale UIDs",
+                        round_id=pending_round.round_id,
+                        uids=list(payload.g1_stale_excluded),
+                        max_stale_rounds=int(getattr(
+                            config.evaluation, "g1_max_stale_rounds", 1,
+                        )),
+                    )
                 # Mirror the about-to-submit weights into Prometheus so
                 # external aggregators don't have to scrape `/v1/state.json`
                 # to learn what each validator votes on chain. Mirrors the

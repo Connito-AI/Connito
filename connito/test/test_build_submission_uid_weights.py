@@ -264,3 +264,156 @@ def test_payload_is_a_frozen_dataclass():
     p = WeightSubmissionPayload(uid_weights={1: 1.0})
     with pytest.raises((TypeError, AttributeError)):
         p.weight_group_1 = (1, 2, 3)   # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# G1 freshness gate
+# ---------------------------------------------------------------------------
+
+
+def _agg_with_points(points: dict[int, list[tuple[int, float]]]) -> MinerScoreAggregator:
+    """Build an aggregator from `{uid: [(round_id, score), ...]}`."""
+    agg = MinerScoreAggregator(max_points=8, max_history_points=64)
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    micro = 1
+    for uid, entries in points.items():
+        for rid, score in entries:
+            agg.add_score(
+                uid=uid, hotkey=f"hk{uid}", score=score,
+                ts=ts.replace(microsecond=micro), round_id=rid,
+            )
+            micro += 1
+    return agg
+
+
+def test_g1_freshness_gate_drops_stale_uid_despite_higher_avg():
+    """A UID whose most recent point predates the freshness window loses
+    its G1 seat even when its rolling avg is the highest in A∪B.
+
+    This is the mainnet uid-158 shape: a big rank score earned several
+    rounds ago keeps the avg high because `avg` divides by *recorded
+    points*, not by rounds elapsed, so the seat survives until the point
+    ages out of retention.
+    """
+    cur_rid, cycle_length = 1000, 100
+    agg = _agg_with_points({
+        # stale: 3 distinct round_ids inside the ≥3-of-5 window [500, 1000],
+        # but nothing since round 800 — and the highest avg by far.
+        1: [(600, 2.25), (700, 2.25), (800, 2.25)],
+        # fresh: scored right up to the current round, much lower avg.
+        2: [(800, 0.5), (900, 0.5), (1000, 0.5)],
+    })
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1, 2)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+    )
+    assert payload.weight_group_1 == (2,)
+    assert payload.g1_stale_excluded == (1,)
+    # Demoted, not erased: the stale UID falls through to the 2% G2 tier
+    # (which gates only on `record_count >= 1`). What it loses is the 98%
+    # seat it was holding on stale evidence.
+    assert payload.weight_group_2 == (1,)
+    assert pytest.approx(payload.uid_weights[2], abs=1e-6) == 0.98
+    assert pytest.approx(payload.uid_weights[1], abs=1e-6) == 0.02
+
+
+def test_g1_freshness_gate_admits_previous_round():
+    """`g1_max_stale_rounds=1` means the current round OR the one before
+    it — a UID last scored exactly `cur_rid - cycle_length` still holds."""
+    cur_rid, cycle_length = 1000, 100
+    agg = _agg_with_points({1: [(700, 1.0), (800, 1.0), (900, 1.0)]})
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1,)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+    )
+    assert payload.weight_group_1 == (1,)
+    assert payload.g1_stale_excluded == ()
+
+
+def test_g1_freshness_gate_is_configurable():
+    """A large `g1_max_stale_rounds` restores the legacy behavior of
+    letting a stale rolling average hold a G1 seat."""
+    cur_rid, cycle_length = 1000, 100
+    points = {1: [(600, 2.25), (700, 2.25), (800, 2.25)]}
+    strict = build_submission_uid_weights(
+        score_aggregator=_agg_with_points(points),
+        cohort_state=_cohort_state(a=(1,)),
+        round_id=cur_rid, cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(g1_max_stale_rounds=1),
+    )
+    assert strict.weight_group_1 == (0,)          # empty G1 → owner redirect
+    assert strict.g1_redirected_to_uid_zero is True
+
+    lax = build_submission_uid_weights(
+        score_aggregator=_agg_with_points(points),
+        cohort_state=_cohort_state(a=(1,)),
+        round_id=cur_rid, cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(g1_max_stale_rounds=8),
+    )
+    assert lax.weight_group_1 == (1,)
+    assert lax.g1_stale_excluded == ()
+
+
+def test_g1_freshness_gate_all_stale_redirects_to_uid_zero():
+    """If every A∪B UID is stale the 98% share goes to uid=0 rather than
+    to a miner the validator has no current evidence about."""
+    cur_rid, cycle_length = 1000, 100
+    agg = _agg_with_points({
+        1: [(600, 2.25), (700, 2.25), (800, 1.0)],
+        2: [(500, 1.5), (600, 1.5), (700, 1.5)],
+    })
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1, 2)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+    )
+    assert payload.g1_redirected_to_uid_zero is True
+    assert payload.weight_group_1 == (0,)
+    assert set(payload.g1_stale_excluded) == {1, 2}
+    assert pytest.approx(payload.uid_weights[0], abs=1e-6) == 0.98
+    assert pytest.approx(sum(payload.uid_weights.values()), abs=1e-6) == 1.0
+
+
+def test_g1_freshness_gate_counts_a_zero_score_as_evidence():
+    """A `0.0` written by `finalize_round_scores` is still evidence that
+    the validator looked at the miner this round, so it satisfies the
+    gate. The gate is about freshness, not about performance — the low
+    score is already reflected in the avg used for ranking."""
+    cur_rid, cycle_length = 1000, 100
+    agg = _agg_with_points({1: [(800, 2.25), (900, 0.0), (1000, 0.0)]})
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1,)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+    )
+    assert payload.weight_group_1 == (1,)
+    assert payload.g1_stale_excluded == ()
+
+
+def test_g1_freshness_gate_does_not_affect_group_2():
+    """G2 keeps its `record_count >= 1` gate with no recency or freshness
+    requirement — the 2% tier is explicitly the wider net."""
+    cur_rid, cycle_length = 1000, 100
+    agg = _agg_with_points({
+        1: [(800, 0.5), (900, 0.5), (1000, 0.5)],   # fresh → G1
+        9: [(600, 0.4)],                             # stale, single record → G2
+    })
+    payload = build_submission_uid_weights(
+        score_aggregator=agg,
+        cohort_state=_cohort_state(a=(1,), c=(9,)),
+        round_id=cur_rid,
+        cycle_length=cycle_length,
+        eval_cfg=_eval_cfg(),
+    )
+    assert payload.weight_group_1 == (1,)
+    assert payload.weight_group_2 == (9,)
