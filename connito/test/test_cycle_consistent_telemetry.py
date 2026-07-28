@@ -269,6 +269,46 @@ def test_finalize_recovery_path_reemits_commits(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Per-round baseline loss
+# ---------------------------------------------------------------------------
+
+def test_set_baseline_loss_sets_both_gauges():
+    rid = 920_100
+    T.set_baseline_loss(rid, 1.8342)
+    # Unlabeled gauge carries the latest value (backward compat).
+    unlabeled = _samples_for(T.VALIDATOR_BASELINE_LOSS, "validator_baseline_loss")
+    assert unlabeled and unlabeled[0].value == 1.8342
+    # Labeled family carries the same value under the round's id.
+    labeled = [
+        s
+        for s in _samples_for(
+            T.VALIDATOR_BASELINE_LOSS_BY_ROUND, "validator_baseline_loss_by_round"
+        )
+        if s.labels["round_id"] == str(rid)
+    ]
+    assert len(labeled) == 1
+    assert labeled[0].value == 1.8342
+    # round_id registered for eviction.
+    assert rid in T._EMITTED_ROUND_IDS
+
+
+def test_set_baseline_loss_labeled_is_stable_per_round():
+    # A second round's baseline does not disturb the first round's labeled
+    # value — the whole point of the per-round label vs the overwritten
+    # unlabeled gauge.
+    T.set_baseline_loss(920_200, 2.0)
+    T.set_baseline_loss(920_724, 3.0)
+    by_round = {
+        s.labels["round_id"]: s.value
+        for s in _samples_for(
+            T.VALIDATOR_BASELINE_LOSS_BY_ROUND, "validator_baseline_loss_by_round"
+        )
+    }
+    assert by_round["920200"] == 2.0
+    assert by_round["920724"] == 3.0
+
+
+# ---------------------------------------------------------------------------
 # Per-round series eviction
 # ---------------------------------------------------------------------------
 
@@ -277,6 +317,7 @@ def test_evict_round_series_before():
     for rid in (old_rid, new_rid):
         T.note_round_series(rid)
         T.VALIDATOR_ROUND_MINERS_SCORED.labels(round_id=str(rid)).set(5)
+        T.VALIDATOR_BASELINE_LOSS_BY_ROUND.labels(round_id=str(rid)).set(1.8)
     removed = T.evict_round_series_before(new_rid)
     assert removed >= 1
     rids = {
@@ -287,5 +328,14 @@ def test_evict_round_series_before():
     }
     assert str(old_rid) not in rids
     assert str(new_rid) in rids
+    # The baseline-by-round family is evicted on the same cutoff.
+    baseline_rids = {
+        s.labels["round_id"]
+        for s in _samples_for(
+            T.VALIDATOR_BASELINE_LOSS_BY_ROUND, "validator_baseline_loss_by_round"
+        )
+    }
+    assert str(old_rid) not in baseline_rids
+    assert str(new_rid) in baseline_rids
     # Idempotent / KeyError-safe on repeat.
     assert T.evict_round_series_before(new_rid) == 0

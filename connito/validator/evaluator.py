@@ -22,10 +22,10 @@ from connito.shared.helper import (
 )
 from connito.shared.telemetry import (
     EvalFailureReason,
-    VALIDATOR_BASELINE_LOSS,
     VALIDATOR_MINER_VAL_LOSS,
     inc_error,
     inc_eval_failure,
+    set_baseline_loss,
     set_miner_eval_status,
     track_eval_latency,
     track_model_load_latency,
@@ -1028,10 +1028,11 @@ async def evaluate_foreground_round(
     # `delta_loss = max(0, baseline - val_loss)` per miner. Best-effort
     # — Prometheus exposition is purely an observability side-effect
     # and must never block scoring.
-    try:
-        VALIDATOR_BASELINE_LOSS.set(float(baseline_loss))
-    except Exception:
-        pass
+    # Publishes both the unlabeled gauge (backward compat) and the per-round
+    # labeled family so the gateway can attribute this baseline to the exact
+    # round; the labeled series is evicted on the same cutoff as the other
+    # per-round families. Best-effort — never blocks scoring.
+    set_baseline_loss(round_obj.round_id, baseline_loss)
 
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = completed_out if completed_out is not None else []
