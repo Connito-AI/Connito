@@ -156,6 +156,78 @@ def test_commit_map_from_checkpoints_skips_incomplete():
 
 
 # ---------------------------------------------------------------------------
+# Journal v3: roster_size / lifecycle_step for round-gauge recovery
+# ---------------------------------------------------------------------------
+
+def test_journal_v3_roundtrips_roster_and_step(tmp_path):
+    j = RJ.RoundJournal(
+        round_id=555,
+        scored_uids=(1, 2, 3),
+        failed_uids=(4,),
+        roster_size=165,
+        lifecycle_step=3,
+        finalized=True,
+    )
+    p = tmp_path / "round_555.json"
+    RJ.write_atomic(p, j)
+    loaded = RJ.load(p)
+    assert loaded is not None
+    assert loaded.schema_version == 3
+    assert loaded.roster_size == 165
+    assert loaded.lifecycle_step == 3
+
+
+def test_journal_v2_loads_with_zero_roster(tmp_path):
+    # A v2 file (no roster_size/lifecycle_step) must still load, defaulting
+    # both to 0 so recovery degrades gracefully rather than crashing.
+    v2 = {
+        "round_id": 42, "schema_version": 2,
+        "scored_uids": [1, 2], "failed_uids": [3],
+        "uid_to_commit": {}, "finalized": False,
+    }
+    p = tmp_path / "round_42.json"
+    p.write_text(json.dumps(v2), encoding="utf-8")
+    loaded = RJ.load(p)
+    assert loaded is not None
+    assert loaded.roster_size == 0
+    assert loaded.lifecycle_step == 0
+
+
+def test_recovery_round_carries_v3_fields(tmp_path):
+    j = RJ.RoundJournal(round_id=777, roster_size=100, lifecycle_step=2)
+    stub = RJ._RecoveryRound.from_journal(j, tmp_path / "round_777.json")
+    assert stub.roster_size == 100
+    assert stub.lifecycle_step == 2
+
+
+def test_finalize_preserves_roster_in_journal_rewrite(tmp_path):
+    # finalize re-writes the journal with finalized=True; the v3 fields must
+    # survive that round-trip (they feed the round-gauge restore next boot).
+    rid = 8_888
+    jpath = tmp_path / f"round_{rid}.json"
+    RJ.write_atomic(
+        jpath,
+        RJ.RoundJournal(
+            round_id=rid,
+            uid_to_hotkey={9201: "hk", 9202: "hk2"},
+            scores={9201: 2.5},
+            scored_uids=(9201,),
+            failed_uids=(9202,),
+            roster_size=165,
+            lifecycle_step=3,
+        ),
+    )
+    stub = RJ._RecoveryRound.from_journal(RJ.load(jpath), jpath)
+    finalize_round_scores(
+        round_obj=stub, score_aggregator=_FakeAggregator(), score_path=None,
+    )
+    reloaded = RJ.load(jpath)
+    assert reloaded.finalized is True
+    assert reloaded.roster_size == 165
+    assert reloaded.lifecycle_step == 3
+
+
+# ---------------------------------------------------------------------------
 # finalize_round_scores emission (live-shaped round + recovery path)
 # ---------------------------------------------------------------------------
 
