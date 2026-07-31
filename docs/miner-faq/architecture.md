@@ -73,25 +73,31 @@ Code: `connito/validator/run.py` (the single-loop main function),
 
 ## Expert-group sharding
 
-The base model (DeepSeek-V2-Lite) has 8 experts per MoE layer. Connito
-partitions those experts into **2 worker groups** (`exp_math` and `exp_dummy`
-in the current configuration; `group_id = 0` and `group_id = 1`). A miner
-trains exactly one group's experts and uploads only that group's shard.
+The base model (DeepSeek-V2-Lite) has 64 routed experts per MoE layer, indexed
+0–63, on MoE layers 1–26 (layer 0 is dense). Connito assigns a subset of those
+experts to each **worker group**. A miner trains exactly one group's experts and
+uploads only that group's shard. The active group is **`exp_nemotron_c4`**
+(`group_id = 4`); other directories under `expert_groups/` are inactive or serve
+as frozen helpers.
 
-Group assignment is **declared by the miner in its config**, not chosen by
-chain: `config.task.expert_group_name` picks the directory under
-`expert_groups/`, and that directory's `config.yaml` defines the `group_id` and
-the per-group dataset. There is no chain-level placement — the miner is free
-to switch groups by changing its config (though doing so resets its score
-history; see `scoring.md`).
+The active group is **not** a free choice. `config.task.expert_group_name` is a
+locked field: loading a config with `auto_update_config` resets any other value
+back to the built-in default and rewrites it to your YAML, logging a one-time
+reset warning. Setting it to something else does not switch groups — it is
+overwritten on the next load. This is deliberate, because validators only
+evaluate miners whose group matches their own.
 
 The validator filters all chain commits by `expert_group == config.task.exp.group_id`
-when building its roster, so a validator running `exp_math` only evaluates
-miners that also committed to `exp_math`.
+when building its roster, so a validator on `exp_nemotron_c4` (`group_id = 4`)
+only evaluates miners that also committed under `group_id = 4`. A miner still
+committing under a previous group is invisible to the fleet and scores nothing —
+so group changes are coordinated subnet-wide, announced in advance, and take
+effect when you upgrade to the release that carries them.
 
 Code: `connito/shared/expert_manager.py:ExpertManager.load_expert_group_assignment`,
-`connito/shared/config.py:TaskCfg`,
-`connito/shared/cycle.py:get_miners_from_commit`.
+`connito/shared/config.py:TaskCfg` (`_LOCKED_FIELDS`),
+`connito/shared/cycle.py:get_miners_from_commit`,
+`expert_groups/exp_nemotron_c4/expert_assignment.json`.
 
 ## Foundation / global checkpoint flow
 
@@ -125,18 +131,35 @@ miner's HF shard.
 Validators evaluate miners against two HuggingFace streaming datasets, mixed
 50/50:
 
-- `allenai/c4` (split `en`)
-- `nvidia/Nemotron-CC-Math-v1` (split `4plus`)
+- `allenai/c4` (config `en`)
+- `nvidia/Nemotron-CC-Math-v1` (config `4plus`)
 
-Both use a per-source shuffle buffer of **50 000 rows** and a random skip up
-to **50 000 rows** to prevent the eval set from being memorized. All
-validators in a cycle use the same `combined_seed` derived from chain state
-plus the block hash of the last MinerCommit2 block, so scores are reproducible
-across validators but unpredictable to miners during their commit window.
+**`nvidia/Nemotron-CC-Math-v1` is a gated dataset.** Your `HF_TOKEN` must
+belong to a HuggingFace account that has accepted the license on that dataset's
+page. Dataset metadata is readable without it, so the failure does not appear at
+startup — file reads fail later with a `GatedRepoError` (HTTP 403) when the
+dataloader is built. If your miner cannot stream training data, check this
+first. Both datasets are pinned to a specific commit SHA via
+`eval_source_revision_pin` so every validator reads identical rows.
+
+The eval slice is chosen by **seeded shard-pick**: the round's seed selects
+which shard to open and a hash-derived offset into that shard, so across
+rotating seeds every shard and every row is eventually reachable and no fixed
+window can be memorized. Rows shorter than 200 characters are dropped and rows
+repeating an already-seen 200-character prefix are skipped, so duplicated
+boilerplate cannot inflate a score. Documents longer than the 1024-token
+sequence length contribute a content-hash-derived window rather than always
+their opening tokens.
+
+All validators in a cycle use the same `combined_seed`, derived from the block
+hash of the last MinerCommit2 block, so scores are reproducible across
+validators but unpredictable to miners during their commit window.
 
 Code: `connito/shared/cycle.py:get_combined_validator_seed`,
 `connito/shared/dataloader.py:get_dataloader`,
-`expert_groups/exp_math/config.yaml` (dataset definition).
+`connito/shared/eval_shard_pick.py:pick_shard_for_source`,
+`connito/shared/dataloader.py:tokenize_windowed`,
+`expert_groups/exp_nemotron_c4/config.yaml` (dataset definition).
 
 ## What miners can and cannot influence
 

@@ -1,5 +1,13 @@
 # Migration plan: `exp_math` → `exp_legal` (MultiLegalPile)
 
+> **Historical record — this migration has since been reverted.** The subnet
+> now runs `exp_nemotron_c4` (`group_id 4`, Nemotron-CC-Math + C4). This
+> document is kept because its mechanics still apply verbatim to *any* expert
+> group change: the locked-field activation path, the group-scoped checkpoint
+> directory, and above all the flag-day risk in
+> "Operational notes for the launch period" — a validator on a new group sees
+> only miners that have already migrated, so the fleet must move together.
+
 Plan for adding a new expert group that trains on
 [joelniklaus/Multi_Legal_Pile](https://huggingface.co/datasets/joelniklaus/Multi_Legal_Pile),
 running alongside the existing math expert group during a transition period.

@@ -1,4 +1,16 @@
-# exp_legal — legal expert group
+# exp_legal — legal expert group (INACTIVE)
+
+> **Status: inactive.** The subnet moved back to the Nemotron-CC-Math + C4 mix
+> under `exp_nemotron_c4` (`group_id 4`), which is the current locked value of
+> `TaskCfg.expert_group_name`. This group is retained for reference — its
+> config, expert assignment, and the `Multi_Legal_Pile` policy in
+> `connito/shared/eval_shard_pick.py:_KNOWN_SOURCES` (29-shard verified
+> row-count table) all remain valid if legal data is revisited.
+>
+> Two details below are stale and kept only as historical record: this README
+> predates the switch of `eval_source_seeded_shard_pick` to `true` and the
+> regeneration of the expert assignment via `--min-share 0.035` (179 experts,
+> variable per layer — not the "8 experts per layer" described here).
 
 Expert group that trains on
 [joelniklaus/Multi_Legal_Pile](https://huggingface.co/datasets/joelniklaus/Multi_Legal_Pile)

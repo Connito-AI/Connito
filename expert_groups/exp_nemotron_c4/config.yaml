@@ -1,0 +1,61 @@
+# group_id 4: 0=exp_math, 1=exp_dummy, 2=exp_c4_p02 (the standing frozen helper
+# slot loaded alongside every active task via TaskCfg.helper_group_id),
+# 3=exp_legal. This group carries the same Nemotron+C4 mix exp_math has always
+# used, but as a fresh slot so the switch away from exp_legal is a clean cutover
+# rather than a reuse of group 0's history.
+group_id: 4
+data:
+  dataset_sources:
+    - path: "allenai/c4"
+      name: "en"
+      weight: 0.5
+      text_column: "text"
+    - path: "nvidia/Nemotron-CC-Math-v1"
+      name: "4plus"
+      weight: 0.5
+      text_column: "text"
+      # GATED DATASET. Every validator's HF_TOKEN must belong to an account
+      # that has accepted the license at
+      # https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1 — metadata
+      # is readable without it, but FILE reads 403 with GatedRepoError, so a
+      # validator without access fails at dataloader build, not at startup.
+      # No `trust_remote_code` — neither source ships a loading script. It was
+      # only ever needed for Multi_Legal_Pile (see DatasetSourceCfg).
+  per_device_train_batch_size: 1
+  batch_size: 4
+  # 1024 matches the fleet paradigm and the VRAM envelope miners/validators are
+  # sized for under natural routing (locked DataCfg default; exp_math was moved
+  # 4096 -> 1024 by the 2Fnat PR).
+  sequence_length: 1024
+  world_size: 10 # TODO: approximately how many miners are out there
+  rank: 1 # TODO: based on your uid
+
+  # NOTE: `dataset_class` is deliberately NOT set. Leaving it unset resolves to
+  # `DefaultStreamingTorchDataset`, whose `tokenize_and_format` delegates to
+  # `connito.shared.dataloader.tokenize_windowed` — long documents contribute a
+  # content-hash-derived window instead of always their (most templated) prefix.
+  # `expert_groups/exp_math/dataset.py` still prefix-truncates, so pointing at it
+  # would silently drop that anti-memorization fix.
+
+  # Whole-shard eval reach: seed picks the shard AND the in-shard offset, so
+  # across rotating seeds every shard and every row is eventually reachable.
+  # Inherits the DataCfg default (True); stated explicitly because it is part of
+  # the anti-memorization contract rather than an incidental default.
+  eval_source_seeded_shard_pick: true
+
+  # The global eval gates (`eval_min_text_chars: 200`,
+  # `eval_dedup_prefix_chars: 200`) are inherited unchanged. They were tuned
+  # against Multi_Legal_Pile's pathologies (38% empty rows, 75% sharing a
+  # 200-char prefix), so they were re-measured against this mix before reuse
+  # (600-row sample per source, 2026-07-31):
+  #   c4/en:            0% empty,  5.5% below 200 chars, 0% prefix-duplicate
+  #   Nemotron/4plus:   0% empty,  0.0% below 200 chars, 0% prefix-duplicate
+  # i.e. effectively inert here — no per-group override needed.
+
+  # Pin both sources to a commit SHA. `_KNOWN_SOURCES` declares `revision="main"`
+  # for these two, and `main` is a moving target: an HF re-upload mid-rollout
+  # would make two validators pick different rows for the same seed and break
+  # weight consensus for that round. Resolved 2026-07-31; bump deliberately.
+  eval_source_revision_pin:
+    "allenai/c4": "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
+    "nvidia/Nemotron-CC-Math-v1": "397a2502f2028c659ba411a6c4935b464a7f03aa"

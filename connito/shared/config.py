@@ -508,16 +508,23 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
-    # `expert_group_name` is locked so operators can't drift back to
-    # `exp_math` after the subnet-wide switch to the legal expert group —
+    # `expert_group_name` is locked so the whole fleet evaluates the same task:
     # `auto_update_config` resets any non-default value on load and logs a
-    # one-time reset warning (see docs/exp-legal-migration-plan.md for the
-    # activation checklist). `helper_group_id` and `routing_mode` stay
-    # locked for the natural-routing (2Fnat) consensus contract.
+    # one-time reset warning. Validators only score miners whose chain commit
+    # carries a matching `expert_group`, so a drifting operator would simply
+    # stop seeing (and stop being seen by) everyone else.
+    #
+    # Currently `exp_nemotron_c4` (group 4): Nemotron-CC-Math + C4. This
+    # replaces the `exp_legal` switch made in #186 — see
+    # docs/exp-legal-migration-plan.md for that history and the flag-day
+    # mechanics, which apply identically in this direction.
+    #
+    # `helper_group_id` and `routing_mode` stay locked for the natural-routing
+    # (2Fnat) consensus contract and are independent of the dataset.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "expert_group_name", "helper_group_id", "routing_mode",
     })
-    expert_group_name: str = "exp_legal"
+    expert_group_name: str = "exp_nemotron_c4"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
