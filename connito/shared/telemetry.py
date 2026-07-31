@@ -552,6 +552,36 @@ def note_round_series(round_id: int) -> None:
         pass
 
 
+def set_round_progress(
+    round_id: int, *, scored: int, failed: int, pending: int
+) -> None:
+    """Publish a round's evaluation-progress counters.
+
+    Shared by every path that advances a round: the freeze-time initial
+    publish, foreground eval (during Submission), and the background eval
+    worker (after Merge). This previously lived as a private static method
+    on `BackgroundEvalWorker`, so the counters only started moving once the
+    background eval window opened at Merge — foreground evals accumulated
+    in `scored_uids` with nothing publishing them, and the dashboard's
+    "Evaluated N of M" panel sat on the *previous* round's final value for
+    the first ~14 minutes of every round, then jumped straight to the
+    foreground total.
+
+    Registers the round_id via `note_round_series` so these labelsets are
+    evicted on the normal cutoff.
+
+    Best-effort — never raises. Telemetry must not influence scoring.
+    """
+    try:
+        note_round_series(int(round_id))
+        rid = str(int(round_id))
+        VALIDATOR_ROUND_MINERS_SCORED.labels(round_id=rid).set(float(scored))
+        VALIDATOR_ROUND_MINERS_FAILED.labels(round_id=rid).set(float(failed))
+        VALIDATOR_ROUND_MINERS_PENDING.labels(round_id=rid).set(float(pending))
+    except Exception:
+        pass
+
+
 def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
     """Publish a round's foreground-eval baseline loss to BOTH the unlabeled
     gauge (backward compat) and the per-round labeled family.

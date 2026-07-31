@@ -1127,6 +1127,7 @@ async def evaluate_foreground_round(
                 inc_error(component="foreground_eval", kind="validation")
                 _record_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
                 round_obj.mark_validation_failed(uid)
+                round_obj.publish_progress()
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
@@ -1167,6 +1168,7 @@ async def evaluate_foreground_round(
                 )
                 _record_eval_failure(int(uid), "timeout")
                 round_obj.mark_failed(uid)
+                round_obj.publish_progress()
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
@@ -1176,6 +1178,7 @@ async def evaluate_foreground_round(
                 logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
                 _record_eval_failure(int(uid), "unknown")
                 round_obj.mark_failed(uid)
+                round_obj.publish_progress()
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
@@ -1184,12 +1187,14 @@ async def evaluate_foreground_round(
 
             if evaluated is None:
                 round_obj.mark_failed(uid)
+                round_obj.publish_progress()
                 _prune_non_top_after_eval(
                     config=config,
                     round_obj=round_obj,
                 )
                 continue
             round_obj.mark_scored(uid, evaluated.score)
+            round_obj.publish_progress()
             completed.append(evaluated)
             _prune_non_top_after_eval(
                 config=config,
