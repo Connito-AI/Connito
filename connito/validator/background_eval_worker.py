@@ -518,7 +518,7 @@ class BackgroundEvalWorker(threading.Thread):
             self._prune_non_top(round_obj)
             return
 
-        round_obj.mark_scored(uid, evaluated.score)
+        round_obj.mark_scored(uid, evaluated.score, val_loss=evaluated.val_loss)
         logger.info(
             "bg-eval: success",
             round_id=round_obj.round_id,
