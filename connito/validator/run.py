@@ -201,6 +201,64 @@ logger = structlog.get_logger(__name__)
 from connito.shared.memory import cleanup, release_cpu_ram
 
 
+# Default base port for the Prometheus exporter. Overridable per host via
+# the `CONNITO_TELEMETRY_PORT` env var — see `resolve_telemetry_port`.
+DEFAULT_TELEMETRY_BASE_PORT = 8200
+
+
+def resolve_telemetry_port(rank: int, env: dict[str, str] | None = None) -> int:
+    """Resolve the port for the Prometheus exporter.
+
+    `CONNITO_TELEMETRY_PORT` is a **base** port, not an absolute one: the
+    effective port is `base + rank`. That preserves the semantics of the
+    8200 default it replaces, and keeps a multi-rank deployment on one host
+    collision-free — an absolute override would point every rank at the same
+    port and all but one would fail to bind, which is exactly the bug this
+    override exists to fix. For the validator `rank` is always 0, so
+    `CONNITO_TELEMETRY_PORT=8201` yields 8201.
+
+    Operators need this when the default 8200 is already taken on the host:
+    before this was wired up the env var existed in the image but was never
+    read, so the exporter kept trying 8200, failed with "Address already in
+    use", and the validator ran on with no telemetry at all.
+
+    Invalid input falls back to the default with a warning rather than
+    raising — a typo in an operator's `.env` must not take a validator off
+    chain over a telemetry setting.
+    """
+    env = os.environ if env is None else env
+    raw = str(env.get("CONNITO_TELEMETRY_PORT", "") or "").strip()
+    base = DEFAULT_TELEMETRY_BASE_PORT
+    if raw:
+        try:
+            parsed = int(raw)
+            if not (1 <= parsed <= 65535):
+                raise ValueError(f"port out of range: {parsed}")
+            base = parsed
+        except ValueError as e:
+            logger.warning(
+                "Invalid CONNITO_TELEMETRY_PORT — falling back to default base port",
+                value=raw,
+                default_base=DEFAULT_TELEMETRY_BASE_PORT,
+                error=str(e),
+            )
+    port = base + int(rank)
+    if not (1 <= port <= 65535):
+        logger.warning(
+            "Resolved telemetry port out of range — falling back to default",
+            base=base, rank=rank, resolved=port,
+            default_base=DEFAULT_TELEMETRY_BASE_PORT,
+        )
+        base = DEFAULT_TELEMETRY_BASE_PORT
+        port = base + int(rank)
+    if base != DEFAULT_TELEMETRY_BASE_PORT:
+        logger.info(
+            "Telemetry port overridden via CONNITO_TELEMETRY_PORT",
+            base=base, rank=rank, port=port,
+        )
+    return port
+
+
 @track_metagraph_sync_latency()
 def _sync_lite_metagraph(subtensor, netuid: int):
     """Validator-side metagraph fetch via lite_subtensor.
@@ -700,8 +758,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         None
     """
     # Start the integrated Prometheus telemetry server
-    # Port 8200+rank to avoid conflicts with other services on this host
-    telemetry_port = 8200 + rank
+    telemetry_port = resolve_telemetry_port(rank)
     TelemetryManager().start_server(port=telemetry_port)
     
     if rank == 0:
