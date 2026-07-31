@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.telemetry import set_round_progress
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
@@ -822,6 +823,28 @@ class Round:
                 "claimed": len(self.claimed_uids),
                 "pending": roster_size - len(self.scored_uids) - len(self.failed_uids),
             }
+
+    def publish_progress(self) -> None:
+        """Publish this round's progress counters (scored / failed / pending)
+        to Prometheus.
+
+        Called from every path that advances the round — once at freeze, after
+        each foreground evaluation, and after each background evaluation — so
+        the counters move as soon as evaluation starts rather than only once
+        the background eval window opens at Merge.
+
+        `stats()` takes `self._lock`, so callers must NOT hold it. Every call
+        site is outside the lock (the `mark_*` helpers release it before
+        returning). Best-effort: `set_round_progress` swallows telemetry
+        errors so this can never affect scoring.
+        """
+        stats = self.stats()
+        set_round_progress(
+            self.round_id,
+            scored=stats["scored"],
+            failed=stats["failed"],
+            pending=stats["pending"],
+        )
 
 
 @dataclass

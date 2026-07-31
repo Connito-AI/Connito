@@ -28,9 +28,6 @@ from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
-    VALIDATOR_ROUND_MINERS_FAILED,
-    VALIDATOR_ROUND_MINERS_PENDING,
-    VALIDATOR_ROUND_MINERS_SCORED,
     note_round_series,
 )
 from connito.validator.evaluator import (
@@ -435,7 +432,7 @@ class BackgroundEvalWorker(threading.Thread):
             # so finalize writes score=0 for it. Operational failures
             # below use plain `mark_failed` and leave the EMA alone.
             round_obj.mark_validation_failed(uid)
-            self._record_metrics(round_obj, scored_inc=False)
+            round_obj.publish_progress()
             self._prune_non_top(round_obj)
             return
 
@@ -517,7 +514,7 @@ class BackgroundEvalWorker(threading.Thread):
 
         if evaluated is None:
             round_obj.mark_failed(uid)
-            self._record_metrics(round_obj, scored_inc=False)
+            round_obj.publish_progress()
             self._prune_non_top(round_obj)
             return
 
@@ -528,7 +525,7 @@ class BackgroundEvalWorker(threading.Thread):
             uid=uid, hotkey=hotkey[:6],
             score=round(evaluated.score, 6),
         )
-        self._record_metrics(round_obj, scored_inc=True)
+        round_obj.publish_progress()
         self._prune_non_top(round_obj)
 
     def _stuck_lock_check_and_maybe_recycle(self) -> bool:
@@ -624,13 +621,3 @@ class BackgroundEvalWorker(threading.Thread):
                 files=deleted,
             )
 
-    @staticmethod
-    def _record_metrics(round_obj, *, scored_inc: bool) -> None:
-        try:
-            stats = round_obj.stats()
-            note_round_series(round_obj.round_id)
-            VALIDATOR_ROUND_MINERS_SCORED.labels(round_id=str(round_obj.round_id)).set(stats["scored"])
-            VALIDATOR_ROUND_MINERS_FAILED.labels(round_id=str(round_obj.round_id)).set(stats["failed"])
-            VALIDATOR_ROUND_MINERS_PENDING.labels(round_id=str(round_obj.round_id)).set(stats["pending"])
-        except Exception:
-            pass

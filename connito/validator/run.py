@@ -1417,6 +1417,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             try:
                 note_round_series(new_round.round_id)
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
+                # Seed the progress counters at freeze so the round exists in
+                # the metric from the moment it is frozen (scored=0, failed=0,
+                # pending=roster) instead of appearing only once the first
+                # evaluation lands. Consumers that switch on "newest round with
+                # a non-zero scored value" are unaffected by the zero.
+                new_round.publish_progress()
             except Exception:
                 pass
 
