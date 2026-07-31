@@ -927,6 +927,48 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 journals_finalized=_recovered,
                 journals_seen=len(_journals),
             )
+
+        # Re-emit the most recent finalized round's telemetry.
+        #
+        # Runs unconditionally, and this is the point: the replay loop above
+        # only touches *unfinalized* journals, and replaying one marks it
+        # finalized. So a second restart finds nothing to replay and used to
+        # emit nothing at all — leaving the dashboard blank for the whole
+        # last completed cycle until the next round's evaluations arrived
+        # (observed 2026-07-31: two Watchtower restarts 25 min apart, every
+        # per-miner family at zero series for 17 minutes).
+        #
+        # This is a METRICS-ONLY pass — it never re-runs finalize. Re-running
+        # finalize would keep the aggregator's point set correct (drop_round
+        # runs first) but would re-stamp those points with fresh timestamps,
+        # reshuffling the "last N by timestamp" rolling average that drives
+        # weight submission. See `republish_telemetry_from_journal`.
+        #
+        # Journals are scanned ascending, so the last finalized one is the
+        # most recent round — which is also the one just replayed on a first
+        # restart, making the re-emit a harmless idempotent gauge write.
+        try:
+            _newest_finalized = None
+            for _journal_file in reversed(_journals):
+                _j = _rj_recover.load(_journal_file)
+                if _j is not None and _j.finalized:
+                    _newest_finalized = _j
+                    break
+            if _newest_finalized is not None:
+                _republished = _rj_recover.republish_telemetry_from_journal(
+                    _newest_finalized, score_aggregator=score_aggregator,
+                )
+                logger.info(
+                    "Startup recovery: republished telemetry for last finalized round",
+                    round_id=_newest_finalized.round_id,
+                    uids=_republished,
+                    schema_version=_newest_finalized.schema_version,
+                    val_losses=len(_newest_finalized.uid_to_val_loss),
+                )
+        except Exception as e:
+            logger.warning(
+                "Startup recovery: telemetry republish failed", error=str(e),
+            )
     except Exception as e:
         logger.warning(
             "Startup recovery: scan failed", error=str(e),
@@ -1473,6 +1515,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             download_window_closed.clear()
             try:
                 note_round_series(new_round.round_id)
+                new_round.lifecycle_step = 0
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
                 # Seed the progress counters at freeze so the round exists in
                 # the metric from the moment it is frozen (scored=0, failed=0,
@@ -1559,6 +1602,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 eval_worker.set_eval_base_model(copy.deepcopy(global_model))
             try:
                 note_round_series(new_round.round_id)
+                new_round.lifecycle_step = 2
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
             except Exception:
                 pass
@@ -1791,6 +1835,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
+                new_round.lifecycle_step = 3
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
             except Exception:
                 pass

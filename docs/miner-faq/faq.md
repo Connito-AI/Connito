@@ -58,25 +58,28 @@ Code: `connito/validator/evaluator.py:finalize_round_scores`,
 
 ## Which expert group am I in, and how is that assigned?
 
-You declare your expert group in your local config:
+Your expert group is set in your local config, but the value is **locked**:
 
 ```yaml
 task:
-  expert_group_name: exp_math   # directory under expert_groups/
+  expert_group_name: exp_nemotron_c4   # locked — resets if you change it
 ```
 
-The directory's `config.yaml` defines `group_id`. The validator filters its
-miner roster by `expert_group == config.task.exp.group_id` from each
-`MinerChainCommit`, so the chain commit you write in MinerCommit2 must
-agree with the directory you trained under.
+The directory's `config.yaml` defines `group_id` (currently `4`). The validator
+filters its miner roster by `expert_group == config.task.exp.group_id` from each
+`MinerChainCommit`, so the chain commit you write in MinerCommit2 must agree
+with the directory you trained under.
 
-There is **no chain-level placement** — miners self-select. You can switch
-groups by changing the config, but only validators running that group will
-score you.
+There is **no chain-level placement and no self-selection**. Loading a config
+with `auto_update_config` resets `expert_group_name` to the built-in default and
+rewrites your YAML, so editing it does not move you to another group. The entire
+subnet runs one group at a time; a miner committing under any other group is
+invisible to validators and earns nothing. Group changes are announced in
+advance and take effect when you upgrade to the release that carries them.
 
-Code: `connito/shared/config.py:TaskCfg`,
+Code: `connito/shared/config.py:TaskCfg` (`_LOCKED_FIELDS`),
 `connito/shared/cycle.py:get_miners_from_commit`,
-`expert_groups/exp_math/config.yaml`.
+`expert_groups/exp_nemotron_c4/config.yaml`.
 
 ## How do I commit a checkpoint correctly?
 
@@ -244,16 +247,18 @@ are trainable. Total memory is much smaller than a full DeepSeek-V2-Lite
 fine-tune.
 
 A 24 GB consumer GPU (3090 / 4090) is a reasonable minimum at the default
-config (`fp16-mixed`, `batch_size=4`, `sequence_length=4096`,
+config (`fp16-mixed`, `batch_size=4`, `sequence_length=1024`,
 `gradient_accumulation_steps=4`). Validators run on 40 GB GPUs because
 they have to load the full model for evaluation plus host the eval
 dataloader's buffers.
 
 If you're getting OOM during Train, reduce `task.exp.data.batch_size`
-in the expert-group config; don't reduce `sequence_length` (the
-validator's eval is at 4096 and you'll lose comparability).
+in the expert-group config; don't reduce `sequence_length` (it is a
+locked field and the validator's eval runs at 1024, so a different value
+loses comparability).
 
-Code: `connito/shared/config.py:ParallelismCfg`, `expert_groups/exp_math/config.yaml`.
+Code: `connito/shared/config.py:ParallelismCfg`,
+`expert_groups/exp_nemotron_c4/config.yaml`.
 
 ## Should I upload `.safetensors` or `.pt`?
 

@@ -28,22 +28,28 @@ Code: `connito/shared/config.py:ChainCfg`.
 
 ```yaml
 task:
-  expert_group_name: exp_math    # or exp_dummy — must match a dir under expert_groups/
+  expert_group_name: exp_nemotron_c4   # locked — see below
   # exp.group_id is loaded from expert_groups/<expert_group_name>/config.yaml
 ```
 
 - The directory under `expert_groups/` defines the `group_id`, the dataset,
-  and the routing assignment.
-- **Choose a group where at least one validator is running.** A miner
-  committing to a group no validator covers will never be evaluated and
-  will never earn rewards. The current production groups are
-  `exp_math` (`group_id = 0`) and `exp_dummy` (`group_id = 1`).
-- Switching expert groups **does not** reset your aggregator history if the
-  hotkey stays the same — but the validator only evaluates miners whose
-  chain-committed `expert_group` matches its own active group, so a config
-  switch only takes effect after MinerCommit2 in the cycle of the change.
+  and the routing assignment. The active group is `exp_nemotron_c4`
+  (`group_id = 4`).
+- **This field is locked, not a choice.** Loading a config with
+  `auto_update_config` resets any other value back to the built-in default,
+  rewrites your YAML, and logs a one-time reset warning. Editing it does not
+  switch groups. The whole subnet runs one group at a time so that validators
+  and miners always match.
+- **A miner committing under a different group is never evaluated.** The
+  validator filters its roster by `expert_group == config.task.exp.group_id`,
+  so a stale group means no evaluation and no rewards — not a partial score.
+  When the subnet changes groups, it is announced in advance and takes effect
+  when you upgrade to the release carrying the new default.
+- Changing groups **does not** reset your aggregator history if the hotkey
+  stays the same, but your accumulated scores age out of the rolling window
+  within a few rounds because the loss scale on a new dataset differs.
 
-Code: `connito/shared/config.py:TaskCfg`,
+Code: `connito/shared/config.py:TaskCfg` (`_LOCKED_FIELDS`),
 `connito/shared/expert_manager.py:ExpertManager.load_expert_group_assignment`,
 `connito/shared/cycle.py:get_miners_from_commit`.
 

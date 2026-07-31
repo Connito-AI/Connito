@@ -347,6 +347,19 @@ def finalize_round_scores(
                     uid_to_commit=_rj.commit_map_from_checkpoints(
                         getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
                     ),
+                    # v3 round-level gauge inputs. A live Round exposes
+                    # foreground/background uids; the recovery stub carries
+                    # `roster_size` forward from the journal it was hydrated
+                    # from — so a re-finalize preserves them.
+                    roster_size=int(
+                        getattr(round_obj, "roster_size", 0)
+                        or (
+                            len(getattr(round_obj, "foreground_uids", ()))
+                            + len(getattr(round_obj, "background_uids", ()))
+                        )
+                    ),
+                    lifecycle_step=int(getattr(round_obj, "lifecycle_step", 0)),
+                    uid_to_val_loss=dict(getattr(round_obj, "val_losses", None) or {}),
                     finalized=True,
                 ),
             )
@@ -628,6 +641,14 @@ class MinerEvalJob:
     model_path: str
     step: int
     score: float = 0.0
+    # Raw evaluation loss for this miner this round. Carried alongside the
+    # delta-based `score` so the caller can journal it: `val_loss` is
+    # published to Prometheus at eval time and is NOT recoverable from
+    # `score` alone, because `delta = max(0.0, baseline - val_loss)` clamps
+    # at zero — every miner scoring 0 (the majority in many rounds) would
+    # be underivable. Without journaling it, a mid-round restart loses the
+    # cycle's losses permanently.
+    val_loss: float | None = None
 
 
 # -------------------------- Pipeline Config -----------------------------------
@@ -876,6 +897,7 @@ def evaluate_one_miner_sync(
             model_path=str(model_path),
             step=int(step),
             score=float(score),
+            val_loss=float(val_loss),
         )
     except EvalDeadlineExceeded as e:
         logger.warning(
@@ -1193,7 +1215,7 @@ async def evaluate_foreground_round(
                     round_obj=round_obj,
                 )
                 continue
-            round_obj.mark_scored(uid, evaluated.score)
+            round_obj.mark_scored(uid, evaluated.score, val_loss=evaluated.val_loss)
             round_obj.publish_progress()
             completed.append(evaluated)
             _prune_non_top_after_eval(

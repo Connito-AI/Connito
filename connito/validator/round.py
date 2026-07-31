@@ -77,6 +77,11 @@ class Round:
     # rounds and would let history pull a non-top-this-round miner into
     # the keep set).
     scores: dict[int, float] = field(default_factory=dict)
+    # Per-uid raw evaluation loss, recorded by `mark_scored` alongside the
+    # score. Journaled so a mid-round restart doesn't lose the cycle's
+    # losses — `validator_miner_val_loss` is emitted at eval time and is
+    # not derivable from `scores` (the delta clamps at 0).
+    val_losses: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
     # UIDs the miner is at fault for: explicit validation failures
@@ -96,6 +101,11 @@ class Round:
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
+    # Last live lifecycle step this round reached (set by run.py alongside
+    # the VALIDATOR_ROUND_LIFECYCLE_STEP gauge: 0 freeze / 2 post-foreground
+    # / 3 eval-window). Persisted to the journal so startup recovery can
+    # restore the round-level gauges that only the live loop writes.
+    lifecycle_step: int = 0
 
     # Round-group construction scheme (gated by
     # `config.evaluation.enable_round_group_construction`). All default
@@ -588,6 +598,9 @@ class Round:
             "freeze_zero_uids": tuple(sorted(self.freeze_zero_uids)),
             "freeze_zero_hotkeys": dict(self.freeze_zero_hotkeys),
             "uid_to_commit": commit_map_from_checkpoints(self.uid_to_chain_checkpoint),
+            "uid_to_val_loss": dict(self.val_losses),
+            "roster_size": len(self.foreground_uids) + len(self.background_uids),
+            "lifecycle_step": int(self.lifecycle_step),
             "finalized": False,
         }
 
@@ -640,11 +653,19 @@ class Round:
                 error=str(e), uid=uid, round_id=self.round_id,
             )
 
-    def mark_scored(self, uid: int, score: float = 0.0) -> None:
+    def mark_scored(
+        self, uid: int, score: float = 0.0, val_loss: float | None = None
+    ) -> None:
         """Record a successful evaluation. `score` is this-round's score
         (e.g. ``delta ** 1.2`` from `evaluate_one_miner`); it is stored
         in `self.scores` so per-round ranking — used by post-eval
         submission cleanup — never has to consult the global aggregator.
+
+        `val_loss` is the raw evaluation loss. It is recorded purely so the
+        journal can carry it: `validator_miner_val_loss` is published at
+        eval time and cannot be reconstructed from `score`, because
+        ``delta = max(0.0, baseline - val_loss)`` clamps at zero. Optional
+        so existing callers and test fixtures keep working.
 
         Also writes to the per-round journal and (if configured) the
         score aggregator with the raw delta tagged with this round_id,
@@ -656,6 +677,8 @@ class Round:
         with self._lock:
             self.scored_uids.add(uid)
             self.scores[uid] = score_f
+            if val_loss is not None:
+                self.val_losses[uid] = float(val_loss)
             self.claimed_uids.discard(uid)
             hotkey = self.uid_to_hotkey.get(uid)
         self._persist_journal()
