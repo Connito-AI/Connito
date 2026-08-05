@@ -1590,6 +1590,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     end_block=phase_response.phase_end_block,
                     completed_count=len(miner_jobs),
                 )
+            except Exception:
+                # Foreground eval is best-effort: bg-eval covers the same
+                # roster and finalize does not require a foreground pass.
+                # Before this catch, any non-timeout exception here (e.g.
+                # an HF Hub ConnectionError leaking from the baseline
+                # dataloader build, 2026-07-10 round 8590274) escaped to
+                # run()'s top-level handler and KILLED the validator —
+                # losing the whole round instead of one foreground pass.
+                # evaluate_foreground_round now retries/degrades its own
+                # HF path; this is the safety net for anything else.
+                logger.exception(
+                    "Foreground evaluation failed — continuing round with "
+                    "partial scores (bg-eval unaffected)",
+                    round_id=new_round.round_id,
+                    completed_count=len(miner_jobs),
+                )
             finally:
                 foreground_loop.close()
 

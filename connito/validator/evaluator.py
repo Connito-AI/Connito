@@ -656,6 +656,13 @@ MAX_CONCURRENT_DOWNLOADS = 4
 EVAL_WORKERS = 1
 DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
+# Backoff delays between foreground-baseline dataloader build attempts.
+# Same policy (and rationale) as the background worker's
+# DATALOADER_BUILD_RETRY_DELAYS_SEC: total budget ~40 s absorbs transient
+# HF Hub blips without eating meaningfully into the eval window; after
+# exhaustion the foreground pass degrades (skipped for the round) instead
+# of raising — an HF flake must never be process-fatal.
+FOREGROUND_BASELINE_RETRY_DELAYS_SEC: tuple[float, ...] = (0.0, 10.0, 30.0)
 # ------------------------------------------------------------------------------
 
 # def load_model_from_path(path: str, base_model, device: torch.device) -> nn.Module:
@@ -1030,16 +1037,66 @@ async def evaluate_foreground_round(
     # e692cc7, which moved the GPU work off the event loop); wrap it in
     # `asyncio.to_thread` so this `async def evaluate_foreground_round`
     # doesn't block the event loop during the baseline pass.
-    baseline_metrics = await asyncio.to_thread(
-        _evaluate_on_fresh_loader_sync,
-        config=config,
-        tokenizer=tokenizer,
-        combinded_seed=round_obj.seed,
-        step=step,
-        model=base_model,
-        device=device,
-        max_eval_batches=EVAL_MAX_BATCHES,
-    )
+    #
+    # The baseline build streams eval shards from HF Hub, and a transient
+    # Hub blip here used to be PROCESS-FATAL: the exception propagated
+    # through run()'s foreground loop into the top-level "Quit training"
+    # handler and took the whole validator down (seen 2026-07-10, round
+    # 8590274: `requests.ConnectionError: huggingface.co Read timed out`
+    # inside `load_streaming_shard` → validator exit → round lost →
+    # fallback weights). Mirror the background worker's policy: bounded
+    # retries with backoff, then degrade — skip foreground eval for the
+    # round instead of raising. Bg-eval still covers the roster and
+    # finalize proceeds normally; a skipped foreground pass costs one
+    # round of foreground coverage, not the process.
+    baseline_metrics: dict | None = None
+    last_error: Exception | None = None
+    for attempt, delay in enumerate(FOREGROUND_BASELINE_RETRY_DELAYS_SEC):
+        if delay > 0:
+            logger.info(
+                "foreground eval: backing off before retrying baseline build",
+                attempt=attempt + 1,
+                of=len(FOREGROUND_BASELINE_RETRY_DELAYS_SEC),
+                delay_sec=delay,
+                round_id=round_obj.round_id,
+            )
+            await asyncio.sleep(delay)
+        try:
+            baseline_metrics = await asyncio.to_thread(
+                _evaluate_on_fresh_loader_sync,
+                config=config,
+                tokenizer=tokenizer,
+                combinded_seed=round_obj.seed,
+                step=step,
+                model=base_model,
+                device=device,
+                max_eval_batches=EVAL_MAX_BATCHES,
+            )
+            last_error = None
+            break
+        except asyncio.CancelledError:
+            # The outer wait_for deadline — not ours to swallow.
+            raise
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "foreground eval: baseline build/eval failed",
+                attempt=attempt + 1,
+                of=len(FOREGROUND_BASELINE_RETRY_DELAYS_SEC),
+                error=str(e),
+                round_id=round_obj.round_id,
+            )
+
+    if baseline_metrics is None:
+        logger.error(
+            "foreground eval: baseline exhausted retries — skipping "
+            "foreground eval this round (bg-eval still covers the roster)",
+            attempts=len(FOREGROUND_BASELINE_RETRY_DELAYS_SEC),
+            error=str(last_error),
+            round_id=round_obj.round_id,
+        )
+        return completed_out if completed_out is not None else []
+
     baseline_loss = float(baseline_metrics.get("val_loss", 100))
     del baseline_metrics
     gc.collect()
