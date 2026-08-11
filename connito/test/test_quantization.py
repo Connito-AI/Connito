@@ -412,3 +412,62 @@ def test_quantize_model_leaves_experts_alone_for_miners():
 
     quantize_model_(model, include_experts=True)
     assert model.experts._is_int8()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validator eval-model seam
+# ─────────────────────────────────────────────────────────────────────────────
+def _validator_config(quantization: str):
+    return types.SimpleNamespace(model=types.SimpleNamespace(quantization=quantization))
+
+
+def test_foreground_eval_model_is_global_model_when_toggle_is_off():
+    """With the toggle off the validator must build no third resident model.
+
+    A persistent foreground copy costs every fp16 validator ~8-10 GB of VRAM,
+    and off is the fleet-wide state for the whole shadow period. Returning
+    `global_model` itself also makes the refactor a no-op by construction
+    rather than by measurement.
+    """
+    from connito.validator.run import resolve_foreground_eval_model
+
+    global_model = _toy_model()
+    cache: dict = {}
+
+    resolved = resolve_foreground_eval_model(
+        config=_validator_config("off"),
+        global_model=global_model,
+        round_obj=types.SimpleNamespace(model_snapshot_cpu={}),
+        cache=cache,
+    )
+
+    assert resolved is global_model
+    assert cache == {}
+
+
+def test_foreground_eval_model_is_a_quantized_copy_when_toggle_is_on():
+    from connito.validator.run import resolve_foreground_eval_model
+
+    global_model = _toy_model()
+    round_obj = types.SimpleNamespace(model_snapshot_cpu={})
+    cache: dict = {}
+
+    resolved = resolve_foreground_eval_model(
+        config=_validator_config("int8"),
+        global_model=global_model,
+        round_obj=round_obj,
+        cache=cache,
+    )
+
+    assert resolved is not global_model
+    assert is_quantized(resolved)
+    # global_model itself must stay fp16 — merge and the outer optimizer walk
+    # named_parameters() and would silently skip int8 buffers.
+    assert not is_quantized(global_model)
+    # Persistent across rounds rather than rebuilt.
+    assert resolve_foreground_eval_model(
+        config=_validator_config("int8"),
+        global_model=global_model,
+        round_obj=round_obj,
+        cache=cache,
+    ) is resolved

@@ -115,6 +115,7 @@ from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gra
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
+from connito.shared.modeling.quantization import quantize_model_
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator import cohort_state as cohort_state_module
@@ -462,6 +463,65 @@ def setup_training(
         expert_manager,
         train_dataloader,
     )
+
+
+def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str) -> None:
+    """Apply `model.quantization` to a validator eval model, in place.
+
+    Only ever called on eval copies. `global_model` must stay fp16: merge and
+    the outer optimizer walk `named_parameters()`, and int8 weights are
+    buffers, so quantizing it would make both silently skip every converted
+    tensor — no exception, no warning, just decaying vtrust.
+    """
+    if get_nested_attr(config, "model.quantization", "off") != "int8":
+        return
+
+    model.eval()
+    model.requires_grad_(False)
+    converted = quantize_model_(model, include_experts=True)
+    logger.warning(
+        "int8 quantization ACTIVE on validator eval model — val_loss is NOT "
+        "comparable with an fp16 validator's for the same combined_seed",
+        eval_role=role,
+        converted_modules=len(converted),
+        sample=converted[:8],
+    )
+
+
+def resolve_foreground_eval_model(
+    *,
+    config: ValidatorConfig,
+    global_model: nn.Module,
+    round_obj,
+    cache: dict,
+) -> nn.Module:
+    """Pick the model foreground eval scores this round's miners against.
+
+    With quantization off this returns `global_model` itself, exactly as before
+    — deliberately, so the toggle-off path builds no extra resident model. A
+    third full copy would cost every fp16 validator ~8-10 GB of VRAM for a
+    dormant feature, and off is the fleet-wide state throughout the shadow
+    period.
+
+    With int8 on, foreground needs its own persistent quantized model, because
+    `global_model` cannot be quantized and scoring some of a round's miners in
+    int8 (background) and others in fp16 (foreground) would rank them against
+    each other across mismatched baselines.
+    """
+    if get_nested_attr(config, "model.quantization", "off") != "int8":
+        return global_model
+
+    model = cache.get("model")
+    if model is None:
+        model = copy.deepcopy(global_model)
+        quantize_eval_model_(config, model, role="foreground")
+        cache["model"] = model
+    else:
+        # Re-seed from the round snapshot. The snapshot is fp16 on CPU; the
+        # quantized modules re-quantize it on the way in via their
+        # `_load_from_state_dict`, so nothing here has to know about int8.
+        model.load_state_dict(round_obj.model_snapshot_cpu, strict=False)
+    return model
 
 
 def _release_global_model_grads(model: nn.Module) -> None:
@@ -1015,6 +1075,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             uid=validator_uid,
             version=git_version,
             netuid=int(config.chain.netuid),
+            quantization=str(get_nested_attr(config, "model.quantization", "off")),
         )
     except Exception as e:
         logger.warning("Failed to stamp connito_validator_info; continuing", error=str(e))
@@ -1120,6 +1181,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     )
     last_sync_grad_future: Future | None = None
     last_sync_grad_started_at: float | None = None
+    # Holds the persistent quantized foreground eval model. Stays empty —
+    # and no model is ever built — while model.quantization is "off".
+    foreground_eval_cache: dict = {}
 
     try:
         while True:
@@ -1550,6 +1614,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # scored is still here for the merge step.
             miner_jobs: list[MinerEvalJob] = []
 
+            foreground_base_model = resolve_foreground_eval_model(
+                config=config,
+                global_model=global_model,
+                round_obj=new_round,
+                cache=foreground_eval_cache,
+            )
+
             async def _bounded_foreground_eval():
                 return await asyncio.wait_for(
                     evaluate_foreground_round(
@@ -1558,7 +1629,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         subtensor=subtensor,
                         step=global_opt_step,
                         device=device,
-                        base_model=global_model,
+                        base_model=foreground_base_model,
                         tokenizer=tokenizer,
                         end_block=phase_response.phase_end_block,
                         expert_group_assignment=expert_manager.expert_group_assignment,
@@ -1599,7 +1670,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # only as an architecture template; per-round state comes from
             # round.model_snapshot_cpu.
             if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+                bg_eval_model = copy.deepcopy(global_model)
+                # Quantize the background worker's template to match the
+                # foreground one. If only one of the two were quantized, miners
+                # of the same round would be scored under different numerics
+                # against different baselines and then ranked against each
+                # other — a worse failure than cross-validator divergence.
+                quantize_eval_model_(config, bg_eval_model, role="background")
+                eval_worker.set_eval_base_model(bg_eval_model)
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 2
