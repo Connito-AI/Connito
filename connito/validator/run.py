@@ -465,6 +465,11 @@ def setup_training(
     )
 
 
+# Escape hatch for re-running the rank-preservation gate on a staging host.
+# Not a tuning knob — see `quantize_eval_model_`.
+VALIDATOR_INT8_OVERRIDE_ENV = "CONNITO_ALLOW_VALIDATOR_INT8"
+
+
 def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str) -> None:
     """Apply `model.quantization` to a validator eval model, in place.
 
@@ -472,16 +477,44 @@ def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str
     the outer optimizer walk `named_parameters()`, and int8 weights are
     buffers, so quantizing it would make both silently skip every converted
     tensor — no exception, no warning, just decaying vtrust.
+
+    Refuses to run without an explicit env override, because int8 eval has been
+    *measured* to corrupt scoring rather than merely suspected of it. This is a
+    hard failure and not a warning: both symptoms are silent in production, and
+    one of them zeroes real miners' rewards.
     """
     if get_nested_attr(config, "model.quantization", "off") != "int8":
         return
+
+    if os.environ.get(VALIDATOR_INT8_OVERRIDE_ENV) != "1":
+        raise RuntimeError(
+            "model.quantization='int8' is not permitted on a validator.\n"
+            "\n"
+            "Measured on an L40S against 7 real miner shards, production eval mix "
+            "(C4 + Nemotron-CC-Math), 21 batches @ seq 1024:\n"
+            "  - the top-3 ordering changes, and _RANK_TO_SCORE pays by position "
+            "(2.25/1.5/1.0), so this silently redistributes rewards;\n"
+            "  - int8 manufactures exact val_loss ties out of a tie-free "
+            "population (0 pairs under fp16 -> 2 pairs under int8). "
+            "finalize_round_scores zeroes every miner in an exact tie, so four "
+            "miners lose a round's reward to a quantization artefact — including "
+            "the two int8 itself ranked first and second;\n"
+            "  - per-miner perturbation is 0.36x the best-to-worst spread, "
+            "against a <0.1x bar.\n"
+            "\n"
+            f"Set {VALIDATOR_INT8_OVERRIDE_ENV}=1 only to re-run that gate on a "
+            "staging hotkey. The miner-side toggle is unaffected and needs no "
+            "override."
+        )
 
     model.eval()
     model.requires_grad_(False)
     converted = quantize_model_(model, include_experts=True)
     logger.warning(
-        "int8 quantization ACTIVE on validator eval model — val_loss is NOT "
-        "comparable with an fp16 validator's for the same combined_seed",
+        "int8 quantization ACTIVE on validator eval model via "
+        f"{VALIDATOR_INT8_OVERRIDE_ENV} — scoring is known to be corrupted: "
+        "val_loss is not comparable with an fp16 validator's, the podium "
+        "reorders, and exact-tie zeroing will fire on quantization artefacts",
         eval_role=role,
         converted_modules=len(converted),
         sample=converted[:8],
