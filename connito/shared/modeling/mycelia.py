@@ -17,7 +17,7 @@ if logging.root.level > logging.DEBUG:
     logging.getLogger("transformers.modeling_rope_utils").setLevel(logging.ERROR)
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import get_nested_attr
+from connito.shared.helper import get_nested_attr, resolve_model_dtype
 from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import *
@@ -150,76 +150,23 @@ def get_base_model(
     partial=False,
 ) -> nn.Module | None:
     """
-    Load base model with role-specific optimizations.
+    Load the base model.
 
-    Validators: Load with 4-bit quantization + Unsloth for memory efficiency
-    Miners: Load standard model for training
+    Weights are always loaded at `model.precision` (fp16/bf16). Runtime int8
+    quantization, when enabled, is applied by the caller *after* loading — see
+    `connito.shared.modeling.quantization`. It cannot be done here: the partial
+    path below never goes through `from_pretrained`, so a transformers
+    `quantization_config` would have no effect, and the streaming loaders rely
+    on `state_dict()` returning live views into unquantized parameters.
     """
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-
-    precision = getattr(config.model, "precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        precision = "fp16-mixed"
-    model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
+    model_dtype = resolve_model_dtype(config)
 
     topk = config.moe.partial_topk if partial else config.moe.full_topk
-    model_path = config.model.model_path.lower()
-    
+
     moe_config = get_moe_model_config(
         config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = not partial,
     )
-        
-    is_validator = config.role == "validator"
-    use_quantization = get_nested_attr(config, "model.use_quantization", False) and is_validator
-    use_unsloth = get_nested_attr(config, "model.use_unsloth", False) and is_validator
 
-    # === QUANTIZED PATH (Validators only) ===
-    if use_quantization:
-        logger.info("Loading with 4-bit quantization for validator")
-
-        # Try Unsloth first (fastest)
-        if use_unsloth:
-            try:
-                from unsloth import FastLanguageModel
-
-                model, _ = FastLanguageModel.from_pretrained(
-                    model_name=config.model.model_path,
-                    max_seq_length=moe_config.max_position_embeddings,
-                    dtype=model_dtype,
-                    load_in_4bit=True,
-                    device_map="auto",
-                )
-                FastLanguageModel.for_inference(model)
-                logger.info("✓ Loaded with Unsloth optimizations")
-                return model
-            except Exception as e:
-                logger.warning(f"Unsloth failed, falling back to BitsAndBytes: {e}")
-
-        # Fallback to BitsAndBytes
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=model_dtype,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-
-        max_memory = get_nested_attr(config, "model.max_memory", None)
-        if max_memory is None:
-            max_memory = {0: "46GB", "cpu": "100GB"}
-
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model.model_path,
-            config=moe_config,
-            quantization_config=bnb_config,
-            device_map="auto",
-            max_memory=max_memory,
-            low_cpu_mem_usage=True,
-            torch_dtype=model_dtype,
-        )
-        logger.info("✓ Loaded with BitsAndBytes quantization")
-        return model
-
-    # === STANDARD PATH (Miners / non-quantized validators) ===
     # For full models, load directly into the custom class with low_cpu_mem_usage
     # to avoid materializing an extra full HF model + full intermediate state_dict.
     if not partial:

@@ -28,6 +28,7 @@ load_dotenv(REPO_ROOT / ".env")
 from connito.shared.config import MinerConfig
 from connito.shared.dataloader import get_dataloader
 from connito.shared.expert_manager import ExpertManager
+from connito.shared.helper import resolve_precision
 from connito.shared.modeling.custom_deepseek_v2_lite import CustomDeepseekV2Moe
 from connito.shared.modeling.mycelia import get_base_model, get_base_tokenizer
 
@@ -92,8 +93,10 @@ def load_config(config_path: str, task_name: str) -> MinerConfig:
 
 
 def get_target_device_and_dtype(config: MinerConfig) -> tuple[torch.device, torch.dtype]:
-    precision = getattr(config.model, "precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    # Unlike the runtime paths this falls back to fp32 off-GPU: the assignment
+    # builder does dense linear algebra on CPU where fp16 is both slow and
+    # needlessly lossy.
+    if resolve_precision(config) == "bf16-mixed" and torch.cuda.is_available():
         dtype = torch.bfloat16
     else:
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
