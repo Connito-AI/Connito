@@ -470,6 +470,21 @@ def setup_training(
 VALIDATOR_INT8_OVERRIDE_ENV = "CONNITO_ALLOW_VALIDATOR_INT8"
 
 
+def check_validator_quantization_supported(config: ValidatorConfig) -> None:
+    """Reject an int8 validator config at startup rather than mid-round."""
+    if get_nested_attr(config, "model.quantization", "off") != "int8":
+        return
+    if os.environ.get(VALIDATOR_INT8_OVERRIDE_ENV) == "1":
+        logger.warning(
+            "Starting with int8 validator eval via override — scoring is known to "
+            "be corrupted; use a staging hotkey only",
+            override=VALIDATOR_INT8_OVERRIDE_ENV,
+        )
+        return
+    # Raise through the same path so the explanation lives in one place.
+    quantize_eval_model_(config, nn.Module(), role="startup-check")
+
+
 def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str) -> None:
     """Apply `model.quantization` to a validator eval model, in place.
 
@@ -850,6 +865,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     Returns:
         None
     """
+    # Fail fast on a config that would be rejected later. Without this the
+    # refusal in `quantize_eval_model_` fires part-way through the first round,
+    # after the roster is frozen — an operator who set `quantization: int8`
+    # deserves to find out at startup, not mid-cycle.
+    check_validator_quantization_supported(config)
+
     # Start the integrated Prometheus telemetry server
     telemetry_port = resolve_telemetry_port(rank)
     TelemetryManager().start_server(port=telemetry_port)
