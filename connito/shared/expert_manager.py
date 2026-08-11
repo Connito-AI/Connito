@@ -443,7 +443,7 @@ def populate_global_grads_from_local(
     * We avoid relying on parameter iteration order by matching by name.
     * Uses `.data` to avoid autograd tracking (intentional, as these are sync ops).
     """
-    # int8 weights are buffers, so they are absent from `named_parameters()`.
+    # fp8 weights are buffers, so they are absent from `named_parameters()`.
     # Merging a quantized model would therefore skip every converted tensor
     # with no exception and no missing-key warning — visible only, much later,
     # as degrading vtrust. Fail loudly instead.

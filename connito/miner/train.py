@@ -37,7 +37,7 @@ from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import get_model_hash, get_nested_attr, resolve_precision, sum_model_gradients
-from connito.shared.modeling.quantization import quantize_model_
+from connito.shared.modeling.quantization import all_finite, quantize_model_
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import freeze_parameters, load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
@@ -161,22 +161,22 @@ def setup_training(
         upcast_trainable=True,
     )
 
-    # Runtime int8 quantization, if enabled. This has to sit here — after
+    # Runtime fp8 quantization, if enabled. This has to sit here — after
     # `freeze_parameters` and before the optimizer — for two reasons:
     #   * `get_model_from_checkpoint` runs before any requires_grad flags are
     #     set, so there is no frozen/trainable split to act on yet;
     #   * the validator builds `global_model` through that same shared function,
     #     and quantizing it would make hivemind merge and the outer optimizer
-    #     silently skip every converted tensor (int8 weights are buffers, so
+    #     silently skip every converted tensor (fp8 weights are buffers, so
     #     they vanish from `named_parameters()`).
     # Scope is the frozen non-expert Linears only: the routed experts are held
     # in one stacked tensor per layer that mixes this miner's trainable group
     # with the frozen helper group, so `freeze_parameters` marks it trainable
     # as a whole and it cannot be quantized without changing training.
-    if get_nested_attr(config, "model.quantization", "off") == "int8":
+    if get_nested_attr(config, "model.quantization", "off") == "fp8":
         converted = quantize_model_(model, include_experts=False)
         logger.info(
-            "int8 quantization enabled (miner: frozen non-expert Linears only)",
+            "fp8 quantization enabled (miner: frozen non-expert Linears only)",
             converted_modules=len(converted),
             sample=converted[:8],
         )
@@ -185,12 +185,14 @@ def setup_training(
     with torch.no_grad():
         # Buffers as well as parameters: once quantized, the backbone weights
         # are non-persistent buffers and would otherwise drop silently out of
-        # this guard's coverage.
+        # this guard's coverage. `all_finite` rather than `torch.isfinite`
+        # because the latter raises NotImplementedError on fp8 — which, unlike
+        # int8, passes the `is_floating_point()` filter and so reaches here.
         named_tensors = list(model.named_parameters()) + [
             (name, buf) for name, buf in model.named_buffers() if buf.is_floating_point()
         ]
         for name, param in named_tensors:
-            if not torch.isfinite(param).all():
+            if not all_finite(param):
                 non_finite_param_names.append(name)
                 if len(non_finite_param_names) >= 10:
                     break

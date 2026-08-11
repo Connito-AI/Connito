@@ -152,7 +152,7 @@ def get_base_model(
     """
     Load the base model.
 
-    Weights are always loaded at `model.precision` (fp16/bf16). Runtime int8
+    Weights are always loaded at `model.precision` (fp16/bf16). Runtime fp8
     quantization, when enabled, is applied by the caller *after* loading — see
     `connito.shared.modeling.quantization`. It cannot be done here: the partial
     path below never goes through `from_pretrained`, so a transformers

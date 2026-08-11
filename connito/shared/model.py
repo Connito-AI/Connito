@@ -252,7 +252,7 @@ def get_model_from_checkpoint(
 
     model_dtype = resolve_model_dtype(config)
 
-    # Unconditional dtype cast. Runtime int8 quantization is deliberately
+    # Unconditional dtype cast. Runtime fp8 quantization is deliberately
     # applied *after* this point (miner: `train.py` post-`freeze_parameters`;
     # validator: the eval models only) so nothing here ever sees a quantized
     # module. `require_not_quantized` enforces that rather than trusting the

@@ -62,7 +62,7 @@ def set_validator_identity(
     register cycle) — ``Info.info()`` replaces the labelset atomically.
 
     ``quantization`` reports ``model.quantization``. It belongs here because a
-    validator running int8 produces ``val_loss`` values that are not comparable
+    validator running fp8 produces ``val_loss`` values that are not comparable
     with an fp16 validator's for the same ``combined_seed`` — when weights
     diverge across the fleet, this label is what makes the cause visible
     without shelling into hosts.

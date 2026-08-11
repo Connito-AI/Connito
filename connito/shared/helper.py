@@ -42,7 +42,7 @@ def infer_storage_dtype(model: "torch.nn.Module", default: torch.dtype = torch.f
     """Best-effort read of the half precision a built model stores weights at.
 
     Order-independent, unlike `next(model.parameters()).dtype`: it skips fp32
-    (the miner upcasts *trainable* params to fp32 for AdamW) and int8 (runtime
+    (the miner upcasts *trainable* params to fp32 for AdamW) and fp8 (runtime
     quantization moves converted weights into buffers), so it answers with the
     model's actual storage precision wherever that tensor happens to sit.
     """

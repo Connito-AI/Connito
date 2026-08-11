@@ -439,7 +439,7 @@ def save_checkpoint(
         # === save model, optimizer ===
         # `next(model.parameters()).dtype` read whichever parameter happened to
         # be registered first, which is not a stable answer: the miner upcasts
-        # trainable params to fp32, and int8 quantization moves converted
+        # trainable params to fp32, and fp8 quantization moves converted
         # weights out of `parameters()` entirely. Ask for the storage precision
         # explicitly instead.
         model_dtype = infer_storage_dtype(model)
