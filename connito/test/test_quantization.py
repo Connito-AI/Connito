@@ -599,3 +599,22 @@ def test_validator_int8_allowed_with_explicit_override(monkeypatch):
     quantize_eval_model_(_validator_config("int8"), model, role="foreground")
 
     assert is_quantized(model)
+
+
+def test_validator_startup_check_rejects_int8_before_the_first_round(monkeypatch):
+    """The refusal in quantize_eval_model_ fires part-way through round 1, after
+    the roster is frozen. An operator who set the field wrong should learn at
+    startup instead."""
+    from connito.validator.run import (
+        VALIDATOR_INT8_OVERRIDE_ENV,
+        check_validator_quantization_supported,
+    )
+
+    monkeypatch.delenv(VALIDATOR_INT8_OVERRIDE_ENV, raising=False)
+    with pytest.raises(RuntimeError, match="not permitted on a validator"):
+        check_validator_quantization_supported(_validator_config("int8"))
+
+    check_validator_quantization_supported(_validator_config("off"))  # no-op
+
+    monkeypatch.setenv(VALIDATOR_INT8_OVERRIDE_ENV, "1")
+    check_validator_quantization_supported(_validator_config("int8"))  # allowed
