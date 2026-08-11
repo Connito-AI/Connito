@@ -65,8 +65,10 @@ def _build_config(group_id: int) -> MinerConfig:
     cfg.model.base_arch_model = MODEL_PATH
     cfg.model.device = "cpu"
     cfg.model.precision = "bf16-mixed"
-    cfg.model.use_quantization = False
-    cfg.model.use_unsloth = False
+    # `use_quantization` / `use_unsloth` were set here but never existed as
+    # ModelCfg fields, so under pydantic v2 with extra="ignore" these lines
+    # raised on __setattr__. The knob is now `model.quantization`.
+    cfg.model.quantization = "off"
     cfg.model.torch_compile = False
     cfg.task.expert_group_name = "exp_dummy"
     cfg.task.base_path = EXP_DUMMY_DIR.parent
