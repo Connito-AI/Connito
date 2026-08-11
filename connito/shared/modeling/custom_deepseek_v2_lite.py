@@ -196,6 +196,27 @@ class CustomDeepseekV2Experts(nn.Module):
             self.register_buffer(f"{name}_scale", scale, persistent=False)
         setattr(self, QUANT_MARKER, True)
 
+    def _apply(self, *args, **kwargs):
+        # Keep `_compute_dtype` and the fp32 scales correct across a
+        # `.to(dtype=...)`. Nothing in production casts a quantized model —
+        # `require_not_quantized` guards the one path that would — but a stale
+        # compute dtype would make `state_dict()` report the wrong dtype and
+        # silently break the graft path, so don't rely on call ordering.
+        probe = torch.zeros(1, dtype=self._stacked_dtype()) if self._is_int8() else None
+        out = super()._apply(*args, **kwargs)
+        if self._is_int8():
+            try:
+                probed = args[0](probe).dtype if args else probe.dtype
+            except Exception:  # noqa: BLE001
+                probed = self._compute_dtype
+            if probed.is_floating_point:
+                self._compute_dtype = probed
+            for name in self._STACKED_PARAMS:
+                scale = getattr(self, f"{name}_scale")
+                if scale.dtype != torch.float32:
+                    scale.data = scale.data.float()
+        return out
+
     def _stacked_dtype(self) -> torch.dtype:
         """The compute dtype of the stacked tensors — never int8."""
         if self._is_int8():

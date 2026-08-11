@@ -171,11 +171,22 @@ class Int8Linear(nn.Module):
         )
 
     def _apply(self, *args, **kwargs):
+        # `Module.to(dtype=...)` casts every floating-point buffer, so probe
+        # what it did to a throwaway tensor rather than trying to parse the
+        # caller's arguments: whatever dtype a float lands in is the module's
+        # new compute dtype, and `state_dict()` has to keep reporting that or
+        # the graft path starts seeing dtype mismatches.
+        probe = torch.zeros(1, dtype=self.compute_dtype)
         out = super()._apply(*args, **kwargs)
-        # `Module.to(dtype=...)` casts every floating-point buffer. The int8
-        # values are immune (torch skips the dtype on non-floating tensors) but
-        # the scales are not, and demoting them to fp16 reintroduces exactly the
-        # precision loss the fp32 scale exists to avoid.
+        try:
+            probed = args[0](probe).dtype if args else probe.dtype
+        except Exception:  # noqa: BLE001 - a fn that rejects our probe tells us nothing
+            probed = self.compute_dtype
+        if probed.is_floating_point:
+            self.compute_dtype = probed
+        # The int8 values are immune (torch skips the dtype on non-floating
+        # tensors) but the scales are not, and demoting them to fp16
+        # reintroduces exactly the precision loss the fp32 scale exists to avoid.
         if self.weight_scale.dtype != torch.float32:
             self.weight_scale.data = self.weight_scale.data.float()
         return out

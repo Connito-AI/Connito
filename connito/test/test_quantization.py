@@ -540,3 +540,30 @@ def test_end_to_end_quantized_model_preserves_contract_and_loss():
     # The validator's per-miner graft: fp16 shard into the quantized base.
     result = model.load_state_dict(reference_sd, strict=False)
     assert result.missing_keys == [] and result.unexpected_keys == []
+
+
+def test_compute_dtype_tracks_a_dtype_cast():
+    """A stale `compute_dtype` would make `state_dict()` report the wrong dtype
+    and silently break the graft path. Nothing in production casts a quantized
+    model, but don't rely on call ordering to stay that way."""
+    quantized = Int8Linear.from_linear(nn.Linear(8, 4).to(torch.float16))
+    assert quantized.state_dict()["weight"].dtype == torch.float16
+
+    quantized.to(dtype=torch.bfloat16)
+
+    assert quantized.compute_dtype == torch.bfloat16
+    assert quantized.state_dict()["weight"].dtype == torch.bfloat16
+    assert quantized.weight_scale.dtype == torch.float32
+    assert quantized.weight_int8.dtype == torch.int8
+
+
+def test_experts_compute_dtype_tracks_a_dtype_cast():
+    experts = _experts()
+    experts.quantize_()
+    assert experts.state_dict()["1.gate_up_proj"].dtype == torch.float16
+
+    experts.to(dtype=torch.bfloat16)
+
+    assert experts.state_dict()["1.gate_up_proj"].dtype == torch.bfloat16
+    assert experts.gate_up_proj_scale.dtype == torch.float32
+    assert experts.gate_up_proj_int8.dtype == torch.int8
