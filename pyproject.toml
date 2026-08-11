@@ -69,7 +69,13 @@ plugins = []
 
 [tool.pytest.ini_options]
 addopts = "-ra -q --disable-warnings"
-testpaths = ["tests"]
+# The suite lives in connito/test (singular). This previously pointed at a
+# "tests" directory that has never existed, so a bare `pytest` collected
+# nothing and silently reported success.
+testpaths = ["connito/test"]
+markers = [
+    "integration: heavy tests that download models or need a GPU; opt in via env var",
+]
 
 # Example env-driven defaults (documented in README / .env.example)
 [tool.connito.defaults]
