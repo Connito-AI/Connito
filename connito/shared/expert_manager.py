@@ -443,6 +443,15 @@ def populate_global_grads_from_local(
     * We avoid relying on parameter iteration order by matching by name.
     * Uses `.data` to avoid autograd tracking (intentional, as these are sync ops).
     """
+    # int8 weights are buffers, so they are absent from `named_parameters()`.
+    # Merging a quantized model would therefore skip every converted tensor
+    # with no exception and no missing-key warning — visible only, much later,
+    # as degrading vtrust. Fail loudly instead.
+    from connito.shared.modeling.quantization import require_not_quantized
+
+    require_not_quantized(global_model, "populate_global_grads_from_local(global_model)")
+    require_not_quantized(model, "populate_global_grads_from_local(miner_model)")
+
     local_named = _named_params(model)
     global_named = _named_params(global_model)
 

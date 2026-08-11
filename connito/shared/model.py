@@ -36,7 +36,8 @@ from connito.shared.expert_manager import (
     get_layer_expert_id,
     ExpertAssignments
 )
-from connito.shared.helper import get_model_hash, get_nested_attr
+from connito.shared.helper import get_model_hash, get_nested_attr, resolve_model_dtype
+from connito.shared.modeling.quantization import require_not_quantized
 from connito.shared.memory import cleanup
 from connito.shared.modeling.mycelia import get_base_model
 from connito.shared.schema import verify_message
@@ -248,12 +249,15 @@ def get_model_from_checkpoint(
             logger.info("Tried to resume from checkpoint, but no checkpoint found.")
 
     _device = checkpoint_device if checkpoint_device is not None else config.model.device
-    
-    precision = getattr(config.model, "precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        precision = "fp16-mixed"
-    model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
+    model_dtype = resolve_model_dtype(config)
+
+    # Unconditional dtype cast. Runtime int8 quantization is deliberately
+    # applied *after* this point (miner: `train.py` post-`freeze_parameters`;
+    # validator: the eval models only) so nothing here ever sees a quantized
+    # module. `require_not_quantized` enforces that rather than trusting the
+    # ordering to survive future edits.
+    require_not_quantized(model, "get_model_from_checkpoint dtype cast")
     model = model.to(device=_device, dtype=model_dtype)
     model.gradient_checkpointing_enable()
     return model, latest_checkpoint

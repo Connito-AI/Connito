@@ -239,3 +239,45 @@ Miners expose a Prometheus endpoint at port `8100 + rank` (so rank 0 → port
 before debugging score issues.
 
 Code: `connito/shared/telemetry.py` (MINER_* gauges, line 233-251).
+
+## 8-bit quantization (`model.quantization`)
+
+```yaml
+model:
+  quantization: off               # off | int8. Default: off
+```
+
+An opt-in memory knob. `int8` holds the model's **frozen, non-expert** weights
+as 8-bit integers in GPU memory instead of fp16/bf16, dequantizing them on the
+fly during the forward pass. Weights are still loaded and still saved at
+`model.precision` — quantization only changes how they are held in memory in
+between.
+
+**What it does not cover, and why.** It does not quantize your routed experts —
+the weights you actually train and submit. Every layer stores its experts in one
+stacked tensor that mixes your trainable expert group with the frozen helper
+group, so the whole tensor has to stay trainable. Quantizing it would mean
+freezing the helper slices, which changes what your experts co-adapt against and
+therefore changes what you submit. Expect the saving to come from the backbone
+(attention projections, shared experts, the dense MLPs in the first layers) —
+roughly 0.4 B of the model's parameters, not the ~1.8 B in your expert shard.
+If you are OOM-ing, `data.sequence_length` and
+`local_par.gradient_accumulation_steps` are much larger levers.
+
+**Your submitted checkpoint is unaffected.** Shards are written in fp16/bf16
+exactly as before, with the same keys and shapes, and hash and verify normally
+on the validator. There is no int8 in anything that leaves your box.
+
+**It does slightly change your training numerics**, because the frozen backbone
+your experts train against is reconstructed from 8-bit values (worst case ~0.4%
+relative error per weight). Validators score your submitted weights, not your
+training setup, so this neither helps nor hurts your score directly — but it is
+a real change to the model you are training against. Leave it `off` unless you
+are memory-constrained.
+
+**Not the same as `opt.adamw_optim_bits`.** That knob controls the *optimizer
+state* (AdamW moments) and is a separate, larger memory saving via bitsandbytes.
+The two are independent and can be set together.
+
+Code: `connito/shared/modeling/quantization.py`,
+`connito/miner/train.py:setup_training`, `connito/shared/config.py:ModelCfg`.

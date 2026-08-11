@@ -19,6 +19,7 @@ from connito.shared.expert_manager import (
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
     get_model_hash,
+    infer_storage_dtype,
     load_state_dict_from_path,
 )
 
@@ -436,7 +437,12 @@ def save_checkpoint(
 
     try:
         # === save model, optimizer ===
-        model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
+        # `next(model.parameters()).dtype` read whichever parameter happened to
+        # be registered first, which is not a stable answer: the miner upcasts
+        # trainable params to fp32, and int8 quantization moves converted
+        # weights out of `parameters()` entirely. Ask for the storage precision
+        # explicitly instead.
+        model_dtype = infer_storage_dtype(model)
 
         if save_model_by_expert_group and expert_manager is not None:
             state_dict = model.state_dict()
