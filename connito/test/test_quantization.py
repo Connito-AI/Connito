@@ -471,3 +471,72 @@ def test_foreground_eval_model_is_a_quantized_copy_when_toggle_is_on():
         round_obj=round_obj,
         cache=cache,
     ) is resolved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# End-to-end on the real module tree
+# ─────────────────────────────────────────────────────────────────────────────
+def _tiny_deepseek():
+    """A real `CustomDeekSeekMoE`, shrunk until it builds in a second on CPU.
+
+    Worth the setup cost: the toy fixtures above cannot catch mistakes in module
+    *selection*, which depends on the actual names transformers gives the MLA
+    projections — and those differ between DeepSeek-V2 and V2-Lite.
+    """
+    from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2Config
+
+    from connito.shared.modeling.custom_deepseek_v2_lite import CustomDeekSeekMoE
+
+    config = DeepseekV2Config(
+        vocab_size=256, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=4,
+        n_routed_experts=8, n_shared_experts=1, num_experts_per_tok=2,
+        first_k_dense_replace=1, n_group=1, topk_group=1, q_lora_rank=None,
+        kv_lora_rank=16, qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16,
+        max_position_embeddings=64,
+    )
+    config.full = True
+    config.num_experts = 8
+    config.expert_group_assignment = None
+    config.routing_mode = "masked_topk"
+    return CustomDeekSeekMoE(config).to(torch.float16).eval()
+
+
+def test_end_to_end_quantized_model_preserves_contract_and_loss():
+    torch.manual_seed(0)
+    model = _tiny_deepseek()
+    ids = torch.randint(0, 256, (2, 16))
+    with torch.no_grad():
+        reference = model(input_ids=ids, labels=ids)
+    reference_sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+    model.requires_grad_(False)
+    converted = quantize_model_(model, include_experts=True)
+
+    # Selection: experts in, router and head out. `q_proj` (not q_a_proj) is
+    # what V2-Lite actually has, since q_lora_rank is None.
+    assert any(name.endswith(".experts") for name in converted)
+    assert any(name.endswith("self_attn.q_proj") for name in converted)
+    assert not any(name.endswith("mlp.gate") or name.endswith("lm_head") for name in converted)
+
+    # The state_dict contract the hash and graft paths depend on.
+    quantized_sd = model.state_dict()
+    assert sorted(quantized_sd) == sorted(reference_sd)
+    for key, ref in reference_sd.items():
+        assert quantized_sd[key].shape == ref.shape
+        assert quantized_sd[key].dtype == ref.dtype
+    assert get_model_hash(quantized_sd, hex=True)
+
+    with torch.no_grad():
+        quantized = model(input_ids=ids, labels=ids)
+    assert torch.isfinite(quantized.loss)
+    # Loose on purpose. This asserts the plumbing is sane, NOT that production
+    # eval loss is unaffected — this model is randomly initialised, so its loss
+    # sits at ln(vocab) and is insensitive to weight perturbation. The number
+    # that decides whether int8 is safe on a validator is rank preservation
+    # over replayed rounds with real miner shards, on a GPU.
+    assert abs(quantized.loss.item() - reference.loss.item()) < 0.1
+
+    # The validator's per-miner graft: fp16 shard into the quantized base.
+    result = model.load_state_dict(reference_sd, strict=False)
+    assert result.missing_keys == [] and result.unexpected_keys == []
