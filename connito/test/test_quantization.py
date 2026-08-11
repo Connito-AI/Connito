@@ -445,9 +445,12 @@ def test_foreground_eval_model_is_global_model_when_toggle_is_off():
     assert cache == {}
 
 
-def test_foreground_eval_model_is_a_quantized_copy_when_toggle_is_on():
-    from connito.validator.run import resolve_foreground_eval_model
+def test_foreground_eval_model_is_a_quantized_copy_when_toggle_is_on(monkeypatch):
+    from connito.validator.run import VALIDATOR_INT8_OVERRIDE_ENV, resolve_foreground_eval_model
 
+    # Exercising the mechanism, so opt past the policy gate that normally
+    # refuses int8 on a validator (see test_validator_int8_refuses_without_override).
+    monkeypatch.setenv(VALIDATOR_INT8_OVERRIDE_ENV, "1")
     global_model = _toy_model()
     round_obj = types.SimpleNamespace(model_snapshot_cpu={})
     cache: dict = {}
@@ -567,3 +570,32 @@ def test_experts_compute_dtype_tracks_a_dtype_cast():
     assert experts.state_dict()["1.gate_up_proj"].dtype == torch.bfloat16
     assert experts.gate_up_proj_scale.dtype == torch.float32
     assert experts.gate_up_proj_int8.dtype == torch.int8
+
+
+def test_validator_int8_refuses_without_override(monkeypatch):
+    """int8 eval is measured to corrupt scoring, so a validator must not be able
+    to enable it by editing a YAML field. Hard failure, not a warning: both
+    symptoms (weight divergence, tie-zeroing) are silent in production."""
+    from connito.validator.run import VALIDATOR_INT8_OVERRIDE_ENV, quantize_eval_model_
+
+    monkeypatch.delenv(VALIDATOR_INT8_OVERRIDE_ENV, raising=False)
+    model = _toy_model()
+
+    with pytest.raises(RuntimeError, match="not permitted on a validator"):
+        quantize_eval_model_(_validator_config("int8"), model, role="foreground")
+    assert not is_quantized(model)
+
+    # ...and off stays a silent no-op.
+    quantize_eval_model_(_validator_config("off"), model, role="foreground")
+    assert not is_quantized(model)
+
+
+def test_validator_int8_allowed_with_explicit_override(monkeypatch):
+    from connito.validator.run import VALIDATOR_INT8_OVERRIDE_ENV, quantize_eval_model_
+
+    monkeypatch.setenv(VALIDATOR_INT8_OVERRIDE_ENV, "1")
+    model = _toy_model()
+
+    quantize_eval_model_(_validator_config("int8"), model, role="foreground")
+
+    assert is_quantized(model)
