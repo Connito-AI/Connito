@@ -1863,7 +1863,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             if model_ckpt is not None:
 
                 model_ckpt.expert_group = config.task.exp.group_id
-                model_ckpt.sign_hash(wallet=wallet)
+                if observer_mode_enabled():
+                    # The signature's only consumer is the commit below, which
+                    # observer mode suppresses — and this is the last thing in
+                    # the validator that needs the hotkey's *private* key.
+                    # Skipping it lets an observer run on a public-only
+                    # keyfile, so a live validator's key never has to be copied
+                    # onto the test host at all. Hash anyway: `model_hash` is
+                    # read on the next line and drives eval, and `sign_hash`
+                    # was what triggered it.
+                    if model_ckpt.model_hash is None:
+                        model_ckpt.hash_model()
+                else:
+                    model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 # Dashboard telemetry: the model's global optimization version
                 # (chain-committed `global_ver`) is the "steps" the leaderboard

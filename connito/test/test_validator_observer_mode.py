@@ -118,6 +118,45 @@ def test_telemetry_distinguishes_observer_from_the_hotkey_it_shares():
     assert CONNITO_VALIDATOR_INFO._value["observer"] == "0"
 
 
+def test_public_only_hotkey_serves_every_observer_read(tmp_path, observer_env):
+    """The payoff of gating `sign_hash`: an observer needs the hotkey's
+    address but never its private key, so the live validator's key does not
+    have to be copied onto the test host.
+
+    Everything observer mode still does with the wallet reads `.ss58_address`
+    (metagraph UID lookup, telemetry identity, the startup warning). Signing
+    is the one thing a public-only keyfile cannot do, and nothing left in the
+    path asks for it.
+    """
+    import json
+
+    from bittensor_wallet import Wallet
+    from bittensor_wallet.errors import ConfigurationError
+
+    public_key = "0x" + "ab" * 32
+    hotkeys = tmp_path / "w" / "hotkeys"
+    hotkeys.mkdir(parents=True)
+    (hotkeys / "hk").write_text(json.dumps({
+        "accountId": public_key,
+        "publicKey": public_key,
+        "ss58Address": "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM",
+    }))
+
+    wallet = Wallet(name="w", hotkey="hk", path=str(tmp_path))
+    assert wallet.hotkey.ss58_address == "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"
+    with pytest.raises(ConfigurationError):
+        wallet.hotkey.sign(b"anything")
+
+    config = SimpleNamespace(
+        chain=SimpleNamespace(lite_network="finney", network="finney"),
+    )
+    with (
+        patch("connito.validator.chain_submitter.bittensor.AsyncSubtensor"),
+        patch("connito.validator.chain_submitter.AsyncRunner"),
+    ):
+        ChainSubmitter(config, wallet)
+
+
 def test_live_validator_still_submits(monkeypatch):
     """The gate must not leak into a normal deployment."""
     monkeypatch.delenv(OBSERVER_ENV, raising=False)
