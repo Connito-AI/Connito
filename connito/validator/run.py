@@ -201,6 +201,64 @@ logger = structlog.get_logger(__name__)
 from connito.shared.memory import cleanup, release_cpu_ram
 
 
+# Default base port for the Prometheus exporter. Overridable per host via
+# the `CONNITO_TELEMETRY_PORT` env var — see `resolve_telemetry_port`.
+DEFAULT_TELEMETRY_BASE_PORT = 8200
+
+
+def resolve_telemetry_port(rank: int, env: dict[str, str] | None = None) -> int:
+    """Resolve the port for the Prometheus exporter.
+
+    `CONNITO_TELEMETRY_PORT` is a **base** port, not an absolute one: the
+    effective port is `base + rank`. That preserves the semantics of the
+    8200 default it replaces, and keeps a multi-rank deployment on one host
+    collision-free — an absolute override would point every rank at the same
+    port and all but one would fail to bind, which is exactly the bug this
+    override exists to fix. For the validator `rank` is always 0, so
+    `CONNITO_TELEMETRY_PORT=8201` yields 8201.
+
+    Operators need this when the default 8200 is already taken on the host:
+    before this was wired up the env var existed in the image but was never
+    read, so the exporter kept trying 8200, failed with "Address already in
+    use", and the validator ran on with no telemetry at all.
+
+    Invalid input falls back to the default with a warning rather than
+    raising — a typo in an operator's `.env` must not take a validator off
+    chain over a telemetry setting.
+    """
+    env = os.environ if env is None else env
+    raw = str(env.get("CONNITO_TELEMETRY_PORT", "") or "").strip()
+    base = DEFAULT_TELEMETRY_BASE_PORT
+    if raw:
+        try:
+            parsed = int(raw)
+            if not (1 <= parsed <= 65535):
+                raise ValueError(f"port out of range: {parsed}")
+            base = parsed
+        except ValueError as e:
+            logger.warning(
+                "Invalid CONNITO_TELEMETRY_PORT — falling back to default base port",
+                value=raw,
+                default_base=DEFAULT_TELEMETRY_BASE_PORT,
+                error=str(e),
+            )
+    port = base + int(rank)
+    if not (1 <= port <= 65535):
+        logger.warning(
+            "Resolved telemetry port out of range — falling back to default",
+            base=base, rank=rank, resolved=port,
+            default_base=DEFAULT_TELEMETRY_BASE_PORT,
+        )
+        base = DEFAULT_TELEMETRY_BASE_PORT
+        port = base + int(rank)
+    if base != DEFAULT_TELEMETRY_BASE_PORT:
+        logger.info(
+            "Telemetry port overridden via CONNITO_TELEMETRY_PORT",
+            base=base, rank=rank, port=port,
+        )
+    return port
+
+
 @track_metagraph_sync_latency()
 def _sync_lite_metagraph(subtensor, netuid: int):
     """Validator-side metagraph fetch via lite_subtensor.
@@ -700,8 +758,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         None
     """
     # Start the integrated Prometheus telemetry server
-    # Port 8200+rank to avoid conflicts with other services on this host
-    telemetry_port = 8200 + rank
+    telemetry_port = resolve_telemetry_port(rank)
     TelemetryManager().start_server(port=telemetry_port)
     
     if rank == 0:
@@ -869,6 +926,48 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 "Startup recovery: complete",
                 journals_finalized=_recovered,
                 journals_seen=len(_journals),
+            )
+
+        # Re-emit the most recent finalized round's telemetry.
+        #
+        # Runs unconditionally, and this is the point: the replay loop above
+        # only touches *unfinalized* journals, and replaying one marks it
+        # finalized. So a second restart finds nothing to replay and used to
+        # emit nothing at all — leaving the dashboard blank for the whole
+        # last completed cycle until the next round's evaluations arrived
+        # (observed 2026-07-31: two Watchtower restarts 25 min apart, every
+        # per-miner family at zero series for 17 minutes).
+        #
+        # This is a METRICS-ONLY pass — it never re-runs finalize. Re-running
+        # finalize would keep the aggregator's point set correct (drop_round
+        # runs first) but would re-stamp those points with fresh timestamps,
+        # reshuffling the "last N by timestamp" rolling average that drives
+        # weight submission. See `republish_telemetry_from_journal`.
+        #
+        # Journals are scanned ascending, so the last finalized one is the
+        # most recent round — which is also the one just replayed on a first
+        # restart, making the re-emit a harmless idempotent gauge write.
+        try:
+            _newest_finalized = None
+            for _journal_file in reversed(_journals):
+                _j = _rj_recover.load(_journal_file)
+                if _j is not None and _j.finalized:
+                    _newest_finalized = _j
+                    break
+            if _newest_finalized is not None:
+                _republished = _rj_recover.republish_telemetry_from_journal(
+                    _newest_finalized, score_aggregator=score_aggregator,
+                )
+                logger.info(
+                    "Startup recovery: republished telemetry for last finalized round",
+                    round_id=_newest_finalized.round_id,
+                    uids=_republished,
+                    schema_version=_newest_finalized.schema_version,
+                    val_losses=len(_newest_finalized.uid_to_val_loss),
+                )
+        except Exception as e:
+            logger.warning(
+                "Startup recovery: telemetry republish failed", error=str(e),
             )
     except Exception as e:
         logger.warning(
@@ -1416,7 +1515,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             download_window_closed.clear()
             try:
                 note_round_series(new_round.round_id)
+                new_round.lifecycle_step = 0
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
+                # Seed the progress counters at freeze so the round exists in
+                # the metric from the moment it is frozen (scored=0, failed=0,
+                # pending=roster) instead of appearing only once the first
+                # evaluation lands. Consumers that switch on "newest round with
+                # a non-zero scored value" are unaffected by the zero.
+                new_round.publish_progress()
             except Exception:
                 pass
 
@@ -1496,6 +1602,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 eval_worker.set_eval_base_model(copy.deepcopy(global_model))
             try:
                 note_round_series(new_round.round_id)
+                new_round.lifecycle_step = 2
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
             except Exception:
                 pass
@@ -1728,6 +1835,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
+                new_round.lifecycle_step = 3
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
             except Exception:
                 pass

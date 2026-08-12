@@ -126,6 +126,21 @@ VALIDATOR_BASELINE_LOSS = Gauge(
     "validator_baseline_loss",
     "Round baseline loss against this validator's foreground eval set",
 )
+# Per-round baseline loss, labeled by the round it belongs to. The unlabeled
+# gauge above is overwritten every round, so a scraper can only sample it and
+# a cycle's baseline ends up timing-dependent; this labeled family lets the
+# gateway attribute the right baseline to the right round, freeze it after
+# finalize, and naturally exclude a warming-up validator that has no value for
+# a given round. Evicted on the same cutoff as the other per-round families
+# (see evict_round_series_before). The unlabeled family is retained for
+# backward compat during rollout.
+VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
+    "validator_baseline_loss_by_round",
+    "Round baseline loss (this validator's foreground eval set), labeled by the "
+    "round it belongs to. Stable per round; the unlabeled validator_baseline_loss "
+    "is retained for backward compat.",
+    ["round_id"],
+)
 # Numeric ID of the current round, set when `Round.freeze` returns and
 # the round becomes active. Lets aggregators key per-miner score and
 # val_loss readings to a specific round without parsing the round_id
@@ -537,6 +552,56 @@ def note_round_series(round_id: int) -> None:
         pass
 
 
+def set_round_progress(
+    round_id: int, *, scored: int, failed: int, pending: int
+) -> None:
+    """Publish a round's evaluation-progress counters.
+
+    Shared by every path that advances a round: the freeze-time initial
+    publish, foreground eval (during Submission), and the background eval
+    worker (after Merge). This previously lived as a private static method
+    on `BackgroundEvalWorker`, so the counters only started moving once the
+    background eval window opened at Merge — foreground evals accumulated
+    in `scored_uids` with nothing publishing them, and the dashboard's
+    "Evaluated N of M" panel sat on the *previous* round's final value for
+    the first ~14 minutes of every round, then jumped straight to the
+    foreground total.
+
+    Registers the round_id via `note_round_series` so these labelsets are
+    evicted on the normal cutoff.
+
+    Best-effort — never raises. Telemetry must not influence scoring.
+    """
+    try:
+        note_round_series(int(round_id))
+        rid = str(int(round_id))
+        VALIDATOR_ROUND_MINERS_SCORED.labels(round_id=rid).set(float(scored))
+        VALIDATOR_ROUND_MINERS_FAILED.labels(round_id=rid).set(float(failed))
+        VALIDATOR_ROUND_MINERS_PENDING.labels(round_id=rid).set(float(pending))
+    except Exception:
+        pass
+
+
+def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
+    """Publish a round's foreground-eval baseline loss to BOTH the unlabeled
+    gauge (backward compat) and the per-round labeled family.
+
+    Registers the round_id for eviction so the labeled series is pruned on
+    the same cutoff as the other per-round families. Round creation already
+    registers the id via note_round_series; the extra registration here is
+    idempotent (a set) and keeps this helper self-contained.
+
+    Best-effort — telemetry must never block scoring.
+    """
+    try:
+        value = float(baseline_loss)
+        VALIDATOR_BASELINE_LOSS.set(value)
+        note_round_series(int(round_id))
+        VALIDATOR_BASELINE_LOSS_BY_ROUND.labels(round_id=str(int(round_id))).set(value)
+    except Exception:
+        pass
+
+
 def evict_round_series_before(min_round_id: int) -> int:
     """Remove per-round labelsets for every tracked round_id below the
     cutoff. Called from run.py's journal/aggregator prune block with the
@@ -561,6 +626,7 @@ def evict_round_series_before(min_round_id: int) -> int:
                     VALIDATOR_ROUND_MINERS_SCORED,
                     VALIDATOR_ROUND_MINERS_FAILED,
                     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
+                    VALIDATOR_BASELINE_LOSS_BY_ROUND,
                 ):
                     try:
                         family.remove(rid)
