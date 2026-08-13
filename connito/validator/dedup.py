@@ -41,6 +41,11 @@ logger = structlog.get_logger(__name__)
 # these are a convenience for log-grepping, not a commitment.
 SHADOW_THRESHOLDS: tuple[float, ...] = (0.0, 0.01, 0.02, 0.05, 0.1)
 
+# Threshold `enforce` mode acts on. 0.0 makes the decision a pure sign
+# test; see `is_redundant`. Every larger value in SHADOW_THRESHOLDS was
+# measured to flag 100% of live pairs and is unusable for enforcement.
+DEFAULT_DEDUP_THRESHOLD: float = 0.0
+
 
 def average_state_dicts(
     sd_a: dict[str, torch.Tensor], sd_b: dict[str, torch.Tensor],
@@ -130,6 +135,44 @@ def select_pairs(
     return pairs
 
 
+def compute_merge_penalty(loss_a: float, loss_b: float, loss_avg: float) -> float:
+    """``loss_avg − min(loss_a, loss_b)`` — the merge-loss statistic.
+
+    Negative means averaging beat the better of the two sides outright:
+    each model held information the other lacked. Zero or positive means
+    the merge gained nothing, which is what a near-duplicate looks like.
+
+    Factored out so the enforcing predicate and the shadow log cannot
+    drift apart, and so enforcement can act on the UNROUNDED value —
+    `shadow_report` rounds to 6 dp, and a tiny negative penalty rounded
+    to `-0.0` would satisfy `>= 0` and flag an honest pair.
+    """
+    return loss_avg - min(loss_a, loss_b)
+
+
+def is_redundant(
+    merge_penalty: float, threshold: float = DEFAULT_DEDUP_THRESHOLD,
+) -> bool:
+    """Enforcement predicate: ``merge_penalty >= -threshold``.
+
+    The `would_flag_not_better` criterion promoted from a shadow
+    convenience map to the single decision `enforce` mode acts on.
+
+    At the default ``threshold = 0.0`` this is a pure sign test. Measured
+    on 7 live submissions from round 8814586: pairs containing a miner
+    with a genuine per-cycle training history came out negative (−4.8e-4,
+    −4.9e-4) and were not flagged, while near-copy and noise-injected
+    pairs came out >= 0 (+1.2e-5 … +5.8e-4) and were. The sign carries
+    the signal; the magnitude does not.
+
+    Caller beware: the run-to-run noise floor of `merge_penalty` has NOT
+    been measured. If repeat evaluations of one pair vary by more than
+    ~5e-4, the sign is not stable and this predicate will zero honest
+    miners at random. Measure before enabling `enforce` in production.
+    """
+    return merge_penalty >= -threshold
+
+
 def shadow_report(
     *,
     loss_a: float,
@@ -153,7 +196,7 @@ def shadow_report(
     - ``would_flag_band``: ``|merge_penalty| ≤ τ`` — flags only the
       near-zero band, tolerant of loss-barrier pairs.
     """
-    merge_penalty = loss_avg - min(loss_a, loss_b)
+    merge_penalty = compute_merge_penalty(loss_a, loss_b, loss_avg)
     return {
         "loss_a": round(loss_a, 6),
         "loss_b": round(loss_b, 6),

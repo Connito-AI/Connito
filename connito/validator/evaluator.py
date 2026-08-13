@@ -213,6 +213,12 @@ def finalize_round_scores(
     with round_obj._lock:  # noqa: SLF001 — same module family
         round_scores = dict(round_obj.scores)
         validation_failed = set(round_obj.validation_failed_uids)
+        # `getattr`, not attribute access: this function also runs against
+        # duck-typed stand-ins that are not a real `Round` — notably the
+        # journal-recovery path's `_RecoveryRound`, which carries scores and
+        # validation failures but no dedup state. A recovered round has no
+        # pair measurements to act on, so an empty set is the right answer.
+        dedup_flagged = set(getattr(round_obj, "dedup_flagged_uids", ()) or ())
     freeze_zero = set(round_obj.freeze_zero_uids)
     freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
 
@@ -235,7 +241,19 @@ def finalize_round_scores(
     for _, s in positive:
         score_counts[s] = score_counts.get(s, 0) + 1
     tied_uids = {uid for uid, s in positive if score_counts[s] > 1}
-    unique_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
+    # Near-duplicates confirmed by the merge-loss filter in "enforce" mode:
+    # averaging the pair was not better than its better side, so neither
+    # added information the other lacked. Both sides are zeroed, exactly as
+    # the exact-tie rule above does — this generalizes that rule from
+    # bit-identical to near-identical submissions, which a 1-ULP
+    # perturbation is otherwise enough to slip past. Always empty unless
+    # `dedup_filter_mode == "enforce"`.
+    dedup_uids = {uid for uid, _ in positive if uid in dedup_flagged}
+    penalized_uids = tied_uids | dedup_uids
+    unique_positive = [
+        (uid, s) for uid, s in positive
+        if score_counts[s] == 1 and uid not in penalized_uids
+    ]
     unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
 
     written: dict[int, float] = {}
@@ -251,8 +269,8 @@ def finalize_round_scores(
         written[uid] = rank_score
         top_uids.add(uid)
 
-    # Tied positive-delta miners — explicit 0 entry per uid.
-    for uid in tied_uids:
+    # Tied or dedup-flagged positive-delta miners — explicit 0 entry per uid.
+    for uid in penalized_uids:
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue

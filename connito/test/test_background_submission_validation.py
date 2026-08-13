@@ -994,6 +994,49 @@ class TestFinalizeRoundScores:
             ) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.25]
 
+    def test_dedup_flagged_uids_get_zero_and_skip_rank_slot(self) -> None:
+        # `enforce` mode: the merge-loss filter confirmed roster[0] and
+        # roster[1] are near-duplicates of each other. Both are zeroed even
+        # though their scores are DISTINCT — a 1-ULP perturbation is enough
+        # to dodge the exact-tie rule, which is precisely the gap this
+        # closes. Rank 1 falls through to the next unflagged miner.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)  # flagged → 0
+        rnd.mark_scored(rnd.roster[1].uid, score=0.49)  # flagged → 0
+        rnd.mark_scored(rnd.roster[2].uid, score=0.40)  # rank 1 → 2.25
+        rnd.mark_scored(rnd.roster[3].uid, score=0.30)  # rank 2 → 1.5
+        rnd.mark_scored(rnd.roster[4].uid, score=0.20)  # rank 3 → 1.0
+        rnd.mark_dedup_flagged(rnd.roster[0].uid, rnd.roster[1].uid)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [0.0]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.5]
+        assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [1.0]
+
+    def test_no_dedup_flags_leaves_ranking_untouched(self) -> None:
+        # off/shadow: `dedup_flagged_uids` stays empty and ranking is
+        # byte-for-byte the pre-existing behaviour.
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.50)
+        rnd.mark_scored(rnd.roster[1].uid, score=0.40)
+        rnd.mark_scored(rnd.roster[2].uid, score=0.30)
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert rnd.dedup_flagged_uids == set()
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [2.25]
+        assert self._scores_for_uid(agg, rnd.roster[1].uid, rnd.round_id) == [1.5]
+        assert self._scores_for_uid(agg, rnd.roster[2].uid, rnd.round_id) == [1.0]
+
     def test_zero_delta_excluded_from_top_three(self) -> None:
         # If only one miner has delta > 0, only that miner gets the
         # rank-1 reward (2.25). The other "scored but delta==0" miners

@@ -1030,13 +1030,24 @@ class EvalCfg(BaseConfig):
     # weight, or journal entry. Deliberately NOT a locked field while in
     # shadow: auto_update_config resets locked fields to their defaults on
     # every start, which would force "off" fleet-wide and make per-host
-    # opt-in impossible. Lock it when an enforcing mode ships.
-    dedup_filter_mode: Literal["off", "shadow"] = "off"
+    # opt-in impossible. Deliberately still unlocked in "enforce" so a
+    # single host can run enforcement ahead of the fleet.
+    #
+    # "enforce" additionally zeroes BOTH sides of every pair the filter
+    # confirms redundant, exactly as the exact-score-tie rule already
+    # does for bit-identical submissions.
+    dedup_filter_mode: Literal["off", "shadow", "enforce"] = "off"
     # Compare the top-K positive-delta miners of the round...
     dedup_top_k: int = 5
     # ...but never spend more than this many merged-pair GPU evals per
     # round (each costs about one miner eval).
     dedup_max_pairs: int = 10
+    # Enforcement threshold τ, in val_loss units: a pair is redundant when
+    # `merge_penalty >= -τ`. The default 0.0 makes this a pure SIGN test —
+    # redundant unless averaging beat the better side outright. Do not
+    # raise it casually: measured merge penalties on live submissions are
+    # ~5e-4, so any τ >= 0.01 flags 100% of pairs, honest ones included.
+    dedup_threshold: float = 0.0
 
 
 class ValidatorConfig(WorkerConfig):

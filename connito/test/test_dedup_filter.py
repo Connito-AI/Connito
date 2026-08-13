@@ -45,8 +45,10 @@ _install_stub_if_unavailable(
 
 from connito.validator.dedup import (  # noqa: E402
     average_state_dicts,
+    compute_merge_penalty,
     delta_cosine,
     find_submission_path,
+    is_redundant,
     recover_val_loss,
     select_pairs,
     shadow_report,
@@ -207,12 +209,19 @@ from connito.validator.background_eval_worker import BackgroundEvalWorker  # noq
 from connito.validator.round import Round, RoundRef  # noqa: E402
 
 
-def _make_worker(tmp_path: Path, round_obj: Round, *, mode: str = "shadow") -> BackgroundEvalWorker:
+def _make_worker(
+    tmp_path: Path,
+    round_obj: Round,
+    *,
+    mode: str = "shadow",
+    threshold: float = 0.0,
+) -> BackgroundEvalWorker:
     config = SimpleNamespace(
         evaluation=SimpleNamespace(
             dedup_filter_mode=mode,
             dedup_top_k=5,
             dedup_max_pairs=10,
+            dedup_threshold=threshold,
             per_miner_eval_timeout_sec=30,
             top_k_miners_to_reward=3,
         ),
@@ -351,3 +360,96 @@ def test_retention_top_k_widens_when_dedup_active() -> None:
         top_k_miners_to_reward=3, dedup_filter_mode="shadow", dedup_top_k=5))
     assert retention_top_k(cfg_off) == 3
     assert retention_top_k(cfg_on) == 5
+
+
+# ---------------------------------------------------------------------------
+# enforce mode — threshold 0, both sides of a redundant pair get zeroed
+# ---------------------------------------------------------------------------
+
+def test_is_redundant_is_a_sign_test_at_zero_threshold() -> None:
+    # Exact duplicate: averaging is a no-op, penalty == 0 → redundant.
+    assert is_redundant(0.0) is True
+    # Merge made things worse → nothing was gained → redundant.
+    assert is_redundant(5.79e-4) is True
+    # Merge beat the better side → real information → NOT redundant.
+    assert is_redundant(-4.83e-4) is False
+    assert is_redundant(-4.94e-4) is False
+
+
+def test_is_redundant_widening_threshold_swallows_the_signal() -> None:
+    # The measured spread of live merge penalties. Every honest pair is
+    # negative, every duplicate/noise pair non-negative.
+    honest = (-4.94e-4, -4.83e-4)
+    duplicate = (1.2e-5, 8.5e-5, 2.08e-4, 2.96e-4, 5.79e-4)
+    # tau = 0 separates them perfectly.
+    assert all(not is_redundant(p, 0.0) for p in honest)
+    assert all(is_redundant(p, 0.0) for p in duplicate)
+    # tau = 0.01 (the smallest non-zero SHADOW_THRESHOLD) flags everything,
+    # honest miners included — this is why enforcement pins tau at 0.
+    assert all(is_redundant(p, 0.01) for p in honest + duplicate)
+
+
+def test_enforce_decides_on_unrounded_penalty() -> None:
+    # A genuine pair whose penalty is smaller than the 6 dp the shadow log
+    # keeps. Rounding gives -0.0, and `-0.0 >= 0` is True in Python, so a
+    # naive round-then-compare would flag an honest pair.
+    loss_a, loss_b, loss_avg = 1.7387605, 1.7399313, 1.73876045
+    raw = compute_merge_penalty(loss_a, loss_b, loss_avg)
+    assert raw < 0.0
+    assert is_redundant(raw) is False
+    # Demonstrate the trap the implementation avoids.
+    assert round(raw, 6) == 0.0
+    assert is_redundant(round(raw, 6)) is True
+
+
+def test_enforce_mode_flags_both_sides_of_redundant_pair(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    base = round_obj.model_snapshot_cpu
+    _write_submission(tmp_path, "HK1", 10, {"w": base["w"] + torch.ones(4)})
+    _write_submission(tmp_path, "HK2", 11, {"w": base["w"] + torch.full((4,), 2.0)})
+
+    worker = _make_worker(tmp_path, round_obj, mode="enforce")
+    import connito.shared.evaluate as ev
+
+    # Merged loss worse than both sides → penalty > 0 → redundant.
+    ev.evaluate_model = lambda *a, **k: {"val_loss": 3.5}
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+
+    assert round_obj.dedup_flagged_uids == {1, 2}
+    # Still never mutates the round's own scores — zeroing happens at
+    # finalize, via the flagged set.
+    assert round_obj.scores_snapshot() == {1: 0.9, 2: 0.5}
+
+
+def test_enforce_mode_leaves_genuine_pair_unflagged(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    base = round_obj.model_snapshot_cpu
+    _write_submission(tmp_path, "HK1", 10, {"w": base["w"] + torch.ones(4)})
+    _write_submission(tmp_path, "HK2", 11, {"w": base["w"] + torch.full((4,), 2.0)})
+
+    worker = _make_worker(tmp_path, round_obj, mode="enforce")
+    import connito.shared.evaluate as ev
+
+    # Merged loss beats the better side (recover_val_loss(0.9, 4.0) ~= 3.08)
+    # → penalty < 0 → genuine, must not be flagged.
+    ev.evaluate_model = lambda *a, **k: {"val_loss": 2.5}
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+
+    assert worker._dedup_budget_used == 1  # the pair WAS measured
+    assert round_obj.dedup_flagged_uids == set()  # and cleared
+
+
+def test_shadow_mode_never_flags_even_when_redundant(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    base = round_obj.model_snapshot_cpu
+    _write_submission(tmp_path, "HK1", 10, {"w": base["w"] + torch.ones(4)})
+    _write_submission(tmp_path, "HK2", 11, {"w": base["w"] + torch.full((4,), 2.0)})
+
+    worker = _make_worker(tmp_path, round_obj, mode="shadow")
+    import connito.shared.evaluate as ev
+
+    ev.evaluate_model = lambda *a, **k: {"val_loss": 3.5}
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+
+    assert worker._dedup_budget_used == 1  # measured
+    assert round_obj.dedup_flagged_uids == set()  # but never enforced

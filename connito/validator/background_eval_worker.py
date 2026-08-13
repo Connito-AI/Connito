@@ -37,9 +37,12 @@ from connito.shared.telemetry import (
     note_round_series,
 )
 from connito.validator.dedup import (
+    DEFAULT_DEDUP_THRESHOLD,
     average_state_dicts,
+    compute_merge_penalty,
     delta_cosine,
     find_submission_path,
+    is_redundant,
     recover_val_loss,
     select_pairs,
     shadow_report,
@@ -740,7 +743,8 @@ class BackgroundEvalWorker(threading.Thread):
         keeps real miner evals strictly ahead of shadow work.
         """
         cfg = self.config.evaluation
-        if getattr(cfg, "dedup_filter_mode", "off") != "shadow":
+        mode = getattr(cfg, "dedup_filter_mode", "off")
+        if mode not in ("shadow", "enforce"):
             return
         if self._dedup_round_id != round_obj.round_id:
             return  # snapshot load (which resets dedup state) hasn't run yet
@@ -855,12 +859,28 @@ class BackgroundEvalWorker(threading.Thread):
             loss_a=loss_a, loss_b=loss_b, loss_avg=loss_avg,
             baseline=baseline, cosine=cosine,
         )
+        # Enforcement decides on the UNROUNDED penalty — `report`'s copy is
+        # rounded to 6 dp, where a tiny negative becomes `-0.0` and would
+        # satisfy `>= 0`.
+        threshold = float(getattr(cfg, "dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
+        redundant = is_redundant(
+            compute_merge_penalty(loss_a, loss_b, loss_avg), threshold,
+        )
+        enforced = False
+        if mode == "enforce" and redundant:
+            # Zero BOTH sides at finalize. `merge_penalty` is a property of
+            # the pair, so it says one of the two added nothing the other
+            # lacked — never which one.
+            round_obj.mark_dedup_flagged(uid_a, uid_b)
+            enforced = True
         logger.info(
             "dedup-shadow: pair result",
             round_id=round_obj.round_id,
             uid_a=uid_a, uid_b=uid_b,
             loss_source_a=source_a, loss_source_b=source_b,
             n_keys=n_keys, asymmetric_keys=asymmetric,
+            mode=mode, threshold=threshold,
+            redundant=redundant, enforced=enforced,
             **report,
         )
         try:
