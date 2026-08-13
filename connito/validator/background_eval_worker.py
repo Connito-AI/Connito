@@ -145,6 +145,10 @@ class BackgroundEvalWorker(threading.Thread):
         self._dedup_budget_used: int = 0
         self._dedup_pairs_skipped: int = 0
         self._dedup_summary_emitted: bool = False
+        # Completed evals since the last interleaved dedup pair. Drives the
+        # `dedup_eval_interval` trigger — see the main loop for why the
+        # idle-tick trigger alone is not enough.
+        self._dedup_evals_since_pair: int = 0
 
     # ---------------- Public lifecycle ----------------
     def stop(self) -> None:
@@ -264,6 +268,20 @@ class BackgroundEvalWorker(threading.Thread):
                 idle_ticks = 0
                 uid, hotkey = target
                 await self._evaluate_one(round_obj, uid=uid, hotkey=hotkey)
+                # Interleaved dedup pass. The idle-tick trigger above is
+                # the ideal opportunity — but on a full roster it never
+                # arrives: the eval queue does not drain before the window
+                # closes, so `no pending targets` was logged ZERO times in
+                # 100 minutes of production against a 7m50s eval window,
+                # and the shadow pass never ran once. Spending one pair
+                # every `dedup_eval_interval` completed evals makes the
+                # measurement proportional to work actually done, and it
+                # stays bounded by `dedup_max_pairs` either way. Set the
+                # interval to 0 to restore idle-only behaviour.
+                if self._tick_interleaved_dedup():
+                    # Cheap no-op when the filter is "off": the callee's
+                    # own mode gate returns before touching the GPU.
+                    await self._maybe_run_dedup_shadow(round_obj)
         finally:
             try:
                 VALIDATOR_BG_WORKER_PAUSED.labels(worker="eval").set(0)
@@ -676,6 +694,22 @@ class BackgroundEvalWorker(threading.Thread):
             )
 
     # ---------------- Dedup shadow pass ----------------
+    def _tick_interleaved_dedup(self) -> bool:
+        """Count one completed eval; True when a merged pair is due.
+
+        `dedup_eval_interval == 0` disables interleaving and restores the
+        original idle-only trigger. Kept separate from the pass itself so
+        the cadence is testable without driving the whole worker loop.
+        """
+        self._dedup_evals_since_pair += 1
+        interval = int(getattr(
+            self.config.evaluation, "dedup_eval_interval", 0,
+        ))
+        if interval > 0 and self._dedup_evals_since_pair >= interval:
+            self._dedup_evals_since_pair = 0
+            return True
+        return False
+
     def _reset_dedup_state_if_new_round(self, round_obj) -> None:
         """Reset dedup bookkeeping when a genuinely NEW round arrives.
 
@@ -694,6 +728,7 @@ class BackgroundEvalWorker(threading.Thread):
         self._dedup_budget_used = 0
         self._dedup_pairs_skipped = 0
         self._dedup_summary_emitted = False
+        self._dedup_evals_since_pair = 0
 
     def _emit_dedup_summary(self, *, reason: str) -> None:
         """One `dedup-shadow: round summary` line per round (best effort)."""

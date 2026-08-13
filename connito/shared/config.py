@@ -1067,6 +1067,14 @@ class EvalCfg(BaseConfig):
     # ...but never spend more than this many merged-pair GPU evals per
     # round (each costs about one miner eval).
     dedup_max_pairs: int = 10
+    # Run one merged pair after every N completed miner evals. The pass
+    # ALSO runs on bg-eval idle ticks, but on a full roster those never
+    # happen — measured on production, `no pending targets` was logged 0
+    # times in 100 minutes against a 7m50s eval window, so an idle-only
+    # trigger never fired at all. At the observed ~44 evals per window,
+    # N=8 spends about 5 of the 10-pair budget and adds ~11% to the
+    # window. Set to 0 for idle-only (the original behaviour).
+    dedup_eval_interval: int = 8
     # Enforcement threshold τ, in val_loss units: a pair is redundant when
     # `merge_penalty >= -τ`. The default 0.0 makes this a pure SIGN test —
     # redundant unless averaging beat the better side outright. Do not

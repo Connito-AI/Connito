@@ -215,6 +215,7 @@ def _make_worker(
     *,
     mode: str = "shadow",
     threshold: float = 0.0,
+    eval_interval: int = 8,
 ) -> BackgroundEvalWorker:
     config = SimpleNamespace(
         evaluation=SimpleNamespace(
@@ -222,6 +223,7 @@ def _make_worker(
             dedup_top_k=5,
             dedup_max_pairs=10,
             dedup_threshold=threshold,
+            dedup_eval_interval=eval_interval,
             per_miner_eval_timeout_sec=30,
             top_k_miners_to_reward=3,
         ),
@@ -453,3 +455,39 @@ def test_shadow_mode_never_flags_even_when_redundant(tmp_path: Path) -> None:
 
     assert worker._dedup_budget_used == 1  # measured
     assert round_obj.dedup_flagged_uids == set()  # but never enforced
+
+
+# ---------------------------------------------------------------------------
+# Interleaved trigger — the idle-tick trigger never fires on a full roster
+# ---------------------------------------------------------------------------
+
+def test_interleaved_dedup_fires_every_n_evals(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj, eval_interval=3)
+
+    # Two evals: not due yet.
+    assert worker._tick_interleaved_dedup() is False
+    assert worker._tick_interleaved_dedup() is False
+    # Third: due, and the counter resets.
+    assert worker._tick_interleaved_dedup() is True
+    assert worker._dedup_evals_since_pair == 0
+    # Cadence repeats.
+    assert [worker._tick_interleaved_dedup() for _ in range(3)] == [False, False, True]
+
+
+def test_interleaved_dedup_disabled_by_zero_interval(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj, eval_interval=0)
+    # Idle-only behaviour: never due, no matter how many evals complete.
+    assert not any(worker._tick_interleaved_dedup() for _ in range(50))
+
+
+def test_interleaved_counter_resets_on_new_round(tmp_path: Path) -> None:
+    round_a = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_a, eval_interval=3)
+    worker._tick_interleaved_dedup()
+    worker._tick_interleaved_dedup()
+    assert worker._dedup_evals_since_pair == 2
+    round_b = _make_round(tmp_path, {3: 0.4, 4: 0.3}, round_id=8)
+    worker._reset_dedup_state_if_new_round(round_b)
+    assert worker._dedup_evals_since_pair == 0
