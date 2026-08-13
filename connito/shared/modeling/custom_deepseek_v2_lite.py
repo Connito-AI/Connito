@@ -42,6 +42,14 @@ from connito.shared.app_logging import structlog
 from connito.shared.helper import *
 
 from connito.shared.expert_manager import get_layer_expert_id
+from connito.shared.modeling.quantization import (
+    FP8_DTYPE,
+    QUANT_MARKER,
+    dequantize_for_compute,
+    dequantize_last_dim,
+    quantize_last_dim,
+    require_not_quantized,
+)
 
 if TYPE_CHECKING:
     from connito.shared.config import MinerConfig
@@ -160,16 +168,145 @@ class CustomDeepseekV2Experts(nn.Module):
     # nn.Parameter names (no .weight suffix — these are raw 3D tensors, not nn.Linear)
     _STACKED_PARAMS = ("gate_up_proj", "down_proj")
 
+    # ── fp8 storage ───────────────────────────────────────────────────────
+    # When quantized, each stacked Parameter is replaced by an fp8 buffer plus
+    # a per-expert per-output-row fp32 scale (both persistent=False, so
+    # `state_dict()` is unchanged). Every read of the stacked tensor goes
+    # through `_stacked_tensor` / `_expert_slice` and every write through
+    # `_write_stacked`, so the save/load overrides below work identically in
+    # both modes.
+
+    def _is_fp8(self) -> bool:
+        return getattr(self, QUANT_MARKER, False)
+
+    def quantize_(self) -> None:
+        """Convert the stacked expert parameters to fp8 storage, in place.
+
+        Validator-only. On a miner every stacked tensor is trainable as a whole
+        (the trainable group and the frozen helper group share it), so there is
+        nothing here that can be frozen into fp8 without changing what the
+        trainable experts co-adapt against.
+        """
+        if self._is_fp8():
+            return
+        for name in self._STACKED_PARAMS:
+            param = getattr(self, name)
+            values, scale = quantize_last_dim(param.data)
+            # Record the compute dtype *before* the delattr below: it is the
+            # last read of `param`, and every later consumer
+            # (`_stacked_dtype`, `_expert_slice`, `state_dict`) depends on it.
+            # Safe to keep afterwards because a `torch.dtype` is not a tensor,
+            # so `nn.Module.__setattr__` stores it in `__dict__` rather than
+            # `_parameters` — deleting the parameter leaves it untouched.
+            self._compute_dtype = param.data.dtype
+            delattr(self, name)  # drops it from _parameters
+            self.register_buffer(f"{name}_fp8", values, persistent=False)
+            self.register_buffer(f"{name}_scale", scale, persistent=False)
+        setattr(self, QUANT_MARKER, True)
+
+    def _apply(self, *args, **kwargs):
+        # Keep `_compute_dtype`, the fp8 storage dtype and the fp32 scales
+        # correct across a `.to(dtype=...)`. Nothing in production casts a
+        # quantized model — `require_not_quantized` guards the one path that
+        # would — but a stale compute dtype would make `state_dict()` report the
+        # wrong dtype and silently break the graft path, and an upcast weight
+        # buffer would silently give back the whole memory saving. Don't rely on
+        # call ordering.
+        probe = torch.zeros(1, dtype=self._stacked_dtype()) if self._is_fp8() else None
+        out = super()._apply(*args, **kwargs)
+        if self._is_fp8():
+            try:
+                probed = args[0](probe).dtype if args else probe.dtype
+            except Exception:  # noqa: BLE001
+                probed = self._compute_dtype
+            if probed.is_floating_point and probed != FP8_DTYPE:
+                self._compute_dtype = probed
+            for name in self._STACKED_PARAMS:
+                # fp8 is a *floating* dtype, so unlike int8 the weight buffer is
+                # not skipped by `Module.to(dtype=...)`. Casting it back is
+                # exactly lossless — every value came from fp8 to begin with.
+                values = getattr(self, f"{name}_fp8")
+                if values.dtype != FP8_DTYPE:
+                    values.data = values.data.to(FP8_DTYPE)
+                scale = getattr(self, f"{name}_scale")
+                if scale.dtype != torch.float32:
+                    scale.data = scale.data.float()
+        return out
+
+    def _stacked_dtype(self) -> torch.dtype:
+        """The compute dtype of the stacked tensors — never the fp8 storage dtype."""
+        if self._is_fp8():
+            return self._compute_dtype
+        return getattr(self, self._STACKED_PARAMS[0]).dtype
+
+    def _stacked_device(self) -> torch.device:
+        name = self._STACKED_PARAMS[0]
+        holder = getattr(self, f"{name}_fp8") if self._is_fp8() else getattr(self, name)
+        return holder.device
+
+    def _stacked_shape(self, name: str) -> tuple[int, ...]:
+        holder = getattr(self, f"{name}_fp8") if self._is_fp8() else getattr(self, name)
+        return tuple(holder.shape)
+
+    def _stacked_tensor(self, name: str) -> torch.Tensor:
+        """The full stacked tensor at compute dtype, dequantizing if needed.
+
+        Serialisation/merge path, so this takes the exact fp32-arithmetic
+        dequantization rather than the forward pass's activation-dtype one.
+        """
+        if not self._is_fp8():
+            return getattr(self, name).data.clone()
+        return dequantize_last_dim(
+            getattr(self, f"{name}_fp8"), getattr(self, f"{name}_scale"), self._compute_dtype
+        )
+
+    def _expert_slice(self, name: str, local_idx, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """One expert's 2D weight. Dequantizes only that slice when quantized.
+
+        Forward path, so this uses `dequantize_for_compute` — the multiply lands
+        in the *activation* dtype, matching the reference fp8 implementation.
+        The unquantized branch is left exactly as it was, returning a live view
+        with no cast, so nothing about the fp16 path changes.
+        """
+        if not self._is_fp8():
+            return getattr(self, name)[local_idx]
+        return dequantize_for_compute(
+            getattr(self, f"{name}_fp8")[local_idx],
+            getattr(self, f"{name}_scale")[local_idx],
+            dtype or self._compute_dtype,
+        )
+
+    def _write_stacked(self, name: str, stacked: torch.Tensor) -> None:
+        """Write a full stacked tensor back, re-quantizing if needed."""
+        if not self._is_fp8():
+            getattr(self, name).data.copy_(stacked)
+            return
+        values, scale = quantize_last_dim(stacked.to(self._stacked_device()))
+        getattr(self, f"{name}_fp8").copy_(values)
+        getattr(self, f"{name}_scale").copy_(scale)
+
     # ── Save: expand stacked 3D tensors into per-expert slices ────────────
     # Override _save_to_state_dict (not state_dict) so expansion works
     # when called from the parent model's state_dict() traversal.
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        if keep_vars and self._is_fp8():
+            raise RuntimeError(
+                "CustomDeepseekV2Experts cannot honour state_dict(keep_vars=True) while "
+                "quantized: the per-expert entries are dequantized copies, not live views."
+            )
         super()._save_to_state_dict(destination, prefix, keep_vars)
         for name in self._STACKED_PARAMS:
             stacked_key = f"{prefix}{name}"
-            if stacked_key not in destination:
+            if stacked_key in destination:
+                stacked = destination.pop(stacked_key)
+            elif self._is_fp8():
+                # Quantized: the Parameter is gone and the fp8 buffers are
+                # persistent=False, so super() emitted nothing. Rebuild the
+                # stacked tensor on CPU — save paths call state_dict() before
+                # moving anything, so dequantizing on-device would spike VRAM.
+                stacked = self._stacked_tensor(name).to("cpu")
+            else:
                 continue
-            stacked = destination.pop(stacked_key)
             for local_idx, global_idx in enumerate(self.expert_indices):
                 destination[f"{prefix}{global_idx}.{name}"] = stacked[local_idx]
 
@@ -189,9 +326,14 @@ class CustomDeepseekV2Experts(nn.Module):
             stacked_key = f"{prefix}{name}"
             if stacked_key in state_dict:
                 incoming = state_dict[stacked_key]
-                target_param = getattr(self, name)
                 incoming_shape = tuple(incoming.shape)
-                target_shape = tuple(target_param.shape)
+                target_shape = self._stacked_shape(name)
+                target_device = self._stacked_device()
+                # Never the storage dtype: when quantized that is fp8, and
+                # casting an incoming fp16 slice straight to it would round
+                # every weight to e4m3's three-bit mantissa *unscaled*, so
+                # anything above 448 would become NaN outright.
+                target_dtype = self._stacked_dtype()
 
                 if incoming_shape == target_shape:
                     logger.debug(
@@ -203,14 +345,14 @@ class CustomDeepseekV2Experts(nn.Module):
 
                 # Adapt full stacked tensor [global_experts, ...] to this module's local experts.
                 if (
-                    incoming.ndim == target_param.ndim
+                    incoming.ndim == len(target_shape)
                     and incoming_shape[1:] == target_shape[1:]
                     and len(self.expert_indices) == target_shape[0]
                 ):
                     if all(0 <= int(expert_id) < incoming_shape[0] for expert_id in self.expert_indices):
                         adapted = incoming[self.expert_indices].to(
-                            device=target_param.device,
-                            dtype=target_param.dtype,
+                            device=target_device,
+                            dtype=target_dtype,
                         )
                         state_dict[stacked_key] = adapted
                         logger.info(
@@ -225,8 +367,8 @@ class CustomDeepseekV2Experts(nn.Module):
                     # Backward compatibility for older local-id checkpoints.
                     if incoming_shape[0] >= target_shape[0]:
                         adapted = incoming[: target_shape[0]].to(
-                            device=target_param.device,
-                            dtype=target_param.dtype,
+                            device=target_device,
+                            dtype=target_dtype,
                         )
                         state_dict[stacked_key] = adapted
                         logger.warning(
@@ -246,34 +388,40 @@ class CustomDeepseekV2Experts(nn.Module):
                 state_dict.pop(stacked_key, None)
                 continue
 
-            # Start from the current (base) model weights as default
-            base_param = getattr(self, name)  # [num_local_experts, ...]
-            stacked = base_param.data.clone()
+            # Start from the current (base) model weights as default.
+            # `_stacked_tensor` already returns a detached clone at compute
+            # dtype, so the incoming fp16/bf16 slices below land unmodified.
+            stacked = self._stacked_tensor(name)  # [num_local_experts, ...]
+            # Take the "before" sum here, off the tensor we already hold. The
+            # overlay loop mutates `stacked` in place, so reading it afterwards
+            # meant calling `_stacked_tensor` a second time — a whole extra
+            # clone, and a whole extra dequantization when quantized (~230 MB
+            # transient per MoE layer), purely to populate a debug log field.
+            org_param_sum = float(stacked.sum().item())
             found_any = False
             loaded_experts = []
 
             for local_idx, global_idx in enumerate(self.expert_indices):
                 expert_key = f"{prefix}{global_idx}.{name}"
                 if expert_key in state_dict:
-                    stacked[local_idx] = state_dict.pop(expert_key)
+                    stacked[local_idx] = state_dict.pop(expert_key).to(
+                        device=stacked.device, dtype=stacked.dtype
+                    )
                     found_any = True
                     loaded_experts.append(global_idx)
 
-
             if found_any:
+                # The write itself happens in the single funnel below, so the
+                # tensor is stored exactly once in both modes.
                 state_dict[stacked_key] = stacked
-                # Explicitly write to the parameter as well
-                param = getattr(self, name)
-                org_param_sum = param.sum()
-                param.data.copy_(stacked)
                 merge_events.append(
                     {
                         "param": name,
                         "loaded_count": len(loaded_experts),
                         "loaded_first": loaded_experts[0],
                         "loaded_last": loaded_experts[-1],
-                        "prev": round(org_param_sum.item(), 4),
-                        "new": round(param.sum().item(), 4),
+                        "prev": round(org_param_sum, 4),
+                        "new": round(float(stacked.sum().item()), 4),
                     }
                 )
 
@@ -299,6 +447,21 @@ class CustomDeepseekV2Experts(nn.Module):
                     layer_id=layer_id,
                     total_merged=len(merge_events),
                 )
+
+        # Single write funnel. Every branch above communicates its result by
+        # leaving the assembled tensor at `stacked_key`; consume it here so the
+        # stacked tensor is written exactly once. Popping before delegating is
+        # what keeps super() from (a) loading it a second time in the
+        # unquantized case and (b) reporting it as an unexpected key in the
+        # quantized case, where no Parameter of that name exists any more.
+        for name in self._STACKED_PARAMS:
+            stacked_key = f"{prefix}{name}"
+            if stacked_key in state_dict:
+                self._write_stacked(name, state_dict.pop(stacked_key))
+            elif strict and self._is_fp8():
+                # super() cannot report this for us: when quantized the entry is
+                # a non-persistent buffer, so it is absent from `local_state`.
+                missing_keys.append(stacked_key)
 
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
@@ -328,9 +491,11 @@ class CustomDeepseekV2Experts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[global_expert_idx])
 
             current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[local_expert_idx]).chunk(2, dim=-1)
+            gate_up_w = self._expert_slice("gate_up_proj", local_expert_idx, current_state.dtype)
+            gate, up = nn.functional.linear(current_state, gate_up_w).chunk(2, dim=-1)
             current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[local_expert_idx])
+            down_w = self._expert_slice("down_proj", local_expert_idx, current_hidden_states.dtype)
+            current_hidden_states = nn.functional.linear(current_hidden_states, down_w)
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
@@ -662,6 +827,11 @@ def convert_full_to_partial_model(
     - `source` as an instantiated full model, or
     - `source` as a local/remote pretrained checkpoint path (possibly sharded).
     """
+    # These loaders mutate the tensors returned by `state_dict()` in place;
+    # that works only because they are live views onto real parameters. On a
+    # quantized model `state_dict()` hands back dequantized copies and every
+    # write would land in a temporary.
+    require_not_quantized(partial_model, "convert_full_to_partial_model")
     partial_state = partial_model.state_dict()
     assignments = expert_group_assignment.get(target_group, {})
     loaded_counts = {"full": 0, "sliced": 0, "transposed": 0}
@@ -894,6 +1064,11 @@ def stream_pretrained_state_dict_to_partial_model(
     for the merged partial (see `merge_group_assignments_for_streaming`).
     The caller's `state_dict` is consumed: it ends empty.
     """
+    # These loaders mutate the tensors returned by `state_dict()` in place;
+    # that works only because they are live views onto real parameters. On a
+    # quantized model `state_dict()` hands back dequantized copies and every
+    # write would land in a temporary.
+    require_not_quantized(partial_model, "stream_pretrained_state_dict_to_partial_model")
     partial_state = partial_model.state_dict()
     loaded_counts = {"full": 0, "sliced": 0}
     gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
@@ -967,6 +1142,11 @@ def stream_safetensors_to_partial_model(
             )
         shard_filenames = [SAFE_WEIGHTS_NAME]
 
+    # These loaders mutate the tensors returned by `state_dict()` in place;
+    # that works only because they are live views onto real parameters. On a
+    # quantized model `state_dict()` hands back dequantized copies and every
+    # write would land in a temporary.
+    require_not_quantized(partial_model, "stream_safetensors_to_partial_model")
     partial_state = partial_model.state_dict()
     loaded_counts = {"full": 0, "sliced": 0}
     gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
