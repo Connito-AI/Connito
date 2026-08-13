@@ -100,6 +100,15 @@ services:
       # firewall. Must be passed through explicitly — a value in .env alone
       # only interpolates into this file, it does not reach the container.
       CONNITO_TELEMETRY_PORT: ${CONNITO_TELEMETRY_PORT:-8200}
+      # Set to "1" only for a test validator sharing a hotkey with a live
+      # one: suppresses every chain extrinsic and keeps the process out of
+      # the DHT, so it evaluates without acting under the shared identity.
+      # Empty here, and only the exact value "1" enables it, so a production
+      # deployment that never sets it is unaffected. Like the port above,
+      # this MUST be listed here — a value in .env alone interpolates into
+      # this file without reaching the container, which would leave an
+      # instance meant to be an observer running fully live.
+      CONNITO_VALIDATOR_OBSERVER: ${CONNITO_VALIDATOR_OBSERVER:-}
 
     volumes:
       # Wallets — read-only is safest; the validator only signs with the hotkey.
