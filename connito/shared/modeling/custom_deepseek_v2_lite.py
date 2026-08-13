@@ -192,6 +192,12 @@ class CustomDeepseekV2Experts(nn.Module):
         for name in self._STACKED_PARAMS:
             param = getattr(self, name)
             values, scale = quantize_last_dim(param.data)
+            # Record the compute dtype *before* the delattr below: it is the
+            # last read of `param`, and every later consumer
+            # (`_stacked_dtype`, `_expert_slice`, `state_dict`) depends on it.
+            # Safe to keep afterwards because a `torch.dtype` is not a tensor,
+            # so `nn.Module.__setattr__` stores it in `__dict__` rather than
+            # `_parameters` — deleting the parameter leaves it untouched.
             self._compute_dtype = param.data.dtype
             delattr(self, name)  # drops it from _parameters
             self.register_buffer(f"{name}_fp8", values, persistent=False)
