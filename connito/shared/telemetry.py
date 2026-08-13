@@ -54,7 +54,13 @@ CONNITO_VALIDATOR_INFO = Info(
 
 
 def set_validator_identity(
-    *, hotkey: str, uid: int | None, version: str, netuid: int, quantization: str = "off"
+    *,
+    hotkey: str,
+    uid: int | None,
+    version: str,
+    netuid: int,
+    quantization: str = "off",
+    observer: bool = False,
 ) -> None:
     """Stamp the validator's identity onto the ``connito_validator_info``
     metric. Call once at validator startup, immediately after ``validator_uid``
@@ -75,6 +81,9 @@ def set_validator_identity(
         "version": str(version),
         "netuid": str(netuid),
         "quantization": str(quantization),
+        # An observer shares a hotkey with the live validator, so hotkey and
+        # uid alone do not distinguish this scrape from that one.
+        "observer": "1" if observer else "0",
     })
 
 
