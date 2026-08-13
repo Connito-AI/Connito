@@ -196,6 +196,31 @@ class ModelCfg(BaseConfig):
     attn_implementation: str = "sdpa"
     precision: str = "fp16-mixed"
     device: str = "cuda"
+    # Runtime weight-only fp8 quantization (float8_e4m3fn, scaled per output
+    # row). Weights are always *loaded* and *saved* at `precision`; "fp8" only
+    # changes how they are held in memory between those points. See
+    # connito/shared/modeling/quantization.py.
+    #
+    # What it covers differs by role, and not for want of trying:
+    #   validator -> the eval models only (never `global_model`, whose merge and
+    #                outer-optimizer paths walk `named_parameters()` and would
+    #                silently skip fp8 buffers). Covers the routed experts, so
+    #                this is where the memory actually drops.
+    #   miner     -> the frozen non-expert Linears only (~0.4 B params: MLA
+    #                projections, the first_k_dense_replace dense MLPs, shared
+    #                experts). The routed experts CANNOT be quantized here: the
+    #                trainable group and the frozen helper group are interleaved
+    #                in one stacked tensor per layer, which `freeze_parameters`
+    #                marks trainable as a whole. Expect a modest saving.
+    #
+    # CONSENSUS: this changes `val_loss`. A validator running "fp8" produces
+    # numbers that are not comparable with an fp16 validator's for the same
+    # `combined_seed`, exactly like the eval_source_* knobs above. Deliberately
+    # NOT a locked field while it is opt-in: auto_update_config resets locked
+    # fields to their defaults on every start, which would force "off"
+    # fleet-wide and make the per-host staging validation impossible. Lock it
+    # if and when it becomes the fleet default.
+    quantization: Literal["off", "fp8"] = "off"
 
 
 class DatasetSourceCfg(BaseConfig):

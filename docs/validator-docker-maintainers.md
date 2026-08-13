@@ -51,7 +51,7 @@ is why `.dockerignore` lives at the repo root.
 1. Base: `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`. Pin via the
    `CUDA_IMAGE` build arg.
 2. System deps: Python 3.10, build tools, git (needed for the VCS-installed
-   `hivemind` and `unsloth` deps), curl (for the healthcheck).
+   `hivemind` dep), curl (for the healthcheck).
 3. `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124`.
    Torch is pinned in `requirements.txt`; the extra index just makes
    sure pip picks up the cu124 binary wheel instead of the CPU one.
@@ -486,10 +486,6 @@ When in doubt: announce it, then push.
 - **Hivemind installs from a git SHA** (`@4bd43b77`). If that ref
   disappears (force push, repo rename) the build breaks for everyone.
   Mirror it under our org if it ever becomes load-bearing.
-- **Unsloth installs from `main`.** Same risk, but only on `linux` per
-  the requirements.txt marker. A breaking unsloth change can land in
-  master with zero warning. Consider pinning to a SHA before the next
-  validator-critical release.
 - **`shm_size: 16gb` in `docker-compose.yml`.** PyTorch DataLoader
   workers need a lot of `/dev/shm`. If you drop this, validators on
   smaller hosts will OOM mysteriously inside the dataloader.

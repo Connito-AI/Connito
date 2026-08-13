@@ -53,11 +53,25 @@ CONNITO_VALIDATOR_INFO = Info(
 )
 
 
-def set_validator_identity(*, hotkey: str, uid: int | None, version: str, netuid: int) -> None:
+def set_validator_identity(
+    *,
+    hotkey: str,
+    uid: int | None,
+    version: str,
+    netuid: int,
+    quantization: str = "off",
+    observer: bool = False,
+) -> None:
     """Stamp the validator's identity onto the ``connito_validator_info``
     metric. Call once at validator startup, immediately after ``validator_uid``
     resolution. Safe to re-call (e.g. on UID change after a deregister/re-
     register cycle) — ``Info.info()`` replaces the labelset atomically.
+
+    ``quantization`` reports ``model.quantization``. It belongs here because a
+    validator running fp8 produces ``val_loss`` values that are not comparable
+    with an fp16 validator's for the same ``combined_seed`` — when weights
+    diverge across the fleet, this label is what makes the cause visible
+    without shelling into hosts.
     """
     CONNITO_VALIDATOR_INFO.info({
         "hotkey": str(hotkey),
@@ -66,6 +80,10 @@ def set_validator_identity(*, hotkey: str, uid: int | None, version: str, netuid
         "uid": str(uid if uid is not None else -1),
         "version": str(version),
         "netuid": str(netuid),
+        "quantization": str(quantization),
+        # An observer shares a hotkey with the live validator, so hotkey and
+        # uid alone do not distinguish this scrape from that one.
+        "observer": "1" if observer else "0",
     })
 
 

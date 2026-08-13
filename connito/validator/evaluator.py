@@ -15,6 +15,7 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
+from connito.shared.modeling.quantization import state_dict_shapes
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
     load_state_dict_from_path,
@@ -714,15 +715,19 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
 
     model = copy.deepcopy(base_model)
 
-    # Keys in each state_dict (before loading)
-    base_sd = base_model.state_dict()
+    # Keys in each state_dict (before loading). This block only ever reads keys
+    # and shapes, so take the cached shape map rather than `base_model
+    # .state_dict()`: this runs once per miner against the same base model, and
+    # on a quantized base every call would materialise a full dequantized copy
+    # and eat exactly the memory the quantization saved.
+    base_sd = state_dict_shapes(base_model)
     base_keys = set(base_sd.keys())
     ckpt_keys = set(sd.keys())
 
     # 1) Params that are the same across both dicts (intersection).
     #    (Optional: filter to ones with matching shapes too.)
     common_keys = base_keys & ckpt_keys
-    common_same_shape = {k for k in common_keys if base_sd[k].shape == sd[k].shape}
+    common_same_shape = {k for k in common_keys if base_sd[k] == tuple(sd[k].shape)}
 
     # 2) Keys containing 'expert' that exist in the checkpoint but NOT in the base model
     expert_not_in_base = {k for k in ckpt_keys - base_keys if "expert" in k}
