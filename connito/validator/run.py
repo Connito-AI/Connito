@@ -531,7 +531,14 @@ def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str
 
     model.eval()
     model.requires_grad_(False)
-    converted = quantize_model_(model, include_experts=True)
+    # Experts only, backbone left at full precision. This matches the scope of
+    # the reference implementation in the experiment repo
+    # (`partial_moe.py:quantize_expert_fp8`, 17c878d), which quantizes expert
+    # projections and nothing else — a loss delta measured here is only
+    # comparable with one measured there if both are quantizing the same set of
+    # tensors. It also keeps most of the memory win: the experts dominate a
+    # partial model (~1.8 B params against a ~0.4 B backbone).
+    converted = quantize_model_(model, include_experts=True, include_linears=False)
     logger.warning(
         "fp8 quantization ACTIVE on validator eval model via "
         f"{VALIDATOR_FP8_OVERRIDE_ENV} — scoring is expected to be corrupted: "
