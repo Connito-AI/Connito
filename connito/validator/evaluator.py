@@ -251,16 +251,24 @@ def finalize_round_scores(
     # `dedup_filter_mode == "enforce"`.
     dedup_uids = {uid for uid, _ in positive if uid in dedup_flagged}
     penalized_uids = tied_uids | dedup_uids
-    unique_positive = [
-        (uid, s) for uid, s in positive
-        if score_counts[s] == 1 and uid not in penalized_uids
-    ]
-    unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
+    # Ranking list. Tied miners are dropped outright, so everyone below them
+    # moves up — the pre-existing exact-tie behaviour, deliberately left
+    # alone (it applies even with the dedup filter off). Dedup-flagged
+    # miners instead KEEP their position and are paid 0, which burns the
+    # slot rather than handing it to the next miner up. Two reasons it must
+    # not cascade: the pairwise filter only ever examines the top
+    # `dedup_top_k`, so a promoted miner is one nobody compared against
+    # anything; and cascading pays an attacker for taking out a rival, since
+    # zeroing the leader lifts every UID behind it by exactly one rank.
+    ranked_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
+    ranked_positive.sort(key=lambda kv: (-kv[1], kv[0]))
 
     written: dict[int, float] = {}
     top_uids: set[int] = set()
-    for rank, (uid, _) in enumerate(unique_positive):
+    for rank, (uid, _) in enumerate(ranked_positive):
         rank_score = _RANK_TO_SCORE[rank] if rank < len(_RANK_TO_SCORE) else 0.0
+        if uid in dedup_uids:
+            rank_score = 0.0  # slot burned, not reassigned
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -270,8 +278,11 @@ def finalize_round_scores(
         written[uid] = rank_score
         top_uids.add(uid)
 
-    # Tied or dedup-flagged positive-delta miners — explicit 0 entry per uid.
+    # Tied miners — plus any dedup-flagged miner that was *also* tied and so
+    # never appeared in `ranked_positive`. Explicit 0 entry per uid.
     for uid in penalized_uids:
+        if uid in written:
+            continue
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -439,12 +450,12 @@ def finalize_round_scores(
     logger.info(
         "finalize_round_scores: round scored by rank",
         round_id=round_obj.round_id,
-        top3={
-            int(u): _RANK_TO_SCORE[r]
-            for r, (u, _) in enumerate(unique_positive[:3])
-        },
+        # Actual awarded score, not the rank's nominal value — a burned
+        # slot must read 0 here or the log contradicts the aggregator.
+        top3={int(u): written.get(int(u), 0.0) for u, _ in ranked_positive[:3]},
         scored_count=len(scored),
         tied_count=len(tied_uids),
+        dedup_flagged_count=len(dedup_uids),
         validation_failed_count=len(validation_failed),
         freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )
