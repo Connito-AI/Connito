@@ -1048,6 +1048,79 @@ class EvalCfg(BaseConfig):
     # "delete-your-model-and-keep-earning" hole; set False to restore the
     # legacy EMA-preserving behavior.
     repo_unavailable_is_miner_fault: bool = True
+    # Duplicate-submission ("entropy") filter. "shadow" runs a merge-loss
+    # measurement pass over pairs of the round's top positive-scoring
+    # submissions and LOGS the results (loss of the averaged pair vs each
+    # side, plus delta-cosine similarity) without affecting any score,
+    # weight, or journal entry. Deliberately NOT a locked field while in
+    # shadow: auto_update_config resets locked fields to their defaults on
+    # every start, which would force "off" fleet-wide and make per-host
+    # opt-in impossible. Deliberately still unlocked in "enforce" so a
+    # single host can run enforcement ahead of the fleet.
+    #
+    # "enforce" additionally zeroes BOTH sides of every pair the filter
+    # confirms redundant, exactly as the exact-score-tie rule already
+    # does for bit-identical submissions.
+    dedup_filter_mode: Literal["off", "shadow", "enforce"] = "off"
+    # Compare the top-K positive-delta miners of the round...
+    dedup_top_k: int = 5
+    # ...but never spend more than this many merged-pair GPU evals per
+    # round (each costs about one miner eval).
+    dedup_max_pairs: int = 10
+    # Run one merged pair after every N completed miner evals. DEFAULT OFF
+    # (0), because interleaving DISPLACES miner evals rather than extending
+    # the window: the window is bounded by phase transitions, so a pair run
+    # mid-scoring costs one miner its evaluation, and an unevaluated miner
+    # scores 0 for the round. The honest miner pays for the filter.
+    #
+    # Not needed in the normal case either. The bg-eval window spans
+    # ValidatorCommit1 → Train, and measured on production the roster was
+    # graded in ~27 min of a ~68 min Train, leaving ~41 min idle with the
+    # model still resident — far more than the ~7 min ten pairs need. The
+    # idle-tick trigger covers that.
+    #
+    # Set > 0 only for a validator whose roster leaves no idle tail (where
+    # grading alone overruns Train), and accept the displacement knowingly.
+    dedup_eval_interval: int = 0
+    # Seconds a merged pair is assumed to need. The pass will not START a
+    # pair when less than this remains of the eval window, because the
+    # window closes at MinerCommit1 - 5 — exactly where finalize applies
+    # verdicts and weights go to chain, so a later result is wasted. ~120 s
+    # is generous against the ~41 s/eval measured on the RTX 6000 Ada.
+    dedup_pair_budget_sec: int = 120
+    # Enforcement threshold τ, in val_loss units: a pair is redundant when
+    # `merge_penalty >= -τ`. The default 0.0 makes this a pure SIGN test —
+    # redundant unless averaging beat the better side outright. Do not
+    # raise it casually: measured merge penalties on live submissions are
+    # ~5e-4, so any τ >= 0.01 flags 100% of pairs, honest ones included.
+    dedup_threshold: float = 0.0
+    # Reserve the tail of the eval window for the pairwise pass and stop
+    # claiming new miner evals once it opens, so the ranking the pass runs
+    # against cannot move underneath it.
+    #
+    # Without this, `select_pairs` re-reads the score map on every trigger,
+    # so "top K" means "top K of whoever happens to be graded right now".
+    # Miners are graded in stalest-first order, which is unrelated to
+    # quality, so an early sample is a RANDOM subset — and `dedup_max_pairs`
+    # is a per-ROUND budget while `dedup_top_k` bounds a single call. Pairs
+    # drawn from a half-filled scoreboard therefore burn the whole budget
+    # before the real top-K exists, and in `enforce` mode their verdicts
+    # still apply at finalize: `dedup_flagged_uids` is only ever added to,
+    # so a miner flagged against a neighbour who later fell away is zeroed
+    # on a comparison the final ranking would never have chosen to make.
+    #
+    # The reserved span is `dedup_max_pairs * dedup_pair_budget_sec` — the
+    # pass's own worst case for its own budget, so the last pair starts
+    # exactly at the point `_dedup_window_allows_pair` still permits. Tune
+    # by changing either of those two knobs; the round summary logs how
+    # much of the tail was actually used.
+    #
+    # Cost: miners still ungraded when the tail opens score 0 for the round.
+    # On a validator with a long idle tail (measured: roster graded in ~27
+    # min of a ~68 min Train) this costs nothing. On one whose grading
+    # already overruns the window it costs real coverage — the freeze log
+    # reports `unscored_at_freeze` so that is visible rather than silent.
+    dedup_freeze_field: bool = True
 
 
 class ValidatorConfig(WorkerConfig):

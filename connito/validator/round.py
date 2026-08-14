@@ -100,6 +100,12 @@ class Round:
     # (which only covers roster miners with a valid checkpoint).
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
+    # Near-duplicate submissions confirmed by the merge-loss dedup filter
+    # while `dedup_filter_mode == "enforce"`. BOTH sides of a redundant
+    # pair land here and both get score 0 at finalize — the same posture
+    # as the exact-score-tie rule, generalized from bit-identical to
+    # near-identical submissions. Always empty in "off"/"shadow" mode.
+    dedup_flagged_uids: set[int] = field(default_factory=set)
     weights_submitted: bool = False
     # Last live lifecycle step this round reached (set by run.py alongside
     # the VALIDATOR_ROUND_LIFECYCLE_STEP gauge: 0 freeze / 2 post-foreground
@@ -684,6 +690,28 @@ class Round:
         self._persist_journal()
         if hotkey is not None:
             self._record_in_cycle_score(uid, hotkey, score_f)
+
+    def scores_snapshot(self) -> dict[int, float]:
+        """Lock-guarded copy of this round's per-miner delta scores.
+
+        For readers outside the round's module family (e.g. the dedup
+        shadow pass) that need a consistent view without reaching into
+        `_lock` — same pattern `finalize_round_scores` uses internally.
+        """
+        with self._lock:
+            return dict(self.scores)
+
+    def mark_dedup_flagged(self, uid_a: int, uid_b: int) -> None:
+        """Record a confirmed-redundant pair (enforce mode only).
+
+        Both sides are recorded: `merge_penalty` is a property of the
+        PAIR, so it establishes that one of the two added nothing the
+        other lacked — not which one. Picking a survivor is a separate
+        policy question this method deliberately does not answer.
+        """
+        with self._lock:
+            self.dedup_flagged_uids.add(int(uid_a))
+            self.dedup_flagged_uids.add(int(uid_b))
 
     def top_scored_uids_this_round(self, top_k: int) -> set[int]:
         """Top-`top_k` UIDs by *this round's* score. Returns every scored

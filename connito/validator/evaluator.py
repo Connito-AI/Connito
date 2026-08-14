@@ -214,6 +214,12 @@ def finalize_round_scores(
     with round_obj._lock:  # noqa: SLF001 — same module family
         round_scores = dict(round_obj.scores)
         validation_failed = set(round_obj.validation_failed_uids)
+        # `getattr`, not attribute access: this function also runs against
+        # duck-typed stand-ins that are not a real `Round` — notably the
+        # journal-recovery path's `_RecoveryRound`, which carries scores and
+        # validation failures but no dedup state. A recovered round has no
+        # pair measurements to act on, so an empty set is the right answer.
+        dedup_flagged = set(getattr(round_obj, "dedup_flagged_uids", ()) or ())
     freeze_zero = set(round_obj.freeze_zero_uids)
     freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
 
@@ -236,13 +242,33 @@ def finalize_round_scores(
     for _, s in positive:
         score_counts[s] = score_counts.get(s, 0) + 1
     tied_uids = {uid for uid, s in positive if score_counts[s] > 1}
-    unique_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
-    unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
+    # Near-duplicates confirmed by the merge-loss filter in "enforce" mode:
+    # averaging the pair was not better than its better side, so neither
+    # added information the other lacked. Both sides are zeroed, exactly as
+    # the exact-tie rule above does — this generalizes that rule from
+    # bit-identical to near-identical submissions, which a 1-ULP
+    # perturbation is otherwise enough to slip past. Always empty unless
+    # `dedup_filter_mode == "enforce"`.
+    dedup_uids = {uid for uid, _ in positive if uid in dedup_flagged}
+    penalized_uids = tied_uids | dedup_uids
+    # Ranking list. Tied miners are dropped outright, so everyone below them
+    # moves up — the pre-existing exact-tie behaviour, deliberately left
+    # alone (it applies even with the dedup filter off). Dedup-flagged
+    # miners instead KEEP their position and are paid 0, which burns the
+    # slot rather than handing it to the next miner up. Two reasons it must
+    # not cascade: the pairwise filter only ever examines the top
+    # `dedup_top_k`, so a promoted miner is one nobody compared against
+    # anything; and cascading pays an attacker for taking out a rival, since
+    # zeroing the leader lifts every UID behind it by exactly one rank.
+    ranked_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
+    ranked_positive.sort(key=lambda kv: (-kv[1], kv[0]))
 
     written: dict[int, float] = {}
     top_uids: set[int] = set()
-    for rank, (uid, _) in enumerate(unique_positive):
+    for rank, (uid, _) in enumerate(ranked_positive):
         rank_score = _RANK_TO_SCORE[rank] if rank < len(_RANK_TO_SCORE) else 0.0
+        if uid in dedup_uids:
+            rank_score = 0.0  # slot burned, not reassigned
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -252,8 +278,11 @@ def finalize_round_scores(
         written[uid] = rank_score
         top_uids.add(uid)
 
-    # Tied positive-delta miners — explicit 0 entry per uid.
-    for uid in tied_uids:
+    # Tied miners — plus any dedup-flagged miner that was *also* tied and so
+    # never appeared in `ranked_positive`. Explicit 0 entry per uid.
+    for uid in penalized_uids:
+        if uid in written:
+            continue
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -421,12 +450,12 @@ def finalize_round_scores(
     logger.info(
         "finalize_round_scores: round scored by rank",
         round_id=round_obj.round_id,
-        top3={
-            int(u): _RANK_TO_SCORE[r]
-            for r, (u, _) in enumerate(unique_positive[:3])
-        },
+        # Actual awarded score, not the rank's nominal value — a burned
+        # slot must read 0 here or the log contradicts the aggregator.
+        top3={int(u): written.get(int(u), 0.0) for u, _ in ranked_positive[:3]},
         scored_count=len(scored),
         tied_count=len(tied_uids),
+        dedup_flagged_count=len(dedup_uids),
         validation_failed_count=len(validation_failed),
         freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )
@@ -549,6 +578,21 @@ def build_submission_uid_weights(
     )
 
 
+def retention_top_k(config) -> int:
+    """How many top submissions to keep on disk after each eval.
+
+    Normally `top_k_miners_to_reward`; while the dedup filter is active
+    the shadow pass needs the top `dedup_top_k` files to survive pruning
+    long enough to build merged pairs, so keep the max of the two. Used
+    by BOTH prune sites (foreground `_prune_non_top_after_eval` here and
+    the background worker's `_prune_non_top`).
+    """
+    keep = int(config.evaluation.top_k_miners_to_reward)
+    if getattr(config.evaluation, "dedup_filter_mode", "off") != "off":
+        keep = max(keep, int(getattr(config.evaluation, "dedup_top_k", 0)))
+    return keep
+
+
 def _prune_non_top_after_eval(
     *,
     config,
@@ -561,7 +605,7 @@ def _prune_non_top_after_eval(
         deleted = cleanup_non_top_submissions(
             round_obj=round_obj,
             submission_dir=Path(config.ckpt.miner_submission_path),
-            top_k=int(config.evaluation.top_k_miners_to_reward),
+            top_k=retention_top_k(config),
         )
     except Exception as e:
         logger.warning("foreground eval: post-eval cleanup failed", error=str(e))
@@ -649,6 +693,10 @@ class MinerEvalJob:
     # at zero — every miner scoring 0 (the majority in many rounds) would
     # be underivable. Without journaling it, a mid-round restart loses the
     # cycle's losses permanently.
+    #
+    # The dedup shadow pass also reads this: an exact `val_loss` avoids
+    # re-deriving the loss by inverting `score`, which is lossy at 0.
+    # `None` (not NaN) is the absent marker — consumers must check for it.
     val_loss: float | None = None
 
 

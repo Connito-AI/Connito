@@ -15,6 +15,9 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import copy
+import gc
+import math
 import threading
 import time
 from pathlib import Path
@@ -23,17 +26,32 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.helper import load_state_dict_from_path
 from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
+    VALIDATOR_DEDUP_PAIRS_EVALUATED_TOTAL,
+    VALIDATOR_DEDUP_WOULD_FLAG_TOTAL,
     note_round_series,
+)
+from connito.validator.dedup import (
+    DEFAULT_DEDUP_THRESHOLD,
+    average_state_dicts,
+    compute_merge_penalty,
+    delta_cosine,
+    find_submission_path,
+    is_redundant,
+    recover_val_loss,
+    select_pairs,
+    shadow_report,
 )
 from connito.validator.evaluator import (
     EVAL_MAX_BATCHES,
     cleanup_non_top_submissions,
     evaluate_one_miner_sync,
+    retention_top_k,
 )
 from connito.validator.round import RoundRef
 
@@ -115,6 +133,37 @@ class BackgroundEvalWorker(threading.Thread):
         # `_eval_base_model` reference and re-park; the next foreground
         # eval re-seeds us via `set_eval_base_model`.
         self._stuck_lock_streak: int = 0
+        # Dedup shadow-pass state. Keyed by `_dedup_round_id` — NOT by
+        # `_loaded_round_id`, which the stuck-lock recycler nulls for the
+        # SAME round; keying dedup state to it would re-evaluate pairs
+        # after a recycle. Reset only when a genuinely new round arrives
+        # (see `_reset_dedup_state_if_new_round`).
+        self._dedup_round_id: int | None = None
+        self._scored_paths: dict[int, Path] = {}
+        self._scored_val_loss: dict[int, float] = {}
+        self._dedup_pairs_done: set[frozenset[int]] = set()
+        self._dedup_budget_used: int = 0
+        self._dedup_pairs_skipped: int = 0
+        self._dedup_summary_emitted: bool = False
+        # Completed evals since the last interleaved dedup pair. Drives the
+        # `dedup_eval_interval` trigger — see the main loop for why the
+        # idle-tick trigger alone is not enough.
+        self._dedup_evals_since_pair: int = 0
+        # Last reason the dedup pass declined to run, so `_note_dedup_skip`
+        # can log transitions only. The pass is polled every couple of
+        # seconds across a ~68 min Train phase; logging unconditionally
+        # would bury the log.
+        self._dedup_last_skip_reason: str | None = None
+        # Monotonic deadline for the eval window, published by run.py via
+        # `set_window_deadline`. None disables the guard.
+        self._eval_window_deadline: float | None = None
+        # Monotonic instant the reserved dedup tail opens — derived from the
+        # deadline in `set_window_deadline`. From here the worker stops
+        # claiming miner evals so the ranking cannot move under the pairwise
+        # pass. None when the deadline is unknown or freezing is disabled.
+        self._dedup_tail_open: float | None = None
+        # One freeze-transition log line per round, not one per poll.
+        self._dedup_freeze_logged: bool = False
 
     # ---------------- Public lifecycle ----------------
     def stop(self) -> None:
@@ -205,6 +254,18 @@ class BackgroundEvalWorker(threading.Thread):
                 if round_obj.round_id != self._loaded_round_id:
                     await self._load_round_snapshot(round_obj)
 
+                # Reserved dedup tail. Stop claiming miner evals from here
+                # so the ranking `select_pairs` reads is settled: the top-K
+                # must not change between one pair and the next, or the
+                # budget gets spent on miners who are not the ones about to
+                # be paid. Costs coverage for anyone still ungraded — the
+                # freeze log reports how many.
+                if self._dedup_tail_active():
+                    self._log_dedup_freeze_once(round_obj)
+                    await self._maybe_run_dedup_shadow(round_obj)
+                    await asyncio.sleep(self.poll_interval_sec)
+                    continue
+
                 target = self._next_target(round_obj)
                 if target is None:
                     # Log only on the transition into idle; stay quiet until
@@ -221,12 +282,33 @@ class BackgroundEvalWorker(threading.Thread):
                             round_stats=stats,
                         )
                     idle_ticks += 1
+                    # Dedup shadow pass: spend idle GPU time measuring
+                    # merged-pair losses over the round's top scorers.
+                    # One pair per idle tick, and only after a short
+                    # quiescence (>= 2 ticks), so freshly-landed
+                    # downloads always win the GPU over shadow work.
+                    if idle_ticks >= 2:
+                        await self._maybe_run_dedup_shadow(round_obj)
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
 
                 idle_ticks = 0
                 uid, hotkey = target
                 await self._evaluate_one(round_obj, uid=uid, hotkey=hotkey)
+                # Interleaved dedup pass. The idle-tick trigger above is
+                # the ideal opportunity — but on a full roster it never
+                # arrives: the eval queue does not drain before the window
+                # closes, so `no pending targets` was logged ZERO times in
+                # 100 minutes of production against a 7m50s eval window,
+                # and the shadow pass never ran once. Spending one pair
+                # every `dedup_eval_interval` completed evals makes the
+                # measurement proportional to work actually done, and it
+                # stays bounded by `dedup_max_pairs` either way. Set the
+                # interval to 0 to restore idle-only behaviour.
+                if self._tick_interleaved_dedup():
+                    # Cheap no-op when the filter is "off": the callee's
+                    # own mode gate returns before touching the GPU.
+                    await self._maybe_run_dedup_shadow(round_obj)
         finally:
             try:
                 VALIDATOR_BG_WORKER_PAUSED.labels(worker="eval").set(0)
@@ -256,6 +338,10 @@ class BackgroundEvalWorker(threading.Thread):
             merge_phase_active=self.merge_phase_active.is_set(),
             eval_window_active=self.eval_window_active.is_set(),
         )
+        # Entering a gated stretch usually means the eval window closed
+        # (or Merge started) — a natural point to summarize the round's
+        # shadow pass. Idempotent via `_dedup_summary_emitted`.
+        self._emit_dedup_summary(reason="gated")
         while not self.stop_event.is_set():
             round_obj = self.round_ref.current
             if (
@@ -284,6 +370,8 @@ class BackgroundEvalWorker(threading.Thread):
         # datasets/pandas chain at module-import time (helps tests).
         from connito.shared.dataloader import get_dataloader, materialize_batches
         from connito.shared.evaluate import evaluate_model
+
+        self._reset_dedup_state_if_new_round(round_obj)
 
         # Drop any previous round's cached batches before loading the new
         # round's. The CPU-side tensor list can run to several hundred MB
@@ -519,6 +607,15 @@ class BackgroundEvalWorker(threading.Thread):
             return
 
         round_obj.mark_scored(uid, evaluated.score, val_loss=evaluated.val_loss)
+        # Dedup shadow bookkeeping: remember where this miner's file
+        # lives (pop_downloaded above removed the only uid→path map) and
+        # its exact val_loss, so shadow pairs don't have to re-derive
+        # either. Read-only breadcrumbs — never fed back into scoring.
+        if round_obj.round_id == self._dedup_round_id:
+            self._scored_paths[uid] = Path(path)
+            ev_loss = evaluated.val_loss
+            if isinstance(ev_loss, float) and math.isfinite(ev_loss):
+                self._scored_val_loss[uid] = ev_loss
         logger.info(
             "bg-eval: success",
             round_id=round_obj.round_id,
@@ -608,7 +705,9 @@ class BackgroundEvalWorker(threading.Thread):
             deleted = cleanup_non_top_submissions(
                 round_obj=round_obj,
                 submission_dir=Path(self.config.ckpt.miner_submission_path),
-                top_k=int(self.config.evaluation.top_k_miners_to_reward),
+                # Widened to dedup_top_k while the dedup filter is active
+                # so the shadow pass can still read the files it pairs.
+                top_k=retention_top_k(self.config),
             )
         except Exception as e:
             logger.warning("bg-eval: post-eval submission cleanup failed", error=str(e))
@@ -621,3 +720,387 @@ class BackgroundEvalWorker(threading.Thread):
                 files=deleted,
             )
 
+    # ---------------- Dedup shadow pass ----------------
+    def set_window_deadline(self, deadline_monotonic: float | None) -> None:
+        """Publish when the current eval window closes (monotonic clock).
+
+        Called by run.py when it opens the window. `None` clears the guard.
+        Also derives when the reserved dedup tail opens — see
+        `dedup_freeze_field` for why the pass must not run before it.
+        """
+        self._eval_window_deadline = deadline_monotonic
+        self._dedup_tail_open = None
+        if deadline_monotonic is None:
+            return
+        cfg = self.config.evaluation
+        # Only reserve the tail when there is a pass to reserve it FOR.
+        # Without this the default (`dedup_filter_mode: off`) would stop
+        # claiming miner evals for the whole reserved span and spend it
+        # doing nothing, since the pass's own mode gate returns immediately.
+        if getattr(cfg, "dedup_filter_mode", "off") not in ("shadow", "enforce"):
+            return
+        if not bool(getattr(cfg, "dedup_freeze_field", True)):
+            return
+        reserved = (
+            int(getattr(cfg, "dedup_max_pairs", 0))
+            * float(getattr(cfg, "dedup_pair_budget_sec", 120))
+        )
+        if reserved <= 0:
+            return
+        self._dedup_tail_open = deadline_monotonic - reserved
+
+    def _log_dedup_freeze_once(self, round_obj) -> None:
+        """Announce the freeze, with the coverage it costs, once per round."""
+        if self._dedup_freeze_logged:
+            return
+        self._dedup_freeze_logged = True
+        try:
+            stats = round_obj.stats()
+        except Exception:
+            stats = None
+        scores = round_obj.scores_snapshot()
+        logger.info(
+            "bg-eval: dedup tail open — eval field frozen",
+            round_id=round_obj.round_id,
+            scored=len(scores),
+            positive=sum(1 for s in scores.values() if s > 0.0),
+            round_stats=stats,
+        )
+
+    def _dedup_tail_active(self) -> bool:
+        """True once the reserved tail has opened (field frozen).
+
+        Always False when freezing is off or the deadline was never
+        published — in that case the pass keeps its previous idle/interval
+        triggers and the field is never frozen.
+        """
+        tail_open = self._dedup_tail_open
+        return tail_open is not None and time.monotonic() >= tail_open
+
+    def _note_dedup_skip(self, reason: str, **fields) -> None:
+        """Log why the pass declined to run — once per distinct reason.
+
+        Every early return in `_maybe_run_dedup_shadow` used to be silent,
+        so a pass that never produced a pair was indistinguishable from one
+        that was never called. That cost three separate wrong diagnoses.
+        Logging on *change* gives one line per state transition, which is
+        diagnostic without flooding a log polled every couple of seconds.
+        """
+        if reason == self._dedup_last_skip_reason:
+            return
+        self._dedup_last_skip_reason = reason
+        logger.info("dedup-shadow: pass skipped", reason=reason, **fields)
+
+    def _dedup_window_allows_pair(self) -> bool:
+        """False when too little of the eval window remains to finish a pair.
+
+        A pair that completes after the window closes is wasted work: the
+        window closes at MinerCommit1 - 5, which is exactly where
+        `finalize_round_scores` applies verdicts and weights are handed to
+        the chain submitter. A verdict produced after that misses the round
+        entirely. Inactive until run.py publishes a deadline.
+        """
+        deadline = self._eval_window_deadline
+        if deadline is None:
+            return True
+        budget = float(getattr(
+            self.config.evaluation, "dedup_pair_budget_sec", 120,
+        ))
+        remaining = deadline - time.monotonic()
+        if remaining >= budget:
+            return True
+        self._note_dedup_skip(
+            "window_deadline",
+            remaining_sec=round(remaining, 1),
+            pair_budget_sec=budget,
+        )
+        return False
+
+    def _tick_interleaved_dedup(self) -> bool:
+        """Count one completed eval; True when a merged pair is due.
+
+        `dedup_eval_interval == 0` disables interleaving and restores the
+        original idle-only trigger. Kept separate from the pass itself so
+        the cadence is testable without driving the whole worker loop.
+        """
+        self._dedup_evals_since_pair += 1
+        interval = int(getattr(
+            self.config.evaluation, "dedup_eval_interval", 0,
+        ))
+        if interval > 0 and self._dedup_evals_since_pair >= interval:
+            self._dedup_evals_since_pair = 0
+            return True
+        return False
+
+    def _reset_dedup_state_if_new_round(self, round_obj) -> None:
+        """Reset dedup bookkeeping when a genuinely NEW round arrives.
+
+        Called from `_load_round_snapshot`, which also re-runs after a
+        stuck-lock recycle for the SAME round — hence the explicit
+        round-id key instead of piggybacking on `_loaded_round_id`.
+        Emits the previous round's summary first (idempotent).
+        """
+        if self._dedup_round_id == round_obj.round_id:
+            return
+        self._emit_dedup_summary(reason="round_transition")
+        self._dedup_round_id = round_obj.round_id
+        self._scored_paths = {}
+        self._scored_val_loss = {}
+        self._dedup_pairs_done = set()
+        self._dedup_budget_used = 0
+        self._dedup_pairs_skipped = 0
+        self._dedup_summary_emitted = False
+        self._dedup_evals_since_pair = 0
+        self._dedup_last_skip_reason = None
+        self._dedup_freeze_logged = False
+
+    def _emit_dedup_summary(self, *, reason: str) -> None:
+        """One `dedup-shadow: round summary` line per round (best effort)."""
+        if self._dedup_summary_emitted or self._dedup_round_id is None:
+            return
+        # Gate on the FILTER being enabled, not on whether anything ran. The
+        # previous `budget_used == 0 and pairs_skipped == 0` guard silenced
+        # exactly the case worth reporting: a round where the pass was
+        # reached but every attempt was gated. That left "produced nothing"
+        # indistinguishable from "never called" at round granularity, which
+        # is what made this take three attempts to diagnose. A disabled
+        # filter still stays quiet.
+        mode = getattr(self.config.evaluation, "dedup_filter_mode", "off")
+        if mode not in ("shadow", "enforce"):
+            return
+        self._dedup_summary_emitted = True
+        logger.info(
+            "dedup-shadow: round summary",
+            round_id=self._dedup_round_id,
+            mode=mode,
+            pairs_evaluated=len(self._dedup_pairs_done) - self._dedup_pairs_skipped,
+            pairs_skipped=self._dedup_pairs_skipped,
+            budget_used=self._dedup_budget_used,
+            budget_max=int(getattr(self.config.evaluation, "dedup_max_pairs", 0)),
+            last_skip_reason=self._dedup_last_skip_reason,
+            reason=reason,
+        )
+
+    def _resolve_submission_path(self, round_obj, uid: int) -> Path | None:
+        """uid → on-disk submission file, best effort.
+
+        Bg-scored miners were captured in `_scored_paths`; foreground-
+        scored miners never transit this worker, so fall back to the
+        filename convention (hotkey + block inside the round's submission
+        window). Either way the file may have been pruned since —
+        callers treat None / missing file as "skip pair".
+        """
+        path = self._scored_paths.get(uid)
+        if path is not None and path.exists():
+            return path
+        hotkey = round_obj.uid_to_hotkey.get(uid)
+        if hotkey is None:
+            return None
+        return find_submission_path(
+            Path(self.config.ckpt.miner_submission_path),
+            hotkey,
+            getattr(round_obj, "submission_block_range", None),
+        )
+
+    async def _maybe_run_dedup_shadow(self, round_obj) -> None:
+        """Evaluate at most ONE merged pair of top submissions, then yield.
+
+        Shadow mode: measurement + logging only. This method never calls
+        `mark_scored`/`mark_failed`/`claim_for_eval`/`pop_downloaded` and
+        never writes to the aggregator or journal — it cannot affect any
+        miner's score or the round's lifecycle. One pair per idle tick
+        keeps real miner evals strictly ahead of shadow work.
+        """
+        cfg = self.config.evaluation
+        mode = getattr(cfg, "dedup_filter_mode", "off")
+        if mode not in ("shadow", "enforce"):
+            return  # disabled; not a diagnostic case, stay silent
+        if self._dedup_round_id != round_obj.round_id:
+            # Snapshot load (which resets dedup state) hasn't run yet.
+            self._note_dedup_skip(
+                "snapshot_not_loaded",
+                dedup_round_id=self._dedup_round_id,
+                round_id=round_obj.round_id,
+            )
+            return
+        max_pairs = int(getattr(cfg, "dedup_max_pairs", 0))
+        if self._dedup_budget_used >= max_pairs:
+            self._note_dedup_skip(
+                "budget_exhausted",
+                used=self._dedup_budget_used, max_pairs=max_pairs,
+            )
+            return
+        # Same gates as a real eval, re-checked immediately before work —
+        # split out so the log names which one fired.
+        if self.round_ref.current is not round_obj:
+            self._note_dedup_skip("round_superseded")
+            return
+        if self._loaded_round_id != round_obj.round_id:
+            self._note_dedup_skip("snapshot_round_mismatch")
+            return
+        if self._eval_base_model is None:
+            self._note_dedup_skip("no_base_model")
+            return
+        if self._cached_batches is None:
+            self._note_dedup_skip("no_cached_batches")
+            return
+        if self.merge_phase_active.is_set():
+            self._note_dedup_skip("merge_active")
+            return
+        if not self.eval_window_active.is_set():
+            self._note_dedup_skip("eval_window_closed")
+            return
+        # The top-K is not settled until the field is frozen. Running before
+        # then spends a per-ROUND budget on a snapshot of whoever happens to
+        # be graded, and in `enforce` mode those verdicts still bite at
+        # finalize. Inactive when `dedup_freeze_field` is off or no deadline
+        # was published, which preserves the old idle/interval triggers.
+        if self._dedup_tail_open is not None and not self._dedup_tail_active():
+            self._note_dedup_skip(
+                "awaiting_dedup_tail",
+                opens_in_sec=round(self._dedup_tail_open - time.monotonic(), 1),
+            )
+            return
+        if not self._dedup_window_allows_pair():
+            return  # logs its own reason
+
+        round_scores = round_obj.scores_snapshot()
+        pairs = select_pairs(
+            round_scores,
+            top_k=int(getattr(cfg, "dedup_top_k", 0)),
+            max_pairs=max_pairs - self._dedup_budget_used,
+            exclude=self._dedup_pairs_done,
+        )
+        if not pairs:
+            # The counts are the whole point: an empty round and an
+            # exhausted pair list look identical from the counter alone.
+            self._note_dedup_skip(
+                "no_pairs",
+                scored=len(round_scores),
+                positive=sum(1 for s in round_scores.values() if s > 0.0),
+                pairs_done=len(self._dedup_pairs_done),
+            )
+            return
+        # A pair is about to run — re-arm the skip log so the next stall
+        # is reported even if it repeats an earlier reason.
+        self._dedup_last_skip_reason = None
+        uid_a, uid_b = pairs[0]
+        # Mark the pair consumed up-front: a pair that fails (missing
+        # file, eval error) is not retried — its files are only going to
+        # get *less* available as pruning proceeds.
+        self._dedup_pairs_done.add(frozenset((uid_a, uid_b)))
+        self._dedup_budget_used += 1
+
+        path_a = self._resolve_submission_path(round_obj, uid_a)
+        path_b = self._resolve_submission_path(round_obj, uid_b)
+        if path_a is None or path_b is None:
+            self._dedup_pairs_skipped += 1
+            logger.info(
+                "dedup-shadow: pair skipped — submission file unavailable",
+                round_id=round_obj.round_id,
+                uid_a=uid_a, uid_b=uid_b,
+                has_a=path_a is not None, has_b=path_b is not None,
+            )
+            return
+
+        baseline = (
+            self._loaded_baseline_loss
+            if self._loaded_baseline_loss is not None
+            else 100.0
+        )
+        scores = round_obj.scores_snapshot()
+
+        def _side_loss(uid: int) -> tuple[float, str]:
+            exact = self._scored_val_loss.get(uid)
+            if exact is not None:
+                return exact, "bg_exact"
+            # Foreground-scored miners: invert score = delta**1.2. Their
+            # delta was computed against the FOREGROUND baseline (same
+            # snapshot + seed, different loader instance), so a small
+            # offset vs our measurement of loss_avg is possible — tagged
+            # so the what-if analysis can segment.
+            return recover_val_loss(scores.get(uid, 0.0), baseline), "recovered"
+
+        timeout = float(cfg.per_miner_eval_timeout_sec)
+        deadline = time.monotonic() + timeout
+        outer_timeout = timeout + EVAL_DEADLINE_GRACE_SEC
+
+        def _run_pair() -> tuple[float, float, int, int]:
+            # CPU work (load, cosine, average) outside the GPU lock —
+            # the lock-yielding invariant wants the narrowest scope.
+            from connito.shared.evaluate import evaluate_model
+
+            sd_a = load_state_dict_from_path(path_a)
+            sd_b = load_state_dict_from_path(path_b)
+            cosine, n_keys = delta_cosine(sd_a, sd_b, round_obj.model_snapshot_cpu)
+            merged_sd, asymmetric = average_state_dicts(sd_a, sd_b)
+            del sd_a, sd_b
+            with self.gpu_eval_lock:
+                # Deepcopy per pair — NEVER mutate `_eval_base_model` in
+                # place: real miner evals interleave between pairs and
+                # deepcopy it assuming pristine round-snapshot weights.
+                merged_model = copy.deepcopy(self._eval_base_model)
+                try:
+                    merged_model.load_state_dict(merged_sd, strict=False)
+                    metrics = evaluate_model(
+                        0, merged_model, self._cached_batches,
+                        self.device, EVAL_MAX_BATCHES, None,
+                        deadline_monotonic=deadline,
+                    )
+                finally:
+                    del merged_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            return float(metrics.get("val_loss", float("inf"))), cosine, n_keys, asymmetric
+
+        try:
+            loss_avg, cosine, n_keys, asymmetric = await asyncio.wait_for(
+                asyncio.to_thread(_run_pair), timeout=outer_timeout,
+            )
+        except Exception as e:
+            self._dedup_pairs_skipped += 1
+            logger.warning(
+                "dedup-shadow: pair eval failed",
+                round_id=round_obj.round_id,
+                uid_a=uid_a, uid_b=uid_b, error=str(e),
+            )
+            return
+
+        loss_a, source_a = _side_loss(uid_a)
+        loss_b, source_b = _side_loss(uid_b)
+        report = shadow_report(
+            loss_a=loss_a, loss_b=loss_b, loss_avg=loss_avg,
+            baseline=baseline, cosine=cosine,
+        )
+        # Enforcement decides on the UNROUNDED penalty — `report`'s copy is
+        # rounded to 6 dp, where a tiny negative becomes `-0.0` and would
+        # satisfy `>= 0`.
+        threshold = float(getattr(cfg, "dedup_threshold", DEFAULT_DEDUP_THRESHOLD))
+        redundant = is_redundant(
+            compute_merge_penalty(loss_a, loss_b, loss_avg), threshold,
+        )
+        enforced = False
+        if mode == "enforce" and redundant:
+            # Zero BOTH sides at finalize. `merge_penalty` is a property of
+            # the pair, so it says one of the two added nothing the other
+            # lacked — never which one.
+            round_obj.mark_dedup_flagged(uid_a, uid_b)
+            enforced = True
+        logger.info(
+            "dedup-shadow: pair result",
+            round_id=round_obj.round_id,
+            uid_a=uid_a, uid_b=uid_b,
+            loss_source_a=source_a, loss_source_b=source_b,
+            n_keys=n_keys, asymmetric_keys=asymmetric,
+            mode=mode, threshold=threshold,
+            redundant=redundant, enforced=enforced,
+            **report,
+        )
+        try:
+            VALIDATOR_DEDUP_PAIRS_EVALUATED_TOTAL.inc()
+            for threshold, flagged in report["would_flag_not_better"].items():
+                if flagged:
+                    VALIDATOR_DEDUP_WOULD_FLAG_TOTAL.labels(threshold=threshold).inc()
+        except Exception:
+            pass

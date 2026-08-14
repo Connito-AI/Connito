@@ -177,6 +177,32 @@ _PHASE_PERIOD_ATTR: dict[str, str] = {
 }
 
 
+def eval_window_close_block(config, merge_phase_start_block: int) -> int:
+    """Block at which the validator closes the background-eval window.
+
+    The window opens immediately after Merge (`run.py` — `eval_window_active
+    .set()`) and closes 5 blocks before the next `MinerCommit1`, where
+    `finalize_round_scores` runs and miner weights are handed to the chain
+    submitter in the same step ("(4) Finalize round-K scoring and submit
+    weights"). Phase order after Merge is ValidatorCommit1 →
+    ValidatorCommit2 → Distribute → Train → MinerCommit1, and both
+    ValidatorCommit phases use `commit_period` (see `_PHASE_PERIOD_ATTR`).
+
+    Matters to the dedup filter: a merged-pair measurement that finishes
+    after this block is wasted work — finalize has already applied the
+    verdicts and the weights are on their way to chain.
+    """
+    c = config.cycle
+    return (
+        merge_phase_start_block
+        + c.merge_period
+        + 2 * c.commit_period
+        + c.distribute_period
+        + c.train_period
+        - 5
+    )
+
+
 def _synth_phase_response_for_test(
     config: MinerConfig | ValidatorConfig,
     phase_name: str,

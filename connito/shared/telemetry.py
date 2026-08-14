@@ -356,6 +356,19 @@ VALIDATOR_BG_EVAL_RECYCLE_TOTAL = Counter(
     "validator_bg_eval_recycle_total",
     "Times bg-eval dropped its eval_base_model after a stuck-lock streak",
 )
+# Dedup (shadow) filter — pair counts only. Deliberately NO uid-pair or
+# round_id labels (cardinality); per-pair detail lives in the
+# "dedup-shadow: pair result" structured log lines.
+VALIDATOR_DEDUP_PAIRS_EVALUATED_TOTAL = Counter(
+    "validator_dedup_pairs_evaluated_total",
+    "Merged-pair evaluations completed by the dedup shadow pass",
+)
+VALIDATOR_DEDUP_WOULD_FLAG_TOTAL = Counter(
+    "validator_dedup_would_flag_total",
+    "Pairs the dedup filter WOULD flag as near-duplicates (shadow only; "
+    "'not strictly better' predicate) at a fixed threshold",
+    ["threshold"],
+)
 
 # Miner (Gauges)
 MINER_TRAINING_LOSS = Gauge("miner_training_loss", "Local model training loss", ["expert_group"])
