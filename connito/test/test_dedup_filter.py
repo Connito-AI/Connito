@@ -224,6 +224,7 @@ def _make_worker(
             dedup_max_pairs=10,
             dedup_threshold=threshold,
             dedup_eval_interval=eval_interval,
+            dedup_pair_budget_sec=120,
             per_miner_eval_timeout_sec=30,
             top_k_miners_to_reward=3,
         ),
@@ -491,3 +492,108 @@ def test_interleaved_counter_resets_on_new_round(tmp_path: Path) -> None:
     round_b = _make_round(tmp_path, {3: 0.4, 4: 0.3}, round_id=8)
     worker._reset_dedup_state_if_new_round(round_b)
     assert worker._dedup_evals_since_pair == 0
+
+
+# ---------------------------------------------------------------------------
+# Window deadline guard + skip-reason logging
+# ---------------------------------------------------------------------------
+
+def test_eval_window_close_block_lands_5_before_minercommit1() -> None:
+    from connito.shared.cycle import eval_window_close_block
+
+    cfg = SimpleNamespace(cycle=SimpleNamespace(
+        merge_period=50, commit_period=10, distribute_period=20, train_period=300,
+    ))
+    # Merge starts at 1000. VC1(10) + VC2(10) + Distribute(20) + Train(300)
+    # after Merge(50) puts MinerCommit1 at 1390; the window shuts 5 earlier.
+    assert eval_window_close_block(cfg, 1000) == 1385
+
+
+def test_window_guard_blocks_a_pair_that_cannot_finish(tmp_path: Path) -> None:
+    import time as _time
+
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj)
+
+    # No deadline published -> guard inactive (backwards compatible).
+    assert worker._dedup_window_allows_pair() is True
+
+    # Plenty of room.
+    worker.set_window_deadline(_time.monotonic() + 600)
+    assert worker._dedup_window_allows_pair() is True
+
+    # Less than one pair's budget left -> refuse to start.
+    worker.set_window_deadline(_time.monotonic() + 30)
+    assert worker._dedup_window_allows_pair() is False
+    assert worker._dedup_last_skip_reason == "window_deadline"
+
+    # Already past it.
+    worker.set_window_deadline(_time.monotonic() - 10)
+    assert worker._dedup_window_allows_pair() is False
+
+
+def test_deadline_guard_stops_the_pass_before_it_spends_gpu(tmp_path: Path) -> None:
+    import time as _time
+
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    base = round_obj.model_snapshot_cpu
+    _write_submission(tmp_path, "HK1", 10, {"w": base["w"] + torch.ones(4)})
+    _write_submission(tmp_path, "HK2", 11, {"w": base["w"] + torch.full((4,), 2.0)})
+
+    worker = _make_worker(tmp_path, round_obj)
+    worker.set_window_deadline(_time.monotonic() + 5)  # window practically over
+    import connito.shared.evaluate as ev
+
+    ev.evaluate_model = lambda *a, **k: {"val_loss": 3.5}
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+
+    assert worker._dedup_budget_used == 0  # no GPU spent
+    assert worker._dedup_last_skip_reason == "window_deadline"
+
+
+def test_skip_reason_names_an_empty_round(tmp_path: Path) -> None:
+    # The case that cost three wrong diagnoses: the pass is reached but the
+    # round it is looking at has nothing to pair.
+    round_obj = _make_round(tmp_path, {1: 0.0, 2: 0.0})
+    worker = _make_worker(tmp_path, round_obj)
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+    assert worker._dedup_last_skip_reason == "no_pairs"
+    assert worker._dedup_budget_used == 0
+
+
+def test_skip_reason_distinguishes_the_gates(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+
+    worker = _make_worker(tmp_path, round_obj)
+    worker.merge_phase_active.set()
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+    assert worker._dedup_last_skip_reason == "merge_active"
+
+    worker = _make_worker(tmp_path, round_obj)
+    worker.eval_window_active.clear()
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+    assert worker._dedup_last_skip_reason == "eval_window_closed"
+
+    worker = _make_worker(tmp_path, round_obj)
+    worker._eval_base_model = None
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+    assert worker._dedup_last_skip_reason == "no_base_model"
+
+
+def test_skip_log_only_fires_on_change(tmp_path: Path) -> None:
+    # Polled every couple of seconds for ~68 min; logging every tick would
+    # bury the log, so repeats must be suppressed.
+    round_obj = _make_round(tmp_path, {1: 0.0, 2: 0.0})
+    worker = _make_worker(tmp_path, round_obj)
+    logged = []
+
+    import connito.validator.background_eval_worker as bw
+
+    orig = bw.logger.info
+    bw.logger.info = lambda msg, **kw: logged.append(kw.get("reason")) if msg == "dedup-shadow: pass skipped" else None
+    try:
+        for _ in range(5):
+            asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+    finally:
+        bw.logger.info = orig
+    assert logged == ["no_pairs"]  # five calls, one line

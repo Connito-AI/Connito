@@ -149,6 +149,14 @@ class BackgroundEvalWorker(threading.Thread):
         # `dedup_eval_interval` trigger — see the main loop for why the
         # idle-tick trigger alone is not enough.
         self._dedup_evals_since_pair: int = 0
+        # Last reason the dedup pass declined to run, so `_note_dedup_skip`
+        # can log transitions only. The pass is polled every couple of
+        # seconds across a ~68 min Train phase; logging unconditionally
+        # would bury the log.
+        self._dedup_last_skip_reason: str | None = None
+        # Monotonic deadline for the eval window, published by run.py via
+        # `set_window_deadline`. None disables the guard.
+        self._eval_window_deadline: float | None = None
 
     # ---------------- Public lifecycle ----------------
     def stop(self) -> None:
@@ -694,6 +702,52 @@ class BackgroundEvalWorker(threading.Thread):
             )
 
     # ---------------- Dedup shadow pass ----------------
+    def set_window_deadline(self, deadline_monotonic: float | None) -> None:
+        """Publish when the current eval window closes (monotonic clock).
+
+        Called by run.py when it opens the window. `None` clears the guard.
+        """
+        self._eval_window_deadline = deadline_monotonic
+
+    def _note_dedup_skip(self, reason: str, **fields) -> None:
+        """Log why the pass declined to run — once per distinct reason.
+
+        Every early return in `_maybe_run_dedup_shadow` used to be silent,
+        so a pass that never produced a pair was indistinguishable from one
+        that was never called. That cost three separate wrong diagnoses.
+        Logging on *change* gives one line per state transition, which is
+        diagnostic without flooding a log polled every couple of seconds.
+        """
+        if reason == self._dedup_last_skip_reason:
+            return
+        self._dedup_last_skip_reason = reason
+        logger.info("dedup-shadow: pass skipped", reason=reason, **fields)
+
+    def _dedup_window_allows_pair(self) -> bool:
+        """False when too little of the eval window remains to finish a pair.
+
+        A pair that completes after the window closes is wasted work: the
+        window closes at MinerCommit1 - 5, which is exactly where
+        `finalize_round_scores` applies verdicts and weights are handed to
+        the chain submitter. A verdict produced after that misses the round
+        entirely. Inactive until run.py publishes a deadline.
+        """
+        deadline = self._eval_window_deadline
+        if deadline is None:
+            return True
+        budget = float(getattr(
+            self.config.evaluation, "dedup_pair_budget_sec", 120,
+        ))
+        remaining = deadline - time.monotonic()
+        if remaining >= budget:
+            return True
+        self._note_dedup_skip(
+            "window_deadline",
+            remaining_sec=round(remaining, 1),
+            pair_budget_sec=budget,
+        )
+        return False
+
     def _tick_interleaved_dedup(self) -> bool:
         """Count one completed eval; True when a merged pair is due.
 
@@ -729,6 +783,7 @@ class BackgroundEvalWorker(threading.Thread):
         self._dedup_pairs_skipped = 0
         self._dedup_summary_emitted = False
         self._dedup_evals_since_pair = 0
+        self._dedup_last_skip_reason = None
 
     def _emit_dedup_summary(self, *, reason: str) -> None:
         """One `dedup-shadow: round summary` line per round (best effort)."""
@@ -780,31 +835,65 @@ class BackgroundEvalWorker(threading.Thread):
         cfg = self.config.evaluation
         mode = getattr(cfg, "dedup_filter_mode", "off")
         if mode not in ("shadow", "enforce"):
-            return
+            return  # disabled; not a diagnostic case, stay silent
         if self._dedup_round_id != round_obj.round_id:
-            return  # snapshot load (which resets dedup state) hasn't run yet
+            # Snapshot load (which resets dedup state) hasn't run yet.
+            self._note_dedup_skip(
+                "snapshot_not_loaded",
+                dedup_round_id=self._dedup_round_id,
+                round_id=round_obj.round_id,
+            )
+            return
         max_pairs = int(getattr(cfg, "dedup_max_pairs", 0))
         if self._dedup_budget_used >= max_pairs:
+            self._note_dedup_skip(
+                "budget_exhausted",
+                used=self._dedup_budget_used, max_pairs=max_pairs,
+            )
             return
-        # Same gates as a real eval, re-checked immediately before work.
-        if (
-            self.round_ref.current is not round_obj
-            or self._loaded_round_id != round_obj.round_id
-            or self._eval_base_model is None
-            or self._cached_batches is None
-            or self.merge_phase_active.is_set()
-            or not self.eval_window_active.is_set()
-        ):
+        # Same gates as a real eval, re-checked immediately before work —
+        # split out so the log names which one fired.
+        if self.round_ref.current is not round_obj:
+            self._note_dedup_skip("round_superseded")
             return
+        if self._loaded_round_id != round_obj.round_id:
+            self._note_dedup_skip("snapshot_round_mismatch")
+            return
+        if self._eval_base_model is None:
+            self._note_dedup_skip("no_base_model")
+            return
+        if self._cached_batches is None:
+            self._note_dedup_skip("no_cached_batches")
+            return
+        if self.merge_phase_active.is_set():
+            self._note_dedup_skip("merge_active")
+            return
+        if not self.eval_window_active.is_set():
+            self._note_dedup_skip("eval_window_closed")
+            return
+        if not self._dedup_window_allows_pair():
+            return  # logs its own reason
 
+        round_scores = round_obj.scores_snapshot()
         pairs = select_pairs(
-            round_obj.scores_snapshot(),
+            round_scores,
             top_k=int(getattr(cfg, "dedup_top_k", 0)),
             max_pairs=max_pairs - self._dedup_budget_used,
             exclude=self._dedup_pairs_done,
         )
         if not pairs:
+            # The counts are the whole point: an empty round and an
+            # exhausted pair list look identical from the counter alone.
+            self._note_dedup_skip(
+                "no_pairs",
+                scored=len(round_scores),
+                positive=sum(1 for s in round_scores.values() if s > 0.0),
+                pairs_done=len(self._dedup_pairs_done),
+            )
             return
+        # A pair is about to run — re-arm the skip log so the next stall
+        # is reported even if it repeats an earlier reason.
+        self._dedup_last_skip_reason = None
         uid_a, uid_b = pairs[0]
         # Mark the pair consumed up-front: a pair that fails (missing
         # file, eval error) is not retried — its files are only going to

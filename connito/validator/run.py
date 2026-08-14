@@ -103,6 +103,7 @@ from connito.shared.hf_distribute import (
 from connito.shared.cycle import (
     BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
+    eval_window_close_block,
     wait_till,
 )
 from connito.shared.dataloader import get_dataloader
@@ -1988,6 +1989,31 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # worker uses round.model_snapshot_cpu (taken at freeze time) so
             # the post-Merge mutation of global_model does not affect it.
             eval_window_active.set()
+            # Publish when this window closes so the dedup pass will not
+            # START a merged pair it cannot finish. The window ends at
+            # MinerCommit1 - 5, which is where (4) finalizes scores and
+            # submits weights — a verdict produced after that misses the
+            # round. Best-effort: on failure the guard stays inactive and
+            # the pass behaves exactly as before.
+            try:
+                if eval_worker is None:
+                    raise RuntimeError("bg-eval worker disabled")
+                close_block = eval_window_close_block(
+                    config, phase_response.phase_start_block,
+                )
+                blocks_left = max(0, close_block - lite_subtensor.block)
+                eval_worker.set_window_deadline(
+                    time.monotonic() + blocks_left * BITTENSOR_BLOCK_TIME_SECONDS
+                )
+                logger.info(
+                    "(3) Published bg-eval window deadline",
+                    close_block=close_block,
+                    blocks_left=blocks_left,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not publish bg-eval window deadline", error=str(e),
+                )
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 3

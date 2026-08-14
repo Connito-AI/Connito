@@ -1067,14 +1067,27 @@ class EvalCfg(BaseConfig):
     # ...but never spend more than this many merged-pair GPU evals per
     # round (each costs about one miner eval).
     dedup_max_pairs: int = 10
-    # Run one merged pair after every N completed miner evals. The pass
-    # ALSO runs on bg-eval idle ticks, but on a full roster those never
-    # happen — measured on production, `no pending targets` was logged 0
-    # times in 100 minutes against a 7m50s eval window, so an idle-only
-    # trigger never fired at all. At the observed ~44 evals per window,
-    # N=8 spends about 5 of the 10-pair budget and adds ~11% to the
-    # window. Set to 0 for idle-only (the original behaviour).
-    dedup_eval_interval: int = 8
+    # Run one merged pair after every N completed miner evals. DEFAULT OFF
+    # (0), because interleaving DISPLACES miner evals rather than extending
+    # the window: the window is bounded by phase transitions, so a pair run
+    # mid-scoring costs one miner its evaluation, and an unevaluated miner
+    # scores 0 for the round. The honest miner pays for the filter.
+    #
+    # Not needed in the normal case either. The bg-eval window spans
+    # ValidatorCommit1 → Train, and measured on production the roster was
+    # graded in ~27 min of a ~68 min Train, leaving ~41 min idle with the
+    # model still resident — far more than the ~7 min ten pairs need. The
+    # idle-tick trigger covers that.
+    #
+    # Set > 0 only for a validator whose roster leaves no idle tail (where
+    # grading alone overruns Train), and accept the displacement knowingly.
+    dedup_eval_interval: int = 0
+    # Seconds a merged pair is assumed to need. The pass will not START a
+    # pair when less than this remains of the eval window, because the
+    # window closes at MinerCommit1 - 5 — exactly where finalize applies
+    # verdicts and weights go to chain, so a later result is wasted. ~120 s
+    # is generous against the ~41 s/eval measured on the RTX 6000 Ada.
+    dedup_pair_budget_sec: int = 120
     # Enforcement threshold τ, in val_loss units: a pair is redundant when
     # `merge_penalty >= -τ`. The default 0.0 makes this a pure SIGN test —
     # redundant unless averaging beat the better side outright. Do not
