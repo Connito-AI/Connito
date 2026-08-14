@@ -1094,6 +1094,33 @@ class EvalCfg(BaseConfig):
     # raise it casually: measured merge penalties on live submissions are
     # ~5e-4, so any τ >= 0.01 flags 100% of pairs, honest ones included.
     dedup_threshold: float = 0.0
+    # Reserve the tail of the eval window for the pairwise pass and stop
+    # claiming new miner evals once it opens, so the ranking the pass runs
+    # against cannot move underneath it.
+    #
+    # Without this, `select_pairs` re-reads the score map on every trigger,
+    # so "top K" means "top K of whoever happens to be graded right now".
+    # Miners are graded in stalest-first order, which is unrelated to
+    # quality, so an early sample is a RANDOM subset — and `dedup_max_pairs`
+    # is a per-ROUND budget while `dedup_top_k` bounds a single call. Pairs
+    # drawn from a half-filled scoreboard therefore burn the whole budget
+    # before the real top-K exists, and in `enforce` mode their verdicts
+    # still apply at finalize: `dedup_flagged_uids` is only ever added to,
+    # so a miner flagged against a neighbour who later fell away is zeroed
+    # on a comparison the final ranking would never have chosen to make.
+    #
+    # The reserved span is `dedup_max_pairs * dedup_pair_budget_sec` — the
+    # pass's own worst case for its own budget, so the last pair starts
+    # exactly at the point `_dedup_window_allows_pair` still permits. Tune
+    # by changing either of those two knobs; the round summary logs how
+    # much of the tail was actually used.
+    #
+    # Cost: miners still ungraded when the tail opens score 0 for the round.
+    # On a validator with a long idle tail (measured: roster graded in ~27
+    # min of a ~68 min Train) this costs nothing. On one whose grading
+    # already overruns the window it costs real coverage — the freeze log
+    # reports `unscored_at_freeze` so that is visible rather than silent.
+    dedup_freeze_field: bool = True
 
 
 class ValidatorConfig(WorkerConfig):

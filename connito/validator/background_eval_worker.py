@@ -157,6 +157,13 @@ class BackgroundEvalWorker(threading.Thread):
         # Monotonic deadline for the eval window, published by run.py via
         # `set_window_deadline`. None disables the guard.
         self._eval_window_deadline: float | None = None
+        # Monotonic instant the reserved dedup tail opens — derived from the
+        # deadline in `set_window_deadline`. From here the worker stops
+        # claiming miner evals so the ranking cannot move under the pairwise
+        # pass. None when the deadline is unknown or freezing is disabled.
+        self._dedup_tail_open: float | None = None
+        # One freeze-transition log line per round, not one per poll.
+        self._dedup_freeze_logged: bool = False
 
     # ---------------- Public lifecycle ----------------
     def stop(self) -> None:
@@ -246,6 +253,18 @@ class BackgroundEvalWorker(threading.Thread):
                 # Reload state_dict on round transition.
                 if round_obj.round_id != self._loaded_round_id:
                     await self._load_round_snapshot(round_obj)
+
+                # Reserved dedup tail. Stop claiming miner evals from here
+                # so the ranking `select_pairs` reads is settled: the top-K
+                # must not change between one pair and the next, or the
+                # budget gets spent on miners who are not the ones about to
+                # be paid. Costs coverage for anyone still ungraded — the
+                # freeze log reports how many.
+                if self._dedup_tail_active():
+                    self._log_dedup_freeze_once(round_obj)
+                    await self._maybe_run_dedup_shadow(round_obj)
+                    await asyncio.sleep(self.poll_interval_sec)
+                    continue
 
                 target = self._next_target(round_obj)
                 if target is None:
@@ -706,8 +725,57 @@ class BackgroundEvalWorker(threading.Thread):
         """Publish when the current eval window closes (monotonic clock).
 
         Called by run.py when it opens the window. `None` clears the guard.
+        Also derives when the reserved dedup tail opens — see
+        `dedup_freeze_field` for why the pass must not run before it.
         """
         self._eval_window_deadline = deadline_monotonic
+        self._dedup_tail_open = None
+        if deadline_monotonic is None:
+            return
+        cfg = self.config.evaluation
+        # Only reserve the tail when there is a pass to reserve it FOR.
+        # Without this the default (`dedup_filter_mode: off`) would stop
+        # claiming miner evals for the whole reserved span and spend it
+        # doing nothing, since the pass's own mode gate returns immediately.
+        if getattr(cfg, "dedup_filter_mode", "off") not in ("shadow", "enforce"):
+            return
+        if not bool(getattr(cfg, "dedup_freeze_field", True)):
+            return
+        reserved = (
+            int(getattr(cfg, "dedup_max_pairs", 0))
+            * float(getattr(cfg, "dedup_pair_budget_sec", 120))
+        )
+        if reserved <= 0:
+            return
+        self._dedup_tail_open = deadline_monotonic - reserved
+
+    def _log_dedup_freeze_once(self, round_obj) -> None:
+        """Announce the freeze, with the coverage it costs, once per round."""
+        if self._dedup_freeze_logged:
+            return
+        self._dedup_freeze_logged = True
+        try:
+            stats = round_obj.stats()
+        except Exception:
+            stats = None
+        scores = round_obj.scores_snapshot()
+        logger.info(
+            "bg-eval: dedup tail open — eval field frozen",
+            round_id=round_obj.round_id,
+            scored=len(scores),
+            positive=sum(1 for s in scores.values() if s > 0.0),
+            round_stats=stats,
+        )
+
+    def _dedup_tail_active(self) -> bool:
+        """True once the reserved tail has opened (field frozen).
+
+        Always False when freezing is off or the deadline was never
+        published — in that case the pass keeps its previous idle/interval
+        triggers and the field is never frozen.
+        """
+        tail_open = self._dedup_tail_open
+        return tail_open is not None and time.monotonic() >= tail_open
 
     def _note_dedup_skip(self, reason: str, **fields) -> None:
         """Log why the pass declined to run — once per distinct reason.
@@ -784,6 +852,7 @@ class BackgroundEvalWorker(threading.Thread):
         self._dedup_summary_emitted = False
         self._dedup_evals_since_pair = 0
         self._dedup_last_skip_reason = None
+        self._dedup_freeze_logged = False
 
     def _emit_dedup_summary(self, *, reason: str) -> None:
         """One `dedup-shadow: round summary` line per round (best effort)."""
@@ -880,6 +949,17 @@ class BackgroundEvalWorker(threading.Thread):
             return
         if not self.eval_window_active.is_set():
             self._note_dedup_skip("eval_window_closed")
+            return
+        # The top-K is not settled until the field is frozen. Running before
+        # then spends a per-ROUND budget on a snapshot of whoever happens to
+        # be graded, and in `enforce` mode those verdicts still bite at
+        # finalize. Inactive when `dedup_freeze_field` is off or no deadline
+        # was published, which preserves the old idle/interval triggers.
+        if self._dedup_tail_open is not None and not self._dedup_tail_active():
+            self._note_dedup_skip(
+                "awaiting_dedup_tail",
+                opens_in_sec=round(self._dedup_tail_open - time.monotonic(), 1),
+            )
             return
         if not self._dedup_window_allows_pair():
             return  # logs its own reason

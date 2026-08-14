@@ -216,6 +216,7 @@ def _make_worker(
     mode: str = "shadow",
     threshold: float = 0.0,
     eval_interval: int = 8,
+    freeze: bool = True,
 ) -> BackgroundEvalWorker:
     config = SimpleNamespace(
         evaluation=SimpleNamespace(
@@ -225,6 +226,7 @@ def _make_worker(
             dedup_threshold=threshold,
             dedup_eval_interval=eval_interval,
             dedup_pair_budget_sec=120,
+            dedup_freeze_field=freeze,
             per_miner_eval_timeout_sec=30,
             top_k_miners_to_reward=3,
         ),
@@ -638,3 +640,83 @@ def test_round_summary_stays_quiet_when_filter_disabled(tmp_path: Path) -> None:
     finally:
         bw.logger.info = orig
     assert lines == []
+
+
+def test_reserved_tail_is_derived_from_the_pair_budget(tmp_path: Path) -> None:
+    import time as _time
+
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj)
+
+    # No deadline published -> no tail, and the field is never frozen.
+    assert worker._dedup_tail_open is None
+    assert worker._dedup_tail_active() is False
+
+    # Reserved span = dedup_max_pairs * dedup_pair_budget_sec = 10 * 120.
+    deadline = _time.monotonic() + 3600
+    worker.set_window_deadline(deadline)
+    assert worker._dedup_tail_open == pytest.approx(deadline - 1200)
+    # An hour out, so the tail has not opened: the field is still moving.
+    assert worker._dedup_tail_active() is False
+
+    # Inside the reserved span -> frozen.
+    worker.set_window_deadline(_time.monotonic() + 600)
+    assert worker._dedup_tail_active() is True
+
+
+def test_freeze_disabled_restores_the_unfrozen_triggers(tmp_path: Path) -> None:
+    import time as _time
+
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj, freeze=False)
+
+    worker.set_window_deadline(_time.monotonic() + 3600)
+    assert worker._dedup_tail_open is None
+    assert worker._dedup_tail_active() is False
+    # The MinerCommit1-5 guard is independent and still armed.
+    assert worker._dedup_window_allows_pair() is True
+
+
+def test_pass_waits_for_the_tail_before_spending_round_budget(tmp_path: Path) -> None:
+    import time as _time
+
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    base = round_obj.model_snapshot_cpu
+    _write_submission(tmp_path, "HK1", 10, {"w": base["w"] + torch.ones(4)})
+    _write_submission(tmp_path, "HK2", 11, {"w": base["w"] + torch.full((4,), 2.0)})
+
+    worker = _make_worker(tmp_path, round_obj)
+    # Whole window still ahead: the ranking is not settled, so not a single
+    # pair may be spent — `dedup_max_pairs` is a per-ROUND budget.
+    worker.set_window_deadline(_time.monotonic() + 3600)
+
+    import connito.shared.evaluate as ev
+
+    orig = ev.evaluate_model
+    ev.evaluate_model = lambda *a, **k: {"val_loss": 3.5}
+    try:
+        asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+        assert worker._dedup_budget_used == 0
+        assert worker._dedup_pairs_done == set()
+        assert worker._dedup_last_skip_reason == "awaiting_dedup_tail"
+
+        # Once the tail opens the same call proceeds.
+        worker.set_window_deadline(_time.monotonic() + 600)
+        asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+        assert worker._dedup_budget_used == 1
+    finally:
+        ev.evaluate_model = orig
+
+
+def test_filter_off_never_freezes_the_eval_field(tmp_path: Path) -> None:
+    # The freeze costs miner evals, so it must not arm when there is no pass
+    # to spend the tail on. `dedup_filter_mode: off` is the DEFAULT, and this
+    # is the regression that would stall every validator's last 20 minutes.
+    import time as _time
+
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj, mode="off")
+
+    worker.set_window_deadline(_time.monotonic() + 600)
+    assert worker._dedup_tail_open is None
+    assert worker._dedup_tail_active() is False
