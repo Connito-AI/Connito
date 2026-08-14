@@ -789,16 +789,26 @@ class BackgroundEvalWorker(threading.Thread):
         """One `dedup-shadow: round summary` line per round (best effort)."""
         if self._dedup_summary_emitted or self._dedup_round_id is None:
             return
-        if self._dedup_budget_used == 0 and self._dedup_pairs_skipped == 0:
-            return  # nothing ran (mode off, or <2 positive miners) — stay quiet
+        # Gate on the FILTER being enabled, not on whether anything ran. The
+        # previous `budget_used == 0 and pairs_skipped == 0` guard silenced
+        # exactly the case worth reporting: a round where the pass was
+        # reached but every attempt was gated. That left "produced nothing"
+        # indistinguishable from "never called" at round granularity, which
+        # is what made this take three attempts to diagnose. A disabled
+        # filter still stays quiet.
+        mode = getattr(self.config.evaluation, "dedup_filter_mode", "off")
+        if mode not in ("shadow", "enforce"):
+            return
         self._dedup_summary_emitted = True
         logger.info(
             "dedup-shadow: round summary",
             round_id=self._dedup_round_id,
+            mode=mode,
             pairs_evaluated=len(self._dedup_pairs_done) - self._dedup_pairs_skipped,
             pairs_skipped=self._dedup_pairs_skipped,
             budget_used=self._dedup_budget_used,
             budget_max=int(getattr(self.config.evaluation, "dedup_max_pairs", 0)),
+            last_skip_reason=self._dedup_last_skip_reason,
             reason=reason,
         )
 

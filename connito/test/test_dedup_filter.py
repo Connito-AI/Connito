@@ -597,3 +597,44 @@ def test_skip_log_only_fires_on_change(tmp_path: Path) -> None:
     finally:
         bw.logger.info = orig
     assert logged == ["no_pairs"]  # five calls, one line
+
+
+def test_round_summary_reports_a_round_that_produced_nothing(tmp_path: Path) -> None:
+    # The diagnostic case: pass reached, every attempt gated, zero pairs.
+    # This must still produce a round-level line carrying the reason.
+    round_obj = _make_round(tmp_path, {1: 0.0, 2: 0.0})
+    worker = _make_worker(tmp_path, round_obj)
+    asyncio.run(worker._maybe_run_dedup_shadow(round_obj))
+
+    import connito.validator.background_eval_worker as bw
+
+    lines = []
+    orig = bw.logger.info
+    bw.logger.info = lambda msg, **kw: lines.append((msg, kw))
+    try:
+        worker._emit_dedup_summary(reason="round_transition")
+    finally:
+        bw.logger.info = orig
+
+    assert len(lines) == 1
+    msg, kw = lines[0]
+    assert msg == "dedup-shadow: round summary"
+    assert kw["budget_used"] == 0
+    assert kw["last_skip_reason"] == "no_pairs"
+    assert kw["mode"] == "shadow"
+
+
+def test_round_summary_stays_quiet_when_filter_disabled(tmp_path: Path) -> None:
+    round_obj = _make_round(tmp_path, {1: 0.9, 2: 0.5})
+    worker = _make_worker(tmp_path, round_obj, mode="off")
+
+    import connito.validator.background_eval_worker as bw
+
+    lines = []
+    orig = bw.logger.info
+    bw.logger.info = lambda msg, **kw: lines.append(msg)
+    try:
+        worker._emit_dedup_summary(reason="gated")
+    finally:
+        bw.logger.info = orig
+    assert lines == []
