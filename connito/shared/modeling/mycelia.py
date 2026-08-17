@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import warnings
 from collections import OrderedDict
@@ -57,6 +58,37 @@ else:
 logger = structlog.get_logger(__name__)
 
 
+@contextlib.contextmanager
+def build_at_dtype(dtype: torch.dtype):
+    """Construct modules directly at `dtype` instead of fp32-then-cast.
+
+    `nn.Parameter(torch.empty(...))` and `nn.Linear` take torch's *default*
+    dtype, which is fp32. Building a model and casting afterwards therefore
+    peaks at 2x its final size, because the fp32 storage for every parameter is
+    live until that parameter is individually replaced.
+
+    Measured on the full DeepSeek-V2-Lite topology (15.71 B params): 59.6 GB
+    peak resident on a 62 GB host for a model whose final size is ~31 GB. The
+    build alone was within a couple of GB of exhausting the machine, before the
+    gradient buffers or any eval copy existed.
+
+    Callers should keep their trailing `.to(dtype=...)`: `Tensor.to` returns
+    self when the dtype already matches, so it costs nothing and the end state
+    stays pinned to the same invariant if a submodule ever hard-codes fp32.
+
+    `set_default_dtype` is process-global, so this must wrap construction only —
+    never a region that yields to concurrent model building. Model construction
+    happens once at startup on the main thread, which is why this is safe here
+    and would not be inside the round loop.
+    """
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
 # ---------------------------------------------------------------------
 # Loading helpers
 # ---------------------------------------------------------------------
@@ -94,9 +126,13 @@ def load_pretrained_model_low_mem(
 ) -> nn.Module:
     """Load pretrained weights directly into the custom model with low CPU memory usage."""
     if bool(getattr(moe_config, "full", False)):
-        # Build at `model_dtype` from the start: a fp32 default + later
-        # cast would peak at ~2x the final size for a 15B-param model.
-        model = model_class(moe_config).to(dtype=model_dtype)
+        # Build at `model_dtype` from the start: a fp32 default + later cast
+        # peaks at ~2x the final size for a 15B-param model. The trailing
+        # `.to()` is a no-op once construction is already at the right dtype
+        # (`Tensor.to` returns self) and is kept as the invariant's backstop.
+        with build_at_dtype(model_dtype):
+            model = model_class(moe_config)
+        model = model.to(dtype=model_dtype)
 
         # Stream through the same per-key translator the partial path uses.
         # A bare `load_state_dict(strict=False)` here loaded NOTHING into the
@@ -163,7 +199,9 @@ def load_pretrained_model_low_mem(
         del model
         gc.collect()
 
-        model = model_class(moe_config).to(dtype=model_dtype)
+        with build_at_dtype(model_dtype):
+            model = model_class(moe_config)
+        model = model.to(dtype=model_dtype)
         pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
         model.load_state_dict(pretrained_sd, strict=False)
         del pretrained_sd
@@ -237,7 +275,12 @@ def get_base_model(
             )
             target_device = "cpu"
 
-        model = _CausalLMClass(moe_config)
+        # Same fp32-then-cast trap as the full path, an order of magnitude
+        # smaller: the partial model is ~4 GB, so the old peak was ~8 GB rather
+        # than ~60 GB. Fixed here too because it is the same bug and the same
+        # one-line remedy, not because it was hurting anything.
+        with build_at_dtype(model_dtype):
+            model = _CausalLMClass(moe_config)
         # Merge every loaded group's per-layer expert assignment into a single
         # mapping whose my_expert_ids match the merged partial model's local
         # slot layout (sorted-by-org_expert_id). This lets us stream pretrained
