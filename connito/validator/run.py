@@ -478,7 +478,9 @@ def check_validator_quantization_supported(config: ValidatorConfig) -> None:
     if os.environ.get(VALIDATOR_FP8_OVERRIDE_ENV) == "1":
         logger.warning(
             "Starting with fp8 validator eval via override — scoring is expected "
-            "to be corrupted and has not been gated; use a staging hotkey only",
+            "to be corrupted: the rank-preservation gate has been run against "
+            "fp8 and it FAILED (0.21x perturbation against a <0.1x bar, top-3 "
+            "reordering). Use a staging hotkey only",
             override=VALIDATOR_FP8_OVERRIDE_ENV,
         )
         return
@@ -519,19 +521,41 @@ def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str
             "  - per-miner perturbation was 0.36x the best-to-worst spread, "
             "against a <0.1x bar.\n"
             "\n"
-            "fp8 (e4m3) is a strictly coarser format than the one that failed: "
-            "2.645% relative weight error against int8's 0.829%, at identical "
-            "storage. It has NOT been gated in its own right, and there is no "
-            "reason to expect it to pass a bar int8 missed by 3.6x.\n"
+            "fp8 (e4m3) has since been gated in its own right, on the same 7 "
+            "shards and the same eval mix, and it FAILED the same way: top-3 "
+            "reordering, one exact val_loss tie manufactured out of a tie-free "
+            "population, and 0.21x perturbation against the <0.1x bar. That is "
+            "the expected result for a strictly coarser format — 2.654% mean "
+            "relative weight error against int8's 0.829%, at identical storage "
+            "(measured across all 4992 expert projections of DeepSeek-V2-Lite; "
+            "min 2.645%, max 2.660%).\n"
             "\n"
-            f"Set {VALIDATOR_FP8_OVERRIDE_ENV}=1 only to run that gate on a "
+            "Do not read a small *loss* delta as a licence to enable this. On a "
+            "correctly loaded full model the absolute val_loss shift is only "
+            "~0.001 — negligible for training, and the reason the miner-side "
+            "toggle is safe. But the inter-miner spread the ranking has to "
+            "resolve is itself of that order, which is exactly how a harmless "
+            "loss delta becomes a reordered podium.\n"
+            "\n"
+            f"Set {VALIDATOR_FP8_OVERRIDE_ENV}=1 only to re-run that gate on a "
             "staging hotkey. The miner-side toggle is unaffected and needs no "
             "override."
         )
 
     model.eval()
     model.requires_grad_(False)
-    converted = quantize_model_(model, include_experts=True)
+    # Experts only, backbone left at full precision. This matches the scope of
+    # the reference implementation in the experiment repo
+    # (`partial_moe.py:quantize_expert_fp8`, 17c878d), which quantizes expert
+    # projections and nothing else — a loss delta measured here is only
+    # comparable with one measured there if both are quantizing the same set of
+    # tensors. It also keeps most of the memory win: the routed experts dominate
+    # the model either way. Measured on an L40S against DeepSeek-V2-Lite —
+    # 15.71 B total, of which 14.39 B is the 1664 routed experts and 1.32 B is
+    # everything else — quantizing experts alone took the full model from
+    # 29.36 GiB resident to 16.98 GiB. The partial model this validator builds
+    # holds 430 of those experts (3.72 B), so the same ratio applies.
+    converted = quantize_model_(model, include_experts=True, include_linears=False)
     logger.warning(
         "fp8 quantization ACTIVE on validator eval model via "
         f"{VALIDATOR_FP8_OVERRIDE_ENV} — scoring is expected to be corrupted: "

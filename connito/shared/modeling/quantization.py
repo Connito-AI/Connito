@@ -341,6 +341,7 @@ def quantize_model_(
     model: nn.Module,
     *,
     include_experts: bool,
+    include_linears: bool = True,
     denylist: tuple[str, ...] = DEFAULT_LINEAR_DENYLIST,
     frozen_only: bool = True,
 ) -> list[str]:
@@ -353,11 +354,26 @@ def quantize_model_(
     interleaves the trainable group with the frozen helper group and
     `freeze_parameters` necessarily marks the whole thing trainable.
 
+    ``include_linears`` covers the non-expert `nn.Linear` modules — the MLA
+    projections, the `first_k_dense_replace` dense MLPs and `shared_experts`.
+    It is a *preference*, unlike the flag above: both settings are correct, and
+    the choice is about what a given run is for. The validator passes False so
+    its scope matches the reference implementation in the experiment repo
+    (`partial_moe.py:quantize_expert_fp8`, commit 17c878d), which quantizes
+    expert projections only and leaves the backbone at full precision — loss
+    measurements only transfer between the two codebases when the two are
+    quantizing the same thing. The miner has no experts it can quantize, so
+    leaving this True is the only reason its toggle does anything at all.
+
     Discovery of the expert modules is duck-typed (`quantize_` + a
     `_STACKED_PARAMS` attribute) rather than by isinstance, because the
     concrete class lives in a module that imports this one.
     """
-    converted = quantize_linear_modules_(model, denylist=denylist, frozen_only=frozen_only)
+    converted = (
+        quantize_linear_modules_(model, denylist=denylist, frozen_only=frozen_only)
+        if include_linears
+        else []
+    )
 
     if include_experts:
         for name, module in model.named_modules():
