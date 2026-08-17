@@ -402,7 +402,14 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
+    # global_model — used for optimization and for every per-miner eval copy
+    # (`evaluator.load_model_from_path` deepcopies it), so its topology is the
+    # topology the subnet is scored on. `moe.partial_moe` selects:
+    #   True  -> partial, only the trainable (+ helper) group's experts
+    #   False -> full, every routed expert of the base checkpoint
+    # Previously hard-coded True, which left the full branch of
+    # `mycelia.get_base_model` unreachable from any config.
+    #
     # `load_global_checkpoint=False`: the validator boots from the pretrained
     # backbone + experts (`get_base_model`) without overlaying any on-disk
     # expert state. Peer-resync via `reload_model_inplace` still pulls the
@@ -410,7 +417,7 @@ def setup_training(
     # resume below is also independent of this flag.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
-        partial=True, checkpoint_device=device,
+        partial=bool(config.moe.partial_moe), checkpoint_device=device,
         load_global_checkpoint=False,
     )
 
@@ -486,6 +493,47 @@ def check_validator_quantization_supported(config: ValidatorConfig) -> None:
         return
     # Raise through the same path so the explanation lives in one place.
     quantize_eval_model_(config, nn.Module(), role="startup-check")
+
+
+def warn_on_full_expert_topology(config: ValidatorConfig) -> None:
+    """Announce a full-topology validator at startup, with its cost.
+
+    Not a refusal: the full topology is the deployment geometry the reference
+    experiment measures, and matching it is the point of the option. But it is
+    not a drop-in swap for `partial_moe: true`, and the failure mode is an OOM
+    part-way through the first round rather than at startup, so an operator who
+    set it deserves the numbers up front.
+
+    Where the memory goes, measured on an L40S (46 GB):
+
+      * The model itself. Full carries 14.39 B routed-expert params against
+        partial's 1.32 B — ~29 GB of fp16 weights instead of ~2.6 GB.
+      * `evaluator.load_model_from_path` builds each per-miner eval model with
+        `copy.deepcopy(global_model)` and `quantize_eval_model_` runs *after*
+        that copy, so the transient peak is two unquantized models. fp8 shrinks
+        the copy it produces, not the peak that produces it. This was measured
+        OOMing, not predicted.
+      * `global_model` must stay unquantized regardless: merge and the outer
+        optimizer walk `named_parameters()`, and fp8 weights live in buffers.
+
+    So `partial_moe: false` currently needs host RAM for the base model and a
+    card that can hold two copies of it. Treat 46 GB as not enough.
+    """
+    if bool(get_nested_attr(config, "moe.partial_moe", True)):
+        return
+    logger.warning(
+        "Validator built on the FULL expert topology — every routed expert is "
+        "materialised and scored. This is the reference experiment's geometry, "
+        "but it is ~29 GB of fp16 expert weights against partial's ~2.6 GB, and "
+        "each per-miner eval deepcopies the model before quantization can "
+        "shrink it. Expect OOM on a 46 GB card. Also note this is not a locked "
+        "field: a validator here scores on a different forward graph to a "
+        "validator on partial, and their weights will disagree",
+        partial_moe=False,
+        full_topk=get_nested_attr(config, "moe.full_topk", None),
+        quantization=get_nested_attr(config, "model.quantization", "off"),
+        precision=get_nested_attr(config, "model.precision", None),
+    )
 
 
 def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str) -> None:
@@ -902,6 +950,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # after the roster is frozen — an operator who set `quantization: fp8`
     # deserves to find out at startup, not mid-cycle.
     check_validator_quantization_supported(config)
+    warn_on_full_expert_topology(config)
 
     # Start the integrated Prometheus telemetry server
     telemetry_port = resolve_telemetry_port(rank)

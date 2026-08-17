@@ -194,6 +194,19 @@ class ModelCfg(BaseConfig):
     foundation: bool = True
     torch_compile: bool = False
     attn_implementation: str = "sdpa"
+    # "fp16-mixed" | "bf16-mixed". `helper.resolve_precision` downgrades
+    # bf16 -> fp16 on a device without BF16 compute, so bf16 is safe to set
+    # anywhere.
+    #
+    # Left at fp16 rather than following the base checkpoint: DeepSeek-V2-Lite
+    # ships `torch_dtype: bfloat16` and the reference experiment runs bf16
+    # (`~/experiment/config.py:torch_dtype`), so a like-for-like comparison
+    # against its numbers wants `bf16-mixed` here. Changing the *default*
+    # would move every existing validator's scoring, including on the partial
+    # topology that the fleet runs today, which is a bigger change than the
+    # full-topology work this belongs to — so it stays a per-host config choice
+    # for now. Set it alongside `moe.partial_moe: false` when reproducing the
+    # experiment.
     precision: str = "fp16-mixed"
     device: str = "cuda"
     # Runtime weight-only fp8 quantization (float8_e4m3fn, scaled per output
@@ -369,9 +382,40 @@ class MoECfg(BaseConfig):
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
     partial_topk: PositiveInt = 6
-    full_topk: PositiveInt = 2
+    # Routing width of the *full* topology, i.e. `num_experts_per_tok` when
+    # every routed expert is present. DeepSeek-V2-Lite's own config ships
+    # `num_experts_per_tok: 6`, and that is what the reference experiment
+    # measures its full-topology numbers at — it loads the checkpoint through
+    # `AutoModelForCausalLM.from_pretrained` and never overrides the gate, so
+    # its "full side" is the native 6 (`~/experiment/doc/
+    # partial-model-training-paper.md`, and `partial_moe.py` reads
+    # `top_k = getattr(self.gate, "top_k")` straight off the stock gate).
+    #
+    # This sat at 2 from the initial commit until 2026-08-17. Nothing ever read
+    # it: the only consumer is `mycelia.get_base_model(partial=False)`, and
+    # every call site in both roles hard-coded `partial=True`, so the value was
+    # never exercised and never reviewed. `partial_topk` got a deliberate
+    # 1 -> 6 bump in 917bb16; this field was missed.
+    full_topk: PositiveInt = 6
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
+    # Topology of the model the validator builds and scores on.
+    #
+    #   True  (default) - partial: only the trainable group's experts (plus an
+    #                     optional helper group) are materialised. ~1.3 B routed
+    #                     params; routed with `partial_topk`.
+    #   False           - full: every routed expert of the base checkpoint.
+    #                     ~14.4 B routed params; routed with `full_topk`.
+    #
+    # Deliberately NOT in `_LOCKED_FIELDS`, so a staging host can flip it
+    # without the locked-field reset undoing the edit on the next start. That
+    # cuts both ways: two validators on different topologies score on different
+    # forward graphs and their weights will disagree. Lock it before it ever
+    # becomes a fleet default.
+    #
+    # Read the memory note in `validator.run.warn_on_full_expert_topology`
+    # before enabling: the full topology does not currently fit alongside the
+    # per-miner eval copy on a 46 GB card.
     partial_moe: bool = True
     num_worker_groups: PositiveInt = 2
 
