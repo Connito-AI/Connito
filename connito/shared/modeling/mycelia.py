@@ -29,6 +29,7 @@ MODEL_BACKEND = "deepseek_v2"
 if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
+        assignments_from_expert_modules as _assignments_from_expert_modules_impl,
         get_moe_model_config as _get_moe_model_config_impl,
         merge_group_assignments_for_streaming as _merge_group_assignments_for_streaming_impl,
         stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
@@ -93,17 +94,47 @@ def load_pretrained_model_low_mem(
 ) -> nn.Module:
     """Load pretrained weights directly into the custom model with low CPU memory usage."""
     if bool(getattr(moe_config, "full", False)):
-        logger.info(
-            "Using direct explicit state_dict load for full model to avoid meta-tensor finalize issues",
-            path=model_path,
-        )
         # Build at `model_dtype` from the start: a fp32 default + later
         # cast would peak at ~2x the final size for a 15B-param model.
         model = model_class(moe_config).to(dtype=model_dtype)
-        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
-        model.load_state_dict(pretrained_sd, strict=False)
-        del pretrained_sd
-        logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
+
+        # Stream through the same per-key translator the partial path uses.
+        # A bare `load_state_dict(strict=False)` here loaded NOTHING into the
+        # routed experts: the checkpoint names them
+        # `...experts.{N}.{gate,up,down}_proj.weight`, one tensor per expert per
+        # projection, while `CustomDeepseekV2Experts` stores each layer's experts
+        # stacked and gate/up fused, under `...experts.{N}.gate_up_proj`. Neither
+        # side matched, `strict=False` swallowed both the 4992 unexpected keys
+        # and the 52 missing ones, and every routed expert kept its
+        # `_init_weights` random values — 14.39 B of 15.71 B parameters, with no
+        # exception and no warning. Measured on an L40S: the model scored 9.956
+        # against the stock HF model's 1.449 on identical batches.
+        assignments = _assignments_from_expert_modules_impl(model)
+        try:
+            model = _stream_safetensors_to_partial_impl(
+                model, model_path, assignments, model_dtype,
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back, then report
+            # Same fallback ladder as the partial path: a checkpoint with no
+            # safetensors (or an unreadable index) still loads, just at the
+            # cost of holding the state dict in host RAM.
+            logger.warning(
+                "Safetensors streaming unavailable for full model; falling back "
+                "to an in-RAM state dict",
+                path=model_path,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
+            model = _stream_pretrained_to_partial_impl(model, pretrained_sd, assignments)
+            del pretrained_sd
+
+        logger.info(
+            "Loaded full model",
+            path=model_path,
+            dtype=str(model_dtype),
+            moe_layers=len(assignments),
+            routed_experts=sum(len(v) for v in assignments.values()),
+        )
         return model
 
     model = model_class.from_pretrained(
