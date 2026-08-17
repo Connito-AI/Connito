@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Optional, Set
+from typing import Any, Optional, Sequence, Set
 import threading
 
 import bittensor as bt
@@ -217,7 +217,22 @@ def build_grad_buff_from_model(
     expert_group_assignment: dict[int, dict[int, list[int]]],
     include_shared: bool = False,
     buffer_dtype: torch.dtype | None = None,
+    group_ids: Sequence[int | str] | None = None,
 ) -> dict[str | int, dict]:
+    """`group_ids` restricts which groups get a buffer allocated. None = all.
+
+    The caller has always kept exactly one group — its own — and deleted the
+    rest immediately after this returns. Building them first was free-looking
+    and is not: each buffer is a real `torch.zeros` in host RAM, so a validator
+    allocated and binned a full second copy on every start. 7.25 GB on the
+    partial topology the fleet runs today; 27.4 GB on the full one, where it
+    was a material part of running out of memory.
+
+    Name bucketing below still runs over *every* group, deliberately — it costs
+    nothing (it builds lists of strings) and `include_shared` needs the
+    complete ownership picture to work out which tensors belong to no group at
+    all. Only the allocation is skipped.
+    """
     if buffer_dtype is None:
         buffer_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
     """
@@ -263,7 +278,12 @@ def build_grad_buff_from_model(
     # 2) Build gradient buffer per expert group
     group_buff_metas: dict[str | int, Any] = {}
     buffer_element_size = torch.empty((), dtype=buffer_dtype).element_size()
+    wanted = None if group_ids is None else set(group_ids)
+    skipped: list[str | int] = []
     for group_id in expert_group_to_names.keys():
+        if wanted is not None and group_id not in wanted:
+            skipped.append(group_id)
+            continue
         tensors_for_group = {name: name_to_tensor[name] for name in expert_group_to_names[group_id]}
         if len(tensors_for_group) == 0:
             logger.warning(
@@ -281,6 +301,13 @@ def build_grad_buff_from_model(
             buffer_dtype=str(buffer_dtype),
             total_numel=total_numel,
             approx_buffer_mb=round(total_numel * buffer_element_size / (1024 * 1024), 2),
+        )
+
+    if skipped:
+        logger.info(
+            "Skipped grad buffers for non-active expert groups",
+            skipped_group_ids=skipped,
+            built_group_ids=sorted(group_buff_metas, key=str),
         )
 
     if include_shared:
