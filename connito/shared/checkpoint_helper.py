@@ -118,7 +118,8 @@ def save_state_dict_by_expert_group(
         - active_expert_group_id is None:
             write one shard per expert group.
         - active_expert_group_id is set:
-            write model_expgroup_{id}.pt with experts owned by that group only.
+            write model_expgroup_{id}.safetensors with experts owned by that
+            group only.
     """
 
     os.makedirs(save_dir, exist_ok=True)
