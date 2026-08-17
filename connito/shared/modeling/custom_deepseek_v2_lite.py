@@ -1043,6 +1043,32 @@ def merge_group_assignments_for_streaming(
     }
 
 
+def assignments_from_expert_modules(
+    model: nn.Module,
+) -> dict[int, list[tuple[int, int]]]:
+    """Read the local-slot -> global-expert mapping off the model itself.
+
+    `merge_group_assignments_for_streaming` derives the same mapping from a
+    group assignment, which is what a *partial* build has to do: the groups
+    decide which experts exist. A full build has no group — every routed
+    expert is present — so the mapping is whatever `expert_indices` each
+    module already holds, and asking the model is both simpler and safe
+    against a layout that is not the identity.
+    """
+    assignments: dict[int, list[tuple[int, int]]] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, CustomDeepseekV2Experts):
+            continue
+        match = _EXPERT_PREFIX_LAYER_RE.search(f"{name}.")
+        if match is None:
+            continue
+        assignments[int(match.group(1))] = [
+            (local_idx, int(global_idx))
+            for local_idx, global_idx in enumerate(module.expert_indices)
+        ]
+    return assignments
+
+
 def stream_pretrained_state_dict_to_partial_model(
     partial_model: CustomDeekSeekMoE,
     state_dict: dict[str, torch.Tensor],

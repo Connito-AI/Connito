@@ -16,6 +16,7 @@ from connito.shared.chain import (
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
 from connito.shared.config import CheckpointCfg, HfCfg
 from connito.shared.hf_distribute import (
+    HFFileMissingError,
     get_hf_upload_readiness,
     resolve_default_checkpoint_repo,
     resolve_hf_repo_ids,
@@ -370,14 +371,81 @@ def test_hydrate_miner_submissions_from_hf_writes_assigned_miners_only(tmp_path,
     )
 
     assert hydrated == 1
-    assert seen == [("some-user/co-miner", "abcdef0", "model_expgroup_0.pt")]
+    # `.safetensors` since #118. This assertion previously read `.pt`, which is
+    # what the hydrator asked for and no checkpoint has published since May —
+    # the test was pinning the bug rather than catching it.
+    assert seen == [("some-user/co-miner", "abcdef0", "model_expgroup_0.safetensors")]
     # Assigned HF miner got a submission file with the expected naming convention.
-    assert (submission_dir / "hotkey_miner-assigned_block_999.pt").exists()
+    # The destination carries the suffix that was actually downloaded, because
+    # `load_state_dict_from_path` dispatches on it.
+    assert (submission_dir / "hotkey_miner-assigned_block_999.safetensors").exists()
     # Unassigned miner is skipped even though it has HF coords.
     assert not list(submission_dir.glob("*miner-unassigned*"))
     # Miner without HF coords is missing for this round and gets the zero-score penalty.
     assert not list(submission_dir.glob("*miner-no-hf*"))
     # No leftover tmp dirs from atomic-rename path.
+    assert not list(submission_dir.glob(".tmp_*"))
+
+
+def test_hydrate_miner_submissions_falls_back_to_legacy_pt(tmp_path, monkeypatch):
+    """A pre-#118 repo carrying only `.pt` is still hydrated.
+
+    The two suffixes go out as separate requests because
+    `download_checkpoint_from_hf` raises on the first missing entry — one call
+    listing both would fail against every repo, since none carries both.
+    """
+    submission_dir = tmp_path / "miner_submission"
+    submission_dir.mkdir()
+
+    config = SimpleNamespace(
+        chain=SimpleNamespace(netuid=102, hotkey_ss58="validator-hotkey"),
+        ckpt=SimpleNamespace(miner_submission_path=submission_dir),
+        hf=SimpleNamespace(token_env_var="HF_TOKEN"),
+        task=SimpleNamespace(exp=SimpleNamespace(group_id=0)),
+    )
+    subtensor = SimpleNamespace(block=999)
+
+    assigned = ChainCheckpoint(
+        uid=7,
+        hotkey="miner-assigned",
+        global_ver=10,
+        model_hash="abcd",
+        signed_model_hash="signed",
+        expert_group=0,
+        ip="127.0.0.1",
+        port=8000,
+        hf_repo_id="some-user/co-miner",
+        hf_revision="abcdef0",
+    )
+    monkeypatch.setattr(
+        "connito.shared.checkpoints.build_chain_checkpoints_from_previous_phase",
+        lambda **kwargs: ChainCheckpoints(checkpoints=[assigned]),
+    )
+
+    attempted: list[str] = []
+
+    def only_pt_exists(**kwargs):
+        dest_dir = Path(kwargs["dest_dir"])
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for fname in kwargs["filenames"]:
+            attempted.append(fname)
+            if not fname.endswith(".pt"):
+                raise HFFileMissingError(f"missing: {fname}")
+            (dest_dir / fname).write_bytes(b"legacy-shard")
+
+    monkeypatch.setattr("connito.shared.cycle.download_checkpoint_from_hf", only_pt_exists)
+
+    hydrated = hydrate_miner_submissions_from_hf(
+        config=config,
+        subtensor=subtensor,
+        validator_miner_assignment={"validator-hotkey": ["miner-assigned"]},
+    )
+
+    assert hydrated == 1
+    assert attempted == ["model_expgroup_0.safetensors", "model_expgroup_0.pt"]
+    # Destination keeps the downloaded suffix so the loader dispatches correctly.
+    assert (submission_dir / "hotkey_miner-assigned_block_999.pt").exists()
+    assert not (submission_dir / "hotkey_miner-assigned_block_999.safetensors").exists()
     assert not list(submission_dir.glob(".tmp_*"))
 
 

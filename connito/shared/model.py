@@ -25,7 +25,10 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
-from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
+from connito.shared.hf_distribute import (
+    HFFileMissingError,
+    download_checkpoint_from_hf_with_timeout,
+)
 from connito.shared.cycle import (
     PhaseNames,
     get_blocks_from_previous_phase_from_api,
@@ -45,11 +48,23 @@ from connito.shared.schema import verify_message
 logger = structlog.get_logger(__name__)
 
 
-def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int | str, str]]:
+# Expert-group shards have been published as `.safetensors` since #118
+# (2026-05-07); `.pt` is the pre-migration format. `_build_download_targets`
+# asked for `.pt` alone, so every chain fetch 404'd and silently fell through
+# to a cold start — verified against a live checkpoint, which carries two
+# `.safetensors` shards and no `.pt` at all.
+EXPERT_SHARD_SUFFIX = ".safetensors"
+LEGACY_EXPERT_SHARD_SUFFIX = ".pt"
+
+
+def _build_download_targets(
+    expert_group_ids: list[int | str],
+    suffix: str = EXPERT_SHARD_SUFFIX,
+) -> list[tuple[int | str, str]]:
     targets: list[tuple[int | str, str]] = []
     for expert_group_id in expert_group_ids:
         if isinstance(expert_group_id, int):
-            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
+            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}{suffix}"))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state
             # is reconstructed from `config.model.model_path` at instantiation.
@@ -84,6 +99,58 @@ def _download_checkpoint_from_hf_with_timeout(
         dest_dir=dest_dir,
         token_env_var=token_env_var or "HF_TOKEN",
         timeout_sec=timeout_sec,
+    )
+
+
+def _download_expert_shards(
+    *,
+    repo_id: str,
+    revision: str,
+    expert_group_ids: list[int | str],
+    dest_dir: Path,
+    token_env_var: str | None,
+    timeout_sec: float | None,
+) -> list[str]:
+    """Fetch the expert-group shards, preferring `.safetensors`.
+
+    Returns the filenames written, or `[]` when the caller asked for nothing
+    downloadable. Raises whatever the last attempt raised.
+
+    The fallback is a separate attempt rather than one request listing both
+    suffixes because `download_checkpoint_from_hf` is all-or-nothing: a single
+    `EntryNotFoundError` aborts the batch, so asking for both would fail on
+    every repo that has only one — which is every repo.
+    """
+    last_error: Exception | None = None
+    for suffix in (EXPERT_SHARD_SUFFIX, LEGACY_EXPERT_SHARD_SUFFIX):
+        targets = _build_download_targets(expert_group_ids, suffix=suffix)
+        filenames = [filename for _, filename in targets]
+        if not filenames:
+            return []
+        _clear_download_targets(dest_dir, filenames)
+        try:
+            _download_checkpoint_from_hf_with_timeout(
+                repo_id=repo_id,
+                revision=revision,
+                filenames=filenames,
+                dest_dir=dest_dir,
+                token_env_var=token_env_var,
+                timeout_sec=timeout_sec,
+            )
+            return filenames
+        except HFFileMissingError as exc:
+            # Only a missing *file* is worth retrying under the other suffix. A
+            # missing repo/revision, an auth failure or a timeout means the
+            # candidate is unusable and the caller should move on.
+            last_error = exc
+            logger.debug(
+                "Expert shard not found under this suffix; trying the next",
+                repo_id=repo_id,
+                revision=revision,
+                suffix=suffix,
+            )
+    raise last_error if last_error is not None else FileNotFoundError(
+        f"no expert shards downloadable from {repo_id}@{revision}"
     )
 
 
@@ -394,9 +461,7 @@ def fetch_model_from_chain_validator(
                 )
                 out_folder.mkdir(parents=True, exist_ok=True)
 
-                targets = _build_download_targets(expert_group_ids)
-                filenames = [filename for _, filename in targets]
-                if not filenames:
+                if not _build_download_targets(expert_group_ids):
                     continue
 
                 if not (chain_checkpoint.hf_repo_id and chain_checkpoint.hf_revision):
@@ -407,13 +472,11 @@ def fetch_model_from_chain_validator(
                     )
                     continue
 
-                _clear_download_targets(out_folder, filenames)
-
                 try:
-                    _download_checkpoint_from_hf_with_timeout(
+                    _download_expert_shards(
                         repo_id=chain_checkpoint.hf_repo_id,
                         revision=chain_checkpoint.hf_revision,
-                        filenames=filenames,
+                        expert_group_ids=expert_group_ids,
                         dest_dir=out_folder,
                         token_env_var=config.hf.token_env_var,
                         timeout_sec=download_timeout_sec,

@@ -50,7 +50,10 @@ from connito.shared.helper import (
     h256_int,
     parse_dynamic_filename,
 )
-from connito.shared.hf_distribute import download_checkpoint_from_hf
+from connito.shared.hf_distribute import (
+    HFFileMissingError,
+    download_checkpoint_from_hf,
+)
 from connito.validator.evaluator import MinerEvalJob
 
 configure_logging()
@@ -974,7 +977,12 @@ def hydrate_miner_submissions_from_hf(
     # download worker may have already placed the file, and we don't want to
     # re-download on subsequent polls.
     existing_hotkeys: set[str] = set()
-    for file_path in submission_dir.glob("*.pt"):
+    # Both suffixes: submissions have been `.safetensors` since #118, and the
+    # background download worker names them after whatever it fetched. Globbing
+    # `*.pt` alone saw none of them, so every poll re-downloaded every miner.
+    for file_path in (
+        p for suffix in MINER_CHECKPOINT_SUFFIXES for p in submission_dir.glob(f"*{suffix}")
+    ):
         if file_path.name.startswith(".tmp"):
             continue
         meta = parse_dynamic_filename(file_path.name)
@@ -990,7 +998,13 @@ def hydrate_miner_submissions_from_hf(
         return 0
 
     expert_group_id = config.task.exp.group_id
-    filename_in_hf = f"model_expgroup_{expert_group_id}.pt"
+    # `.safetensors` first, `.pt` only as a pre-#118 fallback. Requesting both
+    # in one call is not an option: `download_checkpoint_from_hf` raises on the
+    # first missing entry, so a repo carrying only one suffix would fail.
+    candidate_filenames = [
+        f"model_expgroup_{expert_group_id}{suffix}"
+        for suffix in MINER_CHECKPOINT_SUFFIXES
+    ]
 
     hydrated = 0
     for ckpt in chain_checkpoints.checkpoints:
@@ -1002,17 +1016,37 @@ def hydrate_miner_submissions_from_hf(
             continue
 
         tmp_dir = submission_dir / f".tmp_hf_{ckpt.hotkey}"
-        dest_name = f"hotkey_{ckpt.hotkey}_block_{subtensor.block}.pt"
-        dest = submission_dir / dest_name
         try:
             tmp_dir.mkdir(parents=True, exist_ok=True)
-            download_checkpoint_from_hf(
-                repo_id=ckpt.hf_repo_id,
-                revision=ckpt.hf_revision,
-                filenames=[filename_in_hf],
-                dest_dir=tmp_dir,
-                token_env_var=config.hf.token_env_var,
+            filename_in_hf: str | None = None
+            last_error: Exception | None = None
+            for candidate in candidate_filenames:
+                try:
+                    download_checkpoint_from_hf(
+                        repo_id=ckpt.hf_repo_id,
+                        revision=ckpt.hf_revision,
+                        filenames=[candidate],
+                        dest_dir=tmp_dir,
+                        token_env_var=config.hf.token_env_var,
+                    )
+                    filename_in_hf = candidate
+                    break
+                except HFFileMissingError as exc:
+                    last_error = exc
+            if filename_in_hf is None:
+                raise last_error if last_error is not None else FileNotFoundError(
+                    f"no expert shard at {ckpt.hf_repo_id}@{ckpt.hf_revision}"
+                )
+
+            # The destination keeps the suffix we actually downloaded:
+            # `load_state_dict_from_path` dispatches on it, so writing
+            # safetensors bytes into a `.pt` name would route them to
+            # `torch.load` and fail.
+            dest_name = (
+                f"hotkey_{ckpt.hotkey}_block_{subtensor.block}"
+                f"{Path(filename_in_hf).suffix}"
             )
+            dest = submission_dir / dest_name
             # Atomic rename so gather_validation_job never sees a partial file.
             (tmp_dir / filename_in_hf).replace(dest)
             existing_hotkeys.add(ckpt.hotkey)
