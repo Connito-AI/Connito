@@ -37,7 +37,11 @@ from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import get_model_hash, get_nested_attr, resolve_precision, sum_model_gradients
-from connito.shared.modeling.quantization import all_finite, quantize_model_
+from connito.shared.modeling.quantization import (
+    all_finite,
+    quantize_frozen_expert_slices_,
+    quantize_model_,
+)
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import freeze_parameters, load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
@@ -169,17 +173,30 @@ def setup_training(
     #     and quantizing it would make hivemind merge and the outer optimizer
     #     silently skip every converted tensor (fp8 weights are buffers, so
     #     they vanish from `named_parameters()`).
-    # Scope is the frozen non-expert Linears only: the routed experts are held
-    # in one stacked tensor per layer that mixes this miner's trainable group
-    # with the frozen helper group, so `freeze_parameters` marks it trainable
-    # as a whole and it cannot be quantized without changing training.
+    # Default scope is the frozen non-expert Linears only. The routed experts sit
+    # in one stacked tensor per layer that mixes this miner's trainable group with
+    # the frozen helper group, and `freeze_parameters` marks the whole tensor
+    # trainable — so quantizing them wholesale is not available here.
     if get_nested_attr(config, "model.quantization", "off") == "fp8":
         converted = quantize_model_(model, include_experts=False)
         logger.info(
-            "fp8 quantization enabled (miner: frozen non-expert Linears only)",
+            "fp8 quantization enabled (miner: frozen non-expert Linears)",
             converted_modules=len(converted),
             sample=converted[:8],
         )
+        # Opt-in: also move the frozen helper expert slices to fp8. Per-slice, so
+        # the trainable group keeps its full-precision Parameter and its
+        # gradients. Off by default because it stops helper slices from being
+        # updated, which changes the training trajectory — see the config comment.
+        if get_nested_attr(config, "model.quantize_helper_experts", False):
+            expert_modules = quantize_frozen_expert_slices_(model)
+            logger.warning(
+                "fp8 helper-expert quantization enabled — helper slices are now "
+                "frozen, so this miner's training trajectory differs from a "
+                "run with it off",
+                expert_modules=len(expert_modules),
+                sample=expert_modules[:4],
+            )
 
     non_finite_param_names = []
     with torch.no_grad():

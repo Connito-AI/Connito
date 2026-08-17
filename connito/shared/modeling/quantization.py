@@ -391,6 +391,49 @@ def quantize_model_(
 # ─────────────────────────────────────────────────────────────────────────────
 # Invariants
 # ─────────────────────────────────────────────────────────────────────────────
+def quantize_frozen_expert_slices_(model: nn.Module) -> list[str]:
+    """Quantize only the *helper*-group expert slices, in place.
+
+    This is the miner counterpart to the validator's wholesale
+    `include_experts=True`, and it is the one place our scope can match the
+    reference implementation's (`_apply_frozen_kept_quantization`, which
+    converts frozen-kept helper experts and leaves trainable ones alone).
+
+    Each MoE block already knows the split: `CustomDeepseekV2Moe` registers a
+    `helper_ids` buffer holding the global expert ids contributed by the helper
+    group, disjoint from `trainable_ids`. Those are mapped to local slice
+    indices through the experts module's own `global_to_local_map`.
+
+    **This changes training.** Helper slices currently sit inside a trainable
+    stacked tensor, so they receive gradients and drift; moving them to fp8
+    freezes them, which changes what the trainable experts co-adapt against and
+    therefore changes what the miner submits. Gated behind
+    `model.quantize_helper_experts`, default off, for exactly that reason.
+
+    Returns the names of the modules that had slices converted.
+    """
+    converted: list[str] = []
+    for name, module in model.named_modules():
+        experts = getattr(module, "experts", None)
+        helper_ids = getattr(module, "helper_ids", None)
+        if experts is None or helper_ids is None:
+            continue
+        if not hasattr(experts, "quantize_") or not hasattr(experts, "global_to_local_map"):
+            continue
+        if helper_ids.numel() == 0:
+            continue
+        local = [
+            int(experts.global_to_local_map[int(gid)])
+            for gid in helper_ids.tolist()
+            if int(experts.global_to_local_map[int(gid)]) >= 0
+        ]
+        if not local:
+            continue
+        experts.quantize_(local_indices=local)
+        converted.append(f"{name}.experts" if name else "experts")
+    return sorted(converted)
+
+
 def is_quantized(model: nn.Module) -> bool:
     """True if any submodule holds fp8 weights."""
     return any(getattr(module, QUANT_MARKER, False) for module in model.modules())

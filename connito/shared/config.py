@@ -221,6 +221,19 @@ class ModelCfg(BaseConfig):
     # fleet-wide and make the per-host staging validation impossible. Lock it
     # if and when it becomes the fleet default.
     quantization: Literal["off", "fp8"] = "off"
+    # Miner-only, and only meaningful when `quantization` is "fp8": also move the
+    # frozen HELPER expert slices to fp8. This is where the real memory is — the
+    # routed experts dwarf the backbone — and it is what makes our scope match
+    # the reference implementation, which quantizes frozen-kept helper experts.
+    #
+    # CHANGES TRAINING, which is why it is separate and defaults off. Helper
+    # slices today share a trainable stacked tensor per layer, so they receive
+    # gradients and drift over a cycle. Quantizing them freezes them, which
+    # changes what the trainable experts co-adapt against and therefore changes
+    # the weights a miner submits. Turn it on only with a measured comparison in
+    # hand; the submitted shard is still bit-identical for identical inputs, but
+    # the training trajectory is not.
+    quantize_helper_experts: bool = False
 
 
 class DatasetSourceCfg(BaseConfig):

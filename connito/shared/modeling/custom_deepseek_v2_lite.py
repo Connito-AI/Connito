@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 import re
 
@@ -179,19 +180,55 @@ class CustomDeepseekV2Experts(nn.Module):
     def _is_fp8(self) -> bool:
         return getattr(self, QUANT_MARKER, False)
 
-    def quantize_(self) -> None:
-        """Convert the stacked expert parameters to fp8 storage, in place.
+    def _fp8_logical(self) -> torch.Tensor:
+        """Local expert indices held in fp8 storage, ascending."""
+        return (self._fp8_row >= 0).nonzero(as_tuple=True)[0]
 
-        Validator-only. On a miner every stacked tensor is trainable as a whole
-        (the trainable group and the frozen helper group share it), so there is
-        nothing here that can be frozen into fp8 without changing what the
-        trainable experts co-adapt against.
+    def _keep_logical(self) -> torch.Tensor:
+        """Local expert indices still held as a real Parameter, ascending."""
+        return (self._keep_row >= 0).nonzero(as_tuple=True)[0]
+
+    def quantize_(self, local_indices: Sequence[int] | None = None) -> None:
+        """Move some or all stacked expert slices to fp8 storage, in place.
+
+        ``local_indices=None`` converts every slice and drops the Parameter
+        entirely — the validator eval model, where nothing trains.
+
+        A subset converts only those slices and keeps the rest as a (smaller)
+        real `nn.Parameter`, which is what makes a miner able to quantize its
+        frozen helper experts while the trainable group keeps full precision
+        and keeps receiving gradients. The two stores are addressed through
+        `_fp8_row` / `_keep_row`, which map a *logical* local index (0 ..
+        num_local_experts-1, the indexing every caller uses) onto a physical row
+        in whichever store holds it, or -1.
+
+        The logical layout never changes, so `state_dict()` still emits exactly
+        the same per-expert keys with the same shapes — the split is invisible
+        outside this class, and the checkpoint hash contract is untouched.
         """
         if self._is_fp8():
             return
+        total = self.num_local_experts
+        if local_indices is None:
+            quant_rows = list(range(total))
+        else:
+            quant_rows = sorted({int(i) for i in local_indices if 0 <= int(i) < total})
+        if not quant_rows:
+            return
+        quant_set = set(quant_rows)
+        keep_rows = [i for i in range(total) if i not in quant_set]
+
+        fp8_row = torch.full((total,), -1, dtype=torch.long)
+        keep_row = torch.full((total,), -1, dtype=torch.long)
+        for physical, logical in enumerate(quant_rows):
+            fp8_row[logical] = physical
+        for physical, logical in enumerate(keep_rows):
+            keep_row[logical] = physical
+
         for name in self._STACKED_PARAMS:
             param = getattr(self, name)
-            values, scale = quantize_last_dim(param.data)
+            kept = param.data[keep_rows].clone() if keep_rows else None
+            values, scale = quantize_last_dim(param.data[quant_rows])
             # Record the compute dtype *before* the delattr below: it is the
             # last read of `param`, and every later consumer
             # (`_stacked_dtype`, `_expert_slice`, `state_dict`) depends on it.
@@ -202,6 +239,16 @@ class CustomDeepseekV2Experts(nn.Module):
             delattr(self, name)  # drops it from _parameters
             self.register_buffer(f"{name}_fp8", values, persistent=False)
             self.register_buffer(f"{name}_scale", scale, persistent=False)
+            if kept is not None:
+                # Re-registered under the ORIGINAL name so `named_parameters()`,
+                # `freeze_parameters` and the optimizer keep seeing the trainable
+                # expert weights under the key they already expect.
+                self.register_parameter(name, nn.Parameter(kept))
+        # persistent=False: these are derived addressing, never checkpoint state.
+        # Long dtype also keeps them out of the miner's finiteness guard, which
+        # filters `named_buffers()` on `is_floating_point()`.
+        self.register_buffer("_fp8_row", fp8_row, persistent=False)
+        self.register_buffer("_keep_row", keep_row, persistent=False)
         setattr(self, QUANT_MARKER, True)
 
     def _apply(self, *args, **kwargs):
@@ -245,8 +292,15 @@ class CustomDeepseekV2Experts(nn.Module):
         return holder.device
 
     def _stacked_shape(self, name: str) -> tuple[int, ...]:
+        """The *logical* shape [num_local_experts, ...].
+
+        Deliberately not the physical shape of either store: under a partial
+        split neither one covers every expert, and every caller (the shape
+        checks in `_load_from_state_dict`, above all) reasons about the logical
+        layout.
+        """
         holder = getattr(self, f"{name}_fp8") if self._is_fp8() else getattr(self, name)
-        return tuple(holder.shape)
+        return (self.num_local_experts, *tuple(holder.shape[1:]))
 
     def _stacked_tensor(self, name: str) -> torch.Tensor:
         """The full stacked tensor at compute dtype, dequantizing if needed.
@@ -256,9 +310,20 @@ class CustomDeepseekV2Experts(nn.Module):
         """
         if not self._is_fp8():
             return getattr(self, name).data.clone()
-        return dequantize_last_dim(
+        dequantized = dequantize_last_dim(
             getattr(self, f"{name}_fp8"), getattr(self, f"{name}_scale"), self._compute_dtype
         )
+        kept = self._parameters.get(name)
+        if kept is None:
+            return dequantized  # fully quantized: physical order == logical order
+        out = torch.empty(
+            (self.num_local_experts, *dequantized.shape[1:]),
+            dtype=self._compute_dtype,
+            device=dequantized.device,
+        )
+        out[self._fp8_logical()] = dequantized
+        out[self._keep_logical()] = kept.data.to(dtype=self._compute_dtype, device=out.device)
+        return out
 
     def _expert_slice(self, name: str, local_idx, dtype: torch.dtype | None = None) -> torch.Tensor:
         """One expert's 2D weight. Dequantizes only that slice when quantized.
@@ -270,20 +335,38 @@ class CustomDeepseekV2Experts(nn.Module):
         """
         if not self._is_fp8():
             return getattr(self, name)[local_idx]
+        physical = int(self._fp8_row[int(local_idx)])
+        if physical < 0:
+            # Not quantized — a trainable slice. Return the live view with no
+            # cast, exactly as the unquantized branch does, so autograd sees the
+            # Parameter itself rather than a copy.
+            return getattr(self, name)[int(self._keep_row[int(local_idx)])]
         return dequantize_for_compute(
-            getattr(self, f"{name}_fp8")[local_idx],
-            getattr(self, f"{name}_scale")[local_idx],
+            getattr(self, f"{name}_fp8")[physical],
+            getattr(self, f"{name}_scale")[physical],
             dtype or self._compute_dtype,
         )
 
-    def _write_stacked(self, name: str, stacked: torch.Tensor) -> None:
-        """Write a full stacked tensor back, re-quantizing if needed."""
+    def _write_stacked(self, name: str, stacked: torch.Tensor) -> torch.Tensor | None:
+        """Write a full logical stacked tensor back into whichever stores exist.
+
+        Returns the rows belonging to the surviving Parameter (or None), so the
+        caller can hand them to `super()._load_from_state_dict` — that keeps a
+        single writer per store and keeps super()'s missing-key bookkeeping
+        honest, rather than writing the Parameter here and leaving super() to
+        report the key it never saw.
+        """
         if not self._is_fp8():
             getattr(self, name).data.copy_(stacked)
-            return
-        values, scale = quantize_last_dim(stacked.to(self._stacked_device()))
+            return None
+        stacked = stacked.to(self._stacked_device())
+        values, scale = quantize_last_dim(stacked[self._fp8_logical()])
         getattr(self, f"{name}_fp8").copy_(values)
         getattr(self, f"{name}_scale").copy_(scale)
+        kept = self._parameters.get(name)
+        if kept is None:
+            return None
+        return stacked[self._keep_logical()].to(dtype=kept.dtype)
 
     # ── Save: expand stacked 3D tensors into per-expert slices ────────────
     # Override _save_to_state_dict (not state_dict) so expansion works
@@ -297,14 +380,20 @@ class CustomDeepseekV2Experts(nn.Module):
         super()._save_to_state_dict(destination, prefix, keep_vars)
         for name in self._STACKED_PARAMS:
             stacked_key = f"{prefix}{name}"
-            if stacked_key in destination:
-                stacked = destination.pop(stacked_key)
-            elif self._is_fp8():
-                # Quantized: the Parameter is gone and the fp8 buffers are
-                # persistent=False, so super() emitted nothing. Rebuild the
-                # stacked tensor on CPU — save paths call state_dict() before
-                # moving anything, so dequantizing on-device would spike VRAM.
+            if self._is_fp8():
+                # Checked before the `in destination` branch on purpose. Fully
+                # quantized, super() emitted nothing (the fp8 buffers are
+                # persistent=False); partially quantized, it emitted the
+                # surviving Parameter, which holds only the trainable slices.
+                # Either way the full logical tensor has to be rebuilt, and any
+                # partial entry discarded — otherwise the checkpoint would
+                # silently omit every quantized expert. Rebuilt on CPU because
+                # save paths call state_dict() before moving anything, so
+                # dequantizing on-device would spike VRAM.
+                destination.pop(stacked_key, None)
                 stacked = self._stacked_tensor(name).to("cpu")
+            elif stacked_key in destination:
+                stacked = destination.pop(stacked_key)
             else:
                 continue
             for local_idx, global_idx in enumerate(self.expert_indices):
@@ -457,10 +546,15 @@ class CustomDeepseekV2Experts(nn.Module):
         for name in self._STACKED_PARAMS:
             stacked_key = f"{prefix}{name}"
             if stacked_key in state_dict:
-                self._write_stacked(name, state_dict.pop(stacked_key))
-            elif strict and self._is_fp8():
-                # super() cannot report this for us: when quantized the entry is
-                # a non-persistent buffer, so it is absent from `local_state`.
+                remainder = self._write_stacked(name, state_dict.pop(stacked_key))
+                if remainder is not None:
+                    # Partial split: hand the trainable rows back so super()
+                    # loads the surviving Parameter through its normal path.
+                    state_dict[stacked_key] = remainder
+            elif strict and self._is_fp8() and name not in self._parameters:
+                # super() cannot report this for us: when a slice lives in fp8 the
+                # entry is a non-persistent buffer, so it is absent from
+                # `local_state`. When a Parameter survives, super() reports it.
                 missing_keys.append(stacked_key)
 
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
