@@ -1170,11 +1170,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
 
     # === set up averager ===
-    group_grad_buff_meta = build_grad_buff_from_model(
-        model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
-    )
-    # Only keep this validator's expert group and shared; drop other groups
+    # Only this validator's own expert group is ever averaged. Ask for that one
+    # up front rather than building every group and deleting the rest a line
+    # later: each buffer is a real host-RAM allocation, so the discarded ones
+    # were 7.25 GB on the partial topology and 27.4 GB on the full one.
     active_group_id = config.task.exp.group_id
+    group_grad_buff_meta = build_grad_buff_from_model(
+        model=global_model,
+        expert_group_assignment=expert_manager.expert_group_assignment,
+        group_ids=[active_group_id],
+    )
+    # Belt and braces: `group_ids` is the allocation guard, this is the
+    # invariant. Anything other than the active group (or "shared", which the
+    # caller does not currently request) must not reach the averager.
     excluded = [gid for gid in group_grad_buff_meta if gid != active_group_id and gid != "shared"]
     for gid in excluded:
         logger.info("Disabling averager for non-active expert group", excluded_group_id=gid, active_group_id=active_group_id)
