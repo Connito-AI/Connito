@@ -501,21 +501,25 @@ def check_full_topology_eval_supported(config: ValidatorConfig) -> None:
 
     Each of these fails mid-round otherwise, after the roster is frozen:
 
-    * `background_worker_enabled` — the bg worker deepcopies its own eval
-      template; a second full base is another 29.3 GiB that does not exist
-      on the card. v1 scores foreground-only.
     * `quantization` — the fp8 foreground cache path (`resolve_foreground_
       eval_model`) and the graft path would fight over which model
       foreground scores against, and fp8 eval is gated on its own merits.
     * `moe.partial_moe: false` — a full global model cannot merge (87.8 GiB
       peak, measured); the whole point of the eval base is that the global
       model stays partial.
+
+    Note what is NOT checked here: `background_worker_enabled`. An earlier
+    version required it false, on the grounds that bg-eval would need a second
+    full template. That is true of bg-*eval* and false of bg-*download*, which
+    the same flag gates — and foreground reads exclusively from the directory
+    bg-download fills. Requiring the flag off therefore starved the round it
+    was meant to protect: one full window, `discovered_total=0`, `scored=0`,
+    against four claimed foreground UIDs. bg-eval is now suppressed on its own
+    in `run()` and downloads keep flowing.
     """
     if not bool(get_nested_attr(config, "evaluation.full_topology_eval", False)):
         return
     problems = []
-    if bool(get_nested_attr(config, "evaluation.background_worker_enabled", True)):
-        problems.append("evaluation.background_worker_enabled must be false")
     if get_nested_attr(config, "model.quantization", "off") != "off":
         problems.append("model.quantization must be 'off'")
     if not bool(get_nested_attr(config, "moe.partial_moe", True)):
@@ -1338,6 +1342,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     download_worker: BackgroundDownloadWorker | None = None
     eval_worker: BackgroundEvalWorker | None = None
+    # bg-eval needs its own resident eval template; under full-topology
+    # scoring that would be a second full base (29.3 GiB) and does not fit.
+    # bg-*download* must keep running regardless: foreground reads from
+    # `miner_submission_path`, which only bg-download fills, so switching it
+    # off starves the round (observed — a full window with
+    # `discovered_total=0` and `scored=0` against 4 claimed foreground UIDs).
+    bg_eval_enabled = config.evaluation.background_worker_enabled and not bool(
+        get_nested_attr(config, "evaluation.full_topology_eval", False)
+    )
     if config.evaluation.background_worker_enabled:
         download_worker = BackgroundDownloadWorker(
             config=config,
@@ -1347,24 +1360,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
         # bg-eval idles until the main loop hands it a copy of
         # global_model after foreground eval completes (see below).
-        eval_worker = BackgroundEvalWorker(
-            config=config,
-            round_ref=round_ref,
-            device=device,
-            tokenizer=tokenizer,
-            merge_phase_active=merge_phase_active,
-            eval_window_active=eval_window_active,
-            gpu_eval_lock=gpu_eval_lock,
-            expert_group_assignment=expert_manager.expert_group_assignment,
-        )
+        if bg_eval_enabled:
+            eval_worker = BackgroundEvalWorker(
+                config=config,
+                round_ref=round_ref,
+                device=device,
+                tokenizer=tokenizer,
+                merge_phase_active=merge_phase_active,
+                eval_window_active=eval_window_active,
+                gpu_eval_lock=gpu_eval_lock,
+                expert_group_assignment=expert_manager.expert_group_assignment,
+            )
         download_worker.start()
-        eval_worker.start()
+        if eval_worker is not None:
+            eval_worker.start()
         logger.info(
             "Background workers launched",
             download_thread=download_worker.name,
             download_ident=download_worker.ident,
-            eval_thread=eval_worker.name,
-            eval_ident=eval_worker.ident,
+            eval_thread=eval_worker.name if eval_worker else None,
+            eval_ident=eval_worker.ident if eval_worker else None,
+            bg_eval_enabled=bg_eval_enabled,
         )
 
     logger.info("ChainSubmitter ready")

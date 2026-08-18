@@ -52,6 +52,31 @@ from connito.shared.helper import load_state_dict_from_path
 
 logger = structlog.get_logger(__name__)
 
+
+def _log_memory(message: str, device) -> None:
+    """VRAM and host RSS either side of every move.
+
+    The first live run died between `park()` and the merge with no traceback,
+    and neither transition logged anything — so the post-mortem had a
+    seventeen-second window and no numbers in it. Cheap insurance.
+    """
+    fields: dict[str, float | str] = {"device": str(device)}
+    try:
+        import os
+
+        with open(f"/proc/{os.getpid()}/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    fields["host_rss_gb"] = round(int(line.split()[1]) / 1024**2, 2)
+                    break
+    except OSError:
+        pass
+    if torch.cuda.is_available():
+        free_b, total_b = torch.cuda.mem_get_info()
+        fields["vram_used_gb"] = round((total_b - free_b) / 1024**3, 2)
+        fields["vram_free_gb"] = round(free_b / 1024**3, 2)
+    logger.info(message, **fields)
+
 # Miner shards as our serializer writes them: per-expert slices of the fused
 # stacked storage, global expert id in the key, no trailing `.weight`.
 _SHARD_KEY_RE = re.compile(
@@ -97,6 +122,20 @@ class FullTopologyEvalBase:
         # stale shard onto the refreshed base — the generation check turns it
         # into a clean per-miner failure instead.
         self._generation = 0
+        # Host storage, kept alive for the process lifetime.
+        #
+        # `.to("cpu")` does not reuse anything: the host tensors were released
+        # when the model moved to the GPU, so parking would *allocate* another
+        # 29.3 GB — at the exact moment the merge phase begins and wants memory
+        # of its own. A validator died there, silently, with no traceback.
+        #
+        # Holding references to the original CPU tensors instead means the
+        # host cost is a flat 29.3 GB from build to shutdown, and `park()`
+        # becomes a copy into storage that already exists. Peak host is
+        # unchanged from steady-state host; there is no spike to mistime.
+        self._shadow_params = {n: p.data for n, p in self.model.named_parameters()}
+        self._shadow_buffers = {n: b for n, b in self.model.named_buffers()}
+        self._on_gpu = False
 
     @classmethod
     def build(cls, config, expert_manager) -> "FullTopologyEvalBase":
@@ -128,8 +167,10 @@ class FullTopologyEvalBase:
         logger.info(
             "Full-topology eval base built",
             layers=len(allowed),
+            owned_experts=sum(len(v) for v in allowed.values()),
             device="cpu",
         )
+        _log_memory("full-topology base: resident on host", "cpu")
         return base
 
     # ── round lifecycle ──────────────────────────────────────────────────
@@ -146,8 +187,13 @@ class FullTopologyEvalBase:
         """
         with self.lock:
             self._generation += 1
+            # `.to()` in this direction is safe: it allocates on the GPU and
+            # *releases* host storage. The shadow dict keeps the host tensors
+            # alive across the move, which is what makes park() free later.
             self.model.to(device)
+            self._on_gpu = True
             self.refresh_from(global_model)
+            _log_memory("full-topology base: on GPU for eval", device)
 
     def round_handle(self) -> "_RoundGraftHandle":
         """A graft controller pinned to the current generation.
@@ -182,19 +228,44 @@ class FullTopologyEvalBase:
             self.model.load_state_dict(global_model.state_dict(), strict=False)
 
     def park(self) -> None:
-        """Off the GPU for the merge window. Idempotent.
+        """Release the GPU for the merge window. Idempotent.
 
-        Blocks on the lock until a running eval drains — moving the tensors
-        out from under a live forward pass is not an option — and bumps the
-        generation so queued orphans fail instead of grafting onto a CPU
-        model. Worst-case block is one per-miner eval; the alternative is the
-        merge OOMing against a resident base.
+        Copies back into the pre-allocated host tensors rather than calling
+        `.to("cpu")`, which would allocate a second 29.3 GB alongside whatever
+        the merge is about to want. Nothing is allocated here; the GPU tensors
+        are dropped when the last reference goes.
+
+        Blocks on the lock until a running eval drains — pulling storage out
+        from under a live forward pass is not an option — and bumps the
+        generation so a queued orphan fails instead of grafting onto a parked
+        model. Worst case is one per-miner eval's wait; the alternative is the
+        merge fighting a resident 29.3 GiB base for a 44.4 GiB card.
         """
         with self.lock:
             self._generation += 1
-            self.model.to("cpu")
+            if not self._on_gpu:
+                return
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    shadow = self._shadow_params[name]
+                    shadow.copy_(param.data)
+                    param.data = shadow
+                for name, buf in self.model.named_buffers():
+                    shadow = self._shadow_buffers.get(name)
+                    if shadow is None:  # buffer registered after build
+                        self._shadow_buffers[name] = buf.detach().to("cpu")
+                        continue
+                    shadow.copy_(buf)
+                    self._set_buffer(name, shadow)
+            self._on_gpu = False
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        _log_memory("full-topology base: parked on host", "cpu")
+
+    def _set_buffer(self, qualified_name: str, tensor: torch.Tensor) -> None:
+        module_path, _, attr = qualified_name.rpartition(".")
+        module = self.model.get_submodule(module_path) if module_path else self.model
+        setattr(module, attr, tensor)
 
     # ── per-miner graft ──────────────────────────────────────────────────
     def graft_from_path(self, path: str, *, generation: int | None = None) -> nn.Module:

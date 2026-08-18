@@ -245,6 +245,43 @@ def test_refresh_discards_a_stale_graft_backup(tmp_path):
     )
 
 
+# ── park reuses host storage instead of allocating ───────────────────────────
+def test_park_writes_back_into_the_pre_allocated_shadow():
+    """The fix for a silent death entering the merge.
+
+    `.to("cpu")` allocates a fresh 29.3 GB — the host tensors were released
+    when the model moved to the GPU — right as the merge phase starts wanting
+    memory. Parking must land in storage that already exists, so peak host
+    never exceeds steady-state host. Asserted by `data_ptr`: identity of the
+    Python wrapper says nothing, the storage address is the claim.
+    """
+    base = _base()
+    addresses = {n: p.data.data_ptr() for n, p in base.model.named_parameters()}
+
+    base.prepare_for_round(_Model(seed=0), device="cpu")
+    base.park()
+
+    after = {n: p.data.data_ptr() for n, p in base.model.named_parameters()}
+    assert after == addresses
+
+
+def test_park_is_idempotent():
+    base = _base()
+    base.park()
+    base.park()  # must not double-copy or throw when already parked
+    assert not base._on_gpu
+
+
+def test_park_preserves_values():
+    base = _base()
+    base.prepare_for_round(_Model(seed=1), device="cpu")
+    before = _snapshot(base)
+    base.park()
+    after = base.model.state_dict()
+    for key in before:
+        assert torch.equal(after[key], before[key]), key
+
+
 # ── the frozen contract ──────────────────────────────────────────────────────
 def test_the_base_is_frozen():
     """No `.grad`, no momentum, no optimizer — the entire memory argument."""
