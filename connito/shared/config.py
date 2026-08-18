@@ -188,7 +188,9 @@ class RunCfg(BaseConfig):
 
 
 class ModelCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"model_path", "base_arch_model"})
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "model_path", "base_arch_model", "precision", "quantization",
+    })
     model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
     base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
     foundation: bool = True
@@ -196,18 +198,22 @@ class ModelCfg(BaseConfig):
     attn_implementation: str = "sdpa"
     # "fp16-mixed" | "bf16-mixed". `helper.resolve_precision` downgrades
     # bf16 -> fp16 on a device without BF16 compute, so bf16 is safe to set
-    # anywhere.
+    # anywhere — which is what makes this field safe to lock: an operator whose
+    # card lacks BF16 compute lands on fp16 through the resolver rather than
+    # through a broken config.
     #
-    # Left at fp16 rather than following the base checkpoint: DeepSeek-V2-Lite
-    # ships `torch_dtype: bfloat16` and the reference experiment runs bf16
-    # (`~/experiment/config.py:torch_dtype`), so a like-for-like comparison
-    # against its numbers wants `bf16-mixed` here. Changing the *default*
-    # would move every existing validator's scoring, including on the partial
-    # topology that the fleet runs today, which is a bigger change than the
-    # full-topology work this belongs to — so it stays a per-host config choice
-    # for now. Set it alongside `moe.partial_moe: false` when reproducing the
-    # experiment.
-    precision: str = "fp16-mixed"
+    # bf16 follows the base checkpoint. DeepSeek-V2-Lite ships
+    # `torch_dtype: bfloat16` and the reference experiment runs bf16
+    # (`~/experiment/config.py:torch_dtype`), so any like-for-like comparison
+    # against its numbers needs bf16 here. This sat at fp16 while the full
+    # topology was opt-in, because moving it would have moved every existing
+    # validator's scoring on the *partial* topology too. It ships as the
+    # default now precisely because that fleet-wide move is the intent: see
+    # `evaluation.full_topology_eval`, which lands in the same release.
+    #
+    # CONSENSUS: locked. Two validators at different precision produce
+    # different `val_loss` for the same weights.
+    precision: str = "bf16-mixed"
     device: str = "cuda"
     # Runtime weight-only fp8 quantization (float8_e4m3fn, scaled per output
     # row). Weights are always *loaded* and *saved* at `precision`; "fp8" only
@@ -228,11 +234,21 @@ class ModelCfg(BaseConfig):
     #
     # CONSENSUS: this changes `val_loss`. A validator running "fp8" produces
     # numbers that are not comparable with an fp16 validator's for the same
-    # `combined_seed`, exactly like the eval_source_* knobs above. Deliberately
-    # NOT a locked field while it is opt-in: auto_update_config resets locked
-    # fields to their defaults on every start, which would force "off"
-    # fleet-wide and make the per-host staging validation impossible. Lock it
-    # if and when it becomes the fleet default.
+    # `combined_seed`, exactly like the eval_source_* knobs above.
+    #
+    # Locked at "off", and the lock is load-bearing rather than a preference:
+    # `evaluation.full_topology_eval` (locked true) is rejected at startup
+    # alongside fp8 by `check_full_topology_eval_supported`, because the fp8
+    # foreground-cache path and the graft path disagree about which model
+    # foreground scores against. Leaving this unlocked would mean any operator
+    # who had ever set "fp8" crash-loops on the release that turns full-
+    # topology eval on. Locking both together is what makes the fleet land on
+    # one config instead of two.
+    #
+    # This does not contradict matching the reference experiment: its fp8 is
+    # training-side, applied to a miner's frozen helper experts, and its own
+    # full-topology evaluation runs bf16. Staging can still exercise fp8 with
+    # `--no-auto_update_config`, which suppresses the locked-field reset.
     quantization: Literal["off", "fp8"] = "off"
 
 
@@ -377,6 +393,7 @@ class DataloaderCfg(BaseConfig):
 class MoECfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
+        "partial_moe",
     })
     interleave: bool = True
     num_experts: PositiveInt = 8
@@ -407,15 +424,22 @@ class MoECfg(BaseConfig):
     #   False           - full: every routed expert of the base checkpoint.
     #                     ~14.4 B routed params; routed with `full_topk`.
     #
-    # Deliberately NOT in `_LOCKED_FIELDS`, so a staging host can flip it
-    # without the locked-field reset undoing the edit on the next start. That
-    # cuts both ways: two validators on different topologies score on different
-    # forward graphs and their weights will disagree. Lock it before it ever
-    # becomes a fleet default.
+    # LOCKED at true, and note what that does and does not mean. It does not
+    # mean the fleet scores on the partial topology — `evaluation.
+    # full_topology_eval` (locked true) puts every routed expert in front of
+    # every miner. It means the model that *merges* stays partial, which is
+    # the whole memory argument: a full global model peaks at 87.8 GiB in the
+    # outer step against 27.6 GiB partial, measured.
+    #
+    # So this and `full_topology_eval` are locked as a pair.
+    # `check_full_topology_eval_supported` rejects the combination
+    # `full_topology_eval=true, partial_moe=false` at startup; unlocking
+    # either half hands an operator a config that crash-loops.
     #
     # Read the memory note in `validator.run.warn_on_full_expert_topology`
-    # before enabling: the full topology does not currently fit alongside the
-    # per-miner eval copy on a 46 GB card.
+    # before setting this false on a staging host with
+    # `--no-auto_update_config`: a full *global* model does not fit alongside
+    # the per-miner eval copy on a 46 GB card.
     partial_moe: bool = True
     num_worker_groups: PositiveInt = 2
 
@@ -1056,13 +1080,40 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n",
+        "full_topology_eval",
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
     score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
     foreground_top_n: PositiveInt = 5
     background_worker_enabled: bool = True
+    # Score miners on the FULL expert topology: a separate frozen model with
+    # every routed expert resident, routed at `moe.full_topk` (the base
+    # checkpoint's native 6), grafted in place per miner and parked on CPU
+    # outside the eval window. The global model stays partial — merge, chain
+    # hash and peer sync are untouched. See validator/full_topology_eval.py
+    # for the design and the memory budget it exists to fit.
+    #
+    # LOCKED at true: this is the fleet default, and it has to be, because it
+    # changes `val_loss`. Full and partial topology rank miners *differently*
+    # — Spearman rho = -0.45 across 22 real submissions, per the reference
+    # experiment — so a fleet split across the two is not a fleet with some
+    # noise in it, it is two subnets disagreeing about who earns. There is no
+    # gradual rollout of this field that is better than no rollout.
+    #
+    # Locked as a set with `model.precision` (bf16), `model.quantization`
+    # (off) and `moe.partial_moe` (true): `check_full_topology_eval_supported`
+    # rejects the other combinations at startup, so leaving any of the four
+    # unlocked hands some operator a crash-loop on the release that turns this
+    # on. A staging host that needs to diverge uses `--no-auto_update_config`.
+    #
+    # Constraints enforced at startup by
+    # `check_full_topology_eval_supported`: model.quantization must be "off"
+    # and moe.partial_moe must stay true. `background_worker_enabled` is NOT
+    # among them — an earlier version required it false and starved the round
+    # it was meant to protect; see that function's docstring.
+    full_topology_eval: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
     # Round-group construction scheme. When true, Round.freeze() partitions
