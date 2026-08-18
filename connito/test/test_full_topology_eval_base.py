@@ -245,6 +245,61 @@ def test_refresh_discards_a_stale_graft_backup(tmp_path):
     )
 
 
+# ── the backup lives on the host, and is pooled ──────────────────────────────
+def test_backup_rows_are_staged_on_the_host(tmp_path):
+    """The fix for a round that scored zero miners.
+
+    `rows[local].clone()` clones onto the *source* device. With the base on
+    the GPU for eval that put ~3.4 GiB of backup in VRAM: baseline fitted at
+    39.5 GiB of 44.4, every miner then OOM'd at 42.9 GiB with 213 MB free.
+    Nothing reads these rows on the GPU — they are written once and read once,
+    at restore — so they belong on the host whatever device the base is on.
+    """
+    base = _base()
+    base.graft_from_path(_shard(tmp_path, {
+        f"{PREFIX}.0.gate_up_proj": torch.full((2 * INTER, HIDDEN), 7.0),
+        f"{PREFIX}.1.down_proj": torch.full((HIDDEN, INTER), -3.0),
+    }))
+
+    assert base._backup, "nothing was backed up"
+    for _, _, _, saved in base._backup:
+        assert saved.device.type == "cpu"
+
+
+def test_the_backup_pool_is_reused_across_miners(tmp_path):
+    """Flat host cost, not 3.4 GB of churn per miner on a swapless box.
+
+    Every miner of a round touches the same expert set — this validator's
+    group — so the staging storage is allocated once and written over.
+    `data_ptr` is the claim; a fresh tensor each miner would still pass any
+    value-based assertion.
+    """
+    base = _base()
+    key = f"{PREFIX}.0.gate_up_proj"
+
+    base.graft_from_path(_shard(tmp_path, {key: torch.full((2 * INTER, HIDDEN), 7.0)}))
+    first = [t.data_ptr() for *_, t in base._backup]
+    base.restore_grafted()
+
+    base.graft_from_path(_shard(tmp_path, {key: torch.full((2 * INTER, HIDDEN), 9.0)}))
+    assert [t.data_ptr() for *_, t in base._backup] == first
+
+
+def test_restore_from_host_storage_is_still_bit_identical(tmp_path):
+    """Staging on the host must not change what restore puts back."""
+    base = _base()
+    before = _snapshot(base)
+    base.graft_from_path(_shard(tmp_path, {
+        f"{PREFIX}.0.gate_up_proj": torch.full((2 * INTER, HIDDEN), 7.0),
+        f"{PREFIX}.1.down_proj": torch.full((HIDDEN, INTER), -3.0),
+    }))
+    base.restore_grafted()
+
+    after = base.model.state_dict()
+    for key in before:
+        assert torch.equal(after[key], before[key]), key
+
+
 # ── park reuses host storage instead of allocating ───────────────────────────
 def test_park_writes_back_into_the_pre_allocated_shadow():
     """The fix for a silent death entering the merge.

@@ -34,9 +34,14 @@ here costs at worst one round's scores, and `refresh_from` rebuilds the base
 from `global_model` at the next round anyway.
 
 Budget on an L40S (44.4 GiB usable), measured pieces: eval window holds the
-partial global (9.2 GiB, idle) + this base (29.3 GiB) + one shard's backup rows
-(~3.4 GiB) + activations. Merge window holds the partial merge peak (27.6 GiB)
-with this base parked on host (29.3 GB of 62).
+partial global (9.2 GiB, idle) + this base (29.3 GiB) + activations. Merge
+window holds the partial merge peak (27.6 GiB) with this base parked on host
+(29.3 GB of 62).
+
+The backup rows are deliberately NOT in that VRAM list. v1 put them there and
+the first live round scored nothing: baseline eval fitted at 39.5 GiB, then
+every miner OOM'd at 42.9 GiB with 213 MB free. The rows are pooled on the
+host now — see `_stage_backup`.
 """
 
 from __future__ import annotations
@@ -136,6 +141,21 @@ class FullTopologyEvalBase:
         self._shadow_params = {n: p.data for n, p in self.model.named_parameters()}
         self._shadow_buffers = {n: b for n, b in self.model.named_buffers()}
         self._on_gpu = False
+        # Reusable HOST storage for graft backups, keyed by the row it holds.
+        #
+        # v1 cloned the touched rows with `rows[local].clone()`, which clones
+        # onto the *source* device — the GPU, during the eval window. Measured
+        # cost of that: baseline eval ran at 39.5 GiB of 44.4, and every miner
+        # then OOM'd at 42.9 GiB with 213 MB free. The delta is this backup.
+        # The rows are write-once and read-once at restore; nothing reads them
+        # on the GPU, so nothing justifies their being there.
+        #
+        # Pooled rather than allocated per miner for the same reason `park()`
+        # writes into `_shadow_*`: every miner of a round touches the same
+        # expert set (this validator's group), so a pool is allocated once and
+        # reused, and host cost is flat instead of a 3.4 GB churn per miner on
+        # a box that has no swap.
+        self._backup_pool: dict[tuple[str, int, str], torch.Tensor] = {}
 
     @classmethod
     def build(cls, config, expert_manager) -> "FullTopologyEvalBase":
@@ -316,7 +336,9 @@ class FullTopologyEvalBase:
                 experts = self.model.get_submodule(module_path)
                 local = int(experts.global_to_local_map[gid])
                 rows = getattr(experts, name).data
-                backup.append((experts, name, local, rows[local].clone()))
+                backup.append(
+                    (experts, name, local, self._stage_backup(module_path, gid, name, rows[local]))
+                )
             self._backup = backup
             try:
                 self.model.load_state_dict(sd, strict=False)
@@ -326,16 +348,48 @@ class FullTopologyEvalBase:
                 # handed back, so self-heal here and re-raise.
                 self.restore_grafted()
                 raise
+        # Per-miner memory, because the round that motivated the pool above
+        # also grew host RSS 31.5 -> 47.3 GB across four eval loader builds
+        # and then died entering the merge. Whatever is growing, it shows up
+        # between these two lines or it does not show up in the eval at all.
+        _log_memory("full-topology base: grafted", self._device())
         return self.model
+
+    def _stage_backup(
+        self, module_path: str, gid: int, name: str, row: torch.Tensor
+    ) -> torch.Tensor:
+        """Copy one expert's rows into pooled host storage and return it.
+
+        Always lands on CPU regardless of where the base currently is: the
+        backup exists to be read once, at restore, and holding it in VRAM was
+        what left the eval window with 213 MB free.
+        """
+        key = (module_path, gid, name)
+        staged = self._backup_pool.get(key)
+        if staged is None or staged.shape != row.shape or staged.dtype != row.dtype:
+            staged = torch.empty(row.shape, dtype=row.dtype, device="cpu")
+            self._backup_pool[key] = staged
+        staged.copy_(row)
+        return staged
 
     def restore_grafted(self) -> None:
         """Put the backed-up rows back. The base is bit-identical to
         pre-graft afterwards — asserted by test, relied on by every
-        subsequent miner's eval."""
+        subsequent miner's eval.
+
+        The saved rows live on the host; `copy_` handles the transfer back
+        onto whichever device the base is on.
+        """
+        had_backup = bool(self._backup)
         with torch.no_grad():
             for experts, name, local, saved in self._backup:
                 getattr(experts, name).data[local].copy_(saved)
         self._backup = []
+        if had_backup:
+            _log_memory("full-topology base: restored", self._device())
+
+    def _device(self):
+        return next(self.model.parameters()).device
 
 
 class _RoundGraftHandle:
