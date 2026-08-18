@@ -48,15 +48,23 @@ def test_topology_fields_stay_locked():
     assert {"partial_topk", "full_topk", "num_experts_per_tok"} <= locked
 
 
-def test_partial_moe_is_not_locked():
-    """Deliberate: locking it would make the full topology untestable.
+def test_partial_moe_is_locked_true():
+    """It was deliberately unlocked while the full topology was opt-in.
 
+    Locking it then would have made the full topology untestable:
     `check_and_prompt_locked` resets a locked field to its class default on
-    load, so a staging host that set `partial_moe: false` would silently be
-    back on partial after one restart. The tradeoff is that this field *can*
-    diverge across the fleet — see `warn_on_full_expert_topology`.
+    load, so a staging host that set `partial_moe: false` would have been
+    silently back on partial after one restart. It is locked now because
+    `evaluation.full_topology_eval` is locked true, and
+    `check_full_topology_eval_supported` rejects that alongside
+    `partial_moe: false` — an unlocked half is a crash-loop waiting for the
+    operator who edited it. Staging diverges via `--no-auto_update_config`.
+
+    Locked *true* does not mean the fleet scores on partial: it means the
+    model that merges stays partial. See `evaluation.full_topology_eval`.
     """
-    assert "partial_moe" not in MoECfg._LOCKED_FIELDS
+    assert "partial_moe" in MoECfg._LOCKED_FIELDS
+    assert MoECfg.model_fields["partial_moe"].default is True
 
 
 # ── the switch reaches the loader ────────────────────────────────────────────

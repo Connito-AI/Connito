@@ -857,8 +857,16 @@ def evaluate_one_miner_sync(
     rank: int | None = None,
     deadline_monotonic: float | None = None,
     cached_batches: list | None = None,
+    graft_controller=None,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
+
+    `graft_controller` (a `FullTopologyEvalBase`) switches the per-miner model
+    from deepcopy-and-overlay to graft-in-place-and-restore: the controller
+    owns `base_model`, backs up the rows the shard touches, and puts them back
+    in this function's `finally`. With it set, `base_model` is mutated during
+    the eval and clean again after — the read-only contract holds at the call
+    boundary, not inside it.
 
     All GPU work — `load_model_from_path`, dataloader build, and
     `evaluate_model` — happens inside this single function so the caller
@@ -887,7 +895,20 @@ def evaluate_one_miner_sync(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        miner_model = load_model_from_path(str(model_path), base_model, device)
+        if graft_controller is not None:
+            # Serialise graft→eval→restore on the shared base. Acquired inside
+            # this thread (same reasoning as bg-eval's gpu_eval_lock, see the
+            # docstring above): release then tracks actual completion, so an
+            # orphaned timed-out eval finishes its restore before the next
+            # miner's graft can begin.
+            graft_controller.lock.acquire()
+            try:
+                miner_model = graft_controller.graft_from_path(str(model_path))
+            except BaseException:
+                graft_controller.lock.release()
+                raise
+        else:
+            miner_model = load_model_from_path(str(model_path), base_model, device)
 
         try:
             metrics = _evaluate_on_fresh_loader_sync(
@@ -903,7 +924,16 @@ def evaluate_one_miner_sync(
                 cached_batches=cached_batches,
             )
         finally:
-            del miner_model
+            if graft_controller is not None:
+                # Restore instead of discard: `miner_model` IS the shared
+                # base, and the next miner needs it bit-identical to
+                # pre-graft.
+                try:
+                    graft_controller.restore_grafted()
+                finally:
+                    graft_controller.lock.release()
+            else:
+                del miner_model
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -998,6 +1028,7 @@ async def evaluate_one_miner(
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
+    graft_controller=None,
 ) -> "MinerEvalJob | None":
     """Evaluate a single miner and return the per-round delta-based score.
 
@@ -1037,6 +1068,7 @@ async def evaluate_one_miner(
         round_id=round_id,
         max_eval_batches=max_eval_batches,
         rank=rank,
+        graft_controller=graft_controller,
     )
 
 
@@ -1054,6 +1086,7 @@ async def evaluate_foreground_round(
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
     completed_out: list[MinerEvalJob] | None = None,
+    graft_controller=None,
 ) -> list[MinerEvalJob]:
     """Foreground (step 2): evaluate the round's top-N miners during
     Submission + Validate.
@@ -1076,6 +1109,13 @@ async def evaluate_foreground_round(
     # Lazy imports — connito.shared.cycle imports this module, so a top-
     # level import would create a cycle.
     from connito.shared.cycle import BITTENSOR_BLOCK_TIME_SECONDS, gather_validation_job
+
+    if graft_controller is not None:
+        # Pin the round's generation now, before the first miner. Orphaned
+        # evals from a previous round that are still queued on the base's lock
+        # will fail their generation check instead of grafting stale shards
+        # onto the refreshed base mid-round.
+        graft_controller = graft_controller.round_handle()
 
     # Baseline once against the round's input model (= live `base_model`,
     # which equals round.model_snapshot_cpu since the foreground runs
@@ -1232,6 +1272,7 @@ async def evaluate_foreground_round(
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
+                graft_controller=graft_controller,
             )
             try:
                 evaluated = await asyncio.wait_for(eval_coro, timeout=effective_timeout)

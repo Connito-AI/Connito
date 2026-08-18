@@ -123,6 +123,7 @@ from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter, observer_mode_enabled
+from connito.validator.full_topology_eval import FullTopologyEvalBase
 from connito.validator.evaluator import (
     MinerEvalJob,
     build_submission_uid_weights,
@@ -493,6 +494,41 @@ def check_validator_quantization_supported(config: ValidatorConfig) -> None:
         return
     # Raise through the same path so the explanation lives in one place.
     quantize_eval_model_(config, nn.Module(), role="startup-check")
+
+
+def check_full_topology_eval_supported(config: ValidatorConfig) -> None:
+    """Reject an unworkable `full_topology_eval` combination at startup.
+
+    Each of these fails mid-round otherwise, after the roster is frozen:
+
+    * `quantization` — the fp8 foreground cache path (`resolve_foreground_
+      eval_model`) and the graft path would fight over which model
+      foreground scores against, and fp8 eval is gated on its own merits.
+    * `moe.partial_moe: false` — a full global model cannot merge (87.8 GiB
+      peak, measured); the whole point of the eval base is that the global
+      model stays partial.
+
+    Note what is NOT checked here: `background_worker_enabled`. An earlier
+    version required it false, on the grounds that bg-eval would need a second
+    full template. That is true of bg-*eval* and false of bg-*download*, which
+    the same flag gates — and foreground reads exclusively from the directory
+    bg-download fills. Requiring the flag off therefore starved the round it
+    was meant to protect: one full window, `discovered_total=0`, `scored=0`,
+    against four claimed foreground UIDs. bg-eval is now suppressed on its own
+    in `run()` and downloads keep flowing.
+    """
+    if not bool(get_nested_attr(config, "evaluation.full_topology_eval", False)):
+        return
+    problems = []
+    if get_nested_attr(config, "model.quantization", "off") != "off":
+        problems.append("model.quantization must be 'off'")
+    if not bool(get_nested_attr(config, "moe.partial_moe", True)):
+        problems.append("moe.partial_moe must stay true (the global model stays partial)")
+    if problems:
+        raise RuntimeError(
+            "evaluation.full_topology_eval=true is not supported with this "
+            "config: " + "; ".join(problems)
+        )
 
 
 def warn_on_full_expert_topology(config: ValidatorConfig) -> None:
@@ -950,6 +986,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # after the roster is frozen — an operator who set `quantization: fp8`
     # deserves to find out at startup, not mid-cycle.
     check_validator_quantization_supported(config)
+    check_full_topology_eval_supported(config)
     warn_on_full_expert_topology(config)
 
     # Start the integrated Prometheus telemetry server
@@ -1016,6 +1053,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         expert_manager,
         train_dataloader,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+
+    # === full-topology eval base ===
+    # Built once, on CPU (~38 GB host transient with build_at_dtype, ~29 GB
+    # resident after), parked there between eval windows. `global_model` above
+    # stays partial regardless — this base is scoring-only and disposable.
+    #
+    # `evaluation.full_topology_eval` is a locked field defaulting to true, so
+    # this is the fleet path, not an opt-in one. The guard stays because the
+    # flag is still readable-false on a host running
+    # `--no-auto_update_config`, and because `get_nested_attr`'s fallback has
+    # to be *false*: an old config that predates the field must not silently
+    # build a 29 GB base before the locked-field reset has had its say.
+    full_eval_base: FullTopologyEvalBase | None = None
+    if bool(get_nested_attr(config, "evaluation.full_topology_eval", False)):
+        full_eval_base = FullTopologyEvalBase.build(config, expert_manager)
 
     global_opt_step = start_step
     # Tracks whether this validator participated in the last allreduce.
@@ -1297,6 +1349,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     download_worker: BackgroundDownloadWorker | None = None
     eval_worker: BackgroundEvalWorker | None = None
+    # bg-eval needs its own resident eval template; under full-topology
+    # scoring that would be a second full base (29.3 GiB) and does not fit.
+    # bg-*download* must keep running regardless: foreground reads from
+    # `miner_submission_path`, which only bg-download fills, so switching it
+    # off starves the round (observed — a full window with
+    # `discovered_total=0` and `scored=0` against 4 claimed foreground UIDs).
+    bg_eval_enabled = config.evaluation.background_worker_enabled and not bool(
+        get_nested_attr(config, "evaluation.full_topology_eval", False)
+    )
     if config.evaluation.background_worker_enabled:
         download_worker = BackgroundDownloadWorker(
             config=config,
@@ -1306,24 +1367,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
         # bg-eval idles until the main loop hands it a copy of
         # global_model after foreground eval completes (see below).
-        eval_worker = BackgroundEvalWorker(
-            config=config,
-            round_ref=round_ref,
-            device=device,
-            tokenizer=tokenizer,
-            merge_phase_active=merge_phase_active,
-            eval_window_active=eval_window_active,
-            gpu_eval_lock=gpu_eval_lock,
-            expert_group_assignment=expert_manager.expert_group_assignment,
-        )
+        if bg_eval_enabled:
+            eval_worker = BackgroundEvalWorker(
+                config=config,
+                round_ref=round_ref,
+                device=device,
+                tokenizer=tokenizer,
+                merge_phase_active=merge_phase_active,
+                eval_window_active=eval_window_active,
+                gpu_eval_lock=gpu_eval_lock,
+                expert_group_assignment=expert_manager.expert_group_assignment,
+            )
         download_worker.start()
-        eval_worker.start()
+        if eval_worker is not None:
+            eval_worker.start()
         logger.info(
             "Background workers launched",
             download_thread=download_worker.name,
             download_ident=download_worker.ident,
-            eval_thread=eval_worker.name,
-            eval_ident=eval_worker.ident,
+            eval_thread=eval_worker.name if eval_worker else None,
+            eval_ident=eval_worker.ident if eval_worker else None,
+            bg_eval_enabled=bg_eval_enabled,
         )
 
     logger.info("ChainSubmitter ready")
@@ -1773,12 +1837,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # scored is still here for the merge step.
             miner_jobs: list[MinerEvalJob] = []
 
-            foreground_base_model = resolve_foreground_eval_model(
-                config=config,
-                global_model=global_model,
-                round_obj=new_round,
-                cache=foreground_eval_cache,
-            )
+            if full_eval_base is not None:
+                # Full-topology scoring: onto the GPU, re-seeded from the
+                # current global state (post any prior merge). Foreground's
+                # baseline then runs on this base automatically, so baseline
+                # and miner losses share one topology.
+                full_eval_base.prepare_for_round(global_model, device)
+                foreground_base_model = full_eval_base.model
+            else:
+                foreground_base_model = resolve_foreground_eval_model(
+                    config=config,
+                    global_model=global_model,
+                    round_obj=new_round,
+                    cache=foreground_eval_cache,
+                )
 
             async def _bounded_foreground_eval():
                 return await asyncio.wait_for(
@@ -1794,6 +1866,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         expert_group_assignment=expert_manager.expert_group_assignment,
                         per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                         completed_out=miner_jobs,
+                        graft_controller=full_eval_base,
                     ),
                     timeout=foreground_timeout_sec,
                 )
@@ -1869,6 +1942,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 score_aggregator.persist_atomic(score_path)
             except Exception as e:
                 logger.warning(f"Failed to persist score_aggregator: {e}")
+
+            # The merge window must not share the GPU with the eval base:
+            # partial merge peak (params + .grad + momentum, 27.6 GiB) plus a
+            # resident 29.3 GiB base does not fit 44.4. park() is idempotent
+            # and cheap when already parked, so it runs unconditionally here —
+            # including after a foreground timeout, when the base may hold a
+            # stale graft that the next prepare_for_round will discard.
+            if full_eval_base is not None:
+                full_eval_base.park()
 
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
