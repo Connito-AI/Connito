@@ -1054,10 +1054,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         train_dataloader,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
-    # === full-topology eval base (opt-in) ===
+    # === full-topology eval base ===
     # Built once, on CPU (~38 GB host transient with build_at_dtype, ~29 GB
     # resident after), parked there between eval windows. `global_model` above
     # stays partial regardless — this base is scoring-only and disposable.
+    #
+    # `evaluation.full_topology_eval` is a locked field defaulting to true, so
+    # this is the fleet path, not an opt-in one. The guard stays because the
+    # flag is still readable-false on a host running
+    # `--no-auto_update_config`, and because `get_nested_attr`'s fallback has
+    # to be *false*: an old config that predates the field must not silently
+    # build a 29 GB base before the locked-field reset has had its say.
     full_eval_base: FullTopologyEvalBase | None = None
     if bool(get_nested_attr(config, "evaluation.full_topology_eval", False)):
         full_eval_base = FullTopologyEvalBase.build(config, expert_manager)
