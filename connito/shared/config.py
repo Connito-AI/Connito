@@ -1063,6 +1063,24 @@ class EvalCfg(BaseConfig):
     score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
     foreground_top_n: PositiveInt = 5
     background_worker_enabled: bool = True
+    # Score miners on the FULL expert topology: a separate frozen model with
+    # every routed expert resident, routed at `moe.full_topk` (the base
+    # checkpoint's native 6), grafted in place per miner and parked on CPU
+    # outside the eval window. The global model stays partial — merge, chain
+    # hash and peer sync are untouched. See validator/full_topology_eval.py
+    # for the design and the memory budget it exists to fit.
+    #
+    # This changes `val_loss` — full and partial topology are measured to rank
+    # miners differently (Spearman rho = -0.45 across 22 real submissions, per
+    # the reference experiment) — so like `model.quantization` it is
+    # deliberately NOT locked while it is opt-in: a staging host must be able
+    # to hold it across restarts. Lock it if it becomes the fleet default.
+    #
+    # v1 constraints, enforced at startup by
+    # `check_full_topology_eval_supported`: background_worker_enabled must be
+    # false (the bg worker would need its own full copy — does not fit),
+    # model.quantization must be "off", and moe.partial_moe must stay true.
+    full_topology_eval: bool = False
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
     # Round-group construction scheme. When true, Round.freeze() partitions
