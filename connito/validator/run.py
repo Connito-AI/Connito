@@ -688,6 +688,47 @@ def resolve_foreground_eval_model(
     return model
 
 
+def _move_outer_optimizer_state(optimizer: torch.optim.Optimizer, device) -> float:
+    """Relocate SGD momentum buffers to `device`. Returns GiB moved.
+
+    The outer optimizer is DiLoCo-style SGD with momentum, so `step()`
+    allocates a `momentum_buffer` the same size as the parameter set on its
+    first call and holds it for the process lifetime. On the partial global
+    model that is a second ~9.5 GiB living on the card between rounds:
+
+        round start, pre-merge   allocated =  9,513.3 MB   (params)
+        steady, post-merge       allocated = 19,027.8 MB   (params + momentum)
+
+    That is fine on its own, and it was invisible for as long as the eval
+    model was a per-miner deepcopy sized to the partial topology. It stops
+    being fine with `evaluation.full_topology_eval`: the eval window then
+    wants the 29.3 GiB base resident too, and 19.0 + 29.3 = 48.3 GiB does not
+    fit a 44.39 GiB card. Observed as a CUDA OOM inside
+    `FullTopologyEvalBase.prepare_for_round`'s `model.to(device)` on the
+    *second* round of every process — first round fits because momentum has
+    not been allocated yet, so validators crash-looped on a ~2-cycle rhythm.
+
+    Nothing reads the buffer between steps, so it has no reason to occupy the
+    card while miners are being scored. Offloading after `step()` and
+    onloading before the next one restores the eval window to the 38.8 GiB
+    this design was budgeted at. Values are untouched — this is a relocation,
+    not a reset, so the momentum trajectory is bit-identical to before.
+
+    Cost is ~9.5 GiB over PCIe each way once per round, well under a second
+    against a multi-minute round, and it is skipped entirely when the buffers
+    are already where they need to be.
+    """
+    target = torch.device(device)
+    moved_bytes = 0
+    for state in optimizer.state.values():
+        buffer = state.get("momentum_buffer")
+        if buffer is None or buffer.device.type == target.type:
+            continue
+        moved_bytes += buffer.numel() * buffer.element_size()
+        state["momentum_buffer"] = buffer.to(target)
+    return moved_bytes / 1024 ** 3
+
+
 def _release_global_model_grads(model: nn.Module) -> None:
     # populate_global_grads_from_local writes .grad on every param it iterates,
     # not just those in outer_optimizer.param_groups, so optimizer.zero_grad()
@@ -937,12 +978,15 @@ def run_global_optimization(
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
 ):
-    # global_model and outer_optimizer state are expected to already live on `device` (GPU).
+    # `global_model` is expected to already live on `device` (GPU). The outer
+    # optimizer's momentum is NOT — it is parked on the host between rounds
+    # (see `_move_outer_optimizer_state`) and brought back just for the step.
     old_shared_name, old_shared_sum = get_weight_sum(global_model, shared=True)
     old_expert_name, old_expert_sum = get_weight_sum(global_model, shared=False)
 
     logger.debug("start syncing shared weights")
 
+    onloaded_gb = _move_outer_optimizer_state(outer_optimizer, device)
     outer_optimizer.step()
     outer_optimizer.zero_grad(set_to_none=True)
     # Also release .grad on params not registered with the outer optimizer
@@ -950,6 +994,21 @@ def run_global_optimization(
     # populate_global_grads_from_local). Without this, the storage pins
     # ~model-size of VRAM across rounds.
     _release_global_model_grads(global_model)
+    # Park momentum on the host before the eval window wants the card. Paired
+    # with the onload above so the buffers are only ever resident during the
+    # step itself.
+    offloaded_gb = _move_outer_optimizer_state(outer_optimizer, "cpu")
+    if torch.cuda.is_available():
+        # Hand the freed blocks back to the driver rather than leaving them in
+        # the caching allocator: the next thing to ask for this memory is the
+        # eval base's `model.to(device)`, which needs large contiguous blocks.
+        torch.cuda.empty_cache()
+    if onloaded_gb or offloaded_gb:
+        logger.info(
+            "Outer optimizer momentum relocated",
+            onloaded_gb=round(onloaded_gb, 2),
+            offloaded_gb=round(offloaded_gb, 2),
+        )
 
     new_shared_name, new_shared_sum = get_weight_sum(global_model, shared=True)
     new_expert_name, new_expert_sum = get_weight_sum(global_model, shared=False)
