@@ -188,12 +188,6 @@ def get_model_hash(state, hex=False):
     else:
         return model_hash
 
-def hex_to_byte(hex_str: str) -> bytes:
-    """
-    Convert hex string to raw bytes.
-    """
-    return bytes.fromhex(hex_str)
-
 def public_multiaddrs(maddrs: Iterable) -> List:
     """
     Keep only multiaddrs whose /ip4 or /ip6 component is globally routable.

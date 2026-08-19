@@ -13,18 +13,12 @@ from transformers import (
 from transformers.utils import (
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
-    WEIGHTS_NAME,
     cached_file,
 )
-# transformers 4.x (<5) compatibility:
-#   - `DeepseekV2Experts` does not exist on 4.x — experts there are an
-#     `nn.ModuleList` of MLPs. We keep our own fused 3D-tensor expert design
-#     (see `CustomDeepseekV2Experts`) and subclass `nn.Module` directly, so this
-#     symbol is intentionally not imported.
-#   - The MoE block is named `DeepseekV2MoE` on 4.x (vs `DeepseekV2Moe` on v5)
-#     and its `forward` uses a `DeepseekV2MoEGate` + ModuleList loop that would
-#     bypass our routing/fused experts. `CustomDeepseekV2Moe` therefore also
-#     subclasses `nn.Module` and defines its own `forward`.
+# transformers 4.x compatibility: neither `DeepseekV2Experts` nor the v5 MoE
+# block exists there, and 4.x's `DeepseekV2MoE.forward` would bypass our
+# routing and fused experts. Both custom classes therefore subclass
+# `nn.Module` directly and define their own `forward`.
 from transformers.models.deepseek_v2.modeling_deepseek_v2 import (
     ACT2FN,
     DeepseekV2Attention,
@@ -149,13 +143,9 @@ class CustomDeepseekV2Experts(nn.Module):
             nn.init.normal_(self.gate_up_proj, mean=0.0, std=init_std)
             nn.init.normal_(self.down_proj, mean=0.0, std=init_std)
 
-    # ── State-dict compatibility ──────────────────────────────────────────
-    # The stacked parameters (shape [num_local_experts, ...]) are serialised
-    # as individual per-expert slices so that checkpoints look like:
-    #   prefix.experts.0.gate_up_proj   shape [2*D, H]
-    #   prefix.experts.1.gate_up_proj   shape [2*D, H]
-    #   ...
-    # This lets us load weights saved from per-expert Linear modules directly.
+    # State-dict compatibility: the stacked [num_local_experts, ...] params are
+    # serialised as per-expert slices (`prefix.experts.<i>.gate_up_proj`), so
+    # checkpoints saved from per-expert Linear modules load directly.
 
     # nn.Parameter names (no .weight suffix — these are raw 3D tensors, not nn.Linear)
     _STACKED_PARAMS = ("gate_up_proj", "down_proj")
@@ -344,13 +334,9 @@ class CustomDeepseekV2Moe(nn.Module):
 
         full_mode = bool(getattr(config, "full", False))
 
-        # --- Determine allowed experts ---
-        # Trainable and helper group sets are supplied independently on the
-        # config (see get_moe_model_config). `allowed_expert_id` is their union
-        # — used by masked-topk routing. `trainable_expert_id` / `helper_expert_id`
-        # remain split so the natural-with-fallback routing rule can preserve
-        # natural picks that land in the trainable set and substitute helpers
-        # for the rest.
+        # `allowed_expert_id` is the union, used by masked-topk. The trainable
+        # and helper sets stay split so natural-with-fallback can keep natural
+        # picks that land in the trainable set and substitute helpers elsewhere.
         trainable_expert_id: list[int] = []
         helper_expert_id: list[int] = []
         if full_mode:
@@ -470,15 +456,11 @@ class CustomDeepseekV2Moe(nn.Module):
         router_logits = router_logits.view(-1, hidden_dim)
         router_logits = router_logits.softmax(dim=-1, dtype=torch.float32)
 
-        # ── natural-with-fallback (2Fnat) ──
-        # The base gate ranks all n_routed_experts natively (no masking). Slots
-        # in the natural top-k that land on a trainable expert are kept as-is
-        # (the trainable expert receives that token with its natural gate
-        # weight). Slots that land on a non-trainable expert get REPLACED by the
-        # token's top-scoring helper expert (ranked by the same gate over the
-        # helper subset). Net effect: trainable experts only ever see tokens the
-        # base gate naturally routes to them (exact train-eval alignment), and
-        # non-trainable demand is absorbed by frozen helpers.
+        # natural-with-fallback (2Fnat): the gate ranks all experts unmasked;
+        # top-k slots landing on a trainable expert keep their natural weight,
+        # and the rest are replaced by the token's best helper. Trainable
+        # experts therefore only ever see tokens the base gate routes to them,
+        # which is what keeps train and eval aligned.
         if (
             self.routing_mode == "natural_with_fallback"
             and self.trainable_ids.numel() > 0
@@ -636,11 +618,9 @@ class CustomDeekSeekMoE(DeepseekV2ForCausalLM):
         )
 
     def __init__(self, config):
-        # IMPORTANT: avoid constructing the full DeepseekV2Model twice.
-        # DeepseekV2ForCausalLM.__init__ builds DeepseekV2Model(config),
-        # which causes a large transient CPU RAM spike for DeepSeek-V2-Lite.
-        # We initialize the pretrained base directly, then attach only our
-        # custom partial-aware model once.
+        # `DeepseekV2ForCausalLM.__init__` would build a second full
+        # DeepseekV2Model, spiking CPU RAM. Initialize the base directly and
+        # attach our partial-aware model once.
         DeepseekV2PreTrainedModel.__init__(self, config)
         self.model = CustomDeepseekV2Model(config)
         self.vocab_size = config.vocab_size

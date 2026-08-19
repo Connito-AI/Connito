@@ -12,7 +12,6 @@ import torch.nn as nn
 
 from connito.shared.app_logging import structlog
 from connito.shared.config import ExpertCfg, WorkerConfig
-from connito.shared.helper import sum_model_gradients
 
 logger = structlog.getLogger(__name__)
 

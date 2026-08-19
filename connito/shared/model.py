@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import re
 import time
-import traceback
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
@@ -12,14 +10,12 @@ from torch import nn
 
 from connito.shared.app_logging import structlog
 from connito.shared.chain import (
-    SignedModelHashChainCommit,
     get_chain_commits,
 )
 from connito.shared.checkpoint_helper import compile_full_state_dict_from_path, load_checkpoint
 from connito.shared.checkpoints import (
     ChainCheckpoints,
     ModelCheckpoint,
-    build_chain_checkpoints,
     build_chain_checkpoints_from_previous_phase,
     delete_old_checkpoints,
     select_best_checkpoint,
@@ -27,8 +23,6 @@ from connito.shared.checkpoints import (
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
 from connito.shared.cycle import (
-    PhaseNames,
-    get_blocks_from_previous_phase_from_api,
     get_validator_seed_from_commit,
 )
 from connito.shared.expert_manager import (
@@ -39,7 +33,6 @@ from connito.shared.expert_manager import (
 from connito.shared.helper import get_model_hash, get_nested_attr
 from connito.shared.memory import cleanup
 from connito.shared.modeling.mycelia import get_base_model
-from connito.shared.schema import verify_message
 
 logger = structlog.get_logger(__name__)
 
@@ -135,9 +128,6 @@ def freeze_parameters(
     for name, param in model.named_parameters():
         layer_id, expert_id = get_layer_expert_id(name)
         
-        # Check specifically for 3D fused expert blocks (e.g., Qwen3-VL-MoE)
-        is_3d_expert_block = bool(re.search(r"layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)", name))
-
         if uses_per_expert_names:
             # ── per-expert mode ──────────────────────────────────────────────
             if layer_id is not None and expert_id is not None:
@@ -233,13 +223,9 @@ def get_model_from_checkpoint(
                 model=model,
                 rank=rank,
                 device=checkpoint_device if checkpoint_device is not None else config.model.device,
-                # Only the active expert group is read from disk. Any legacy
-                # `model_shared.*` next to it is ignored — backbone state is
-                # already in `model` from `get_base_model`'s pretrained load
-                # (full path via `from_pretrained`, partial path via the
-                # full→partial port in mycelia.get_base_model), and we no
-                # longer trust on-disk shared weights (they were a source of
-                # cross-validator divergence; see PR description).
+                # Active expert group only. Legacy `model_shared.*` is
+                # ignored: the backbone already came from the pretrained load,
+                # and on-disk shared weights caused cross-validator divergence.
                 expert_groups=[config.task.exp.group_id] if partial else None,
             )
         else:

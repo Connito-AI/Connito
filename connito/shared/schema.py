@@ -29,12 +29,6 @@ class SignedDownloadRequestMessage(SignedMessage):
     expert_group_id: int | str | None = None
 
 
-@dataclass()
-class SignedModelSubmitMessage(SignedMessage):
-    model_hex: str
-    block_hex: str
-
-
 def construct_model_message(model_path: str | Path, expert_groups: list[int | str] | None = None) -> bytes:
     """
     Sign:

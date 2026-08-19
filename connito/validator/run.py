@@ -192,7 +192,6 @@ from connito.shared.telemetry import (
     evict_round_series_before,
     track_metagraph_sync_latency,
 )
-from datetime import datetime
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -262,35 +261,6 @@ def _sync_lite_metagraph(subtensor, netuid: int):
     ``validator_metagraph_last_sync_timestamp`` on success.
     """
     return subtensor.metagraph(netuid=netuid)
-
-
-def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
-    if not torch.cuda.is_available():
-        print(f"[{tag}] CUDA not available")
-        return
-
-    if device is None:
-        device = torch.cuda.current_device()
-
-    torch.cuda.synchronize(device)
-
-    allocated = torch.cuda.memory_allocated(device)
-    reserved = torch.cuda.memory_reserved(device)
-
-    free, total = torch.cuda.mem_get_info(device)  # bytes
-
-    def mb(x):
-        return x / 1024**2
-
-    log_phase(
-        f"[{tag}] cuda:{device}",
-        allocated=f"{mb(allocated):.1f}MB",
-        reserved=f"{mb(reserved):.1f}MB",
-        free=f"{mb(free):.1f}MB",
-        total=f"{mb(total):.1f}MB",
-        alloc_pct=f"{allocated/total*100:.1f}%",
-        reserved_pct=f"{reserved/total*100:.1f}%",
-    )
 
 
 def _install_signal_logging() -> None:
@@ -390,12 +360,9 @@ def setup_training(
 
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
-    # `load_global_checkpoint=False`: the validator boots from the pretrained
-    # backbone + experts (`get_base_model`) without overlaying any on-disk
-    # expert state. Peer-resync via `reload_model_inplace` still pulls the
-    # current pool state in the round loop; the optimizer/scaler/dataloader
-    # resume below is also independent of this flag.
+    # Partial model (assigned experts only). `load_global_checkpoint=False`:
+    # boot from the pretrained backbone with no on-disk expert overlay —
+    # peer-resync in the round loop still pulls current pool state.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
@@ -466,14 +433,10 @@ async def aggregate_miner_gradient_change(
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
 ) -> list[str]:
-    # global_model is expected to already live on `device` (GPU).
-    # `MinerEvalJob.score` is the per-round delta-based signal
-    # (`(baseline_loss - val_loss) ** 1.2`) returned by `evaluate_one_miner`.
-    # The aggregator is no longer fed during eval — `finalize_round_scores`
-    # writes rank-based scores to it at end of round — so merge ranking
-    # reads `job.score` directly. Drop zero-score miners first (a single
-    # bad eval excludes them regardless of history), then keep the top
-    # `top_k_miners_to_merge` by this-round score.
+    # global_model must already be on `device`. Merge ranks on `job.score`
+    # (this round's delta signal) rather than the aggregator, which only gets
+    # rank-based scores at finalize: one bad eval excludes a miner regardless
+    # of history.
     scored_jobs = [job for job in miner_jobs if job.score > 0]
     skipped_zero_uids = [job.uid for job in miner_jobs if job not in scored_jobs]
     if skipped_zero_uids:
@@ -799,12 +762,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     _participated_in_merge = True
 
     score_window = config.evaluation.score_window
-    # On-disk retention per miner — kept independent of score_window so
-    # avg/sum/ema (the metric driving weight submission) still cap reads
-    # at score_window. Larger here means more historical points are
-    # retained on disk for diagnostics without changing scoring.
-    # Hard-coded for now; promote to a config field once we settle on a
-    # default that won't change cross-validator behavior.
+    # On-disk retention only. Deliberately larger than score_window so extra
+    # history is kept for diagnostics; avg/sum/ema still read score_window, so
+    # scoring is unaffected. TODO: promote to config once the default settles.
     score_history_window: int = 80
     score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
     if pkg_version == "v0.2.3":
@@ -846,13 +806,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
-    # Startup recovery. If a previous run died before `finalize_round_scores` could run
-    # (SIGKILL, OOM, validator crash), the per-round journal on disk
-    # holds the partial scoring state. Replay each unfinalized journal
-    # through `finalize_round_scores` so the aggregator on disk gets
-    # the same rank-based entries it would have had without the kill.
-    # A failure on a single journal logs a warning and continues — never
-    # abort startup.
+    # Startup recovery: replay any journal a previous run left unfinalized
+    # (SIGKILL / OOM / crash) so the aggregator ends up where it would have
+    # been. A failure on one journal must never abort startup.
     try:
         from connito.validator import round_journal as _rj_recover
         from connito.validator.round_journal import _RecoveryRound
@@ -896,25 +852,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 journals_seen=len(_journals),
             )
 
-        # Re-emit the most recent finalized round's telemetry.
+        # Re-emit the last finalized round's telemetry, unconditionally: the
+        # replay above only touches unfinalized journals, so a second restart
+        # would otherwise leave the dashboard blank for a whole cycle.
         #
-        # Runs unconditionally, and this is the point: the replay loop above
-        # only touches *unfinalized* journals, and replaying one marks it
-        # finalized. So a second restart finds nothing to replay and used to
-        # emit nothing at all — leaving the dashboard blank for the whole
-        # last completed cycle until the next round's evaluations arrived
-        # (observed 2026-07-31: two Watchtower restarts 25 min apart, every
-        # per-miner family at zero series for 17 minutes).
-        #
-        # This is a METRICS-ONLY pass — it never re-runs finalize. Re-running
-        # finalize would keep the aggregator's point set correct (drop_round
-        # runs first) but would re-stamp those points with fresh timestamps,
-        # reshuffling the "last N by timestamp" rolling average that drives
-        # weight submission. See `republish_telemetry_from_journal`.
-        #
-        # Journals are scanned ascending, so the last finalized one is the
-        # most recent round — which is also the one just replayed on a first
-        # restart, making the re-emit a harmless idempotent gauge write.
+        # Metrics only — never re-run finalize here. That would re-stamp the
+        # aggregator's points with fresh timestamps and reshuffle the
+        # last-N-by-timestamp average that drives weight submission.
         try:
             _newest_finalized = None
             for _journal_file in reversed(_journals):
@@ -945,7 +889,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     group_grad_buff_meta = build_grad_buff_from_model(
         model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
     )
-    # Only keep this validator's expert group and shared; drop other groups
     active_group_id = config.task.exp.group_id
     excluded = [gid for gid in group_grad_buff_meta if gid != active_group_id and gid != "shared"]
     for gid in excluded:
@@ -956,9 +899,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
 
-    # Resolve this validator's UID so the poller can emit vtrust / consensus
-    # for our own slot. Failing this lookup keeps the metagraph block of the
-    # poller inert (validator_uid=None) rather than crashing startup.
+    # Needed for our own vtrust / consensus gauges. A failed lookup leaves the
+    # poller's metagraph block inert rather than crashing startup.
     validator_uid: int | None
     try:
         bootstrap_metagraph = _sync_lite_metagraph(lite_subtensor, config.chain.netuid)
@@ -970,10 +912,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
         validator_uid = None
 
-    # Stamp identity onto the connito_validator info metric so every Prom scrape
-    # carries which validator emitted it. _get_build_version() reads
-    # CONNITO_GIT_VERSION / CONNITO_GIT_SHA (baked into the Docker image) with a
-    # git-cli fallback in source checkouts.
+    # Stamp identity onto the info metric so every scrape carries which
+    # validator emitted it.
     git_version, git_sha = _get_build_version()
     try:
         set_validator_identity(
@@ -1015,24 +955,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     if config.ckpt.cleanup_stale_temporary_checkpoints:
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
-    # === Round-lifecycle scaffolding ===
-    # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
-    #   Pauses bg-download (HF bandwidth contention with the validator's own
-    #   HF upload) and bg-eval (GPU contention with allreduce / optimizer step).
-    # eval_window_active: set after Merge(K) completes so the eval worker may
-    #   evaluate round K's downloaded miners; cleared at the top of the next
-    #   cycle right before submit_weights for round K.
-    # download_window_closed: set when the main loop begins waiting for
-    #   MinerCommit1 of the next round (round K's downloads are dead weight
-    #   past that point); cleared at the next freeze. Pauses bg-download
-    #   from MinerCommit1(K+1) → Submission(K+1).
-    # gpu_eval_lock: held by the eval worker only across its load_state_dict
-    #   and evaluate_one_miner calls (yielded everywhere else).
+    # Round-lifecycle gates for the two background workers:
+    #   merge_phase_active   — Merge phase + HF upload; pauses both workers
+    #                          (HF bandwidth, GPU contention with allreduce).
+    #   eval_window_active   — bg-eval may score round K, from end of Merge(K)
+    #                          until just before round K's weight submission.
+    #   download_window_closed — pauses bg-download from MinerCommit1(K+1)
+    #                          until the next freeze; round K's downloads are
+    #                          dead weight past that point.
+    #   gpu_eval_lock        — held by bg-eval only across load_state_dict and
+    #                          evaluate_one_miner, yielded everywhere else.
     #
-    # Note: bg-download intentionally does NOT pause on the foreground eval
-    # pass. Foreground reads from `miner_submission_path`, which bg-download
-    # is responsible for filling, so they MUST run concurrently or foreground
-    # never finds anything to evaluate.
+    # bg-download deliberately does NOT pause during foreground eval: it fills
+    # `miner_submission_path`, which foreground reads from, so they must run
+    # concurrently or foreground finds nothing to evaluate.
     merge_phase_active = threading.Event()
     eval_window_active = threading.Event()
     download_window_closed = threading.Event()
@@ -1072,13 +1008,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     logger.info("ChainSubmitter ready")
 
-    # Hard wall-clock cap for sync_grad_across_validators. Python threads
-    # can't be cancelled, so on timeout we abandon the worker and skip the
-    # rest of this round's merge — the orphan keeps running until avg.step
-    # unwinds (cooperative deadline checks inside the function should make
-    # that quick). The next merge cycle refuses to start a fresh sync
-    # while a previous orphan is still alive, so the orphan can't race
-    # outer_optimizer.step or the next round's pack_grads for model.grad.
+    # Hard wall-clock cap for sync_grad_across_validators. Python threads can't
+    # be cancelled, so on timeout we abandon the worker and skip the rest of
+    # this round's merge. The next merge refuses to start while an orphan is
+    # still alive, so it can't race outer_optimizer.step or the next
+    # pack_grads for model.grad.
     sync_grad_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="connito-sync-grad",
     )
@@ -1095,20 +1029,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
             logger.info("Commit new seed for next validation")
 
-            # === (4) Finalize round-K scoring and submit weights.
+            # (4) Finalize round-K scoring and submit weights.
             #
-            # Close the (3) bg-eval window FIRST so no in-flight eval can
-            # add a new entry to `round.scores` after `finalize_round_scores`
-            # has snapshotted it. The archive/prune step that lives lower
-            # in this block also runs while the window is closed — same
-            # invariant we used to rely on, just hoisted up.
+            # Close the bg-eval window FIRST so no in-flight eval can add to
+            # `round.scores` after finalize snapshots it; the archive/prune
+            # below relies on the same gate.
             #
-            # `finalize_round_scores` is the sole writer to the global
-            # aggregator for this round_id: it computes ranks from the
-            # delta-based per-round signal in `round.scores`, drops any
-            # stale aggregator points tagged with this round_id, and
-            # writes 3/2/1 for the top-3 (with delta>0), 0 for everyone
-            # else (incl. failed evals and freeze-time invalid checkpoints).
+            # `finalize_round_scores` is the sole writer to the aggregator for
+            # this round_id: it ranks the per-round deltas, drops stale points
+            # tagged with the round, and writes 0 for everyone outside the
+            # top-3 (including failed evals and freeze-time invalid commits).
             eval_window_active.clear()
             pending_round: Round | None = round_ref.current
             scheduled_round_weights = False
@@ -1192,17 +1122,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         weight_group_1=list(payload.weight_group_1),
                         weight_group_2=list(payload.weight_group_2),
                     )
-                # Mirror the about-to-submit weights into Prometheus so external
-                # aggregators can see what each validator votes on chain. Entries
-                # are written only for UIDs we actually weight, so a miner the
-                # validator has never scored has *no* sample rather than a
-                # zero (preserves prior EMA semantics).
-                #
-                # The per-miner score snapshots (latest / avg / samples /
-                # emitted_at) are NOT published here anymore — they moved to
-                # `finalize_round_scores`, which covers every verdict uid
-                # (not just weight recipients) and re-publishes via the
-                # journal-recovery replay after a restart.
+                # Mirror the about-to-submit weights into Prometheus. Only for
+                # UIDs we actually weight, so an unscored miner has no sample
+                # rather than a zero. Per-miner score snapshots are published
+                # by `finalize_round_scores`, not here.
                 for _uid, _weight in uid_weights.items():
                     try:
                         VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(
@@ -1215,20 +1138,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
                 scheduled_round_weights = True
 
-            # Submit fallback weights if last_update is stale (past max_weight_age)
-            # AND we did not just schedule a fresh round-weight submission. The
-            # round's set_weights will bump last_update once it lands, which is
-            # exactly what the fallback would do — and racing both extrinsics on
-            # the same wallet caused substrate "Invalid Transaction" / "Priority
-            # is too low" errors and let the (older) fallback weights overwrite
-            # the round's weights on chain. If the round's submit fails, next
-            # cycle's stale-weights check catches it (no race that cycle).
+            # Fallback weights only when last_update is stale AND we didn't
+            # just schedule a round submission. Racing both extrinsics on one
+            # wallet produces substrate "Priority is too low" errors and lets
+            # the older fallback overwrite the round's weights. If the round
+            # submit fails, next cycle's staleness check catches it.
             max_weight_age = int(config.cycle.cycle_length)
-            # `lite=False` so `metagraph.weights` is populated, matching the
-            # shape we re-fetch below right before `Round.freeze`. This fetch
-            # is only used for the fallback-weights staleness check that
-            # follows; the freeze-time fetch is refreshed separately because
-            # ~80 blocks of phases pass between here and Submission.
+            # `lite=False` so `metagraph.weights` is populated. Used only for
+            # the staleness check below; freeze re-fetches because ~80 blocks
+            # pass between here and Submission.
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
@@ -1250,19 +1168,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
 
-            # The (3) eval window was closed at the top of this block before
-            # `finalize_round_scores`. Archive/prune below runs with bg-eval
-            # gated, preserving the file-race protection that used to live
-            # at this point in the loop.
-            #
-            # Fresh 16-bit random seed each cycle. Read by every validator at
-            # the next Submission start via `get_combined_validator_seed`,
-            # which sha256s the sorted concat — so cohort-wide assignment
-            # rotates each cycle even when miner/validator membership is
-            # static. 16 bits = up to 5 decimal digits, ≤9 bytes of JSON; the
-            # downstream sha256 supplies the entropy `assign_miners_to_validators`
-            # actually needs, so going wider just costs commit-budget bytes
-            # for no shuffle-quality gain.
+            # Fresh 16-bit seed each cycle. Every validator's seed is hashed
+            # together at the next Submission (`get_combined_validator_seed`),
+            # so assignment rotates even with static membership. 16 bits keeps
+            # the commit under budget; the downstream sha256 supplies the
+            # entropy.
             new_miner_seed = secrets.randbits(16)
             chain_submitter.async_commit(ValidatorChainCommit(
                 model_hash=current_model_hash,
@@ -1382,13 +1292,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception:
                 pass
 
-            # Dashboard telemetry: publish per-miner cohort group, this
-            # validator's assignment role, and last-observed-commit block for
-            # the round we just froze. All values are read off `new_round` (no
-            # extra chain/RPC work) and emitted for EVERY metagraph uid so the
-            # gateway sees a fresh value per miner each round — stale group /
-            # assignment membership never lingers across cohort epochs. One
-            # broad try/except: telemetry must never break the round loop.
+            # Per-miner dashboard gauges for the round just frozen, read off
+            # `new_round` with no extra RPC. Emitted for EVERY metagraph uid so
+            # stale group/assignment membership never lingers across cohort
+            # epochs. Broad try/except: telemetry must never break the loop.
             try:
                 _group_code_by_uid: dict[int, int] = {}
                 for _uid in new_round.validation_group_a:
@@ -1401,13 +1308,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 _foreground_set = {int(u) for u in new_round.foreground_uids}
                 _background_set = {int(u) for u in new_round.background_uids}
 
-                # Tail = miners on this validator's roster (foreground or
-                # background) but outside the formal A/B/C tiers. Distinct
-                # from code 0 ("none"), which means the validator has no
-                # roster status for this miner at all. The dashboard uses
-                # this to render "evaluated opportunistically" instead of
-                # leaving these miners visually indistinguishable from
-                # unrostered ones.
+                # Tail = on this validator's roster but outside the A/B/C
+                # tiers. Distinct from code 0 ("no roster status at all") so
+                # the dashboard can show "evaluated opportunistically".
                 for _uid in (_foreground_set | _background_set) - _group_code_by_uid.keys():
                     _group_code_by_uid[_uid] = 4
 
@@ -1444,13 +1347,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         error=str(e),
                         path=str(cohort_state_path),
                     )
-            # Belt-and-suspenders: drop any leftover submission file whose
-            # block falls outside this round's window. The end-of-cycle
-            # prune is normally enough, but a validator restart that
-            # crashed mid-cycle (or any path that skips that prune) leaves
-            # stale .pt files behind — bg-download's _existing_submission
-            # would then short-circuit the fresh fetch and publish the
-            # stale path, which gather_validation_job silently rejects.
+            # Drop leftover submissions outside this round's block window. A
+            # crash that skipped the end-of-cycle prune leaves stale files that
+            # bg-download would reuse instead of fetching, and that
+            # gather_validation_job then silently rejects.
             try:
                 deleted = prune_submissions_outside_window(
                     folder_path=config.ckpt.miner_submission_path,
@@ -1483,17 +1383,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception:
                 pass
 
-            # (2) Foreground evaluation: top-N miners only, by incentive,
-            # bounded by per_miner_eval_timeout_sec; spillover lands in (3).
-            # bg-download runs concurrently here, filling
-            # `miner_submission_path` with foreground UIDs first so this loop
-            # has work to discover.
+            # (2) Foreground evaluation: top-N by incentive; spillover lands
+            # in (3). bg-download runs concurrently, filling
+            # `miner_submission_path` so this loop has work to discover.
             #
-            # Hard wall-clock backstop on top of the cooperative deadline
-            # checks inside evaluate_foreground_round: derive a budget
-            # from the validate phase's end_block. If the inner path
-            # overshoots, asyncio.wait_for cancels the in-flight eval
-            # and the rest of this round's pipeline runs without it.
+            # Wall-clock backstop on top of the cooperative deadline checks
+            # inside evaluate_foreground_round: on overshoot, wait_for cancels
+            # the in-flight eval and the rest of the round still runs.
             foreground_timeout_sec = max(
                 0.0,
                 (phase_response.phase_end_block - lite_subtensor.block)
@@ -1525,16 +1421,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     timeout=foreground_timeout_sec,
                 )
 
-            # Use a private event loop instead of asyncio.run so a timed-out
-            # evaluate_one_miner cannot stall this thread on cleanup:
-            # asyncio.to_thread cancellation only detaches the awaiter; the
-            # underlying default-executor thread keeps running. asyncio.run
-            # would then block in shutdown_default_executor(wait=True) waiting
-            # on that orphan, freezing the main loop indefinitely (we hit
-            # exactly this — round 8081470 sat ~27 min after
-            # "foreground eval: complete"). loop.close() calls
-            # executor.shutdown(wait=False), so the orphan thread is left to
-            # die with the process and we proceed to the validate phase.
+            # Private loop, not asyncio.run: cancelling an `asyncio.to_thread`
+            # only detaches the awaiter, and asyncio.run would then block
+            # forever in shutdown_default_executor(wait=True) on the orphan
+            # thread. loop.close() shuts the executor down with wait=False, so
+            # the orphan dies with the process and the loop moves on.
             foreground_loop = asyncio.new_event_loop()
             try:
                 foreground_loop.run_until_complete(_bounded_foreground_eval())
@@ -1668,10 +1559,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 if grad_is_valid:
                     logger.info("Syncing gradient across validators")
 
-                    # Refuse to start a fresh sync while a previous one is
-                    # still alive — its thread may still be inside
-                    # unpack_to_grads writing model.grad. Letting a new
-                    # pack_grads run alongside would corrupt both.
+                    # A previous sync may still be inside unpack_to_grads
+                    # writing model.grad; a concurrent pack_grads corrupts both.
                     if (
                         last_sync_grad_future is not None
                         and not last_sync_grad_future.done()
@@ -1732,13 +1621,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         )
                         _participated_in_merge = True
                     else:
-                        # Sync was orphaned or skipped: don't run the outer
-                        # optimizer (model.grad may be in an indeterminate
-                        # state) and trigger the peer-resync path next
-                        # cycle via _participated_in_merge=False. Release
-                        # the aggregated-but-unused grads so they don't
-                        # accumulate into the next round's populate, and
-                        # so the storage isn't pinned through to next cycle.
+                        # Sync orphaned or skipped: model.grad is
+                        # indeterminate, so skip the optimizer, release the
+                        # unused grads, and peer-resync next cycle.
                         _release_global_model_grads(global_model)
                         _participated_in_merge = False
                 else:
@@ -1846,14 +1731,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     # would contend on the same network/disk.
                     merge_phase_active.set()
                     try:
-                        # Subprocess isolation: huggingface_hub's chunked
-                        # upload + TLS holds the GIL long enough to starve
-                        # the bittensor websocket keepalive thread in this
-                        # process, which then dumps a ConnectionClosedError
-                        # mid-upload and forces a substrate reconnect/retry
-                        # on the next extrinsic. A spawned child has its
-                        # own interpreter, so the parent's keepalive keeps
-                        # ticking.
+                        # Subprocess isolation: hf_hub's chunked upload holds
+                        # the GIL long enough to starve the bittensor
+                        # websocket keepalive, which forces a substrate
+                        # reconnect on the next extrinsic. A child process has
+                        # its own interpreter, so the keepalive keeps ticking.
                         hf_revision = upload_checkpoint_to_hf_subprocess(
                             ckpt_dir=model_ckpt.path,
                             repo_id=hf_upload_repo_id,
@@ -1897,23 +1779,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     if ckpt_deleted:
                         logger.debug(f"Deleted old checkpoints: {ckpt_deleted}")
 
-            # === (4) Set weight to chain ===
-            # Relocated to the top of the next iteration's MinerCommit1 block
-            # so it can incorporate the (3) background scores collected from
-            # end-of-Validate(K) through end-of-Train(K+1).
+            # (4) Weight submission happens at the top of the next iteration's
+            # MinerCommit1 block, so it can include the background scores
+            # collected through end-of-Train(K+1).
 
-            # Close the download window 15 blocks before the next
-            # MinerCommit1 so bg-download stops pulling round-K submissions in
-            # the quiet window before the new cycle. Archive + prune of those
-            # files runs just after MinerCommit1 begins (above), so bg-eval can
-            # keep scoring round-K's miners here without racing the cleanup.
+            # Stop bg-download 15 blocks before the next MinerCommit1; round-K
+            # pulls are dead weight past that point. Archive + prune runs just
+            # after MinerCommit1, so bg-eval can keep scoring here without
+            # racing the cleanup.
             wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             download_window_closed.set()
 
-            # === Re-sync from peer if we were excluded last cycle ===
-            # Done in the same quiet pre-MinerCommit1 window as the
-            # download-window close above so the sync settles before the
-            # new cycle begins.
+            # Re-sync from a peer if we missed the allreduce. Same quiet
+            # pre-MinerCommit1 window, so the sync settles before the new cycle.
             if not _participated_in_merge:
                 logger.info(
                     "Re-syncing model from peer validator (was excluded from allreduce last cycle)"
@@ -1952,17 +1830,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
-        # Stop the producer first so the eval worker drains its remaining
-        # claims; then stop the eval worker; finally stop the chain_submitter
-        # so any in-flight chain RPCs get cancelled cleanly.
+        # Producer first so the eval worker drains its claims, then the
+        # worker, then the chain submitter (cancels in-flight RPCs).
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
-        # Don't wait on a stuck sync_grad worker — it may be blocked inside
-        # avg.step. cancel_futures only affects pending submissions, not
-        # the in-flight one, which keeps running until avg.step unwinds.
+        # Don't wait on a sync_grad worker stuck in avg.step; cancel_futures
+        # only drops pending submissions, not the in-flight one.
         sync_grad_executor.shutdown(wait=False, cancel_futures=True)
         for _, a in group_averagers.items():
             a.shutdown()

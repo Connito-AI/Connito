@@ -155,12 +155,8 @@ def upload_checkpoint_to_hf(
         if getattr(e.response, "status_code", None) not in (409,):
             raise
 
-    # Default uploads expert-group shards only (both `.pt` and `.safetensors`
-    # during the migration window). `model_shared.*` is intentionally excluded
-    # from the default: it's no longer persisted or distributed; every
-    # participant reconstructs backbone state from `config.model.model_path`
-    # at startup. Callers that need different behavior can override
-    # `allow_patterns` explicitly.
+    # Expert-group shards only. `model_shared.*` is excluded deliberately —
+    # every participant rebuilds the backbone from `config.model.model_path`.
     default_allow_patterns = [
         "model_expgroup_*.pt",
         "model_expgroup_*.safetensors",
@@ -185,17 +181,11 @@ def _install_queue_listener_eof_suppressor() -> None:
     """Silence the QueueListener teardown EOFError that HF up/download
     children spill onto the parent's inherited stderr.
 
-    `huggingface_hub`'s xet backend (and a few related HF subsystems)
-    start a `logging.handlers.QueueListener` inside the spawned child
-    to forward log records from its internal worker pool. When the
-    child exits, the workers tear down their multiprocessing queue
-    before the listener's `_monitor` thread is joined. `_monitor`
-    blocks in `queue.get()`, the queue closes underneath it, and
-    `_recv()` raises `EOFError`. Python's default `threading.excepthook`
-    then prints a ~20-line traceback to the child's stderr. The child
-    inherits stderr from the validator, so every spawn dumps that
-    traceback into the validator log — hundreds per cycle, with no
-    operational signal in it.
+    HF's xet backend runs a `QueueListener` in the spawned child; on exit its
+    workers close the queue before the `_monitor` thread is joined, so
+    `_monitor` raises `EOFError` and the default `threading.excepthook` prints
+    a ~20-line traceback. The child inherits the validator's stderr, so that
+    lands in the validator log hundreds of times per cycle.
 
     Suppression is intentionally narrow: only `EOFError` raised in a
     thread whose name ends with `"(_monitor)"` (the QueueListener's
@@ -585,15 +575,10 @@ def download_checkpoint_from_hf_subprocess(
                 f"HF download subprocess exceeded {timeout_sec}s; killed"
             )
 
-        # The child writes exactly one message before exiting; if it
-        # crashed before either `conn.send` (e.g. import failure, OOM,
-        # SIGSEGV inside a C extension) the pipe is either empty or
-        # closed. `poll()` returns False for the empty case but True
-        # for the closed-without-write case (the OS surfaces EOF as
-        # "data available"), and the subsequent `recv()` then raises
-        # `EOFError`. Both shapes mean the same thing: the child died
-        # silently. Translate both into a single RuntimeError that
-        # carries the exit code so an oncall can grep for it.
+        # The child sends exactly one message. If it died first the pipe is
+        # empty (poll() False) or closed (poll() True, then recv() raises
+        # EOFError, because the OS surfaces EOF as readable). Both mean a silent
+        # child death; report one RuntimeError carrying the exit code.
         try:
             if not parent_conn.poll():
                 raise RuntimeError(

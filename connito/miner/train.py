@@ -76,8 +76,8 @@ def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: call
     Returns:
         None
     """
-    # world_size>1 spawns fresh processes, so cycle._TEST_MODE must be re-set
-    # inside each worker — not just the parent — for --test to take effect.
+    # world_size>1 spawns fresh processes, so --test must be re-applied in
+    # each worker, not just the parent.
     if test_mode:
         from connito.shared.cycle import set_test_mode
         set_test_mode(True)
@@ -184,15 +184,10 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    # Optimizer state precision — config.opt.adamw_optim_bits picks how
-    # exp_avg + exp_avg_sq are stored:
-    #   32: torch.optim.AdamW (fp32 state, 8 bytes/param).
-    #    8: bitsandbytes AdamW with optim_bits=8 — 8-bit blockwise-quantized
-    #       state, 4× smaller than fp32. Well-tested for LLM fine-tuning
-    #       (QLoRA/PEFT default) and required to fit this config on a 47GB A6000.
-    # Note: bitsandbytes does NOT support 16-bit AdamW state — it errors at
-    # init_state with NotImplementedError. Only 8 and 32 are valid. fp16-mixed
-    # autocast is orthogonal — it changes compute precision, not optimizer state.
+    # 32 = torch AdamW (fp32 state); 8 = bitsandbytes blockwise-quantized
+    # state, 4x smaller. No other value works — bitsandbytes raises
+    # NotImplementedError for 16-bit state. Orthogonal to fp16-mixed autocast,
+    # which changes compute precision rather than optimizer state.
     optim_bits = int(getattr(config.opt, "adamw_optim_bits", 8))
     if optim_bits == 8:
         import bitsandbytes as _bnb
@@ -425,16 +420,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 inner_scaler.scale(loss).backward()
 
-                grad_total = sum_model_gradients(model)
-                sample_grads = []
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        p_norm = param.norm().item()
-                        grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
-                        sample_grads.append((name, grad_norm, p_norm))
-                        if len(sample_grads) >= 5:
-                            break
-
                 del loss, aux_loss, batch_device, outputs
                 gc.collect()
 
@@ -487,13 +472,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
                 scale_after = None
-                # Defrag before the FIRST optimizer.step(): AdamW lazily
-                # allocates exp_avg + exp_avg_sq (2× fp32 per trainable param,
-                # hundreds of MiB on DeepSeek-V2-Lite) inside optimizer.step,
-                # and it OOMs against ~1 GiB of reserved-but-unallocated
-                # fragmentation on a fresh A6000. `empty_cache` is cheap
-                # (~a few ms) and always safe here since we've just finished
-                # backward.
+                # Defrag before the first optimizer.step(): AdamW lazily
+                # allocates its fp32 moment buffers there and OOMs against
+                # reserved-but-unallocated fragmentation. Safe here because
+                # backward has just finished.
                 gc.collect()
                 torch.cuda.empty_cache()
                 if inner_scaler.is_enabled():
@@ -680,12 +662,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 logger.info("reached barrier, waiting for complete checkpoint saving")
 
-            # === reload model ===
-            # Gated by ckpt.enable_peer_resync (default True). Standalone
-            # smoke/train runs — especially under use_pretrained_only=True —
-            # want this off, otherwise a stale validator_checkpoint dir on
-            # disk triggers a full setup_training rebuild every inner-opt
-            # step and optimizer state gets wiped.
+            # Standalone smoke/train runs want enable_peer_resync off:
+            # otherwise a stale validator_checkpoint dir triggers a full
+            # setup_training rebuild every inner-opt step and wipes optimizer
+            # state.
             if is_inner_optimizer_step and get_nested_attr(config, "ckpt.enable_peer_resync", True):
                 logger.info("(5) Reload Model")
 

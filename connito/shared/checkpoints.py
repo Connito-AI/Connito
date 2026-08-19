@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import time
-from collections import Counter
 from functools import total_ordering
 from pathlib import Path
 from typing import Any
@@ -28,38 +26,17 @@ from connito.shared.cycle import (
     get_phase_from_api,
     wait_till,
 )
-from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+from connito.shared.config import WorkerConfig
 from connito.shared.chain import (
     SignedModelHashChainCommit,
     WorkerChainCommit,
     get_chain_commits,
 )
 from connito.shared.expert_manager import (
-    ExpertManager,
-    get_layer_expert_id,
     ExpertAssignments
 )
 
 logger = structlog.get_logger(__name__)
-
-
-def _normalize_hash(value: str | bytes | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value.hex()
-    if isinstance(value, str):
-        return value.lower()
-    return str(value).lower()
-
-
-def _hash_bytes(value: str | bytes) -> bytes:
-    if isinstance(value, bytes):
-        return value
-    try:
-        return bytes.fromhex(value)
-    except ValueError:
-        return value.encode()
 
 
 @total_ordering
@@ -407,18 +384,11 @@ class ChainCheckpoints(BaseModel):
         if not filtered:
             return ChainCheckpoints(checkpoints=[])
 
-        # Skip the global_ver range filter for the miner role. The chain
-        # commit block can race against the allowed-version window by 1-2
-        # blocks (we observed ckpt_ver=8338209 vs max_allowed=8338208 in
-        # SN102 staging logs — a miner that committed one block after the
-        # window was excluded), which silently drops fresh, otherwise-valid
-        # miner submissions. Validators downstream do their own
-        # evaluation-driven gating, so excluding here is strictly
-        # pessimistic.
-        #
-        # The filter still applies when for_role == "validator" — validators
-        # cross-check each other's commits and the version range there
-        # protects the chosen majority hash from stale validator state.
+        # Miners skip the global_ver range filter: the commit block can race
+        # the allowed-version window by a block or two, silently dropping fresh
+        # submissions, and validators gate on evaluation anyway. The filter
+        # still applies to validators, where it protects the majority hash from
+        # stale peer state.
         if for_role == "miner":
             logger.debug(
                 "filter_checkpoints: skipping version range gate (miner role)",
@@ -758,13 +728,10 @@ def build_chain_checkpoints_from_previous_phase(
         hash_chain_commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(
             config, subtensor, block=commit_2_end_block
         )
-        # Log the source blocks at info: when two validators disagree on which
-        # miner revision to download (the chain-read divergence we saw in SN102
-        # validator/yuma logs around 2026-06-08, where the same UID produced
-        # different `hf_revision` per validator), the first thing to check is
-        # whether their substrate clients agreed on the historical block they
-        # pulled. Without these fields that information is unrecoverable after
-        # the fact.
+        # Log the source blocks at info. When two validators disagree on a
+        # miner's revision, the first thing to check is whether their substrate
+        # clients read the same historical block — unrecoverable after the fact
+        # without these fields.
         if not signed_hash_chain_commits or not hash_chain_commits:
             logger.warning(
                 "Chain commits fetched but some are missing",

@@ -20,9 +20,8 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 
 # Stub heavy modules same way test_background_submission_validation.py does

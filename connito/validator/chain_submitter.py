@@ -155,14 +155,10 @@ class ChainSubmitter:
         round_obj: Round,
         uid_weights: dict[int | str, float],
     ) -> bool:
-        # Reserve a fixed share for the subnet owner before submission.
-        # `build_submission_uid_weights` produces miner-only weights; we
-        # inject the owner share here so the wire submission always
-        # carries it (matching the fallback path). Applied before
-        # `submit_weights_async` runs its own filter/top_k/normalize —
-        # safe because the validator's `top_k` is currently `None`; a
-        # tight `top_k` could drop the 5% share and would need a fix
-        # there before being enabled.
+        # `build_submission_uid_weights` returns miner-only weights, so inject
+        # the owner share here. Applied before submit's own filter/top_k —
+        # safe only while `top_k` is None; a tight top_k would drop the share
+        # and needs fixing there first.
         uid_weights = reserve_subnet_owner_share(
             {int(uid): float(w) for uid, w in uid_weights.items()},
         )

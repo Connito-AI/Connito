@@ -37,31 +37,21 @@ from connito.validator.evaluator import (
 )
 from connito.validator.round import RoundRef
 
-# Recycling threshold: how many consecutive iterations may observe
-# `gpu_eval_lock` held at the iteration boundary before we drop our
-# `_eval_base_model` reference and re-park, forcing the main loop to
-# re-seed us. ~3 iterations × 2s poll = ~6s; long enough that a slow-
-# but-completing eval isn't penalized, short enough that a leaked lock
-# doesn't silently wedge the worker for hours (as observed in
-# notebooks/data/validator_A6000_v0.1.38.log).
+# Consecutive iterations that may see `gpu_eval_lock` still held before we
+# drop `_eval_base_model` and re-park for a re-seed. Long enough that a slow
+# eval isn't penalized, short enough that a leaked lock can't wedge the worker
+# for the life of the process.
 DEFAULT_STUCK_LOCK_RECYCLE_THRESHOLD = 3
 
-# Grace period added to the outer `wait_for` deadline. The in-thread
-# `EvalDeadlineExceeded` fires at `now + per_miner_eval_timeout_sec`,
-# but the eval loop only checks between batches — so we let the awaiter
-# wait an extra GRACE seconds for the in-flight batch to drain and the
-# `with lock` block to unwind. If the awaiter still times out, the
-# thread is genuinely stuck and the recycler will catch it.
+# Slack on the outer `wait_for` deadline. The in-thread deadline only fires
+# between batches, so give the in-flight batch time to drain and release the
+# lock; if the awaiter still times out, the thread is stuck and the recycler
+# catches it.
 EVAL_DEADLINE_GRACE_SEC = 30.0
 
-# Backoff delays (seconds) between dataloader build/materialize attempts
-# inside `_load_round_snapshot`. Total budget ~40 s — short enough that
-# the retry loop never bites into the eval window meaningfully (cycle is
-# ~90 min), long enough to absorb transient HF blips of the sort that
-# triggered the lock-leak wedges (single timeout, recovered seconds
-# later). After exhausting retries, fall back to the degraded baseline
-# path so the round still finalizes — just with poorer scoring fidelity
-# rather than indefinite retries.
+# Backoff between dataloader build attempts. Absorbs transient HF blips
+# without eating into the eval window; on exhaustion we fall back to the
+# degraded baseline path so the round still finalizes.
 DATALOADER_BUILD_RETRY_DELAYS_SEC: tuple[float, ...] = (0.0, 10.0, 30.0)
 
 logger = structlog.get_logger(__name__)
@@ -95,25 +85,18 @@ class BackgroundEvalWorker(threading.Thread):
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
         self.stuck_lock_recycle_threshold = stuck_lock_recycle_threshold
-        # Model is handed in by the main loop (see set_eval_base_model)
-        # right after foreground eval completes, instead of being
+        # Handed in by the main loop after foreground eval, rather than
         # re-fetched from chain at startup.
         self._eval_base_model: nn.Module | None = None
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
-        # Round-scoped cache of materialized eval batches. Built once in
-        # `_load_round_snapshot` from the streaming dataloader, then
-        # iterated by every miner's eval this round. Same combined seed
-        # → same batches, so per-miner re-streaming was wasted work AND
-        # the trigger for the HF-stall lock-leak.
+        # Eval batches materialized once per round. Every miner scores on the
+        # same combined seed, so per-miner re-streaming is wasted work and a
+        # source of HF stalls inside the GPU lock.
         self._cached_batches: list | None = None
-        # Stuck-lock detection: incremented every iteration that observes
-        # `gpu_eval_lock` held at the top-of-loop assertion, reset to 0
-        # on any successful (or even attempted) eval iteration. When the
-        # streak crosses `stuck_lock_recycle_threshold`, we drop our
-        # `_eval_base_model` reference and re-park; the next foreground
-        # eval re-seeds us via `set_eval_base_model`.
+        # Consecutive iterations that saw `gpu_eval_lock` held at the top of
+        # the loop; crossing the threshold re-parks the worker for a re-seed.
         self._stuck_lock_streak: int = 0
 
     # ---------------- Public lifecycle ----------------
@@ -147,10 +130,8 @@ class BackgroundEvalWorker(threading.Thread):
 
     # ---------------- Internal ----------------
     async def _loop(self) -> None:
-        # The eval_base_model is handed to us by the main loop via
-        # set_eval_base_model() after foreground eval completes. Until
-        # then we just gate-loop. This avoids duplicating chain fetches
-        # + MoE construction on a separate thread at startup.
+        # Gate-loop until the main loop seeds us, so startup doesn't duplicate
+        # the chain fetch and MoE construction on this thread.
         logger.info(
             "BackgroundEvalWorker: started",
             device=str(self.device),
@@ -163,14 +144,10 @@ class BackgroundEvalWorker(threading.Thread):
         idle_ticks = 0
         try:
             while not self.stop_event.is_set():
-                # Lock-yielding invariant + stuck-lock recycler. If the
-                # lock is held at the iteration boundary by an orphan,
-                # increment the streak; if it persists past the
-                # threshold, drop our `_eval_base_model` and re-park —
-                # the next foreground eval will re-seed us via
-                # `set_eval_base_model`. Without this, a single timeout
-                # whose GPU thread never returns wedges the worker for
-                # the rest of the process's life.
+                # The lock must never be held across an iteration boundary.
+                # If an orphan holds it past the threshold, re-park for a
+                # re-seed — otherwise one timed-out GPU thread wedges the
+                # worker for the life of the process.
                 if self._stuck_lock_check_and_maybe_recycle():
                     # We just recycled. Skip the rest of this iteration
                     # so we re-enter the gate loop and wait for re-seed.
@@ -299,14 +276,9 @@ class BackgroundEvalWorker(threading.Thread):
 
         await asyncio.to_thread(_load)
 
-        # Build the dataloader and pull all batches into RAM up-front.
-        # Both steps are wrapped in to_thread so the event loop stays
-        # free; if HF is unreachable, the build/materialize raises and
-        # we retry with backoff before falling back to an unscored
-        # baseline. Transient HF blips (the trigger for the lock-leak
-        # wedges) typically resolve in seconds; bounded retry keeps the
-        # round in normal scoring mode without dragging it into
-        # degraded mode on the first failed attempt.
+        # Build and materialize on a thread so the event loop stays free. A
+        # bounded retry rides out transient HF failures instead of dropping
+        # straight into degraded (unscored-baseline) mode.
         def _build_and_materialize() -> list:
             dl = get_dataloader(
                 config=self.config,
@@ -382,13 +354,10 @@ class BackgroundEvalWorker(threading.Thread):
         if not round_obj.claim_for_eval(uid):
             return
 
-        # Last-mile check: if Merge fired between the gate poll and the
-        # claim, abort cleanly instead of running a fresh GPU eval
-        # alongside `sync_grad_across_validators` / global optimizer
-        # (the contention pattern that produced the wedge in
-        # validator_A6000_v0.1.38.log at 23:32:43 → 23:37:43). Done
-        # *before* `pop_downloaded` so the path stays on the pool and
-        # the next iteration after the merge clears can pick it up.
+        # Merge may have started between the gate poll and the claim; running
+        # a GPU eval alongside allreduce/optimizer is the contention pattern
+        # that wedges this worker. Checked before `pop_downloaded` so the path
+        # stays in the pool for the next iteration.
         if self.merge_phase_active.is_set():
             logger.info(
                 "bg-eval: aborting claim — merge_phase_active set after gate",
@@ -444,25 +413,16 @@ class BackgroundEvalWorker(threading.Thread):
             timeout_sec=timeout,
         )
 
-        # Run the entire eval inside one threadpool task and acquire
-        # `gpu_eval_lock` INSIDE that thread. This couples lock release
-        # to actual GPU completion (not awaiter cancellation): when
-        # `wait_for` cancels the awaiter on timeout, the threadpool task
-        # keeps running (`asyncio.to_thread` tasks aren't cancellable),
-        # so the lock stays held until GPU work finishes. The next
-        # eval's `to_thread(_run_eval)` call blocks on `gpu_eval_lock`
-        # inside its own thread until the timed-out thread drains —
-        # preventing two concurrent miner-model allocations on a single
-        # GPU (the OOM cascade observed when cancellation released the
-        # lock mid-thread).
+        # `gpu_eval_lock` is acquired INSIDE the thread so its release is
+        # coupled to GPU completion rather than awaiter cancellation:
+        # `asyncio.to_thread` tasks keep running after `wait_for` gives up, and
+        # releasing the lock there would let a second miner model allocate on
+        # the same GPU and cascade into OOM.
         #
-        # To cover the case where the eval genuinely stalls on GPU, we
-        # forward an in-thread deadline to `evaluate_model`, which
-        # raises `EvalDeadlineExceeded` between batches and unwinds the
-        # `with lock:` block cleanly. The outer `wait_for` is given a
-        # small grace window past that deadline so the in-thread check
-        # fires first; if the awaiter still times out, the thread is
-        # wedged and the recycler in `_loop` will catch it.
+        # For a genuine GPU stall, the in-thread deadline forwarded to
+        # `evaluate_model` raises between batches and unwinds `with lock:`
+        # cleanly. The outer `wait_for` gets a grace window so that fires
+        # first; if it still times out, the recycler in `_loop` catches it.
         deadline = time.monotonic() + timeout
         outer_timeout = timeout + EVAL_DEADLINE_GRACE_SEC
 
@@ -489,10 +449,8 @@ class BackgroundEvalWorker(threading.Thread):
                 asyncio.to_thread(_run_eval), timeout=outer_timeout,
             )
         except asyncio.TimeoutError:
-            # In-thread deadline didn't fire in time — thread is wedged
-            # past the grace period. Lock is still held by the orphan;
-            # the recycler will surface this when the streak crosses
-            # the threshold.
+            # Wedged past the grace period; the orphan still holds the lock
+            # and the recycler will surface it.
             logger.warning(
                 "bg-eval: outer wait_for fired — in-thread deadline did not "
                 "unwind in grace period; gpu_eval_lock likely orphaned",
@@ -571,11 +529,9 @@ class BackgroundEvalWorker(threading.Thread):
         if self._stuck_lock_streak < self.stuck_lock_recycle_threshold:
             return False
 
-        # Threshold crossed. Drop our model reference and re-park; the
-        # main loop owns re-seeding via `set_eval_base_model`. We do NOT
-        # touch the lock itself — the orphan thread still holds it and
-        # may eventually release; reaching in to free a `threading.Lock`
-        # we don't own is undefined behavior.
+        # Drop the model reference and re-park; the main loop re-seeds us.
+        # Never touch the lock — freeing a `threading.Lock` this thread does
+        # not own is undefined behavior, and the orphan may still release it.
         logger.error(
             "bg-eval: lock leak — recycling worker state",
             stuck_streak=self._stuck_lock_streak,

@@ -1,11 +1,8 @@
 """Seeded shard-pick + mod-offset for eval-data sampling.
 
-Replaces the older `.shuffle(seed) + .skip(small)` pattern in
-`get_tokenised_dataset` for the validator eval path, which can only
-reach the head ~`shuffle_buffer + skip_max` rows of whichever shard a
-seed permutes to position 0. With ~50 k + 50 k that's the first ~100 k
-rows of each shard — i.e. ~70 % of every C4-en shard is unreachable
-forever regardless of how long the network runs.
+Replaces the older `.shuffle(seed) + .skip(small)` pattern, which could only
+ever reach the head of each shard — leaving most of every source permanently
+unreachable and small enough for a miner to memorize.
 
 The pick scheme decomposes "skip N rows into the dataset" as:
 
@@ -99,44 +96,24 @@ logger = structlog.get_logger(__name__)
 
 # Per-source shard-list filter, revision pin, and offset-bound policy.
 #
-# `path_prefix`/`path_suffix` are matched against the dataset's
-# `siblings.rfilename` list. The pair is intentionally narrow rather
-# than a glob: silent over-matching (e.g. picking up `validation/`
-# files or `noblocklist` variants) would not raise at config time and
-# would only manifest as cross-validator consensus breaks. Keep these
-# explicit per source.
+# `path_prefix`/`path_suffix` match against `siblings.rfilename`. Keep them
+# narrow: over-matching (picking up `validation/` files, say) fails silently at
+# config time and only shows up as a cross-validator consensus break.
 #
-# `revision` pins to a commit SHA when possible. `"main"` is a moving
-# target; using it accepts a small consensus-break risk in exchange
-# for not having to ship a config update every time HF re-uploads.
-# Operators who care should override via `eval_source_revision_pin`
-# in DataCfg.
+# `revision` should pin a commit SHA. `"main"` moves under us and risks the
+# same divergence; operators override via `eval_source_revision_pin`.
 #
-# `row_count_source` selects how the in-shard offset bound is
-# resolved:
-#   - "constant": use `safe_floor_rows` directly. Required for
-#     formats without a footer (json.gz). Lossy by construction —
-#     rows past the floor are unreachable. Validated at module load
-#     against `verified_shard_rows`.
-#   - "parquet_footer": read `num_rows` from the parquet footer at
-#     pick time. Cheap (~32 KB HTTP range). Bound becomes
-#     `actual_rows − min_headroom_rows`.
+# `row_count_source` decides how the in-shard offset bound is resolved:
+#   - "constant": use `safe_floor_rows`. Required for footerless formats
+#     (json.gz); rows past the floor are unreachable by construction.
+#   - "parquet_footer": read `num_rows` from the footer at pick time
+#     (~32 KB range request); bound is `actual_rows - min_headroom_rows`.
 #
-# `safe_floor_rows`: the offset bound for constant-source policies.
-# Must be set strictly less than `min(verified_shard_rows.values())
-# − min_headroom_rows`, enforced at module load.
-#
-# `min_headroom_rows`: rows guaranteed to remain available in the
-# source AFTER the skip lands. Sized for the downstream pipeline's
-# per-round consumption — see `dataloader.py:281` comment:
-# `~max_eval_batches × world_size / vali_fraction ≈ 5 000` total /
-# 2 sources = ~2 500 per source. Default 10 000 gives a 4× safety
-# margin for filter / split / interleave variance and unusual configs.
-#
-# `verified_shard_rows`: empirically-counted row counts for a small
-# spot-check sample of shards (not the full set). Used at module load
-# to validate `safe_floor_rows`, and at runtime as documentation of
-# what the policy was sized against. Empty for footer-based sources.
+# `min_headroom_rows` is what must remain readable after the skip lands, sized
+# against the eval pipeline's per-round consumption with a wide safety margin.
+# `safe_floor_rows` must stay below `min(verified_shard_rows) -
+# min_headroom_rows`; both invariants are enforced at module load against
+# `verified_shard_rows`, a spot-check sample of counted shards.
 @dataclass(frozen=True)
 class _SourceShardPolicy:
     path_prefix: str
@@ -146,20 +123,14 @@ class _SourceShardPolicy:
     safe_floor_rows: int | None = None
     min_headroom_rows: int = 10_000
     verified_shard_rows: dict[str, int] = field(default_factory=dict)
-    # Override for `_SHARD_NAME_FILTER` when a source's data files don't
-    # follow the `train`/`part_` leaf naming convention (e.g.
-    # Multi_Legal_Pile ships `data/<lang>/<type>/<source>.jsonl.xz`).
-    # Only consulted for listing-based policies; `verified_table`
-    # policies take their shard list from the table and skip name
-    # filtering entirely.
+    # Overrides `_SHARD_NAME_FILTER` for sources that don't use the
+    # `train`/`part_` leaf convention. Listing-based policies only;
+    # `verified_table` takes its shard list from the table.
     leaf_name_pattern: str | None = None
-    # When set (e.g. "json"), `load_streaming_shard` loads the shard via
-    # the named generic builder against a resolved `hf_hub_url` instead
-    # of `load_dataset(repo_id, data_files=...)`. Required for repos
-    # that ship a custom loading script: passing the repo id would
-    # execute the script (defeating both the shard pick and the
-    # `trust_remote_code` opt-out), while the generic builder reads the
-    # raw file directly.
+    # Load the shard through this generic builder against a resolved
+    # `hf_hub_url`. Required for repos shipping a loading script, which
+    # `load_dataset(repo_id, ...)` would execute — defeating both the shard
+    # pick and the `trust_remote_code` opt-out.
     load_builder: str | None = None
 
 
@@ -171,16 +142,10 @@ _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
         path_suffix=(".json.gz",),
         revision="main",  # operator-overridable; see DataCfg
         row_count_source="constant",
-        # Empirically all four spot-checked shards (0, 1, 500, 1023)
-        # are 356 317 or 356 318 rows; C4 is publisher-balanced. The
-        # safe floor (340 000) sits ~16 k below the minimum spot-check
-        # and ~6 k above the (safe_floor + headroom) module-load
-        # threshold of 350 000. Coverage loss per shard is
-        # (356 317 − 340 000) / 356 317 ≈ 4.6 %, accepted in exchange
-        # for not enumerating all 1 024 shards. If C4 is ever
-        # re-uploaded with materially different shard sizes,
-        # `verified_shard_rows` MUST be re-spot-checked and the floor
-        # adjusted before flipping the gate on the new revision.
+        # C4 shards are publisher-balanced at ~356 k rows, so a floor of
+        # 340 000 costs ~4.6 % coverage per shard and avoids enumerating all
+        # 1 024 shards. Re-spot-check `verified_shard_rows` and adjust this
+        # floor before pointing at a re-uploaded revision.
         safe_floor_rows=340_000,
         min_headroom_rows=10_000,
         verified_shard_rows={
@@ -200,13 +165,10 @@ _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
         min_headroom_rows=10_000,
     ),
     ("joelniklaus/Multi_Legal_Pile", "all_all"): _SourceShardPolicy(
-        # The repo's NATIVE data files. Deliberately NOT the `all_all`
-        # builder-script mix: the script streams additional files from
-        # external repos (joelito/eurlex_resources, legal-mc4, …) that
-        # can't be pinned or row-counted here, and executing it requires
-        # `trust_remote_code`. The eval pool is therefore a (large)
-        # subset of the miner-training distribution — acceptable: eval ⊆
-        # train, and the native corpus is tens of GB.
+        # Native data files, deliberately not the `all_all` builder script:
+        # it needs `trust_remote_code` and streams external repos that can't
+        # be pinned or row-counted. Eval is therefore a subset of the training
+        # distribution, which is acceptable.
         path_prefix="data/",
         path_suffix=(".jsonl.xz",),
         # Pinned at registration time (2026-07-21). Bump together with a
@@ -214,13 +176,10 @@ _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
         revision="911e1d214162fd11d2c78d3f1428cbfcbe07782c",
         row_count_source="verified_table",
         min_headroom_rows=10_000,
-        # `.jsonl.xz` has no footer — rows counted once offline (full
-        # decompress of every shard at the pinned revision, 2026-07-21)
-        # and frozen here. The table doubles as the allowlist; four
-        # shards with ≤10k rows (denmark_ddsc caselaw 4 442,
-        # en switzerland_lexfind 147, belgium_jurportal 2 221,
-        # it switzerland_lexfind 5 642) are deliberately left out — no
-        # safe offset exists above the headroom floor.
+        # `.jsonl.xz` has no footer, so rows were counted offline at the
+        # pinned revision and frozen here. The table doubles as the allowlist;
+        # shards too small to leave a safe offset above the headroom floor are
+        # deliberately absent.
         load_builder="json",
         verified_shard_rows={
             "data/bg/legislation/bulgaria_marcell.jsonl.xz": 29_549,
@@ -279,10 +238,8 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
             f"Policy {repo_id}/{name}: min_headroom_rows must be > 0"
         )
     if policy.row_count_source == "verified_table":
-        # The table IS the shard allowlist: every listed shard must have
-        # a row count that leaves at least one valid offset after the
-        # headroom is reserved. Shards too small for the eval pipeline's
-        # per-round consumption must be left out of the table, not
+        # The table is the allowlist: every listed shard must leave a valid
+        # offset after headroom. Too-small shards belong out of the table, not
         # zero-bounded at pick time.
         if not policy.verified_shard_rows:
             raise ValueError(
@@ -330,8 +287,7 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
                 )
     elif policy.row_count_source == "parquet_footer":
         if policy.safe_floor_rows is not None:
-            # Not strictly an error — but flag the inconsistency so a
-            # future reader doesn't wonder which value is used.
+            # Not an error, but flag which value wins.
             logger.warning(
                 "Policy has both row_count_source='parquet_footer' and "
                 "safe_floor_rows set; safe_floor_rows will be ignored",
@@ -339,9 +295,8 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
             )
 
 
-# Validate every registered policy at import time. A misconfigured
-# policy reaching production silently is exactly the kind of bug this
-# system is designed to surface.
+# Validate at import: a misconfigured policy reaching production silently is
+# exactly the failure this module exists to prevent.
 for _key, _policy in _KNOWN_SOURCES.items():
     _validate_policy(_key, _policy)
 
@@ -372,10 +327,9 @@ def _resolve_revision(repo_id: str, requested: str) -> str:
     info = api.dataset_info(repo_id, revision=requested)
     sha = getattr(info, "sha", None)
     if not sha:
-        # Fall back to the requested value verbatim. HF older versions
-        # may not expose `sha` consistently — better to ship the request
-        # string than to crash, and operators will see the consensus
-        # divergence loudly via mismatched losses if it bites.
+        # Older HF versions don't always expose `sha`; ship the requested
+        # value rather than crash. Divergence would surface as mismatched
+        # losses.
         logger.warning(
             "HF dataset_info did not expose `sha`; using requested revision verbatim",
             repo_id=repo_id, requested=requested,
@@ -394,11 +348,8 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
     """
     policy = _policy_for(repo_id, name)
     if policy.row_count_source == "verified_table":
-        # The frozen table doubles as the shard allowlist. Listing from
-        # the HF API here would re-introduce the consensus hazard the
-        # table exists to remove (a re-uploaded repo changing the list
-        # under our feet); the pinned revision + table are the source
-        # of truth.
+        # The frozen table is the allowlist. Listing from the HF API here
+        # would reintroduce the consensus hazard it exists to remove.
         return tuple(sorted(policy.verified_shard_rows))
     info = HfApi().dataset_info(repo_id, revision=revision)
     name_filter = (
@@ -413,10 +364,8 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
             continue
         if not rf.endswith(policy.path_suffix):
             continue
-        # Final-segment shape check guards against accidentally pulling
-        # in unrelated files that happen to share the prefix/suffix
-        # (e.g. metadata, sidecar files). The "train" / "part_" check
-        # is per-source-format and intentionally narrow.
+        # Guards against sidecar/metadata files that share the prefix and
+        # suffix. Intentionally narrow, per source format.
         leaf = rf.split("/")[-1]
         if not name_filter.search(leaf):
             continue
@@ -432,8 +381,7 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
 
 def _shard_rows_via_parquet_footer(repo_id: str, revision: str, shard_path: str) -> int:
     """Read num_rows from the parquet footer without downloading the full file."""
-    # Lazy import — pyarrow is already a dependency of `datasets` but
-    # importing it eagerly at module top-level slows test imports.
+    # Lazy: eager pyarrow import slows test collection.
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
 
@@ -572,10 +520,9 @@ def pick_shard_for_source(
         h256_int("eval_in_shard_offset", repo_id, str(name), int_seed) % offset_bound
     )
 
-    # For constant policies we don't know the actual shard size;
-    # surface `offset_bound` as `shard_rows` so older callers (notebook
-    # / tests) that check "offset < shard_rows" still see the right
-    # invariant. The parquet and verified-table paths know the real count.
+    # Constant policies don't know the real shard size, so report the bound as
+    # `shard_rows` — callers asserting `offset < shard_rows` still see a
+    # correct invariant.
     if policy.row_count_source in {"parquet_footer", "verified_table"}:
         actual_shard_rows = offset_bound + policy.min_headroom_rows
     else:
@@ -610,17 +557,13 @@ def load_streaming_shard(
     Equivalence with the canonical load path must be verified per
     source before flipping the feature flag for production.
     """
-    # Lazy: `datasets` is already imported by the caller side, but
-    # keeping this module importable without the full datasets stack
-    # helps unit tests.
+    # Lazy, so this module stays importable without the datasets stack.
     from datasets import load_dataset
 
     if pick.load_builder:
-        # Script-bypass path: the repo ships a custom loading script, so
-        # `load_dataset(repo_id, ...)` would execute it (and for
-        # Multi_Legal_Pile, stream entirely different files from external
-        # repos). Loading the raw file through a generic builder reads
-        # exactly the picked shard and needs no `trust_remote_code`.
+        # The repo ships a loading script that `load_dataset(repo_id, ...)`
+        # would execute, streaming different files entirely. A generic builder
+        # reads exactly the picked shard and needs no `trust_remote_code`.
         from huggingface_hub import hf_hub_url
 
         url = hf_hub_url(

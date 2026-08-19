@@ -4,7 +4,6 @@ import hivemind
 import bittensor
 from pathlib import Path
 
-from connito.shared.helper import public_multiaddrs
 from connito.validator.inter_validator_connection import HotkeyAuthorizer
 from connito.shared.config import OwnerConfig, parse_args
 from connito.shared.app_logging import configure_logging, structlog

@@ -307,13 +307,9 @@ def save_state_dict_by_expert_group(
             samples=skipped_experts_samples,
         )
 
-    # Save the groups. Format is `.safetensors` — the validator's download
-    # path tries `.safetensors` before `.pt` (PR #98), so this is the
-    # preferred format for new uploads. `.safetensors` has no pickle code
-    # path, so a corrupt or malicious checkpoint can't execute code on the
-    # validator host. The on-chain `model_hash` is computed from the
-    # in-memory state_dict (see `get_model_hash` / `serialize_torch_model_path`),
-    # so it's identical regardless of file format — no chain commit changes.
+    # `.safetensors` has no pickle path, so a malicious checkpoint can't
+    # execute code on the validator host. The on-chain `model_hash` comes from
+    # the in-memory state_dict, so it is unaffected by the file format.
     from safetensors.torch import save_file
     paths = {}
     for gid, sd in grouped_state.items():
@@ -567,13 +563,10 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
                 logger.debug("skipping checkpoint file", path=f, expert_groups=expert_groups)
                 continue
 
-            # Dispatch on suffix: `.safetensors` shards are flat tensor dicts
-            # (no `{"model_state_dict": ...}` wrapper, no `loss` key); `.pt`
-            # shards retain the legacy wrapped format saved by older miner
-            # versions. `load_state_dict_from_path` already handles both for
-            # the single-file branch above; here we replicate the suffix
-            # logic inline because we need to keep the open-file handle from
-            # `fsspec.open_files`.
+            # `.safetensors` shards are flat tensor dicts; `.pt` shards keep
+            # the legacy `{"model_state_dict": ...}` wrapper. Duplicated from
+            # `load_state_dict_from_path` because we need to keep the
+            # `fsspec.open_files` handle.
             suffix = Path(f.path).suffix.lower()
             if suffix == ".safetensors":
                 from safetensors.torch import load_file

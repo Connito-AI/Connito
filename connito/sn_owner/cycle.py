@@ -89,7 +89,6 @@ class PhaseManager:
         start = 0
         for phase in self.phases:
             phase_start = start  # phase start within the cycle [0..cycle_len)
-            phase_end = start + phase["length"] - 1
 
             if phase_start >= cycle_block_index:
                 # Phase still ahead in *this* cycle

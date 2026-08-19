@@ -244,12 +244,9 @@ def _partition_pool(
         max_miners_per_validator=max_per_validator,
     )
     my_slice = assignment.get(my_hotkey, [])
-    # `assign_miners_to_validators` treats `max_miners_per_validator` as a
-    # soft cap — overflow miners that exceed total capacity get pushed to
-    # `prefs[-1]`, which can put a validator over the cap. The round-group
-    # scheme wants a hard cap (it bounds this validator's eval budget), so
-    # truncate here. The slice order is deterministic from the seeded
-    # distribution, so the truncation is stable across runs.
+    # `assign_miners_to_validators` treats the cap as soft — overflow lands on
+    # `prefs[-1]` and can exceed it. This scheme needs a hard cap to bound the
+    # eval budget; the seeded slice order makes the truncation deterministic.
     if max_per_validator is not None and len(my_slice) > max_per_validator:
         my_slice = my_slice[:max_per_validator]
     return tuple(

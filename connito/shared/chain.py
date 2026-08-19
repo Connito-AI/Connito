@@ -5,7 +5,6 @@ import json
 import math
 import threading
 import time
-from typing import Literal
 
 import bittensor
 try:
@@ -266,12 +265,10 @@ def get_chain_commits(
     block: int | None = None,
     signature_commit: bool = False,
 ) -> tuple[WorkerChainCommit, bittensor.Neuron]:
-    # Retry transient upstream-node errors (e.g. SubstrateRequestException
-    # "Internal error" from get_chain_head, WS disconnects, timeouts). Without
-    # this, a single bad RPC response at Round.freeze kills the validator.
-    # The "State discarded" branch is a one-shot fallback to head when the
-    # archive node has pruned the requested historical block — it's tracked
-    # separately so it doesn't burn retry budget.
+    # Retry transient upstream errors; one bad RPC at Round.freeze would
+    # otherwise kill the validator. "State discarded" (archive node pruned the
+    # requested block) is a one-shot fallback to head, tracked separately so it
+    # doesn't burn retry budget.
     max_retries = _CHAIN_READ_MAX_RETRIES
     backoff_s = _CHAIN_READ_BACKOFF_S
     fetch_block = block

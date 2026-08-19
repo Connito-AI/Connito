@@ -203,7 +203,7 @@ def get_status(
                 param_norm = p.grad.detach().data.norm(2)
                 total_norm += param_norm.item() ** 2
         metrics["grad_norm"] = total_norm ** 0.5
-    except Exception as e:
+    except Exception:
         pass
         
     return metrics
