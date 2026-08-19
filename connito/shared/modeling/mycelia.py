@@ -4,6 +4,7 @@ import logging
 import warnings
 from collections import OrderedDict
 import gc
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -160,6 +161,7 @@ def get_base_model(
     model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
     topk = config.moe.partial_topk if partial else config.moe.full_topk
+    model_path = config.model.model_path.lower()
     
     moe_config = get_moe_model_config(
         config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = not partial,

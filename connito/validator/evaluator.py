@@ -4,6 +4,7 @@ import asyncio
 import copy
 import gc
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -679,7 +680,7 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
             expert_in_base_not_common=len(expert_in_base_not_common),
         )
 
-    model.load_state_dict(sd, strict=False)
+    incompatible = model.load_state_dict(sd, strict=False)
 
     return model.to(device)
 

@@ -15,6 +15,8 @@ dedicated 93xxxx range to avoid colliding with other test modules.
 """
 from __future__ import annotations
 
+import threading
+
 from connito.shared import telemetry as T
 from connito.validator.round import Round
 

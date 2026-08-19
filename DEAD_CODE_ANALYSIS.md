@@ -1,18 +1,22 @@
-# Dead code and comment cleanup
+# Dead code analysis and comment cleanup
 
-Scope: `connito/`, `expert_groups/`, `observability/`. Behaviour-preserving
-except where noted under "Dead code removed" — nothing was refactored, renamed,
-or re-typed.
+Scope: `connito/`, `expert_groups/`, `observability/`.
 
-Totals: 46 files, +708 / −1988 lines. Comments in changed files: 3282 → 2248
-(−32%).
+**This change is comment/docstring-only.** The dead code catalogued below was
+found and is reported here, but deliberately left in place at the repo owner's
+direction. Verified: every one of the 37 modified `.py` files is AST-identical
+to `master` with docstrings blanked — no executable code changed.
+
+Totals: 38 files, +923 / −1815 lines. Comments in changed files: 3056 → 2025
+(−34%).
 
 Verification:
-- `ruff check` (0.6.3, repo config): 466 → 393 findings, **zero new**, compared
-  rule-by-rule against a `master` worktree.
+- AST-equivalence check (docstrings blanked) against `master` for all 37
+  modified Python files: **37/37 comment/docstring-only**.
+- `ruff check` (0.6.3, repo config): 466 → 447 findings, **zero new**, compared
+  rule-by-rule against a `master` worktree. The 19-finding drop is trailing
+  whitespace and over-length lines carried by deleted comments.
 - `python -m compileall` clean over the whole tree.
-- AST-equivalence check (docstrings blanked) against `master` for the
-  comment-only portion of the change.
 - **Tests were not run.** The repo's `.con-venv` is unusable — its base
   interpreter `/usr/bin/python3.12` no longer exists on this host (system Python
   is 3.14) and the dependencies are not installed outside it. `pytest` needs a
@@ -20,52 +24,64 @@ Verification:
 
 ---
 
-## Dead code removed
+## Dead code found — NOT removed
+
+Catalogued for a future decision. Nothing in this section was deleted.
 
 ### Functions and classes with no callers
 
 Verified by cross-referencing every identifier against all `.py`, `.ipynb`,
-`.md`, `.yaml` and `.json` files in the repo.
+`.md`, `.yaml` and `.json` files in the repo, so notebook and doc references
+count as uses.
 
-| Symbol | File | Why it is dead |
+| Symbol | File | Status |
 |---|---|---|
-| `_cuda_mem_report` | `validator/run.py` | Never called, **and calls an undefined `log_phase`** — it would have raised `NameError` on the first call. |
+| `_cuda_mem_report` | `validator/run.py` | No callers, **and calls an undefined `log_phase`** — it would raise `NameError` on the first call. Currently unreachable, so the bug is latent. |
 | `PhaseResponseLite` | `shared/cycle.py` | Superseded by `PhaseResponse`. |
 | `search_model_submission_destination` | `shared/cycle.py` | Resolved a validator axon for the HTTP submission path, removed in the HF-only migration. |
 | `SignedModelSubmitMessage` | `shared/schema.py` | Never constructed. |
 | `_normalize_hash`, `_hash_bytes` | `shared/checkpoints.py` | Private helpers, no callers. |
 | `hex_to_byte` | `shared/helper.py` | One-line wrapper over `bytes.fromhex`. |
-| `names_for_expert`, `iter_named_grads` | `validator/inter_validator_connection.py` | No callers (`iter_named_params`, which they sit beside, is used). |
+| `names_for_expert`, `iter_named_grads` | `validator/inter_validator_connection.py` | No callers. `iter_named_params`, which sits between them, is used. |
 
-### Unused imports and duplicate imports
+`shared/chain.py:validate_miner_chain_commit_payload` is also unused in-repo but
+is explicitly documented as a back-compat wrapper for external importers, so it
+is not a candidate.
 
-42 removed across 23 files via `ruff --select F401,F811 --fix`. Checked first
-that none were re-exported: no other module imports any of them from the module
-that held them. Includes two genuine duplicate imports
-(`checkpoints.get_layer_expert_id`, `inter_validator_connection.dataclass`).
+### Unused and duplicate imports
+
+42 across 23 files (`ruff --select F401,F811`). None is re-exported: no other
+module imports any of them from the module that holds them, so all 42 are safe
+to drop whenever that is wanted. Two are genuine duplicate imports —
+`checkpoints.get_layer_expert_id` and `inter_validator_connection.dataclass`.
 
 ### Unused local variables
 
-- **`miner/train.py`** — a per-step diagnostic block (`grad_total`,
-  `sample_grads`, `p_norm`, `grad_norm`) whose results were computed and never
-  read. This is the only removal with a runtime effect: it drops a
-  `sum_model_gradients()` walk and up to five `.norm().item()` GPU syncs per
-  training step. No observable output changes.
-- **`shared/model.py`** `is_3d_expert_block`, **`modeling/mycelia.py`**
-  `model_path`, **`sn_owner/cycle.py`** `phase_end`, **`shared/cycle.py`**
-  `reason` — computed, never read.
-- **`validator/evaluator.py`** — dropped the unused binding from
-  `incompatible = model.load_state_dict(...)`; the call itself is kept.
-- **`miner/train_helper.py`** — `except Exception as e: pass` → `except Exception:`.
+- **`miner/train.py`** — a per-step diagnostic block computes `grad_total`,
+  `sample_grads`, `p_norm` and `grad_norm` and never reads any of them. This one
+  costs measurable runtime: a `sum_model_gradients()` walk over every parameter
+  plus up to five `.norm().item()` GPU syncs, **on every training step**.
+  Removing it would be the only dead-code deletion with a performance effect.
+- **`shared/model.py`** `is_3d_expert_block` (and with it the only use of
+  `import re`), **`modeling/mycelia.py`** `model_path`, **`sn_owner/cycle.py`**
+  `phase_end`, **`shared/cycle.py`** `reason` — computed, never read.
+- **`validator/evaluator.py`** — `incompatible = model.load_state_dict(...)`.
+  The call has essential side effects; only the binding is unused.
+- **`miner/train_helper.py`** — `except Exception as e: pass`.
+- Six more in `connito/test/`.
 
 ### Commented-out code
 
-~330 lines. The largest blocks: a dead `ModelCheckpoint` class and four dead
-checkpoint helpers in `shared/checkpoint_helper.py` (all have live
-implementations in `shared/checkpoints.py`), a superseded `load_model_from_path`
-in `validator/evaluator.py`, a `broadcast_weights` stub in
-`shared/expert_manager.py`, and commented-out `torch.distributed` calls,
-debug prints and superseded assignments in `miner/train.py`.
+~330 lines **were removed**, as the original brief explicitly asked for. The
+largest blocks: a dead `ModelCheckpoint` class and four dead checkpoint helpers
+in `shared/checkpoint_helper.py` (all have live implementations in
+`shared/checkpoints.py`), a superseded `load_model_from_path` in
+`validator/evaluator.py`, a `broadcast_weights` stub in
+`shared/expert_manager.py`, and commented-out `torch.distributed` calls, debug
+prints and superseded assignments in `miner/train.py`.
+
+Two commented-out lines in `miner/train.py` were deliberately kept — see
+"Deliberately not removed".
 
 ---
 
@@ -129,7 +145,7 @@ restated the `logger.debug` on the next line (`# === optimizers ===` above
 | `# llm_weightnet/shared/logging.py` file header | Wrong package name. |
 | `# Module-level logger you can import directly` above `structlog.configure_once(...)` | It is configuration, not a logger. |
 | "category (2)", "PR 3", `# === Comit to chain ===`, `benchamrk`, `trian`, `vlaidators`, `COMISSION`, `mocated` | Dangling references and typos. |
-| `_specs/background-submission-validation.md`, `_specs/round-group-construction-scheme.md` (6 sites) | Not in this repo; retargeted to `docs/validator-round-construction.md` and `docs/miner-validation-group-promotion.md`. **See "Needs a decision" below.** |
+| `_specs/background-submission-validation.md`, `_specs/round-group-construction-scheme.md` (6 sites) | Not in this repo; retargeted to `docs/validator-round-construction.md` and `docs/miner-validation-group-promotion.md`. **See "Needs a decision".** |
 
 ### Invariants deliberately preserved
 
@@ -163,25 +179,18 @@ Compressed but never dropped:
   produced real wedges and cannot be shortened without losing the mechanism.
 - `expert_groups/*/dataset.py` "Customer Extension Point" headers — these are
   operator-facing documentation of a supported extension point.
-- `shared/chain.py` back-compat wrapper note (see below).
 
 ---
 
 ## Deliberately not removed
 
-- **`shared/chain.py:validate_miner_chain_commit_payload`** — unused in-repo,
-  but explicitly documented as a back-compat wrapper for external importers.
-  Removing it would break the documented contract; left alone.
+- **All dead code listed above**, per instruction.
 - **`miner/train.py:398`** — `aux_loss = torch.tensor(0.0)` with the real
   `outputs.aux_loss` computation commented out directly above. The commented
-  line is the only explanation for why the MoE aux loss is hard-zeroed, so it
-  was kept rather than deleted. Needs a decision (below).
+  line is the only explanation for why the MoE aux loss is hard-zeroed.
 - **`miner/train.py:477`** — `# dist.all_reduce(p.grad, ...)` above a bare
   `p.grad.div_(world_size)`. Same reasoning: dividing by `world_size` with no
   all-reduce looks wrong, and the commented line is the only context for it.
-- **Unused locals in `connito/test/`** (6 of them) — left alone; tests were
-  otherwise untouched apart from the two `_specs/` pointers and ruff's import
-  fixes.
 
 ---
 
@@ -205,16 +214,15 @@ Compressed but never dropped:
    "lower val_loss = better", which is not what the value is. The comments are
    now factually neutral; the ordering itself is untouched.
 
-4. **Two `logger.info("reached barrier, ...")` calls in `miner/train.py`** now
-   log a barrier that does not exist — the `dist.barrier` they described was
+4. **Two `logger.info("reached barrier, ...")` calls in `miner/train.py`** log a
+   barrier that does not exist — the `dist.barrier` they described was
    commented-out code and was removed. Changing log strings is out of scope for
-   this pass.
+   a comment pass.
 
 5. **`shared/cycle.py:33`** — `dict[str, "ChainCheckpoint"]` is a forward
    reference with no import (ruff F821, pre-existing). Harmless at runtime under
    `from __future__ import annotations`, but `get_type_hints()` on
-   `ValidatorMinerAssignment` would fail. A `TYPE_CHECKING` import fixes it; not
-   done here because it is neither dead code nor a comment.
+   `ValidatorMinerAssignment` would fail.
 
 6. **`pyproject.toml` is partly stale** (not touched by this pass):
    `[project.scripts]` points at `connito.miner.cli` / `connito.validator.cli`,

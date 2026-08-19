@@ -1,5 +1,6 @@
 import time
 import requests
+import threading
 
 from connito.shared.telemetry import (
     TelemetryManager,

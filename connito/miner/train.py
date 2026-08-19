@@ -420,6 +420,16 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 inner_scaler.scale(loss).backward()
 
+                grad_total = sum_model_gradients(model)
+                sample_grads = []
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        p_norm = param.norm().item()
+                        grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+                        sample_grads.append((name, grad_norm, p_norm))
+                        if len(sample_grads) >= 5:
+                            break
+
                 del loss, aux_loss, batch_device, outputs
                 gc.collect()
 

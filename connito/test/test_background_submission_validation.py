@@ -7,6 +7,7 @@ and HF; everything else is exercised against the real classes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import threading
@@ -76,7 +77,7 @@ _install_stub_if_unavailable(
 )
 
 from connito.validator.aggregator import MinerScoreAggregator, MinerSeries  # noqa: E402
-from connito.validator.round import Round, RoundRef  # noqa: E402
+from connito.validator.round import Round, RosterEntry, RoundRef  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

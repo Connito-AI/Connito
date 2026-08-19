@@ -29,7 +29,7 @@ from unittest.mock import patch
 import pytest
 
 from connito.shared.chain import ValidatorChainCommit
-from connito.shared.cycle import get_combined_validator_seed
+from connito.shared.cycle import PhaseNames, get_combined_validator_seed
 
 
 # A stable, made-up block hash for tests. Real block hashes are

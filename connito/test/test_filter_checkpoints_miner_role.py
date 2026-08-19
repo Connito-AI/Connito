@@ -20,6 +20,8 @@ unchanged.
 """
 from __future__ import annotations
 
+import pytest
+
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
 
 

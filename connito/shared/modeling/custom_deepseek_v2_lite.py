@@ -13,6 +13,7 @@ from transformers import (
 from transformers.utils import (
     SAFE_WEIGHTS_INDEX_NAME,
     SAFE_WEIGHTS_NAME,
+    WEIGHTS_NAME,
     cached_file,
 )
 # transformers 4.x compatibility: neither `DeepseekV2Experts` nor the v5 MoE

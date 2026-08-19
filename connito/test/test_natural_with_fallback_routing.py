@@ -20,6 +20,8 @@ Or:  python -m connito.test.test_natural_with_fallback_routing
 """
 from __future__ import annotations
 
+import types
+
 import torch
 
 
