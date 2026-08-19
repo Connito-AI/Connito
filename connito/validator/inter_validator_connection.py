@@ -1,13 +1,11 @@
 # --- Authorizer --- 
-import fnmatch
-import os
 import secrets
 import time
 from dataclasses import dataclass
 from datetime import timedelta
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Set
+from typing import Any, Optional, Sequence
 import threading
 
 import bittensor as bt
@@ -17,15 +15,13 @@ import torch.nn as nn
 from hivemind.averaging import DecentralizedAverager
 from hivemind.utils.auth import AuthorizedRequestBase, AuthorizedResponseBase
 from hivemind.utils.crypto import RSAPublicKey
-from hivemind.utils.timed_storage import TimedStorage, get_dht_time
+from hivemind.utils.timed_storage import get_dht_time
 from connito.shared.cycle import get_init_peer_id, get_validator_whitelist_from_api
 from connito.shared.app_logging import structlog
 from connito.shared.config import ValidatorConfig
 from connito.shared.expert_manager import get_layer_expert_id
 from connito.shared.schema import sign_message, verify_message
-import traceback
 from bittensor.core.async_subtensor import AsyncSubtensor
-import asyncio
 import multiprocessing as mp
 import queue
 
@@ -121,48 +117,12 @@ def connect_with_peers(config, wallet, subtensor: bt.Subtensor, max_retry: int =
         logger.info("DHT bootstrap complete", visible_peers=visible_addrs)
     return dht
 
-# --- expert group selection helpers ---
-def names_for_expert(
-    model: nn.Module, eid, expert_name_fmt: str, include_buffers: bool
-) -> list[tuple[str, torch.Tensor]]:
-    """Collect all tensors whose names start with the expert module prefix."""
-    prefix = expert_name_fmt.format(eid=eid)
-    out = []
-    for name, tensor in iter_named_params(model):
-        if name.startswith(prefix + ".") or name == prefix:
-            out.append((name, tensor))
-    return out
-
-
 def iter_named_params(model: nn.Module):
     """
     Yield (name, parameter) for model parameters without allocating gradients.
     """
     for n, p in model.named_parameters():
         yield n, p
-
-
-def iter_named_grads(model: nn.Module):
-    """
-    Yield (name, grad_tensor) for all model parameters that have gradients.
-    """
-    for n, p in model.named_parameters():
-        yield n, p.grad
-
-
-def name_selected(name, include_globs, exclude_globs):
-    inc_ok = (not include_globs) or any(fnmatch.fnmatch(name, pat) for pat in include_globs)
-    exc_ok = not any(fnmatch.fnmatch(name, pat) for pat in exclude_globs)
-    return inc_ok and exc_ok
-
-
-def select_tensors(model, include_globs=(), exclude_globs=()):
-    # deterministic order across peers: sort by name!
-    chosen = []
-    for name, tensor in sorted(iter_named_params(model), key=lambda kv: kv[0]):
-        if name_selected(name, include_globs, exclude_globs):
-            chosen.append(tensor)
-    return chosen
 
 
 # --- packaging gradient buff ---

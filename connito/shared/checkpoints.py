@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import time
-from collections import Counter
 from functools import total_ordering
 from pathlib import Path
 from typing import Any
@@ -28,38 +26,15 @@ from connito.shared.cycle import (
     get_phase_from_api,
     wait_till,
 )
-from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
+from connito.shared.config import WorkerConfig
 from connito.shared.chain import (
     SignedModelHashChainCommit,
     WorkerChainCommit,
     get_chain_commits,
 )
-from connito.shared.expert_manager import (
-    ExpertManager,
-    get_layer_expert_id,
-    ExpertAssignments
-)
+from connito.shared.expert_manager import get_layer_expert_id, ExpertAssignments
 
 logger = structlog.get_logger(__name__)
-
-
-def _normalize_hash(value: str | bytes | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value.hex()
-    if isinstance(value, str):
-        return value.lower()
-    return str(value).lower()
-
-
-def _hash_bytes(value: str | bytes) -> bytes:
-    if isinstance(value, bytes):
-        return value
-    try:
-        return bytes.fromhex(value)
-    except ValueError:
-        return value.encode()
 
 
 @total_ordering

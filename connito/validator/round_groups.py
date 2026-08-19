@@ -636,15 +636,6 @@ def split_foreground_background(
     return foreground, tuple(background_list)
 
 
-def split_validation_uids_into_foreground(
-    state: "CohortState",
-) -> tuple[int, ...]:
-    """Deprecated: returns the flat A→B→C concatenation used in earlier
-    drafts. New callers should use `split_foreground_background`.
-    """
-    return tuple([*state.validation_group_a, *state.validation_group_b, *state.validation_group_c])
-
-
 def compute_uid_weights(
     *,
     weight_group_1: tuple[int, ...],

@@ -4,7 +4,6 @@ import asyncio
 import copy
 import gc
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -700,10 +699,6 @@ class MinerEvalJob:
     val_loss: float | None = None
 
 
-# -------------------------- Pipeline Config -----------------------------------
-MAX_CONCURRENT_DOWNLOADS = 4
-EVAL_WORKERS = 1
-DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
 # ------------------------------------------------------------------------------
 

@@ -1,67 +1,8 @@
 import base64
-from dataclasses import asdict, dataclass
-from pathlib import Path
 
 import bittensor as bt
 from bittensor import Keypair
 
-from connito.shared.checkpoint_helper import compile_full_state_dict_from_path
-from connito.shared.helper import get_model_hash
-
-
-@dataclass
-class SignedMessage:
-    target_hotkey_ss58: str
-    origin_hotkey_ss58: str
-    origin_block: int
-    signature: str  # hex string or raw bytes
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict):
-        return cls(**d)
-
-
-@dataclass
-class SignedDownloadRequestMessage(SignedMessage):
-    expert_group_id: int | str | None = None
-
-
-@dataclass()
-class SignedModelSubmitMessage(SignedMessage):
-    model_hex: str
-    block_hex: str
-
-
-def construct_model_message(model_path: str | Path, expert_groups: list[int | str] | None = None) -> bytes:
-    """
-    Sign:
-        model_hash(32 bytes) || construct_block_message(...)
-    """
-    # 1. Get model hash
-    model_hash = get_model_hash(compile_full_state_dict_from_path(model_path))
-
-    return model_hash
-
-
-def construct_block_message(target_hotkey_ss58: str, block: int) -> bytes:
-    """
-    Construct message: pubkey(32 bytes) || block(u64 big-endian)
-    """
-    # Convert SS58 → raw 32-byte pubkey
-    target_kp = bt.Keypair(ss58_address=target_hotkey_ss58)
-    pubkey_bytes = target_kp.public_key
-
-    if len(pubkey_bytes) != 32:
-        raise ValueError("Public key must be 32 bytes!")
-
-    # Convert block → 8 bytes big-endian
-    block_bytes = block.to_bytes(8, "big")
-
-    # Final message
-    return pubkey_bytes + block_bytes
 
 
 def b64url_decode_nopad(s: str) -> bytes:
