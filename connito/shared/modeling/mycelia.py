@@ -340,7 +340,6 @@ def get_base_tokenizer(config: MinerConfig | ValidatorConfig):
     """
 
     tokenizer = AutoTokenizer.from_pretrained(config.model.model_path, use_fast=True)
-    # tokenizer.pad_token = "</s>"
     return tokenizer
 
 
@@ -373,15 +372,12 @@ def merge_state_dicts_with_priority(
             if k not in merged:
                 merged[k] = v
 
-    # If no model provided, return as is
     if model is None:
         return merged, None
 
-    # Filter out unexpected keys
     model_keys = set(model.state_dict().keys())
     cleaned = OrderedDict((k, v) for k, v in merged.items() if k in model_keys)
 
-    # Compute missing keys
     missing_keys = sorted(model_keys - set(cleaned.keys()))
 
     return cleaned, missing_keys

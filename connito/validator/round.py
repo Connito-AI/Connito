@@ -1,5 +1,5 @@
-"""Per-round state for the lifecycle (0)..(4) defined in
-`_specs/background-submission-validation.md`.
+"""Per-round state for the lifecycle (0)..(4); see
+`docs/validator-round-construction.md`.
 
 A `Round` is constructed once, at the start of each Submission phase
 (step 0), and is immutable thereafter. The foreground pass and the two
@@ -111,7 +111,7 @@ class Round:
     # `config.evaluation.enable_round_group_construction`). All default
     # to `()` / 0 so the legacy code path leaves them empty and downstream
     # consumers can branch on `bool(weight_group_1)` without a separate
-    # feature-flag check. Wired in PR 3.
+    # feature-flag check.
     weight_group_1: tuple[int, ...] = ()
     weight_group_2: tuple[int, ...] = ()
     validation_group_a: tuple[int, ...] = ()
@@ -317,8 +317,8 @@ class Round:
             uids=list(stale_tail),
         )
 
-        # Round-group construction overlay (spec:
-        # _specs/round-group-construction-scheme.md). When enabled, the
+        # Round-group construction overlay (see
+        # docs/miner-validation-group-promotion.md). When enabled, the
         # cohort advances at every 8th cycle, and the validation roster
         # for this round is replaced by Group A + B + C in that order.
         # The legacy foreground/background just-computed above is the

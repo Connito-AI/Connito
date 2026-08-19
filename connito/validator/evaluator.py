@@ -658,11 +658,6 @@ DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
 # ------------------------------------------------------------------------------
 
-# def load_model_from_path(path: str, base_model, device: torch.device) -> nn.Module:
-#     sd = torch.load(path, map_location=torch.device("cpu"))["model_state_dict"]
-#     model = copy.deepcopy(base_model)
-#     model.load_state_dict(sd, strict=False)
-#     return model.to(device)
 
 @track_model_load_latency()
 def load_model_from_path(path: str, base_model: nn.Module, device: torch.device) -> nn.Module:
@@ -677,20 +672,13 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
 
     model = copy.deepcopy(base_model)
 
-    # Keys in each state_dict (before loading)
     base_sd = base_model.state_dict()
     base_keys = set(base_sd.keys())
     ckpt_keys = set(sd.keys())
 
-    # 1) Params that are the same across both dicts (intersection).
-    #    (Optional: filter to ones with matching shapes too.)
     common_keys = base_keys & ckpt_keys
     common_same_shape = {k for k in common_keys if base_sd[k].shape == sd[k].shape}
-
-    # 2) Keys containing 'expert' that exist in the checkpoint but NOT in the base model
     expert_not_in_base = {k for k in ckpt_keys - base_keys if "expert" in k}
-
-    # 3) "expert" keys in base_model but NOT in checkpoint/common_keys
     expert_in_base_not_common = {k for k in (base_keys - common_keys) if "expert" in k}
 
     if len(common_same_shape) == 0:
@@ -724,14 +712,7 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
             expert_in_base_not_common=len(expert_in_base_not_common),
         )
 
-    # Load weights (strict=False so missing/unexpected are allowed)
     incompatible = model.load_state_dict(sd, strict=False)
-
-    # # Extra helpful debug (optional)
-    # if incompatible.missing_keys:
-    #     print(f"[load_model] missing keys (first 50): {incompatible.missing_keys[:50]}")
-    # if incompatible.unexpected_keys:
-    #     print(f"[load_model] unexpected keys (first 50): {incompatible.unexpected_keys[:50]}")
 
     return model.to(device)
 
@@ -1047,13 +1028,10 @@ async def evaluate_foreground_round(
         torch.cuda.empty_cache()
 
     # Publish to Prometheus so external aggregators can derive
-    # `delta_loss = max(0, baseline - val_loss)` per miner. Best-effort
-    # — Prometheus exposition is purely an observability side-effect
-    # and must never block scoring.
-    # Publishes both the unlabeled gauge (backward compat) and the per-round
-    # labeled family so the gateway can attribute this baseline to the exact
-    # round; the labeled series is evicted on the same cutoff as the other
-    # per-round families. Best-effort — never blocks scoring.
+    # `delta_loss = max(0, baseline - val_loss)` per miner. Emits both the
+    # unlabeled gauge (backward compat) and the per-round labeled family, which
+    # is evicted on the same cutoff as the other per-round families.
+    # Best-effort — telemetry must never block scoring.
     set_baseline_loss(round_obj.round_id, baseline_loss)
 
     foreground_set = set(round_obj.foreground_uids)

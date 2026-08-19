@@ -1,7 +1,7 @@
 """Tests for the background submission validation lifecycle.
 
 Mirrors the (0)..(4) lifecycle described in
-`_specs/background-submission-validation.md`. Uses mocks for bittensor
+`docs/validator-round-construction.md`. Uses mocks for bittensor
 and HF; everything else is exercised against the real classes.
 """
 

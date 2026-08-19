@@ -554,20 +554,19 @@ def get_dataloader(
         world_size=world_size,
         train=train,
         seed=seed,  # e.g. combined validator seed
-        fraction=config.task.exp.data.vali_fraction,  # use ~20% of the dataset
+        fraction=config.task.exp.data.vali_fraction,
     )
 
     # Collator for causal LM (no MLM)
     if data_collator is None:
         data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Build loader
     num_workers = int(getattr(config.task.exp.data, "num_workers", 1))
     if num_workers < 0:
         num_workers = 0
 
     loader = StatefulDataLoader(
-        tokenised_dataset,  # split
+        tokenised_dataset,
         collate_fn=data_collator,
         batch_size=config.task.exp.data.per_device_train_batch_size,
         num_workers=num_workers,

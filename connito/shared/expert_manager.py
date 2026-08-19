@@ -216,7 +216,6 @@ class ExpertManager:
                     f"group_id in its config.yaml before using it as a trainable task."
                 )
 
-            # Load raw JSON assignment
             with open(task_folder / "expert_assignment.json", encoding="utf-8") as f:
                 raw_assignment = json.load(f)
 
@@ -229,7 +228,6 @@ class ExpertManager:
                 mappings: list[ExpertMapping] = [tuple(pair) for pair in pair_list]
                 layer_assignments[layer_id] = mappings
 
-            # Map this task's expert_group_id -> its layer assignments
             if expert_config.group_id in expert_assignments:
                 logger.warning(
                     "Duplicate expert group id while loading assignments; overriding previous entry",
@@ -270,7 +268,6 @@ class ExpertManager:
                         seen_in_layer.add(my_expert_idx)
 
         if duplicates:
-            # Show a concise but useful error
             msg = "Duplicate mycelia_expert_idx found within expert groups/layers:\n" + "\n".join(duplicates[:10])
             if len(duplicates) > 10:
                 msg += f"\n... and {len(duplicates) - 10} more"
@@ -519,37 +516,6 @@ def sync_expert_weights(
         diff = g.data - p.data
         g.grad = diff
         dist.all_reduce(g.grad, op=dist.ReduceOp.AVG, group=group)
-
-
-# def broadcast_weights(
-#     model: nn.Module,
-#     group_ids: int,
-#     rank_group_assignment: Mapping[int, Iterable[int]],
-#     expert_groups: Mapping[int, dist.ProcessGroup],
-# ) -> None:
-#     """
-#     Broadcast parameters so every rank has a consistent view.
-
-#     Behavior
-#     --------
-#     * Expert params: broadcast **within** group from the lowest-rank member.
-#     * Shared params: broadcast **globally** from rank 0.
-
-#     Notes
-#     -----
-#     Ensure collectives are called by all ranks consistently.
-#     """
-#     if not dist.is_available() or not dist.is_initialized():
-#         raise RuntimeError("torch.distributed must be initialized before broadcast")
-
-#     src_expert_rank = min(rank_group_assignment[group_ids])
-#     expert_group = expert_groups[group_ids]
-
-#     for name, p in model.named_parameters():
-#         if is_expert_param(name):
-#             dist.broadcast(p.data, src=src_expert_rank, group=expert_group)
-#         else:
-#             dist.broadcast(p.data, src=0)
 
 
 def get_weight_sum(model: nn.Module, shared: bool = True) -> tuple[str, torch.Tensor]:

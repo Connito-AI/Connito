@@ -40,7 +40,6 @@ def construct_model_message(model_path: str | Path, expert_groups: list[int | st
     Sign:
         model_hash(32 bytes) || construct_block_message(...)
     """
-    # 1. Get model hash
     model_hash = get_model_hash(compile_full_state_dict_from_path(model_path))
 
     return model_hash
@@ -60,7 +59,6 @@ def construct_block_message(target_hotkey_ss58: str, block: int) -> bytes:
     # Convert block → 8 bytes big-endian
     block_bytes = block.to_bytes(8, "big")
 
-    # Final message
     return pubkey_bytes + block_bytes
 
 
@@ -80,11 +78,8 @@ def verify_message(origin_hotkey_ss58: str, message: bytes, signature_hex: str) 
     Verify the signature for the message: pubkey || block
     signed by the hotkey at `my_hotkey_ss58_address`.
     """
-    # 1. Rebuild signer keypair from their SS58
     signer_kp = bt.Keypair(ss58_address=origin_hotkey_ss58)
 
-    # 2. Decode signature
     signature = b64url_decode_nopad(signature_hex)
 
-    # 3. Verify
     return signer_kp.verify(message, signature)

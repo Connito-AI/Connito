@@ -47,7 +47,6 @@ def init_dht_and_peer_id(
         logger.info("no existing peers found, creating new DHT", dht_port=dht_port)
         dht = hivemind.DHT(
             host_maddrs=[f"/ip4/0.0.0.0/tcp/{int(dht_port)}", f"/ip4/0.0.0.0/udp/{int(dht_port)}/quic"],
-            # host_maddrs=["/ip4/127.0.0.1/tcp/7002", "/ip4/127.0.0.1/udp/7002/quic"],
             start=True,
             client_mode = False,
             authorizer=authorizer,

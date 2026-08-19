@@ -51,7 +51,6 @@ class MetricLogger:
         self.log_wandb: bool = bool(config.log.log_wandb)
         self.validation = validation
 
-        # Ensure the metrics directory exists.
         metrics_dir = os.path.dirname(self.csv_path) or "."
         os.makedirs(metrics_dir, exist_ok=True)
 

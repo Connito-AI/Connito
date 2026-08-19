@@ -56,43 +56,6 @@ def cleanup_temporary_checkpoint_dirs(checkpoint_root: str | Path) -> list[str]:
     return removed
 
 
-# @total_ordering
-# @dataclass
-# class ModelCheckpoint:
-#     global_ver: int = 0
-#     inner_opt: int = 0
-#     path: Path | None = None
-#     role: str | None = None  # [miner, validator]
-#     model_hash: str | None = None
-
-#     def __eq__(self, other: object) -> bool:
-#         try:
-#             other_global_ver = other.global_ver  # type: ignore[attr-defined]
-#             other_inner_opt = other.inner_opt  # type: ignore[attr-defined]
-#             other_model_hash = getattr(other, "model_hash", None)
-#         except AttributeError:
-#             return NotImplemented
-#         return (
-#             self.global_ver == other_global_ver
-#             and self.inner_opt == other_inner_opt
-#             and self.model_hash == other_model_hash
-#         )
-
-#     def __lt__(self, other: "ModelCheckpoint") -> bool:
-#         try:
-#             other_global_ver = other.global_ver  # type: ignore[attr-defined]
-#             other_inner_opt = other.inner_opt  # type: ignore[attr-defined]
-#         except AttributeError:
-#             return NotImplemented
-
-#         # Compare by global_ver first
-#         if self.global_ver != other_global_ver:
-#             return self.global_ver < other_global_ver
-
-#         # Then compare by inner_opt
-#         return self.inner_opt < other_inner_opt
-
-
 # ====================
 # Checkpoint saving / loading
 # ====================
@@ -202,7 +165,6 @@ def save_state_dict_by_expert_group(
             active_my_ids_by_layer[int(layer_id)] = {int(my_id) for my_id, _ in mappings}
             active_org_ids_by_layer[int(layer_id)] = {int(org_id) for _, org_id in mappings}
 
-    # Track per-group counts and bytes for debugging
     group_param_count: dict[int | str, int] = {gid: 0 for gid in group_ids}
     group_bytes: dict[int | str, int] = {gid: 0 for gid in group_ids}
     unassigned_experts: list[str] = []
@@ -212,7 +174,6 @@ def save_state_dict_by_expert_group(
     assigned_expert_param_count = 0
     non_expert_param_count = 0
 
-    # Iterate model weights
     # Convert only selected tensors to CPU fp16 (post-filter) to keep peak RAM low.
     # This avoids materializing a full CPU copy before sharding.
     for name, tensor in state_dict.items():
@@ -283,7 +244,6 @@ def save_state_dict_by_expert_group(
     if overlap_errors:
         raise ValueError(f"Expert param overlap across shards detected: {overlap_errors[:10]}")
 
-    # Log summary per group
     for gid in grouped_state:
         logger.debug(
             "Group split summary",
@@ -417,12 +377,7 @@ def save_checkpoint(
     strict_sharding: bool = False,
     active_expert_group_id: int | None = None,
 ) -> None:
-    """
-    Saves the current model checkpoint.
-
-    Returns:
-        None
-    """
+    """Write the checkpoint to a `.tmp_` directory, then rename it into place."""
     checkpoint_path = Path(checkpoint_path)
     tmp_checkpoint_path = checkpoint_path.with_name(f".tmp_{checkpoint_path.name}")
 
@@ -435,7 +390,6 @@ def save_checkpoint(
     write_path = tmp_checkpoint_path
 
     try:
-        # === save model, optimizer ===
         model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
 
         if save_model_by_expert_group and expert_manager is not None:
@@ -461,7 +415,6 @@ def save_checkpoint(
                 with fsspec.open(str(target), "wb") as f:
                     torch.save(checkpoint, f)
 
-        # === save optimizer ===
         if inner_optimizer is not None:
             opt_checkpoint = {
                 "optimizer_state_dict": inner_optimizer.state_dict(),
@@ -481,7 +434,6 @@ def save_checkpoint(
                 with fsspec.open(str(target), "wb") as f:
                     torch.save(opt_checkpoint, f)
 
-        # === save dataloader ===
         if data_loader is not None:
             rank_state_dict = {}
             rank_state_dict["data_loader"] = data_loader.state_dict()
@@ -494,7 +446,6 @@ def save_checkpoint(
             del rank_state_dict
 
         if save_global_state:
-            # === save global state ===
             global_state_dict = {
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "loss": loss if loss is not None else 0,
@@ -656,18 +607,11 @@ def load_checkpoint(
     data_loader: StatefulDataLoader | None = None,
     expert_groups: list[int | str] | None = None,
 ) -> float:
-    """Load the model and optimizer state from a checkpoint folder
+    """Load model / optimizer / scheduler / dataloader state from a checkpoint
+    folder into whichever of them the caller passes in.
 
-    Args:
-        checkpoint_path: the path to the checkpoint folder
-        model: the model to load
-        optimizer: the optimizer to load
-        scheduler: the scheduler to load
-        outer_optimizer: the outer optimizer to load
-        data_loader: the data loader to load
-
-    Returns:
-        loss: the loss from the checkpoint
+    Returns the loss recorded in the checkpoint, or -1 if there is no global
+    state file to read it from.
     """
 
     if model is not None:
@@ -722,128 +666,8 @@ def load_checkpoint(
 # ====================
 # Checkpoint selection
 # ====================
-
-# def start_model_from(
-#     rank: int, config: MinerConfig, primary_ckpt_path: Path, secondary_ckpt_path: Path | None
-# ) -> tuple[bool, ModelCheckpoint, str | Path | None]:
-#     # if it is a validator, then just start from its own checkpoint
-#     if secondary_ckpt_path is None:
-#         logger.info("returning primary checkpoint")
-#         return get_resume_info(rank, config, config.ckpt.checkpoint_path)
-
-#     primary_ckpt_found, primary_model_meta, latest_primary_ckpt = get_resume_info(rank, config, primary_ckpt_path)
-#     secondary_ckpt_found, secondary_model_meta, latest_secondary_ckpt = get_resume_info(
-#         rank, config, secondary_ckpt_path
-#     )
-
-#     # --- handling either miner / validator checkpoint not found ---
-#     if not secondary_ckpt_found:
-#         logger.info(
-#             "secondary checkpoint not found, using primary",
-#             primary_ckpt_path=primary_ckpt_path,
-#             secondary_ckpt_path=secondary_ckpt_path,
-#             model_meta=primary_model_meta,
-#         )
-#         return primary_ckpt_found, primary_model_meta, latest_primary_ckpt
-
-#     if not primary_ckpt_found and latest_secondary_ckpt is not None:
-#         logger.info(
-#             "primary checkpoint not found, using secondary",
-#             primary_ckpt_path=primary_ckpt_path,
-#             secondary_ckpt_path=secondary_ckpt_path,
-#             model_meta=secondary_model_meta,
-#         )
-#         return secondary_ckpt_found, secondary_model_meta, latest_secondary_ckpt
-
-#     # --- Return based on more updated version ---
-#     if secondary_model_meta >= primary_model_meta and latest_secondary_ckpt is not None:
-#         logger.info("Largest local model", secondary_model_meta)
-#         return secondary_ckpt_found, secondary_model_meta, latest_secondary_ckpt
-#     else:
-#         logger.info("Largest local model", primary_model_meta)
-#         return primary_ckpt_found, primary_model_meta, latest_primary_ckpt
-
-
-# def get_resume_info(
-#     rank: int, config: MinerConfig | ValidatorConfig, path: Path | None = None, msg: str = ""
-# ) -> tuple[bool, ModelCheckpoint, Path | None]:
-#     """
-#     Retrieves the resume information for a given rank and checkpoint configuration.
-
-#     Args:
-#         rank (int): The rank of the process.
-#         ckpt_config (Config): The configuration object for the checkpoint.
-
-#     Returns:
-#         tuple[bool, int, str | None]: A tuple containing a boolean indicating success,
-#         the checkpoint step, and an optional string message.
-#     """
-#     """
-#     Check if we should resume from a checkpoint, if yes return the path to the checkpoint, otherwise return None
-#     """
-#     if config.ckpt.resume_from_ckpt is None:
-#         return False, ModelCheckpoint(), None
-
-#     elif isinstance(config.ckpt.resume_from_ckpt, bool):
-#         # Using fsspec to list directory contents
-#         try:
-#             if path is None:
-#                 path = config.ckpt.checkpoint_path
-
-#             ckpt_files = get_sorted_checkpoints(path)
-
-#         except FileNotFoundError:
-#             logger.debug(
-#                 f"Get resume info from folder {msg}", result="folder not found", path={config.ckpt.checkpoint_path}
-#             )
-#             return False, ModelCheckpoint(), None
-
-#         if len(ckpt_files) == 0:
-#             logger.debug(
-#                 f"Get resume info from folder {msg}", result="doesnt exist any file", path={config.ckpt.checkpoint_path}
-#             )
-#             return False, ModelCheckpoint(), None
-
-#         latest_ckpt = ckpt_files[0].path
-#         model_meta = ckpt_files[0]
-#         logger.debug(
-#             "Get resume info from folder",
-#             result="found",
-#             path={config.ckpt.checkpoint_path},
-#             model_meta=model_meta,
-#         )
-#         return True, model_meta, latest_ckpt
-
-# def get_sorted_checkpoints(checkpoint_path: str) -> dict[ModelCheckpoint]:
-#     fs, root = fsspec.core.url_to_fs(checkpoint_path)
-
-#     ckpt_files = []
-#     for f in fs.ls(root, detail=False):
-#         if Path(f).name.startswith(".tmp_"):
-#             continue
-
-#         if "yaml" in f.lower():  # safer, catches .YAML/.Yaml/.yml too
-#             continue
-
-#         meta = parse_dynamic_filename(f)
-#         if meta is None:
-#             continue
-
-#         # ensure both fields exist and are numeric
-#         model_meta = ModelCheckpoint(
-#             global_ver=int(meta.get("globalver", 0)), inner_opt=int(meta.get("inneropt", 0)), path=Path(f)
-#         )
-#         ckpt_files.append(model_meta)
-
-#     # sort descending by globalver, then inneropt
-#     return sorted(
-#         ckpt_files,
-#         key=lambda item: (-item.global_ver, -item.inner_opt),
-#     )
-
-
 def get_model_files(checkpoint_path):
-    checkpoint_path = Path(checkpoint_path)  # normalize to Path object
+    checkpoint_path = Path(checkpoint_path)
 
     # Case 1: checkpoint_path IS a single checkpoint file (.safetensors preferred, .pt legacy).
     if checkpoint_path.is_file() and checkpoint_path.suffix in MINER_CHECKPOINT_SUFFIXES:
@@ -858,75 +682,3 @@ def get_model_files(checkpoint_path):
         pattern = str(checkpoint_path / f"model*{suffix}")
         files.extend(fsspec.open_files(pattern, mode="rb"))
     return files
-
-
-# def delete_old_checkpoints(checkpoint_path: str, topk: int) -> list[str]:
-#     """
-#     Deletes old checkpoints, keeping only the top 'k' most recent ones.
-
-#     Args:
-#         checkpoint_path (str): The path to the checkpoint directory.
-#         topk (int): The number of recent checkpoints to keep.
-
-#     Returns:
-#         list[str]: A list of deleted checkpoint filenames.
-#     """
-#     fs = GenericFileSystem()
-#     sorted_ckpt_files = get_sorted_checkpoints(checkpoint_path)
-
-#     ckpt_deleted = []
-#     for model_meta in sorted_ckpt_files[topk:]:
-#         fs.rm(str(model_meta.path), recursive=True)
-#         ckpt_deleted.append(str(model_meta.path))
-#     return ckpt_deleted
-
-
-# def delete_old_checkpoints_by_hotkey(folder_path: Path):
-#     """
-#     Deletes all non-latest submission files coming from the same hotkey.
-#     Keeps only the file with the highest block number per hotkey.
-
-#     Requires: parse_dynamic_filename(filename: str) -> dict
-#     """
-#     if not folder_path.exists():
-#         raise FileNotFoundError(f"Folder not found: {folder_path.resolve()}")
-
-#     # Step 1: Group files by hotkey
-#     submissions_by_hotkey = {}
-#     for file_path in folder_path.glob("*.pt"):
-#         meta = parse_dynamic_filename(file_path.name)
-#         if "hotkey" not in meta or "block" not in meta:
-#             print(f"⚠️ Skipping malformed filename: {file_path.name}")
-#             continue
-
-#         hotkey = meta["hotkey"]
-#         block = meta["block"]
-
-#         # Track the latest submission per hotkey
-#         if hotkey not in submissions_by_hotkey:
-#             submissions_by_hotkey[hotkey] = []
-#         submissions_by_hotkey[hotkey].append((block, file_path))
-
-#     # Step 2: For each hotkey, keep only the highest block file
-#     deleted_files = []
-#     for _, entries in submissions_by_hotkey.items():
-#         # Sort by block number descending (latest first)
-#         entries.sort(key=lambda x: x[0], reverse=True)
-
-#         # Keep the first (latest) one, delete the rest
-#         for _, file_path in entries[2:]:
-#             try:
-#                 os.remove(file_path)
-#                 deleted_files.append(file_path.name)
-#             except Exception as e:
-#                 print(f"❌ Failed to delete {file_path.name}: {e}")
-
-#     # Step 3: Log result
-#     if deleted_files:
-#         logger.info(f"🧹 Deleted {len(deleted_files)} outdated submission(s):", deleted_files)
-#         for f in deleted_files:
-#             print(f"   - {f}")
-#     else:
-#         logger.info("✅ No outdated submissions found.")
-
-#     return deleted_files

@@ -106,7 +106,7 @@ def scheduler_service(
         phase_response = wait_till(config, phase_name=PhaseNames.distribute, poll_fallback_block=poll_fallback_block)
         download_queue.put(Job(job_type=JobType.DOWNLOAD, phase_response=phase_response))
 
-        # --------- COMISSION SCHEDULING ---------
+        # --------- COMMIT SCHEDULING ---------
         phase_response = wait_till(
             config, phase_name=PhaseNames.miner_commit_1, poll_fallback_block=poll_fallback_block
         )
@@ -141,7 +141,6 @@ def download_worker(
             logger.info(f"<{PhaseNames.distribute}> shutdown signal received.")
             return
         try:
-            # Read current version/hash snapshot
             current_model_meta = select_best_checkpoint(
                 primary_dir=config.ckpt.validator_checkpoint_path,
                 secondary_dir=config.ckpt.checkpoint_path,
@@ -169,7 +168,6 @@ def download_worker(
 
             logger.info(f"<{PhaseNames.distribute}> downloaded model metadata from chain: {chain_checkpoint}.")
 
-            # Update shared state with new version/hash
             current_model_meta = select_best_checkpoint(
                 primary_dir=config.ckpt.validator_checkpoint_path,
                 secondary_dir=config.ckpt.checkpoint_path,

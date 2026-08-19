@@ -517,11 +517,9 @@ class CustomDeepseekV2Moe(nn.Module):
         if self.allowed_ids is not None and self.allowed_ids.numel() > 0 and self.allowed_ids.numel() < router_logits.size(-1):
             allowed_ids = self.allowed_ids.to(device=router_logits.device)
 
-            # We create a new tensor to avoid in-place modification issues
-            masked_logits = torch.full_like(router_logits, -1e4)  # Use a very large negative
-
-            # Scatter 0.0 only to specific expert indices
-            # If the allowed_ids are [5, 6, 7, 8, 9, 10], ONLY these will have non-infinite scores
+            # New tensor rather than an in-place mask; every non-allowed expert
+            # keeps the -1e4 floor so only allowed_ids get real scores.
+            masked_logits = torch.full_like(router_logits, -1e4)
             masked_logits.scatter_(
                 1,
                 allowed_ids.unsqueeze(0).expand(router_logits.size(0), -1),

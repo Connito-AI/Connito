@@ -210,7 +210,6 @@ def get_model_from_checkpoint(
         group_ids_helper=group_ids_helper,
         load_global_checkpoint=load_global_checkpoint,
     )
-    # get base model
     model = get_base_model(
         config,
         expert_manager=expert_manager,
@@ -220,7 +219,6 @@ def get_model_from_checkpoint(
     )
 
     latest_checkpoint: ModelCheckpoint | None = None
-    # load from checkpoint
     if resume:
         latest_checkpoint = select_best_checkpoint(
             primary_dir=config.ckpt.validator_checkpoint_path,

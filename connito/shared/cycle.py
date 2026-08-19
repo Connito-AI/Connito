@@ -140,22 +140,22 @@ class PhaseResponseLite(BaseModel):
     phase_end_block: int
 class PhaseResponse(BaseModel):
     block: int
-    cycle_length: int  # how long is one cycle
-    cycle_index: int  # which cycle are we in
-    cycle_block_index: int  # how far in block are we into a cycle
-    phase_name: str  # what is the name of the current phase
-    phase_index: int  # what is the id of the phase
-    phase_start_block: int  # the start block of the phase
-    phase_end_block: int  # the end block of the phase
-    blocks_into_phase: int  # how far in block are we in the current phase
-    blocks_remaining_in_phase: int  # how manuy block left in the phase
+    cycle_length: int  # blocks per cycle
+    cycle_index: int
+    cycle_block_index: int  # blocks elapsed in the current cycle
+    phase_name: str
+    phase_index: int
+    phase_start_block: int
+    phase_end_block: int
+    blocks_into_phase: int
+    blocks_remaining_in_phase: int
 
 
 @dataclass
 class PhaseNames:
     distribute: str = "Distribute"  # miner download from validator
-    train: str = "Train"  # miner trian
-    miner_commit_1: str = "MinerCommit1"  # miner commit signed_model_hash and vlaidators commit seed
+    train: str = "Train"  # miner train
+    miner_commit_1: str = "MinerCommit1"  # miner commits signed_model_hash, validators commit seed
     miner_commit_2: str = "MinerCommit2"  # miner commit model_hash
     submission: str = "Submission"  # miner submit model to validator
     validate: str = "Validate"  # validator validate
@@ -776,7 +776,6 @@ def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tupl
     try:
         return resp.json()
     except ValueError as e:
-        # JSON decoding failed
         logger.exception("Invalid JSON from %s: %s", url, e)
         return None
 
@@ -798,7 +797,6 @@ def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None
     try:
         return resp.json()
     except ValueError as e:
-        # JSON decoding failed
         logger.exception("Invalid JSON from %s: %s", url, e)
         return None
 
@@ -857,7 +855,6 @@ def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | N
 
     max_version = miner_commit_1_range[0]  # start block
 
-    # derive cycle_length as sum of all phase lengths
     cycle_length = sum((end - start + 1) for start, end in previous_ranges.values())
 
     min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
@@ -885,7 +882,6 @@ def get_init_peer_id(config: WorkerConfig) -> str | None:
     try:
         return resp.json()
     except ValueError as e:
-        # JSON decoding failed
         logger.exception("Invalid JSON from %s: %s", url, e)
         return None
 
@@ -1070,7 +1066,6 @@ def gather_validation_job(
                         "file_name": file_name,
                         "hotkey": submission_meta["hotkey"],
                         "block": submission_meta["block"],
-                        # "reason": reason,
                     }
                 )
 
@@ -1080,7 +1075,6 @@ def gather_validation_job(
                         "file_name": file_name,
                         "hotkey": submission_meta["hotkey"],
                         "block": submission_meta["block"],
-                        # "reason": reason,
                     }
                 )
 

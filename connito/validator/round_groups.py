@@ -1,6 +1,6 @@
 """Round-group construction for the tiered weight / validation scheme.
 
-Spec: `_specs/round-group-construction-scheme.md`. This module is a pure
+See `docs/miner-validation-group-promotion.md`. This module is a pure
 collection of selection helpers — no I/O, no chain calls — so it is
 trivially unit-testable. All chain reads happen in `Round.freeze()` and
 the orchestration layer; this module only consumes the snapshots.

@@ -765,7 +765,7 @@ def count_rpc_errors():
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                # Naively cast everything as an RPC error count, or you could filter by exception type
+                # Every exception counts as one RPC error; no per-type filtering.
                 RPC_ERRORS_TOTAL.inc()
                 raise e
         return wrapper

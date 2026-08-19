@@ -137,8 +137,6 @@ class CustomDeekSeekMoE(DeepseekV3ForCausalLM):
         for i in range(model_config.num_hidden_layers):
             layer = DeepseekV3DecoderLayer(model_config, layer_idx=i)
 
-            # layer.self_attn = DeepseekAttention(model_config)
-
             # Interleave MoE and dense layers (MoE on odd indices if interleave=True)
             if getattr(model_config, "interleave", True) and (i + 1) % model_config.decoder_sparse_step == 0:
                 if not partial:
@@ -168,9 +166,7 @@ class CustomDeekSeekMoE(DeepseekV3ForCausalLM):
 
 
 def get_moe_model_config(config: MinerConfig, topk: int, org_model_config: AutoConfig = None) -> PretrainedConfig:
-    # get the base config from qwen model
     base_config = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-V3")  # TODO: need user permission
-    # base_config = AutoConfig.from_pretrained(config.model.model_path, trust_remote_code=True) #TODO: need user permission
 
     # merge the existing model config into the base config
     if org_model_config is not None:

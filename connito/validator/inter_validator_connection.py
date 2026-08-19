@@ -1,4 +1,3 @@
-# --- Authorizer --- 
 import fnmatch
 import os
 import secrets
@@ -352,9 +351,6 @@ def build_averagers_from_buff(
             prefix=prefix,
             target_group_size=target_group_size,
             min_group_size=min_group_size,
-            # allreduce_timeout = 60 * 5,
-            # min_matchmaking_time = 60 * 5,
-            # request_timeout = 60 * 2
         )
         avg = group_averagers[group_id]
         logger.info(

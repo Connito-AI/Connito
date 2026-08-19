@@ -210,17 +210,11 @@ def resolve_telemetry_port(rank: int, env: dict[str, str] | None = None) -> int:
     """Resolve the port for the Prometheus exporter.
 
     `CONNITO_TELEMETRY_PORT` is a **base** port, not an absolute one: the
-    effective port is `base + rank`. That preserves the semantics of the
-    8200 default it replaces, and keeps a multi-rank deployment on one host
-    collision-free — an absolute override would point every rank at the same
-    port and all but one would fail to bind, which is exactly the bug this
-    override exists to fix. For the validator `rank` is always 0, so
-    `CONNITO_TELEMETRY_PORT=8201` yields 8201.
-
-    Operators need this when the default 8200 is already taken on the host:
-    before this was wired up the env var existed in the image but was never
-    read, so the exporter kept trying 8200, failed with "Address already in
-    use", and the validator ran on with no telemetry at all.
+    effective port is `base + rank`, so a multi-rank deployment on one host
+    stays collision-free — an absolute override would point every rank at the
+    same port and all but one would fail to bind. For the validator `rank` is
+    always 0, so `CONNITO_TELEMETRY_PORT=8201` yields 8201. Operators need the
+    override when 8200 is already taken on the host.
 
     Invalid input falls back to the default with a warning rather than
     raising — a typo in an operator's `.env` must not take a validator off
@@ -304,13 +298,11 @@ def _install_signal_logging() -> None:
     already takes, so docker-initiated stops run the existing shutdown block
     in `run()` (background workers, chain_submitter, poller, averagers, …).
 
-    The previous implementation restored `SIG_DFL` and re-raised the signal.
-    For SIGTERM that meant "terminate immediately" with no Python exception —
-    the `except KeyboardInterrupt` / `except Exception` arms in `run()` never
-    fired, so nothing was stopped cleanly. Watchtower then timed out after 120s
-    and dockerd was left with a zombie PID 1 (orphaned hivemind libp2p +
-    background-worker threads, no init to reap them) which couldn't be removed.
-    Raising `KeyboardInterrupt` reuses the SIGINT shutdown path verbatim.
+    Restoring `SIG_DFL` and re-raising instead terminates immediately with no
+    Python exception, so the `except` arms in `run()` never fire and nothing is
+    stopped cleanly: Watchtower times out after 120s and dockerd is left with an
+    unremovable zombie PID 1 (orphaned hivemind libp2p + background-worker
+    threads, no init to reap them).
 
     Caveat: if the main thread is parked inside a C extension when the signal
     arrives (hivemind averager step, a torch op, etc.), the exception only
@@ -392,12 +384,10 @@ def setup_training(
     """
     Build model(s), experts layout, optimizers, scheduler, scaler, and optionally resume from a checkpoint.
     """
-    # === checkpoint info ===
     latest_checkpoint = select_best_checkpoint(primary_dir=config.ckpt.checkpoint_path)
     resume = latest_checkpoint is not None
     latest_checkpoint_path = latest_checkpoint.path if latest_checkpoint else None
 
-    # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
     # global_model: partial model (only assigned experts) — used for optimization and evaluation.
@@ -412,7 +402,6 @@ def setup_training(
         load_global_checkpoint=False,
     )
 
-    # === optimizers ===
     logger.debug("setup training - load optimizer")
     outer_optimizer = torch.optim.SGD(
         [p for p in global_model.parameters() if p.requires_grad],
@@ -421,22 +410,17 @@ def setup_training(
         nesterov=True,
     )
 
-    # === scaler ===
     logger.debug("setup training - load scaler")
     outer_scaler = torch.amp.GradScaler(
         "cuda", enabled=(get_nested_attr(config, "model.precision", "") == "fp16-mixed")
     )
 
-    # === dataloader ===
     logger.debug("setup training - load dataloader")
     train_dataloader = get_dataloader(
         config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
     )
 
-    # === load checkpoint (if any) ===
-    logger.debug(
-        "setup training - load past checkpoint"
-    )  # outer_optimizer is static, so dont really need to load checkpoint
+    logger.debug("setup training - load past checkpoint")
     if get_nested_attr(config, "resume_from_ckpt", False) and resume and latest_checkpoint_path:
         _ = load_checkpoint(
             config=config,
@@ -566,7 +550,6 @@ async def aggregate_miner_gradient_change(
             _release_global_model_grads(global_model)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            # finally still runs and releases miner_model.
             oom_abort = True
         else:
             oom_abort = False
@@ -651,7 +634,6 @@ def sync_grad_across_validators(
                     timeout=step_timeout,
                     allow_retries=False,
                     wait=True,
-                    # scheduled_time=scheduled_time.timestamp()
                 )
                 gathered = {}
                 if hasattr(avg_step, "items"):
@@ -746,18 +728,11 @@ def run_global_optimization(
 
 
 def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = "") -> None:
-    """
-    The worker function for training in a distributed setting.
+    """Validator main loop: walk the phase state machine forever.
 
-    Args:
-        rank (int): The rank of the process.
-        world_size (int): The total number of processes.
-        config (Config): The configuration object for the training.
-
-    Returns:
-        None
+    Always invoked as `run(0, 1, ...)` today; `rank` still feeds the telemetry
+    port offset and the checkpoint save path.
     """
-    # Start the integrated Prometheus telemetry server
     telemetry_port = resolve_telemetry_port(rank)
     TelemetryManager().start_server(port=telemetry_port)
     
@@ -770,13 +745,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     if config.run.record_cuda_mem_history:
         torch.cuda.memory._record_memory_history(enabled=True)
 
-    # === create checkpoint directory ===
     os.makedirs(config.ckpt.base_checkpoint_path, exist_ok=True)
     os.makedirs(config.ckpt.checkpoint_path, exist_ok=True)
     os.makedirs(config.log.base_metric_path, exist_ok=True)
     os.makedirs(config.ckpt.miner_submission_path, exist_ok=True)
 
-    # === set up chain worker ===
     # subtensor: archive connection — required by callers that issue
     # historical block queries (Round.freeze, setup_training/load_model,
     # reload_model_inplace, evaluate_foreground_round).
@@ -802,17 +775,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         ),
     )
 
-    # === set logging ===
     metric_logger = MetricLogger(config, rank)
 
-    # === mis ===
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = get_base_tokenizer(config)
 
     # eval_dataloader is built lazily inside the eval step so its worker
     # processes / prefetched batches don't stay resident across the whole cycle.
 
-    # === set up training ===
     (
         global_model,
         outer_optimizer,
@@ -828,7 +798,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # peer validator before continuing.
     _participated_in_merge = True
 
-    # === set up score aggregator ===
     score_window = config.evaluation.score_window
     # On-disk retention per miner — kept independent of score_window so
     # avg/sum/ema (the metric driving weight submission) still cap reads
@@ -877,8 +846,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             max_history_points=score_history_window,
         )
 
-    # === startup recovery: replay any unfinalized round journals ===
-    # If a previous run died before `finalize_round_scores` could run
+    # Startup recovery. If a previous run died before `finalize_round_scores` could run
     # (SIGKILL, OOM, validator crash), the per-round journal on disk
     # holds the partial scoring state. Replay each unfinalized journal
     # through `finalize_round_scores` so the aggregator on disk gets
@@ -974,7 +942,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             "Startup recovery: scan failed", error=str(e),
         )
 
-    # === set up averager ===
     group_grad_buff_meta = build_grad_buff_from_model(
         model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
     )
@@ -1004,10 +971,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         validator_uid = None
 
     # Stamp identity onto the connito_validator info metric so every Prom scrape
-    # carries which validator emitted it, and stash git_version for the
-    # /v1/state.json meta block. _get_build_version() reads CONNITO_GIT_VERSION
-    # / CONNITO_GIT_SHA env vars (baked into the Docker image) with a git-cli
-    # fallback in source checkouts.
+    # carries which validator emitted it. _get_build_version() reads
+    # CONNITO_GIT_VERSION / CONNITO_GIT_SHA (baked into the Docker image) with a
+    # git-cli fallback in source checkouts.
     git_version, git_sha = _get_build_version()
     try:
         set_validator_identity(
@@ -1019,7 +985,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     except Exception as e:
         logger.warning("Failed to stamp connito_validator_info; continuing", error=str(e))
 
-    # Start telemetry sidecar poller
     poller = SystemStatePoller(
         subtensor=lite_subtensor,
         phase_manager=PhaseManager(config, lite_subtensor),
@@ -1031,14 +996,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     poller.start()
 
 
-    # === commit status === (non-blocking; queued on chain_submitter)
+    # Non-blocking; queued on chain_submitter.
     chain_submitter.async_commit(ValidatorChainCommit(
         model_hash=None,
         global_ver=global_opt_step,
         expert_group=config.task.exp.group_id,
     ))
 
-    # === training ===
     loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
     aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
     training_time = 0
@@ -1063,7 +1027,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     #   past that point); cleared at the next freeze. Pauses bg-download
     #   from MinerCommit1(K+1) → Submission(K+1).
     # gpu_eval_lock: held by the eval worker only across its load_state_dict
-    #   and evaluate_one_miner calls (yielded everywhere else; see plan).
+    #   and evaluate_one_miner calls (yielded everywhere else).
     #
     # Note: bg-download intentionally does NOT pause on the foreground eval
     # pass. Foreground reads from `miner_submission_path`, which bg-download
@@ -1126,14 +1090,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Liveness signal: alert on rate(validator_main_loop_heartbeat_total[5m]) == 0
             VALIDATOR_HEARTBEAT_TOTAL.inc()
 
-            # for each step, we run 1 backward
-            # for each inner_opt_step, we run local optimization; gradient_accumulation_steps = 1 real step
-            # for each global_opt_interval number of inner_opt_step, we synchronise weight from different ddp worker, and then run global optimization
-
-            # === Wait till commit phase to submit random seed ===
-            # block_offset=-5 (was -15) trims dead time at the top of the
-            # loop — finalize + submit only need a few blocks of headroom
-            # before MinerCommit1, not 15.
+            # block_offset=-5: finalize + submit only need a few blocks of
+            # headroom before MinerCommit1.
             phase_response = wait_till(config, PhaseNames.miner_commit_1, block_offset=-5)
             logger.info("Commit new seed for next validation")
 
@@ -1234,10 +1192,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         weight_group_1=list(payload.weight_group_1),
                         weight_group_2=list(payload.weight_group_2),
                     )
-                # Mirror the about-to-submit weights into Prometheus so
-                # external aggregators don't have to scrape `/v1/state.json`
-                # to learn what each validator votes on chain. Entries are
-                # written only for UIDs we actually weight, so a miner the
+                # Mirror the about-to-submit weights into Prometheus so external
+                # aggregators can see what each validator votes on chain. Entries
+                # are written only for UIDs we actually weight, so a miner the
                 # validator has never scored has *no* sample rather than a
                 # zero (preserves prior EMA semantics).
                 #
@@ -1360,7 +1317,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # config.evaluation.enable_round_group_construction). When the
             # flag is on, load the held cohort state so Round.freeze can
             # advance it at the cohort boundary or reuse it within one.
-            # Spec: _specs/round-group-construction-scheme.md.
+            # See docs/miner-validation-group-promotion.md.
             cohort_state_path = None
             current_cohort_state = None
             if config.evaluation.enable_round_group_construction:
@@ -1627,14 +1584,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 scores=round_scores,
             )
 
-            # Persist aggregator state atomically.
             try:
                 score_aggregator.persist_atomic(score_path)
             except Exception as e:
                 logger.warning(f"Failed to persist score_aggregator: {e}")
 
-            # === aggragate miner gradient change locally ===
-            # Use global_model (partial) as template for loading miner checkpoints (also partial)
+            # global_model (partial) is the template for loading miner
+            # checkpoints (also partial).
             logger.info("Aggregating miner gradient change locally")
             try:
                 merged_uids = asyncio.run(
@@ -1695,7 +1651,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(lite_subtensor, phase_response)
 
-            # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
 
             # Bound the merge work to the on-chain Merge window: convert the
@@ -1758,7 +1713,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             sync_grad_completed = False
 
                     if sync_grad_completed:
-                        # === global optimizer ===
                         logger.info("Running global model optimization step")
 
                         org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
@@ -1796,7 +1750,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 cleanup(global_model)
 
-                # === save checkpoint ===
                 logger.info("Saving checkpoint")
                 ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
 
@@ -1842,7 +1795,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(lite_subtensor, phase_response)
 
-            # === Comit to chain for new model ===
             model_ckpt = build_local_checkpoint(ckpt_path)
             if model_ckpt is not None:
 
@@ -1950,13 +1902,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # so it can incorporate the (3) background scores collected from
             # end-of-Validate(K) through end-of-Train(K+1).
 
-            # === Close download window before next-cycle MinerCommit1 ===
-            # Wait until 30 blocks before the next MinerCommit1 so bg-download
-            # stops pulling round-K submissions inside the quiet window just
-            # before the new cycle begins. The archive + prune of those files
-            # has been moved to right after MinerCommit1 begins (above), so
-            # bg-eval can keep scoring round-K's miners through this window
-            # without racing the cleanup.
+            # Close the download window 15 blocks before the next
+            # MinerCommit1 so bg-download stops pulling round-K submissions in
+            # the quiet window before the new cycle. Archive + prune of those
+            # files runs just after MinerCommit1 begins (above), so bg-eval can
+            # keep scoring round-K's miners here without racing the cleanup.
             wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             download_window_closed.set()
 
@@ -1985,7 +1935,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
                 _participated_in_merge = True  # reset regardless; try allreduce next cycle
 
-            # === validation and log metric ===
             metrics = get_status(
                 config=config,
                 model=global_model,

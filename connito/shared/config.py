@@ -38,7 +38,7 @@ def find_project_root(start: Path | None = None) -> Path:
     for p in (start, *start.parents):
         if any((p / m).exists() for m in markers):
             return p
-    # Fallback: "up one level from connito/" (kept from original intent)
+    # Fallback: up one level from connito/
     return start.parents[1]
 
 
@@ -113,8 +113,8 @@ def ensure_dirs(paths: Iterable[Path]) -> None:
 class BaseConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # Fields listed here are "locked" — they should stay at their defaults.
-    # Subclasses override this to declare which fields fall into category (2).
+    # Fields that must stay at their class defaults; `check_and_prompt_locked`
+    # resets any drifted value on load. Subclasses declare their own set.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset()
 
     def __str__(self) -> str:
@@ -170,8 +170,8 @@ class CycleCfg(BaseConfig):
     distribute_period: int = 20 # 4 mins
     train_period: int = 300 # 1 hr (will adjust to 500 mins when mature to align with Diloco)
     commit_period: int = 10 # 2 mins
-    submission_period: int = 80 # 4 mins
-    validate_period: int = 10 # 10 mins
+    submission_period: int = 80 # 16 mins
+    validate_period: int = 10 # 2 mins
     merge_period: int = 50 # 10 mins
 
     owner_url: str = "https://cycle-api.connito.ai:443"
@@ -233,68 +233,38 @@ class DataCfg(BaseConfig):
     rank: int = 1
     dataset_class: str | None = None
     vali_fraction: float = 0.1
-    # Per-source streaming-shuffle buffer used ONLY when a seed is passed
-    # (i.e. validator eval; miners pass seed=None and are unaffected). When
-    # > 0, each source is `ds.shuffle(seed=int_seed, buffer_size=N)`-d
-    # before interleave + fractional filter, which (a) shuffles HF shard
-    # order with the seed and (b) buffer-shuffles within the active read
-    # window. Without this, every eval round only reaches the head of each
-    # source's stream (~first few thousand rows), which is small enough to
-    # memorize and turns "score on validation" into "score on a fixed
-    # public subset."
+    # Legacy eval-sampling knobs. Both apply ONLY on the validator eval path
+    # (miners pass seed=None) and ONLY when `eval_source_seeded_shard_pick` is
+    # False. Full rationale at the use sites in `shared/dataloader.py`.
     #
-    # Default 50_000 (~200 MB RAM per source × 2 sources ≈ 400 MB total
-    # working set during eval) enables the protection out of the box.
-    # During the auto-upgrade rollout window, validators on the new
-    # default and validators still on the old default will draw
-    # different eval batches and produce non-comparable losses for the
-    # same `combined_seed` — same brief consensus-divergence shape as
-    # the recent block-hash seed mix-in. Operators who need to opt out
-    # for memory reasons can set this to 0 in their config.
+    # shuffle_buffer: `ds.shuffle(seed, buffer_size=N)` per source before
+    # interleave, so the seed permutes shard order and shuffles within the
+    # read window. Without it every round reaches only the head of each
+    # source's stream — a small enough pool for a miner to memorize. Costs
+    # ~200 MB RAM per source at the default; 0 disables.
     eval_source_shuffle_buffer: int = 50_000
-    # Per-source random read offset applied AFTER the buffer shuffle. When
-    # > 0, each source is `ds.skip(rng.randrange(0, N))`-d so the validator
-    # reads from a random DEPTH into the (already-randomly-chosen) lead
-    # shard, not always from row 0.
+    # skip_max: `ds.skip(rng.randrange(0, N))` applied after the shuffle so the
+    # read starts at a random depth into the lead shard rather than row 0 —
+    # the shuffle alone only varies WHICH shard's head is read. O(N)
+    # decode-and-discard once per source per round (seconds at the default).
     #
-    # Why both this and `eval_source_shuffle_buffer` are needed:
-    #   - `.shuffle(seed, buffer_size=B)` permutes which shard leads each
-    #     round AND buffer-shuffles within a B-wide window. But the
-    #     validator only consumes ~5,000 positions per round, so the read
-    #     never advances past the first ~B rows of the lead shard. Across
-    #     seeds you get different shards' HEADS — not different rows of
-    #     the same shard's body.
-    #   - `.skip(N)` slides the buffer window N rows deep into the lead
-    #     shard, so the reachable pool spans the BODY of each shard. The
-    #     reachable set then grows along two axes: (shard permuted to lead)
-    #     and (offset into that shard).
-    #
-    # Cost: `.skip(N)` on a streaming dataset is O(N) decode-and-discard,
-    # paid once per source per round at eval start. 50_000 adds a few
-    # seconds per round. Tune down if too slow; tune up for even less
-    # predictability. Same coordinated-rollout discipline as
-    # `eval_source_shuffle_buffer` — validators on different defaults
-    # diverge for one round, then re-converge.
+    # Changing either value mid-fleet makes validators draw different eval
+    # batches for the same `combined_seed`, so losses are non-comparable until
+    # every validator is on the same setting.
     eval_source_skip_max: int = 50_000
-    # Switch the validator eval path from the legacy
-    # `.shuffle(seed) + .skip(small)` window (reachable region capped
-    # at first ~`shuffle_buffer + skip_max` rows of every shard) to
-    # seeded shard-pick + hash-mod in-shard offset. When True, the
-    # reachable region per round is the WHOLE chosen shard; across
-    # rotating seeds, every shard × every row is eventually reachable.
-    # `eval_source_shuffle_buffer` and `eval_source_skip_max` are
-    # ignored on the new path.
+    # Switch the validator eval path from the legacy shuffle+skip window
+    # (reachable region capped at the first ~`shuffle_buffer + skip_max` rows
+    # of every shard) to seeded shard-pick + hash-mod in-shard offset, whose
+    # reachable region per round is the WHOLE chosen shard — across rotating
+    # seeds every shard × every row is eventually reachable.
     #
-    # See `connito/shared/eval_shard_pick.py` for the threat model,
-    # consensus assumptions (revision pin per source, deterministic
-    # sort, per-source safe-floor + verified-spot-check policy) and
-    # the policy registry that must contain an entry for every
-    # configured source.
+    # See `connito/shared/eval_shard_pick.py` for the threat model, the
+    # consensus assumptions (per-source revision pin, deterministic sort,
+    # safe-floor + verified-spot-check policy) and the policy registry, which
+    # must contain an entry for every configured source.
     #
-    # Default ON. Same coordinated-rollout discipline as the
-    # earlier shuffle/skip bumps: flip together with all validators
-    # at a gated chain epoch, otherwise losses diverge for the
-    # transition round and weight consensus breaks.
+    # Flip together with all validators: mid-fleet disagreement makes losses
+    # diverge for the transition round and breaks weight consensus.
     eval_source_seeded_shard_pick: bool = True
     # Per-source HF commit SHA to pin shard listing + shard reads to.
     # Keys are the source `path` (e.g. `"allenai/c4"`), values are
@@ -425,10 +395,9 @@ class HfCfg(BaseConfig):
     # and miners download from the returned repo@revision.
     #
     # checkpoint_repo: the HF repo the validator pushes to. Must exist and
-    # be writable by the HF_TOKEN. If omitted, runtime will derive
-    # {authenticated_hf_user}/{default_repo_name}. The on-chain advertised
-    # repo can diverge from this upload target; validator code currently
-    # derives the advertised repo as {owner}/cycle from the upload repo.
+    # be writable by the HF_TOKEN. If omitted, runtime derives
+    # {authenticated_hf_user}/{default_repo_name}. The repo advertised on
+    # chain is the upload repo (see `HfCfg.advertised_repo_id`).
     checkpoint_repo: str | None = None
     default_repo_name: str = "co"
     # Read from HF_TOKEN env at runtime — not stored in config YAML.
@@ -574,7 +543,6 @@ class WorkerConfig(BaseConfig):
     # Lifecycle
     # -----------------------
     def model_post_init(self, __context: Any) -> None:
-        # Fill keys (best-effort)
         self._fill_wallet_data()
 
         # When running inside Docker, override root to container mount points.
@@ -584,13 +552,8 @@ class WorkerConfig(BaseConfig):
             self.task.base_path = Path("/app/expert_groups")
             logger.info("Docker detected — root_path set to /data")
 
-        # Derive paths
         self._refresh_paths()
-
-        # Load per-task overrides
         self._update_by_task()
-
-        # Create directories
         self._ensure_runtime_dirs()
 
     # -----------------------
@@ -755,7 +718,6 @@ class WorkerConfig(BaseConfig):
             for field_name, field_info in sub_cfg.model_fields.items():
                 if field_name in yaml_section:
                     continue
-                # Field is missing from yaml — it's using the code default
                 if field_info.default is PydanticUndefined and field_info.default_factory is None:
                     continue  # required field with no default, pydantic would have errored
 
@@ -772,7 +734,6 @@ class WorkerConfig(BaseConfig):
                     print(f"\n[{section_name}.{field_name}] new field not in config file")
                     answer = input(f"  Enter value (or press Enter for default: {default_val!r}): ").strip()
                     if answer:
-                        # Try to cast to the field's type
                         try:
                             ann = field_info.annotation
                             if ann is int or ann is float:
@@ -803,8 +764,8 @@ class WorkerConfig(BaseConfig):
 
     def check_and_prompt_locked(self, config_path: Path | None = None, auto_update: bool = False) -> None:
         """
-        For each locked field in category-(2) sub-configs, compare the loaded
-        value against the class default.  When they differ:
+        For each locked field in the sections listed in `_LOCKED_SECTIONS`,
+        compare the loaded value against the class default. When they differ:
         - auto_update=True: reset to default without prompting (for systemd / non-interactive).
         - stdin is a TTY: ask the user whether to reset.
         - otherwise: skip silently.
@@ -877,7 +838,7 @@ class WorkerConfig(BaseConfig):
         - If missing: returns self.
         - If same: returns self.
         - If different:
-            * overwrite=True -> return WorkerConfig(**other_dict) (matches original behavior)
+            * overwrite=True -> return WorkerConfig(**other_dict)
             * else bump_if_diff=True -> bump run_name and return self
             * else -> return self unchanged
         """
@@ -980,8 +941,8 @@ class MinerConfig(WorkerConfig):
 
 
 class ValidatorRunCfg(RunCfg):
-    averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
-    averager_step_max_retries: int = 2  # max retry attempts for averager step
+    averager_step_timeout_sec: int = 60  # wait for averager group formation
+    averager_step_max_retries: int = 2
     record_cuda_mem_history: bool = False  # enable torch.cuda.memory._record_memory_history (leaks RAM; profiling only)
 
 
@@ -1002,10 +963,10 @@ class EvalCfg(BaseConfig):
     # (98%) / Group 2 (2%). Default ON; set False to opt back into the
     # legacy foreground/background construction (kept as a rollback path
     # until the new scheme is validated on mainnet for several cohorts).
-    # Spec: _specs/round-group-construction-scheme.md.
+    # See docs/miner-validation-group-promotion.md.
     enable_round_group_construction: bool = True
     cohort_state_filename: str = "cohort_state.json"
-    cohort_window_cycles: int = 8                # 8-cycle hold per spec
+    cohort_window_cycles: int = 8
     weight_group_1_size: int = 3
     weight_group_1_share: float = 0.98
     weight_group_2_size: int = 5
