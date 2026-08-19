@@ -141,9 +141,17 @@ local_par:
 ```
 
 - **GPU memory:** the validator runs DeepSeek-V2-Lite at fp16-mixed on a
-  40 GB GPU (A100/H100 class) with ~24 GB allocated during eval. Miners run
-  partial models (only their expert group is trainable), so memory is
-  smaller — but a 24 GB consumer card is a reasonable minimum.
+  40 GB GPU (A100/H100 class) with ~24 GB allocated during eval. A miner holds
+  a partial model and trains only the experts in its own group; every other
+  expert it holds is frozen, so those carry no gradients and no optimizer
+  state (`connito/shared/model.py:freeze_parameters`). Measured on an L40S
+  against the current expert group, a full training step peaks at **36.5 GB**
+  of VRAM: 1.62 B trainable parameters at `sequence_length: 1024` and
+  `per_device_train_batch_size: 1`, with the default 32-bit optimizer state.
+  **Plan for a 40 GB card**, not a 24 GB one. Optimizer state dominates that
+  figure, so `opt.adamw_optim_bits: 8` — which swaps in bitsandbytes' 8-bit
+  AdamW state — is the main lever if you are close to the limit; it takes
+  roughly 10 GB off the peak. Only 8 and 32 are valid values.
 - **Precision:** `fp16-mixed` is the default. `bf16-mixed` is supported but
   the code path auto-falls back if the device doesn't report BF16 support
   (warned, not crashed).
