@@ -233,13 +233,9 @@ def get_model_from_checkpoint(
                 model=model,
                 rank=rank,
                 device=checkpoint_device if checkpoint_device is not None else config.model.device,
-                # Only the active expert group is read from disk. Any legacy
-                # `model_shared.*` next to it is ignored — backbone state is
-                # already in `model` from `get_base_model`'s pretrained load
-                # (full path via `from_pretrained`, partial path via the
-                # full→partial port in mycelia.get_base_model), and we no
-                # longer trust on-disk shared weights (they were a source of
-                # cross-validator divergence; see PR description).
+                # Active expert group only. Legacy `model_shared.*` is
+                # ignored: the backbone already came from the pretrained load,
+                # and on-disk shared weights caused cross-validator divergence.
                 expert_groups=[config.task.exp.group_id] if partial else None,
             )
         else:

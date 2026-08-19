@@ -282,15 +282,10 @@ def _upload_checkpoint_to_hf_safe(
                 f"miner submission global_ver={latest_checkpoint.global_ver} "
                 f"expert_group={config.task.exp.group_id}"
             ),
-            # Validators fetch this validator's expert-group shard. New
-            # miners ship `.safetensors` (no pickle, no code-execution
-            # surface); the validator's download worker (PR #98) tries
-            # `.safetensors` first and falls back to `.pt`, so we include
-            # both extensions during the migration window so a miner
-            # upgrading mid-cycle whose latest checkpoint is still `.pt`
-            # doesn't end up with an empty upload. `model_shared.*` is
-            # intentionally excluded — validators only fetch the expert-
-            # group shard, and skipping it keeps uploads small.
+            # Both extensions: validators try `.safetensors` first and fall
+            # back to `.pt`, so a miner upgrading mid-cycle whose latest
+            # checkpoint is still `.pt` doesn't upload nothing.
+            # `model_shared.*` is excluded — validators never fetch it.
             allow_patterns=[
                 f"model_expgroup_{config.task.exp.group_id}.safetensors",
                 f"model_expgroup_{config.task.exp.group_id}.pt",
@@ -368,10 +363,9 @@ def commit_worker(
             _commit_signed_model_hash(config, wallet, subtensor, latest_checkpoint)
             check_phase_expired(subtensor, job.phase_response)
 
-            # HF upload runs between the two commits so the revision is known
-            # by the time we write miner_commit_2. Failure returns (None, None)
-            # and the chain commit goes out without r/rv — the miner is then
-            # missing for this round and gets the zero-score penalty.
+            # Upload sits between the two commits so the revision is known by
+            # miner_commit_2. On failure the commit goes out without r/rv and
+            # the miner is scored 0 for the round.
             hf_chain_repo_id, hf_revision = _upload_checkpoint_to_hf_safe(config, latest_checkpoint)
 
             phase_response = wait_till(config, PhaseNames.miner_commit_2)

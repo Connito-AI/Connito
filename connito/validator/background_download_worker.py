@@ -45,13 +45,9 @@ from connito.validator.round import RoundRef
 
 logger = structlog.get_logger(__name__)
 
-# Maximum number of UIDs that may sit in `Round.downloaded_pool` waiting
-# for bg-eval to pick them up before bg-download stops fetching new
-# checkpoints. Without this cap, bg-download will happily pull every
-# miner's shard onto disk even when bg-eval is many minutes behind, which
-# wastes HF bandwidth and (more importantly) inflates the on-disk backlog
-# the cycle-tail prune has to tear down. Re-checked every poll so the cap
-# self-clears once eval drains the queue.
+# Backpressure: stop fetching once this many UIDs are queued for bg-eval.
+# Without it, downloads run far ahead of eval and inflate the on-disk backlog
+# the cycle-tail prune has to tear down. Re-checked every poll.
 DOWNLOAD_PENDING_EVAL_CAP = 5
 
 
@@ -233,13 +229,10 @@ class BackgroundDownloadWorker(threading.Thread):
             submission_dir = Path(self.config.ckpt.miner_submission_path)
             submission_dir.mkdir(parents=True, exist_ok=True)
 
-            # Skip if a submission for this hotkey already exists locally
-            # (e.g. validator restarted mid-round and the file is still on
-            # disk). The match is gated on block ∈ this round's submission
-            # window — without that filter, a leftover file from a previous
-            # cycle would short-circuit the fresh fetch and get published,
-            # but `gather_validation_job` would silently reject it for
-            # being out-of-window.
+            # Reuse a submission already on disk (restart mid-round), but only
+            # within this round's block window — a leftover from a previous
+            # cycle would short-circuit the fetch and then be silently rejected
+            # by `gather_validation_job`.
             existing = self._existing_submission(
                 submission_dir, hotkey, round_obj.submission_block_range,
             )
@@ -278,19 +271,12 @@ class BackgroundDownloadWorker(threading.Thread):
                     # from a missing-file failure can't pollute the next try.
                     shutil.rmtree(tmp_dir, ignore_errors=True)
                     try:
-                        # Subprocess isolation: a fresh `spawn`ed child runs
-                        # `hf_hub_download` and is fully terminable on timeout.
-                        # Previously we ran the download in a private
-                        # ThreadPoolExecutor and deliberately leaked the worker
-                        # thread on timeout (`shutdown(wait=False)`); over a
-                        # multi-day validator that, combined with
-                        # `huggingface_hub`'s xet backend churning its own
-                        # internal worker pool, degraded the shared HF session
-                        # to the point that present-on-HF files began returning
-                        # spurious "no candidate file" (see PR description for
-                        # the per-(uid,repo,revision) comparison against yuma).
-                        # The child has no shared state with the parent, so
-                        # one bad download cannot poison the next.
+                        # Subprocess isolation: a spawned child is fully
+                        # terminable on timeout and shares no HF session state
+                        # with the parent. Leaked in-process worker threads
+                        # degraded the shared session over a multi-day run
+                        # until present-on-HF files started returning spurious
+                        # "no candidate file".
                         await asyncio.to_thread(
                             download_checkpoint_from_hf_subprocess,
                             repo_id=repo_id,
@@ -303,13 +289,10 @@ class BackgroundDownloadWorker(threading.Thread):
                         downloaded_filename = candidate
                         break
                     except TimeoutError:
-                        # Hard timeout means the validator's network is the
-                        # problem, not a missing file — don't waste budget
-                        # retrying with a different suffix. The subprocess
-                        # variant raises the builtin TimeoutError (the old
-                        # thread variant used concurrent.futures.TimeoutError);
-                        # both subclass nothing in common, so we explicitly
-                        # match builtin TimeoutError here.
+                        # A hard timeout means our network, not a missing
+                        # file, so don't retry other suffixes. The subprocess
+                        # path raises the builtin TimeoutError, which shares no
+                        # base class with the futures one — match it explicitly.
                         logger.warning(
                             "bg-download: timeout",
                             uid=uid, hotkey=hotkey[:6], timeout_sec=timeout,
@@ -344,15 +327,11 @@ class BackgroundDownloadWorker(threading.Thread):
                         continue
 
                 if downloaded_filename is None:
-                    # Miner-fault attribution: the download stack said the
-                    # repo/revision/file is definitively gone (typed HF
-                    # errors, not network trouble) for EVERY candidate. Before
-                    # blaming the miner, get a second opinion from an
-                    # unauthenticated probe — if the file is publicly
-                    # fetchable without our token, the failure was on our
-                    # side (expired token, proxy, HF session state) and the
-                    # miner must keep its prior average. Both signals have to
-                    # agree before we zero anyone.
+                    # Every candidate failed with a typed HF "gone" error, not
+                    # network trouble. Confirm with an unauthenticated probe
+                    # before blaming the miner: if the file is publicly
+                    # fetchable, the fault is ours (token, proxy, session) and
+                    # the miner keeps its prior average.
                     if (
                         definitive_misses >= len(candidate_filenames)
                         and getattr(

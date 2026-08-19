@@ -34,12 +34,9 @@ from connito.shared.telemetry import (
 logger = structlog.get_logger(__name__)
 
 
-# Maps the short reason strings returned by `validate_miner_submission` onto
-# the closed `EvalFailureReason` enum used by the
-# `validator_miner_eval_failures_total` Counter and the
-# `validator_miner_eval_status` Gauge. Each row gets its own miner-facing
-# bucket so a miner reading the gateway can tell a bad signature apart from
-# a hash mismatch or an expert-group / NaN-Inf violation.
+# Reason strings from `validate_miner_submission` -> the closed
+# `EvalFailureReason` enum. One bucket per cause so a miner can tell a bad
+# signature from a hash mismatch or an expert-group violation.
 _VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
     "no_chain_commit": "no_chain_commit",
     "signature": "signature_invalid",
@@ -100,11 +97,8 @@ def cleanup_non_top_submissions(
     if not delete_uids:
         return []
 
-    # Map UID → hotkey for the deletion target set, and collect the
-    # hotkeys of every roster UID that has *not* been processed yet so
-    # we can refuse to touch their files even by accident (defense in
-    # depth: a hotkey clash would already be impossible, but the explicit
-    # filter makes the invariant readable at the deletion site).
+    # Also collect the hotkeys of unprocessed roster UIDs, so the deletion
+    # site can refuse to touch their files.
     hotkeys_to_delete = {
         round_obj.uid_to_hotkey[uid]
         for uid in delete_uids
@@ -146,17 +140,11 @@ def cleanup_non_top_submissions(
     return deleted
 
 
-# Rank → score mapping used by `finalize_round_scores`. Geometric
-# progression with ratio 1.5: top-1 in the round's delta ranking gets
-# 2.25, runner-up 1.5, third 1.0; everyone else (and every failed /
-# missing miner) gets 0.0. The geometric spacing concentrates more
-# reward weight at the top — `top1 / top3 = 2.25` vs. the previous
-# arithmetic mapping's `3 / 1 = 3` — while keeping the second-place
-# miner closer to first than to third (`top2 / top1 = 0.667` vs.
-# `top3 / top2 = 0.667`, equal ratios across tiers). Hard-coded rather
-# than parameterized off `top_k_miners_to_reward` (which governs disk
-# retention, not reward weight) because these values are part of the
-# scoring contract — see PR #93.
+# Rank -> score for `finalize_round_scores`; everyone outside the top 3, and
+# every failed or missing miner, gets 0.0. Geometric with ratio 1.5, so the
+# spacing between tiers is uniform. Part of the scoring contract — hard-coded
+# rather than derived from `top_k_miners_to_reward`, which governs disk
+# retention, not reward.
 _RANK_TO_SCORE: tuple[float, ...] = (2.25, 1.5, 1.0)
 
 
@@ -224,13 +212,9 @@ def finalize_round_scores(
         (uid, score) for uid, score in round_scores.items()
         if uid in scored and score > 0.0
     ]
-    # Group by exact score value: any miner whose val_loss matches
-    # another miner's gets 0 regardless of where they would have ranked.
-    # `score = (baseline_loss - val_loss) ** 1.2` with float64 math —
-    # exact equality between two miners is overwhelmingly evidence of a
-    # duplicated submission, not legitimate parallel improvement, so
-    # penalize both sides. Unique-score miners are then ranked normally
-    # and slot into the 3/2/1 mapping by position.
+    # Exact score equality between two miners in float64 means a duplicated
+    # submission, not parallel improvement, so both sides get 0 regardless of
+    # where they would have ranked. Unique scores rank normally.
     score_counts: dict[float, int] = {}
     for _, s in positive:
         score_counts[s] = score_counts.get(s, 0) + 1
@@ -295,15 +279,10 @@ def finalize_round_scores(
         )
         written[uid] = 0.0
 
-    # Telemetry — emit eval_status for the freeze_zero bucket here because
-    # the per-uid `_record_eval_failure` call sites only fire when the eval
-    # loop actually picks the miner up. Freeze-time invalid checkpoints
-    # never reach that point, so without this loop the gateway has no signal
-    # for "we knew at freeze you had no/invalid commit." validation_failed
-    # statuses are already set at the validate_miner_submission call site
-    # with the specific sub-reason (signature/hash/expert_group_or_nan), so
-    # do not overwrite them here. Wrapped broadly — telemetry must never
-    # block finalize.
+    # freeze_zero miners never reach the eval loop, so this is the only place
+    # their status is emitted. Do NOT overwrite validation_failed statuses —
+    # those already carry a specific sub-reason from the validate call site.
+    # Broad try/except: telemetry must never block finalize.
     try:
         from connito.shared.telemetry import set_miner_eval_status as _set_status
         for uid in freeze_zero_only:
@@ -320,11 +299,9 @@ def finalize_round_scores(
                 round_id=round_obj.round_id, error=str(e),
             )
 
-    # Flip the round's journal to `finalized=true` and rewrite it so the
-    # post-finalize file on disk reflects the rank-based scores. The
-    # journal stays on disk after this — pruned by age along with the
-    # aggregator entries it backs (see `prune_before_round` callers in
-    # run.py).
+    # Rewrite the journal as finalized so the file reflects the rank-based
+    # scores. It stays on disk, pruned by age with the aggregator entries it
+    # backs.
     journal_path = getattr(round_obj, "journal_path", None)
     if journal_path is not None:
         try:
@@ -369,14 +346,10 @@ def finalize_round_scores(
                 round_id=round_obj.round_id, error=str(e),
             )
 
-    # --- Cycle-consistent per-miner telemetry (dashboard contract). -------
-    # Emitted HERE — not from run.py's weight loop — for two reasons:
-    # (1) the weight loop only iterates weight recipients, so the dashboard
-    #     previously saw score snapshots for ~1 uid; every verdict uid gets
-    #     one now; (2) the journal-recovery replay calls this function too,
-    #     so a restart re-publishes the series without waiting for a fresh
-    #     round. Best-effort throughout — telemetry must never block
-    #     finalize or scoring.
+    # Cycle-consistent per-miner telemetry (dashboard contract). Emitted here
+    # rather than from run.py's weight loop so every verdict uid gets a
+    # snapshot, not just weight recipients, and so the journal-recovery replay
+    # re-publishes them after a restart. Best-effort throughout.
     try:
         from connito.shared.telemetry import (
             set_miner_evaluated_commit,
@@ -641,13 +614,9 @@ class MinerEvalJob:
     model_path: str
     step: int
     score: float = 0.0
-    # Raw evaluation loss for this miner this round. Carried alongside the
-    # delta-based `score` so the caller can journal it: `val_loss` is
-    # published to Prometheus at eval time and is NOT recoverable from
-    # `score` alone, because `delta = max(0.0, baseline - val_loss)` clamps
-    # at zero — every miner scoring 0 (the majority in many rounds) would
-    # be underivable. Without journaling it, a mid-round restart loses the
-    # cycle's losses permanently.
+    # Carried alongside `score` so the caller can journal it: `delta` clamps
+    # at zero, so val_loss is not recoverable from the score for the majority
+    # of miners that score 0.
     val_loss: float | None = None
 
 
@@ -661,10 +630,9 @@ EVAL_MAX_BATCHES = 50
 
 @track_model_load_latency()
 def load_model_from_path(path: str, base_model: nn.Module, device: torch.device) -> nn.Module:
-    # `path` points to a miner-controlled checkpoint downloaded from HF.
-    # `load_state_dict_from_path` accepts `.safetensors` (preferred — no
-    # pickle path) or `.pt` (gated by `weights_only=True` so a malicious
-    # `__reduce__` payload cannot execute on the validator host).
+    # `path` is miner-controlled. `.safetensors` has no pickle path; `.pt` is
+    # gated by `weights_only=True` so a crafted `__reduce__` payload can't
+    # execute on the validator host.
     sd = load_state_dict_from_path(path)
 
     if len(sd) == 0:
@@ -838,11 +806,8 @@ def evaluate_one_miner_sync(
 
         val_loss = float(metrics.get("val_loss", 100))
         delta = max(0.0, baseline_loss - val_loss)
-        # `score` is the per-round delta-based signal stored on
-        # `MinerEvalJob` and recorded in `round.scores` by the caller via
-        # `mark_scored`. The aggregator is intentionally NOT updated here
-        # — `finalize_round_scores` is the sole writer for this round's
-        # aggregator entries (see PR #93 introducing rank-based scoring).
+        # Per-round signal only; `finalize_round_scores` is the sole writer of
+        # this round's aggregator entries.
         score = delta ** 1.2
         # Publish per-miner val_loss to Prometheus so external aggregators
         # can render the leaderboard without a per-validator HTTP scrape.
@@ -852,12 +817,9 @@ def evaluate_one_miner_sync(
             VALIDATOR_MINER_VAL_LOSS.labels(miner_uid=str(int(uid))).set(float(val_loss))
         except Exception:
             pass
-        # Surface the eval outcome on the per-miner status gauge so miners
-        # can self-serve the answer to "why was my val_loss empty?". A
-        # non-finite loss does not abort scoring — downstream finalize will
-        # naturally produce a 0 ranking score — but the gauge lets the
-        # gateway distinguish "evaluated and clean" from "evaluated and the
-        # eval blew up numerically", which the failure Counter doesn't.
+        # A non-finite loss doesn't abort scoring (finalize gives it 0
+        # anyway), but the gauge lets miners distinguish "evaluated cleanly"
+        # from "eval blew up numerically", which the failure Counter can't.
         if math.isfinite(val_loss):
             set_miner_eval_status(int(uid), None)
         else:
@@ -898,10 +860,8 @@ def evaluate_one_miner_sync(
             torch.cuda.empty_cache()
         return None
     except (ValueError, RuntimeError, EOFError) as e:
-        # ValueError: load_model_from_path's "Unsupported checkpoint format" /
-        # empty state_dict guard. RuntimeError / EOFError: torch.load rejecting
-        # truncated or malformed payloads. All three signal an unreadable
-        # state_dict on disk, which is what the miner needs to see.
+        # Unsupported format, empty state_dict, or a truncated/malformed
+        # payload — all mean an unreadable checkpoint on disk.
         logger.exception("evaluate_one_miner: statedict parse failed", uid=int(uid), error=str(e))
         _record_eval_failure(int(uid), "statedict_parse_failed")
         return None
@@ -1005,12 +965,8 @@ async def evaluate_foreground_round(
     # level import would create a cycle.
     from connito.shared.cycle import BITTENSOR_BLOCK_TIME_SECONDS, gather_validation_job
 
-    # Baseline once against the round's input model (= live `base_model`,
-    # which equals round.model_snapshot_cpu since the foreground runs
-    # before Merge(K)). `_evaluate_on_fresh_loader_sync` is sync (per
-    # e692cc7, which moved the GPU work off the event loop); wrap it in
-    # `asyncio.to_thread` so this `async def evaluate_foreground_round`
-    # doesn't block the event loop during the baseline pass.
+    # Baseline once against the round's input model. The eval helper is sync,
+    # so run it on a thread to keep the event loop free.
     baseline_metrics = await asyncio.to_thread(
         _evaluate_on_fresh_loader_sync,
         config=config,
@@ -1083,11 +1039,9 @@ async def evaluate_foreground_round(
         for uid in round_obj.foreground_uids:
             if uid not in by_uid:
                 continue
-            # Hard-stop before claiming if Validate has ended. Without
-            # this, the inner for-loop walks every foreground UID before
-            # the outer `subtensor.block > end_block` check fires, so a
-            # 5-miner round can spill ~5 × per_miner_eval_timeout_sec
-            # past end_block.
+            # Hard-stop before claiming: the outer block check only fires
+            # after the inner loop walks every foreground UID, which can spill
+            # several eval timeouts past end_block.
             block_now = subtensor.block
             if block_now > end_block:
                 phase_deadline_crossed = True
@@ -1098,11 +1052,8 @@ async def evaluate_foreground_round(
             hotkey = round_obj.uid_to_hotkey[uid]
             progressed = True
 
-            # Verify the on-disk submission against the chain commit (signed
-            # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
-            # GPU eval. A failure here means the submission is off-spec —
-            # mark the miner failed so the missed-submission penalty pass
-            # zeroes their score for the round.
+            # Verify against the chain commit before spending GPU time. A
+            # failure is miner fault and gets score=0 for the round.
             fail_reason = await asyncio.to_thread(
                 validate_miner_submission,
                 round_obj=round_obj,
@@ -1111,13 +1062,9 @@ async def evaluate_foreground_round(
                 expert_group_assignment=expert_group_assignment,
             )
             if fail_reason is not None:
-                # Invalid checkpoint (no chain commit / signature / hash /
-                # expert_group / NaN-Inf): mark validation-failed so
-                # `finalize_round_scores` records score=0 at end of round.
-                # Operational failures below (timeout / OOM / unexpected
-                # exception) use plain `mark_failed`, which leaves the
-                # miner's prior EMA untouched — those failures are not
-                # the miner's fault.
+                # Miner-fault failure: score=0 at finalize. Operational
+                # failures below use plain `mark_failed`, which leaves the
+                # miner's prior average untouched.
                 logger.warning(
                     "foreground eval: submission failed validation — will record score=0 at finalize",
                     uid=uid, hotkey=hotkey[:6],

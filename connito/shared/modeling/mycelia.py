@@ -36,12 +36,10 @@ if MODEL_BACKEND == "deepseek_v2":
     )
 
     def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = False):
-        # Pipe through the 2Fnat knobs. Default routing_mode="natural_with_fallback"
-        # for the miner/validator path — the routing branch self-gates on
-        # trainable_ids and helper_ids both being non-empty, so single-group
-        # loads (only the trainable group; group_ids_helper=None) silently fall
-        # through to masked-topk with byte-identical numerics. When helper
-        # groups are also loaded, 2Fnat activates automatically.
+        # The routing branch self-gates on trainable_ids and helper_ids both
+        # being non-empty, so a single-group load falls through to masked-topk
+        # with identical numerics and 2Fnat activates only once a helper group
+        # is loaded.
         routing_mode = str(get_nested_attr(config, "task.routing_mode", "natural_with_fallback"))
         return _get_moe_model_config_impl(
             config, topk, group_ids_trainable, expert_manager,
@@ -230,28 +228,18 @@ def get_base_model(
             model_dtype=model_dtype,
         )
     else:
-        # Partial path: a bare `_CausalLMClass(moe_config)` would leave every
-        # parameter at its random `_init_weights` default. Downstream
-        # `load_checkpoint` only restores the active expert group, so the
-        # backbone / embeddings / lm_head / attention / dense MLPs / shared
-        # experts would all stay random.
-        #
-        # Strategy (keeps peak memory bounded for DeepSeek-V2-Lite — the
-        # earlier "build full model on CPU + convert" approach peaked at
-        # ~76 GB host RAM):
-        #   1. Build the partial model and move it to its target device
-        #      (typically GPU) at `model_dtype` before any pretrained data
-        #      is loaded. Partial parameters live in VRAM; host RAM for
-        #      the partial model returns to 0.
-        #   2. Open each safetensors shard directly via `safe_open` and
-        #      stream one tensor at a time into the partial model,
-        #      slicing owned experts in the same per-key pass. The full
-        #      state dict is never materialized in CPU RAM, so host RAM
-        #      stays bounded by a single shard's file-backed mmap
-        #      (~6 GB) plus one materialized tensor.
-        #   3. Fall back to `load_pretrained_state_dict` + in-RAM
-        #      streaming only if the safetensors-direct path is not
-        #      available for the current backend.
+        # Partial path. A bare `_CausalLMClass(moe_config)` leaves every
+        # parameter random, and `load_checkpoint` only restores the active
+        # expert group — the backbone, embeddings, lm_head and attention would
+        # stay random. Load pretrained weights ourselves, keeping peak host RAM
+        # bounded (building the full model on CPU first peaked at ~76 GB):
+        #   1. Build the partial model and move it to the target device first,
+        #      so its parameters live in VRAM.
+        #   2. Stream each safetensors shard in one tensor at a time via
+        #      `safe_open`, slicing owned experts in the same pass, so the full
+        #      state dict is never materialized in CPU RAM.
+        #   3. Fall back to in-RAM streaming when the backend has no
+        #      safetensors-direct path.
         target_device = getattr(config.model, "device", "cpu")
         if target_device == "cuda" and not torch.cuda.is_available():
             logger.warning(

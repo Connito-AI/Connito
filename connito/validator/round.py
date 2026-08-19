@@ -57,43 +57,34 @@ class Round:
     background_uids: tuple[int, ...]
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
-    # On-chain Submission phase block range for this round. bg-download uses
-    # it to gate `_existing_submission` reuse — without this filter, a stale
-    # .pt left over from a previous cycle would short-circuit the fresh
-    # fetch and get published into downloaded_pool, but `gather_validation_job`
-    # would silently reject it because its block falls outside the window.
+    # Gates `_existing_submission` reuse in bg-download: without it a stale
+    # file from a previous cycle short-circuits the fetch and is then silently
+    # rejected by `gather_validation_job`.
     submission_block_range: tuple[int, int] | None = None
-    # Per-uid `ChainCheckpoint` snapshot captured at freeze time so the eval
-    # path can run `validate(expert_group_assignment=...)` (signature, hash,
-    # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
+    # Captured at freeze so the eval path can validate submissions without
+    # re-issuing chain RPCs.
     uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = field(default_factory=dict)
 
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
     scored_uids: set[int] = field(default_factory=set)
-    # Per-uid score recorded by `mark_scored`. Scoped to *this round*
-    # only — kept here so cleanup ranking does not have to read the
-    # global `MinerScoreAggregator` (which mixes in scores from prior
-    # rounds and would let history pull a non-top-this-round miner into
-    # the keep set).
+    # This round's scores only. Cleanup ranks off these rather than the
+    # aggregator, whose history would pull a non-top-this-round miner into the
+    # keep set.
     scores: dict[int, float] = field(default_factory=dict)
-    # Per-uid raw evaluation loss, recorded by `mark_scored` alongside the
-    # score. Journaled so a mid-round restart doesn't lose the cycle's
-    # losses — `validator_miner_val_loss` is emitted at eval time and is
-    # not derivable from `scores` (the delta clamps at 0).
+    # Journaled because `scores` clamps the delta at 0, so a restart could not
+    # otherwise recover the cycle's losses.
     val_losses: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
-    # UIDs the miner is at fault for: explicit validation failures
-    # (hash/signature/expert_group/NaN-Inf/no_chain_commit), a committed
-    # HF checkpoint that is no longer publicly retrievable (repo deleted/
-    # private/gated — confirmed by an unauthenticated probe), or freeze-time
-    # invalid checkpoints. These get score=0 in the aggregator at finalize.
-    # `failed_uids ⊃ validation_failed_uids` — operational failures
-    # (timeout/OOM/exception/network-layer download failure) are in
-    # `failed_uids` only and intentionally receive *no* aggregator entry,
-    # so the miner keeps its prior EMA. The validator's lack of
-    # compute/bandwidth must not dock a miner's reward.
+    # Miner-fault failures: bad signature/hash/expert-group/NaN, no chain
+    # commit, an unfetchable HF repo, or a freeze-time invalid checkpoint.
+    # These get score=0 at finalize.
+    #
+    # `failed_uids ⊃ validation_failed_uids`. Operational failures
+    # (timeout/OOM/download) live only in `failed_uids` and deliberately get
+    # NO aggregator entry, so the miner keeps its prior average — the
+    # validator's lack of compute or bandwidth must not dock a miner.
     validation_failed_uids: set[int] = field(default_factory=set)
     # Freeze-time invalid-checkpoint penalties. Hotkey map is captured
     # alongside because these UIDs may not appear in `uid_to_hotkey`
@@ -101,36 +92,24 @@ class Round:
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
-    # Last live lifecycle step this round reached (set by run.py alongside
-    # the VALIDATOR_ROUND_LIFECYCLE_STEP gauge: 0 freeze / 2 post-foreground
-    # / 3 eval-window). Persisted to the journal so startup recovery can
-    # restore the round-level gauges that only the live loop writes.
+    # 0 freeze / 2 post-foreground / 3 eval-window. Journaled so startup
+    # recovery can restore the round-level gauges only the live loop writes.
     lifecycle_step: int = 0
 
-    # Round-group construction scheme (gated by
-    # `config.evaluation.enable_round_group_construction`). All default
-    # to `()` / 0 so the legacy code path leaves them empty and downstream
-    # consumers can branch on `bool(weight_group_1)` without a separate
-    # feature-flag check.
+    # Round-group construction. Default to empty so consumers can branch on
+    # `bool(weight_group_1)` instead of re-reading the feature flag.
     weight_group_1: tuple[int, ...] = ()
     weight_group_2: tuple[int, ...] = ()
     validation_group_a: tuple[int, ...] = ()
     validation_group_b: tuple[int, ...] = ()
     validation_group_c: tuple[int, ...] = ()
     cohort_epoch: int = 0
-    # Transient — the (possibly newly advanced) cohort state for this
-    # round. The caller in run.py reads this off and persists it after
-    # `Round.freeze` returns. `None` when the feature flag is off.
+    # Transient: run.py reads this off and persists it after freeze returns.
     cohort_state: "CohortState | None" = field(default=None, repr=False, compare=False)
 
-    # Per-round journal: every `mark_scored / mark_failed /
-    # mark_validation_failed` writes the round's mutation state to
-    # `journal_path`. Survives a kill before `finalize_round_scores` so
-    # bg-eval work isn't lost; also kept post-finalize as an audit log.
-    # `score_aggregator + score_path` let `mark_scored` write the raw
-    # in-cycle score to the aggregator alongside the journal.
-    # All three default `None` so legacy fixtures and tests that build
-    # `Round` directly (without `Round.freeze`) keep working.
+    # Every mark_* call writes the round's mutation state here, so a kill
+    # before `finalize_round_scores` doesn't lose bg-eval work. All three
+    # default None so tests can build a `Round` without `Round.freeze`.
     journal_path: "Path | None" = field(default=None, repr=False, compare=False)
     score_aggregator: "MinerScoreAggregator | None" = field(default=None, repr=False, compare=False)
     score_path: "Path | None" = field(default=None, repr=False, compare=False)
@@ -174,12 +153,9 @@ class Round:
             get_validator_seed_from_commit,
         )
 
-        # Fetch head-block chain commits ONCE and pass to both helpers; they
-        # would otherwise each issue a duplicate `get_all_commitments` +
-        # `metagraph()` pair against the archive endpoint, serialized through
-        # the global subtensor lock. Same for the metagraph already passed in
-        # by the caller — `get_validator_miner_assignment` reuses it instead
-        # of re-fetching head-block state.
+        # Fetch commits once and share them (plus the caller's metagraph) with
+        # both helpers; each would otherwise repeat a get_all_commitments +
+        # metagraph pair through the global subtensor lock.
         commits = get_chain_commits(config, subtensor)
         seed = get_combined_validator_seed(config, subtensor, commits=commits)
         assignment_result = get_validator_miner_assignment(
@@ -217,13 +193,9 @@ class Round:
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
-        # Freeze-time penalty: every metagraph neuron that lacks a valid
-        # chain checkpoint this round is recorded here so
-        # `finalize_round_scores` can stamp it with score=0 in the
-        # aggregator at end of round. Catching it on the main thread
-        # also covers miners with no commit at all — those never appear
-        # in `miners_with_checkpoint` and would otherwise be invisible
-        # to the eval workers entirely.
+        # Neurons with no valid chain checkpoint, stamped score=0 at finalize.
+        # Collected here because miners with no commit at all never reach the
+        # eval workers and would otherwise be invisible.
         freeze_zero_uids: set[int] = set()
         freeze_zero_hotkeys: dict[int, str] = {}
         for hk in metagraph.hotkeys:
@@ -244,12 +216,8 @@ class Round:
 
         foreground_uids = tuple(foreground)
 
-        # Legacy fallback ordering (used only when
-        # `config.evaluation.enable_round_group_construction = False`):
-        # background = top-N by prior avg score, then staleness tail.
-        # The chain-weight prepend that used to live here is now covered
-        # by the round-group scheme's chain-set Group 1/2 read in
-        # `connito.validator.round_groups.read_chain_set_top_k`.
+        # Legacy ordering, used only when round-group construction is off:
+        # background = top-N by prior avg score, then a staleness tail.
         EPOCH = datetime.min.replace(tzinfo=timezone.utc)
         last_eval_map = last_evaluated or {}
         prior_scores = prior_avg_scores or {}
@@ -284,9 +252,8 @@ class Round:
             *stale_tail,
         ])
 
-        # CPU-resident clone of global_model.state_dict(). Detach + clone +
-        # move to CPU so subsequent in-place mutations of global_model
-        # cannot leak into the snapshot.
+        # Detach + clone so later in-place mutations of global_model cannot
+        # leak into the snapshot.
         snapshot = {
             k: v.detach().clone().cpu() for k, v in global_model.state_dict().items()
         }
@@ -317,13 +284,9 @@ class Round:
             uids=list(stale_tail),
         )
 
-        # Round-group construction overlay (see
-        # docs/miner-validation-group-promotion.md). When enabled, the
-        # cohort advances at every 8th cycle, and the validation roster
-        # for this round is replaced by Group A + B + C in that order.
-        # The legacy foreground/background just-computed above is the
-        # fallback path used by every test fixture and validator that has
-        # not opted into the new scheme yet.
+        # Round-group overlay: the cohort advances every 8th cycle and the
+        # roster becomes Group A + B + C in that order, replacing the legacy
+        # ordering computed above. See docs/miner-validation-group-promotion.md.
         new_cohort_state: "CohortState | None" = None
         new_weight_group_1: tuple[int, ...] = ()
         new_weight_group_2: tuple[int, ...] = ()
@@ -383,26 +346,16 @@ class Round:
                 new_validation_c = new_cohort_state.validation_group_c
                 new_cohort_epoch = new_cohort_state.cohort_epoch
 
-                # Override legacy foreground/background with the cohort
-                # validation roster:
-                #   foreground = `cohort_state.foreground_uids` — this
-                #     validator's per-validator seeded partition of A∪B,
-                #     computed at the cohort boundary.
-                #   background = (A ∪ B ∪ C) \\ foreground, preserving
-                #     A → B → C order. Catches A/B miners outside our
-                #     foreground slice plus all of Group C.
+                # foreground = this validator's seeded slice of A∪B;
+                # background = the rest of A∪B∪C in A→B→C order.
                 foreground_uids, background_uids = round_groups.split_foreground_background(
                     new_cohort_state
                 )
 
-                # Tail: every miner with a chain checkpoint that did not
-                # land in this round's A/B/C roster or the prev-round
-                # A/B carry-over tier. Appended to background_uids
-                # (after the consensus + carry-over tiers) so it still
-                # gets downloaded + evaluated when there is spare
-                # capacity. Ordered staleness-first (longest-since-last
-                # evaluated), random tiebreak so equal-staleness UIDs
-                # rotate naturally across cycles.
+                # Tail: committed miners outside the A/B/C roster and the
+                # carry-over tier, appended last so they are evaluated only
+                # with spare capacity. Staleness-first with a random tiebreak,
+                # so equal-staleness UIDs rotate across cycles.
                 abc_set = (
                     set(new_validation_a)
                     | set(new_validation_b)
@@ -410,14 +363,10 @@ class Round:
                 )
                 cohort_set = abc_set | set(foreground_uids)
 
-                # Carry-over: re-evaluate last round's Group A and B in
-                # this round's background. Within a cohort epoch A/B
-                # are unchanged, so this dedupes to a no-op. At a
-                # cohort boundary the input `cohort_state` still holds
-                # the *previous* epoch's groups (advancement happens
-                # inside `maybe_advance_cohort` above and returns a new
-                # object), so those UIDs get one more eval pass before
-                # rotating out — the handoff does not drop their scores.
+                # Carry-over of last round's A/B into background. A no-op
+                # within a cohort epoch; at a boundary the input state still
+                # holds the previous epoch's groups, so those UIDs get one more
+                # eval pass instead of losing their scores at the handoff.
                 prev_ab_pool: list[int] = []
                 if cohort_state is not None:
                     _seen_prev: set[int] = set()
@@ -452,27 +401,19 @@ class Round:
                         *tail_pool,
                     ])
 
-                # Make sure every UID in the new roster has a hotkey
-                # entry — Group A and B may include UIDs outside this
-                # validator's assignment slice that the earlier loop
-                # didn't see. Cover both foreground and background.
+                # Groups A and B may include UIDs outside this validator's
+                # assignment slice, which the earlier loop never saw.
                 for uid in (*foreground_uids, *background_uids):
                     if uid in uid_to_hotkey:
                         continue
                     if 0 <= uid < len(metagraph.hotkeys):
                         uid_to_hotkey[uid] = metagraph.hotkeys[uid]
 
-                # Splice overlay foreground hotkeys into our entry of the
-                # assignment dict. `gather_validation_job` (called by
-                # `evaluate_foreground_round`) reads
-                # `validator_miner_assignment[my_hotkey]` to decide
-                # `is_assigned` for each submission file on disk. Without
-                # this splice every overlay-foreground UID that fell
-                # outside the legacy full-pool slice is bucketed into
-                # `unexpected_submissions` and silently dropped, wasting
-                # the entire foreground eval window for that round. Copy-
-                # on-write so the dict returned by the chain helper is
-                # not mutated under callers that retained a reference.
+                # `gather_validation_job` decides `is_assigned` from
+                # `validator_miner_assignment[my_hotkey]`, so overlay-foreground
+                # UIDs must be spliced in or they are dropped as unexpected
+                # submissions and the whole eval window is wasted. Copy-on-write
+                # so callers holding the chain helper's dict aren't mutated.
                 my_hk = config.chain.hotkey_ss58
                 spliced_assignment: dict[str, list[str]] = {
                     k: list(v) for k, v in assignment.items()
@@ -503,11 +444,8 @@ class Round:
                     weight_group_2=list(new_weight_group_2),
                 )
 
-        # Resolve the journal location. If `checkpoint_path` is provided
-        # we mirror the aggregator's checkpoint dir; otherwise leave
-        # `journal_path=None` and the round skips journaling (used by
-        # legacy tests that construct rounds directly without
-        # `Round.freeze`).
+        # No `checkpoint_path` means no journaling — used by tests that build
+        # rounds directly.
         resolved_journal_path: "Path | None" = None
         if checkpoint_path is not None:
             from connito.validator import round_journal as _rj
@@ -537,9 +475,8 @@ class Round:
             score_path=score_path,
         )
 
-        # Initial journal write — captures `freeze_zero_*` and the
-        # uid→hotkey map so the recovery pass has the full set of
-        # `finalize_round_scores` inputs even if nothing else mutates.
+        # Initial write, so recovery has the full finalize inputs even if
+        # nothing else mutates this round.
         if resolved_journal_path is not None:
             try:
                 new_round._persist_journal()

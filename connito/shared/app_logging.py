@@ -27,12 +27,9 @@ def configure_logging() -> None:
     logging.getLogger("datasets").setLevel(logging.WARNING)
     logging.getLogger("datasets.builder").setLevel(logging.WARNING)
 
-    # Drop huggingface_hub's per-download "Could not set the permissions" warning.
-    # It fires from `file_download._chmod_and_move` when chmod loses a race with
-    # the `.incomplete` tmp file being cleaned up — harmless, but emits two
-    # multi-line warnings per fetched file. Over a validator's day that's tens
-    # of thousands of lines that drown the rest of the log. We target the
-    # specific message rather than silencing the whole logger so genuine HF
+    # huggingface_hub emits two multi-line warnings per fetched file when
+    # chmod races the `.incomplete` cleanup — harmless, but tens of thousands
+    # of lines a day. Target the message, not the logger, so genuine HF
     # warnings still surface.
     class _HfPermissionsNoise(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
