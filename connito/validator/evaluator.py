@@ -15,6 +15,7 @@ import torch.nn as nn
 from connito.shared.app_logging import structlog
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
+from connito.shared.modeling.quantization import state_dict_shapes
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
     load_state_dict_from_path,
@@ -213,6 +214,12 @@ def finalize_round_scores(
     with round_obj._lock:  # noqa: SLF001 — same module family
         round_scores = dict(round_obj.scores)
         validation_failed = set(round_obj.validation_failed_uids)
+        # `getattr`, not attribute access: this function also runs against
+        # duck-typed stand-ins that are not a real `Round` — notably the
+        # journal-recovery path's `_RecoveryRound`, which carries scores and
+        # validation failures but no dedup state. A recovered round has no
+        # pair measurements to act on, so an empty set is the right answer.
+        dedup_flagged = set(getattr(round_obj, "dedup_flagged_uids", ()) or ())
     freeze_zero = set(round_obj.freeze_zero_uids)
     freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
 
@@ -235,13 +242,33 @@ def finalize_round_scores(
     for _, s in positive:
         score_counts[s] = score_counts.get(s, 0) + 1
     tied_uids = {uid for uid, s in positive if score_counts[s] > 1}
-    unique_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
-    unique_positive.sort(key=lambda kv: (-kv[1], kv[0]))
+    # Near-duplicates confirmed by the merge-loss filter in "enforce" mode:
+    # averaging the pair was not better than its better side, so neither
+    # added information the other lacked. Both sides are zeroed, exactly as
+    # the exact-tie rule above does — this generalizes that rule from
+    # bit-identical to near-identical submissions, which a 1-ULP
+    # perturbation is otherwise enough to slip past. Always empty unless
+    # `dedup_filter_mode == "enforce"`.
+    dedup_uids = {uid for uid, _ in positive if uid in dedup_flagged}
+    penalized_uids = tied_uids | dedup_uids
+    # Ranking list. Tied miners are dropped outright, so everyone below them
+    # moves up — the pre-existing exact-tie behaviour, deliberately left
+    # alone (it applies even with the dedup filter off). Dedup-flagged
+    # miners instead KEEP their position and are paid 0, which burns the
+    # slot rather than handing it to the next miner up. Two reasons it must
+    # not cascade: the pairwise filter only ever examines the top
+    # `dedup_top_k`, so a promoted miner is one nobody compared against
+    # anything; and cascading pays an attacker for taking out a rival, since
+    # zeroing the leader lifts every UID behind it by exactly one rank.
+    ranked_positive = [(uid, s) for uid, s in positive if score_counts[s] == 1]
+    ranked_positive.sort(key=lambda kv: (-kv[1], kv[0]))
 
     written: dict[int, float] = {}
     top_uids: set[int] = set()
-    for rank, (uid, _) in enumerate(unique_positive):
+    for rank, (uid, _) in enumerate(ranked_positive):
         rank_score = _RANK_TO_SCORE[rank] if rank < len(_RANK_TO_SCORE) else 0.0
+        if uid in dedup_uids:
+            rank_score = 0.0  # slot burned, not reassigned
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -251,8 +278,11 @@ def finalize_round_scores(
         written[uid] = rank_score
         top_uids.add(uid)
 
-    # Tied positive-delta miners — explicit 0 entry per uid.
-    for uid in tied_uids:
+    # Tied miners — plus any dedup-flagged miner that was *also* tied and so
+    # never appeared in `ranked_positive`. Explicit 0 entry per uid.
+    for uid in penalized_uids:
+        if uid in written:
+            continue
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
             continue
@@ -420,12 +450,12 @@ def finalize_round_scores(
     logger.info(
         "finalize_round_scores: round scored by rank",
         round_id=round_obj.round_id,
-        top3={
-            int(u): _RANK_TO_SCORE[r]
-            for r, (u, _) in enumerate(unique_positive[:3])
-        },
+        # Actual awarded score, not the rank's nominal value — a burned
+        # slot must read 0 here or the log contradicts the aggregator.
+        top3={int(u): written.get(int(u), 0.0) for u, _ in ranked_positive[:3]},
         scored_count=len(scored),
         tied_count=len(tied_uids),
+        dedup_flagged_count=len(dedup_uids),
         validation_failed_count=len(validation_failed),
         freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )
@@ -548,6 +578,21 @@ def build_submission_uid_weights(
     )
 
 
+def retention_top_k(config) -> int:
+    """How many top submissions to keep on disk after each eval.
+
+    Normally `top_k_miners_to_reward`; while the dedup filter is active
+    the shadow pass needs the top `dedup_top_k` files to survive pruning
+    long enough to build merged pairs, so keep the max of the two. Used
+    by BOTH prune sites (foreground `_prune_non_top_after_eval` here and
+    the background worker's `_prune_non_top`).
+    """
+    keep = int(config.evaluation.top_k_miners_to_reward)
+    if getattr(config.evaluation, "dedup_filter_mode", "off") != "off":
+        keep = max(keep, int(getattr(config.evaluation, "dedup_top_k", 0)))
+    return keep
+
+
 def _prune_non_top_after_eval(
     *,
     config,
@@ -560,7 +605,7 @@ def _prune_non_top_after_eval(
         deleted = cleanup_non_top_submissions(
             round_obj=round_obj,
             submission_dir=Path(config.ckpt.miner_submission_path),
-            top_k=int(config.evaluation.top_k_miners_to_reward),
+            top_k=retention_top_k(config),
         )
     except Exception as e:
         logger.warning("foreground eval: post-eval cleanup failed", error=str(e))
@@ -648,6 +693,10 @@ class MinerEvalJob:
     # at zero — every miner scoring 0 (the majority in many rounds) would
     # be underivable. Without journaling it, a mid-round restart loses the
     # cycle's losses permanently.
+    #
+    # The dedup shadow pass also reads this: an exact `val_loss` avoids
+    # re-deriving the loss by inverting `score`, which is lossy at 0.
+    # `None` (not NaN) is the absent marker — consumers must check for it.
     val_loss: float | None = None
 
 
@@ -677,15 +726,19 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
 
     model = copy.deepcopy(base_model)
 
-    # Keys in each state_dict (before loading)
-    base_sd = base_model.state_dict()
+    # Keys in each state_dict (before loading). This block only ever reads keys
+    # and shapes, so take the cached shape map rather than `base_model
+    # .state_dict()`: this runs once per miner against the same base model, and
+    # on a quantized base every call would materialise a full dequantized copy
+    # and eat exactly the memory the quantization saved.
+    base_sd = state_dict_shapes(base_model)
     base_keys = set(base_sd.keys())
     ckpt_keys = set(sd.keys())
 
     # 1) Params that are the same across both dicts (intersection).
     #    (Optional: filter to ones with matching shapes too.)
     common_keys = base_keys & ckpt_keys
-    common_same_shape = {k for k in common_keys if base_sd[k].shape == sd[k].shape}
+    common_same_shape = {k for k in common_keys if base_sd[k] == tuple(sd[k].shape)}
 
     # 2) Keys containing 'expert' that exist in the checkpoint but NOT in the base model
     expert_not_in_base = {k for k in ckpt_keys - base_keys if "expert" in k}
@@ -804,8 +857,16 @@ def evaluate_one_miner_sync(
     rank: int | None = None,
     deadline_monotonic: float | None = None,
     cached_batches: list | None = None,
+    graft_controller=None,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
+
+    `graft_controller` (a `FullTopologyEvalBase`) switches the per-miner model
+    from deepcopy-and-overlay to graft-in-place-and-restore: the controller
+    owns `base_model`, backs up the rows the shard touches, and puts them back
+    in this function's `finally`. With it set, `base_model` is mutated during
+    the eval and clean again after — the read-only contract holds at the call
+    boundary, not inside it.
 
     All GPU work — `load_model_from_path`, dataloader build, and
     `evaluate_model` — happens inside this single function so the caller
@@ -834,7 +895,20 @@ def evaluate_one_miner_sync(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        miner_model = load_model_from_path(str(model_path), base_model, device)
+        if graft_controller is not None:
+            # Serialise graft→eval→restore on the shared base. Acquired inside
+            # this thread (same reasoning as bg-eval's gpu_eval_lock, see the
+            # docstring above): release then tracks actual completion, so an
+            # orphaned timed-out eval finishes its restore before the next
+            # miner's graft can begin.
+            graft_controller.lock.acquire()
+            try:
+                miner_model = graft_controller.graft_from_path(str(model_path))
+            except BaseException:
+                graft_controller.lock.release()
+                raise
+        else:
+            miner_model = load_model_from_path(str(model_path), base_model, device)
 
         try:
             metrics = _evaluate_on_fresh_loader_sync(
@@ -850,7 +924,16 @@ def evaluate_one_miner_sync(
                 cached_batches=cached_batches,
             )
         finally:
-            del miner_model
+            if graft_controller is not None:
+                # Restore instead of discard: `miner_model` IS the shared
+                # base, and the next miner needs it bit-identical to
+                # pre-graft.
+                try:
+                    graft_controller.restore_grafted()
+                finally:
+                    graft_controller.lock.release()
+            else:
+                del miner_model
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -945,6 +1028,7 @@ async def evaluate_one_miner(
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
+    graft_controller=None,
 ) -> "MinerEvalJob | None":
     """Evaluate a single miner and return the per-round delta-based score.
 
@@ -984,6 +1068,7 @@ async def evaluate_one_miner(
         round_id=round_id,
         max_eval_batches=max_eval_batches,
         rank=rank,
+        graft_controller=graft_controller,
     )
 
 
@@ -1001,6 +1086,7 @@ async def evaluate_foreground_round(
     poll_interval_sec: float = 6.0,
     per_miner_eval_timeout_sec: float | None = None,
     completed_out: list[MinerEvalJob] | None = None,
+    graft_controller=None,
 ) -> list[MinerEvalJob]:
     """Foreground (step 2): evaluate the round's top-N miners during
     Submission + Validate.
@@ -1023,6 +1109,13 @@ async def evaluate_foreground_round(
     # Lazy imports — connito.shared.cycle imports this module, so a top-
     # level import would create a cycle.
     from connito.shared.cycle import BITTENSOR_BLOCK_TIME_SECONDS, gather_validation_job
+
+    if graft_controller is not None:
+        # Pin the round's generation now, before the first miner. Orphaned
+        # evals from a previous round that are still queued on the base's lock
+        # will fail their generation check instead of grafting stale shards
+        # onto the refreshed base mid-round.
+        graft_controller = graft_controller.round_handle()
 
     # Baseline once against the round's input model (= live `base_model`,
     # which equals round.model_snapshot_cpu since the foreground runs
@@ -1179,6 +1272,7 @@ async def evaluate_foreground_round(
                 baseline_loss=baseline_loss,
                 step=step,
                 round_id=round_obj.round_id,
+                graft_controller=graft_controller,
             )
             try:
                 evaluated = await asyncio.wait_for(eval_coro, timeout=effective_timeout)

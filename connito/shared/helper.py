@@ -1,5 +1,6 @@
 import hashlib
 import importlib
+import itertools
 import os
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,40 @@ import torch.nn.functional as F
 # preferred path — no pickle, no code-execution surface. `.pt` is still
 # accepted for backwards compatibility with miners that haven't migrated.
 MINER_CHECKPOINT_SUFFIXES: tuple[str, ...] = (".safetensors", ".pt")
+
+
+def resolve_precision(config: Any) -> str:
+    """Return the effective `model.precision`, downgrading bf16 where unsupported.
+
+    `bf16-mixed` silently becomes `fp16-mixed` on a CUDA device that does not
+    report BF16 compute. This capability check was copy-pasted into four call
+    sites (model loading, the post-load cast, the miner's GradScaler setup and
+    its autocast context); they must agree, because a model built at one dtype
+    and autocast at another produces silently different losses.
+    """
+    precision = str(getattr(getattr(config, "model", None), "precision", "fp16-mixed"))
+    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        return "fp16-mixed"
+    return precision
+
+
+def resolve_model_dtype(config: Any) -> torch.dtype:
+    """Return the torch dtype the model's weights are held at."""
+    return torch.bfloat16 if resolve_precision(config) == "bf16-mixed" else torch.float16
+
+
+def infer_storage_dtype(model: "torch.nn.Module", default: torch.dtype = torch.float16) -> torch.dtype:
+    """Best-effort read of the half precision a built model stores weights at.
+
+    Order-independent, unlike `next(model.parameters()).dtype`: it skips fp32
+    (the miner upcasts *trainable* params to fp32 for AdamW) and fp8 (runtime
+    quantization moves converted weights into buffers), so it answers with the
+    model's actual storage precision wherever that tensor happens to sit.
+    """
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        if tensor.dtype in (torch.float16, torch.bfloat16):
+            return tensor.dtype
+    return default
 
 
 def load_state_dict_from_path(path: str | os.PathLike) -> dict[str, torch.Tensor]:

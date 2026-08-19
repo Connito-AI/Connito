@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import warnings
 from collections import OrderedDict
@@ -17,7 +18,7 @@ if logging.root.level > logging.DEBUG:
     logging.getLogger("transformers.modeling_rope_utils").setLevel(logging.ERROR)
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import get_nested_attr
+from connito.shared.helper import get_nested_attr, resolve_model_dtype
 from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import *
@@ -29,6 +30,7 @@ MODEL_BACKEND = "deepseek_v2"
 if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
+        assignments_from_expert_modules as _assignments_from_expert_modules_impl,
         get_moe_model_config as _get_moe_model_config_impl,
         merge_group_assignments_for_streaming as _merge_group_assignments_for_streaming_impl,
         stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
@@ -54,6 +56,37 @@ else:
     raise ValueError(f"Unknown MODEL_BACKEND: {MODEL_BACKEND!r}")
 
 logger = structlog.get_logger(__name__)
+
+
+@contextlib.contextmanager
+def build_at_dtype(dtype: torch.dtype):
+    """Construct modules directly at `dtype` instead of fp32-then-cast.
+
+    `nn.Parameter(torch.empty(...))` and `nn.Linear` take torch's *default*
+    dtype, which is fp32. Building a model and casting afterwards therefore
+    peaks at 2x its final size, because the fp32 storage for every parameter is
+    live until that parameter is individually replaced.
+
+    Measured on the full DeepSeek-V2-Lite topology (15.71 B params): 59.6 GB
+    peak resident on a 62 GB host for a model whose final size is ~31 GB. The
+    build alone was within a couple of GB of exhausting the machine, before the
+    gradient buffers or any eval copy existed.
+
+    Callers should keep their trailing `.to(dtype=...)`: `Tensor.to` returns
+    self when the dtype already matches, so it costs nothing and the end state
+    stays pinned to the same invariant if a submodule ever hard-codes fp32.
+
+    `set_default_dtype` is process-global, so this must wrap construction only —
+    never a region that yields to concurrent model building. Model construction
+    happens once at startup on the main thread, which is why this is safe here
+    and would not be inside the round loop.
+    """
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 # ---------------------------------------------------------------------
@@ -93,17 +126,51 @@ def load_pretrained_model_low_mem(
 ) -> nn.Module:
     """Load pretrained weights directly into the custom model with low CPU memory usage."""
     if bool(getattr(moe_config, "full", False)):
+        # Build at `model_dtype` from the start: a fp32 default + later cast
+        # peaks at ~2x the final size for a 15B-param model. The trailing
+        # `.to()` is a no-op once construction is already at the right dtype
+        # (`Tensor.to` returns self) and is kept as the invariant's backstop.
+        with build_at_dtype(model_dtype):
+            model = model_class(moe_config)
+        model = model.to(dtype=model_dtype)
+
+        # Stream through the same per-key translator the partial path uses.
+        # A bare `load_state_dict(strict=False)` here loaded NOTHING into the
+        # routed experts: the checkpoint names them
+        # `...experts.{N}.{gate,up,down}_proj.weight`, one tensor per expert per
+        # projection, while `CustomDeepseekV2Experts` stores each layer's experts
+        # stacked and gate/up fused, under `...experts.{N}.gate_up_proj`. Neither
+        # side matched, `strict=False` swallowed both the 4992 unexpected keys
+        # and the 52 missing ones, and every routed expert kept its
+        # `_init_weights` random values — 14.39 B of 15.71 B parameters, with no
+        # exception and no warning. Measured on an L40S: the model scored 9.956
+        # against the stock HF model's 1.449 on identical batches.
+        assignments = _assignments_from_expert_modules_impl(model)
+        try:
+            model = _stream_safetensors_to_partial_impl(
+                model, model_path, assignments, model_dtype,
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back, then report
+            # Same fallback ladder as the partial path: a checkpoint with no
+            # safetensors (or an unreadable index) still loads, just at the
+            # cost of holding the state dict in host RAM.
+            logger.warning(
+                "Safetensors streaming unavailable for full model; falling back "
+                "to an in-RAM state dict",
+                path=model_path,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
+            model = _stream_pretrained_to_partial_impl(model, pretrained_sd, assignments)
+            del pretrained_sd
+
         logger.info(
-            "Using direct explicit state_dict load for full model to avoid meta-tensor finalize issues",
+            "Loaded full model",
             path=model_path,
+            dtype=str(model_dtype),
+            moe_layers=len(assignments),
+            routed_experts=sum(len(v) for v in assignments.values()),
         )
-        # Build at `model_dtype` from the start: a fp32 default + later
-        # cast would peak at ~2x the final size for a 15B-param model.
-        model = model_class(moe_config).to(dtype=model_dtype)
-        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
-        model.load_state_dict(pretrained_sd, strict=False)
-        del pretrained_sd
-        logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
         return model
 
     model = model_class.from_pretrained(
@@ -132,7 +199,9 @@ def load_pretrained_model_low_mem(
         del model
         gc.collect()
 
-        model = model_class(moe_config).to(dtype=model_dtype)
+        with build_at_dtype(model_dtype):
+            model = model_class(moe_config)
+        model = model.to(dtype=model_dtype)
         pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
         model.load_state_dict(pretrained_sd, strict=False)
         del pretrained_sd
@@ -150,76 +219,23 @@ def get_base_model(
     partial=False,
 ) -> nn.Module | None:
     """
-    Load base model with role-specific optimizations.
+    Load the base model.
 
-    Validators: Load with 4-bit quantization + Unsloth for memory efficiency
-    Miners: Load standard model for training
+    Weights are always loaded at `model.precision` (fp16/bf16). Runtime fp8
+    quantization, when enabled, is applied by the caller *after* loading — see
+    `connito.shared.modeling.quantization`. It cannot be done here: the partial
+    path below never goes through `from_pretrained`, so a transformers
+    `quantization_config` would have no effect, and the streaming loaders rely
+    on `state_dict()` returning live views into unquantized parameters.
     """
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-
-    precision = getattr(config.model, "precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        precision = "fp16-mixed"
-    model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
+    model_dtype = resolve_model_dtype(config)
 
     topk = config.moe.partial_topk if partial else config.moe.full_topk
-    model_path = config.model.model_path.lower()
-    
+
     moe_config = get_moe_model_config(
         config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = not partial,
     )
-        
-    is_validator = config.role == "validator"
-    use_quantization = get_nested_attr(config, "model.use_quantization", False) and is_validator
-    use_unsloth = get_nested_attr(config, "model.use_unsloth", False) and is_validator
 
-    # === QUANTIZED PATH (Validators only) ===
-    if use_quantization:
-        logger.info("Loading with 4-bit quantization for validator")
-
-        # Try Unsloth first (fastest)
-        if use_unsloth:
-            try:
-                from unsloth import FastLanguageModel
-
-                model, _ = FastLanguageModel.from_pretrained(
-                    model_name=config.model.model_path,
-                    max_seq_length=moe_config.max_position_embeddings,
-                    dtype=model_dtype,
-                    load_in_4bit=True,
-                    device_map="auto",
-                )
-                FastLanguageModel.for_inference(model)
-                logger.info("✓ Loaded with Unsloth optimizations")
-                return model
-            except Exception as e:
-                logger.warning(f"Unsloth failed, falling back to BitsAndBytes: {e}")
-
-        # Fallback to BitsAndBytes
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=model_dtype,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-
-        max_memory = get_nested_attr(config, "model.max_memory", None)
-        if max_memory is None:
-            max_memory = {0: "46GB", "cpu": "100GB"}
-
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model.model_path,
-            config=moe_config,
-            quantization_config=bnb_config,
-            device_map="auto",
-            max_memory=max_memory,
-            low_cpu_mem_usage=True,
-            torch_dtype=model_dtype,
-        )
-        logger.info("✓ Loaded with BitsAndBytes quantization")
-        return model
-
-    # === STANDARD PATH (Miners / non-quantized validators) ===
     # For full models, load directly into the custom class with low_cpu_mem_usage
     # to avoid materializing an extra full HF model + full intermediate state_dict.
     if not partial:
@@ -259,7 +275,12 @@ def get_base_model(
             )
             target_device = "cpu"
 
-        model = _CausalLMClass(moe_config)
+        # Same fp32-then-cast trap as the full path, an order of magnitude
+        # smaller: the partial model is ~4 GB, so the old peak was ~8 GB rather
+        # than ~60 GB. Fixed here too because it is the same bug and the same
+        # one-line remedy, not because it was hurting anything.
+        with build_at_dtype(model_dtype):
+            model = _CausalLMClass(moe_config)
         # Merge every loaded group's per-layer expert assignment into a single
         # mapping whose my_expert_ids match the merged partial model's local
         # slot layout (sorted-by-org_expert_id). This lets us stream pretrained

@@ -103,6 +103,7 @@ from connito.shared.hf_distribute import (
 from connito.shared.cycle import (
     BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
+    eval_window_close_block,
     wait_till,
 )
 from connito.shared.dataloader import get_dataloader
@@ -115,12 +116,14 @@ from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gra
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
+from connito.shared.modeling.quantization import quantize_model_
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
-from connito.validator.chain_submitter import ChainSubmitter
+from connito.validator.chain_submitter import ChainSubmitter, observer_mode_enabled
+from connito.validator.full_topology_eval import FullTopologyEvalBase
 from connito.validator.evaluator import (
     MinerEvalJob,
     build_submission_uid_weights,
@@ -400,7 +403,14 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
+    # global_model — used for optimization and for every per-miner eval copy
+    # (`evaluator.load_model_from_path` deepcopies it), so its topology is the
+    # topology the subnet is scored on. `moe.partial_moe` selects:
+    #   True  -> partial, only the trainable (+ helper) group's experts
+    #   False -> full, every routed expert of the base checkpoint
+    # Previously hard-coded True, which left the full branch of
+    # `mycelia.get_base_model` unreachable from any config.
+    #
     # `load_global_checkpoint=False`: the validator boots from the pretrained
     # backbone + experts (`get_base_model`) without overlaying any on-disk
     # expert state. Peer-resync via `reload_model_inplace` still pulls the
@@ -408,7 +418,7 @@ def setup_training(
     # resume below is also independent of this flag.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
-        partial=True, checkpoint_device=device,
+        partial=bool(config.moe.partial_moe), checkpoint_device=device,
         load_global_checkpoint=False,
     )
 
@@ -462,6 +472,261 @@ def setup_training(
         expert_manager,
         train_dataloader,
     )
+
+
+# Escape hatch for running the rank-preservation gate on a staging host.
+# Not a tuning knob — see `quantize_eval_model_`.
+VALIDATOR_FP8_OVERRIDE_ENV = "CONNITO_ALLOW_VALIDATOR_FP8"
+
+
+def check_validator_quantization_supported(config: ValidatorConfig) -> None:
+    """Reject an fp8 validator config at startup rather than mid-round."""
+    if get_nested_attr(config, "model.quantization", "off") != "fp8":
+        return
+    if os.environ.get(VALIDATOR_FP8_OVERRIDE_ENV) == "1":
+        logger.warning(
+            "Starting with fp8 validator eval via override — scoring is expected "
+            "to be corrupted: the rank-preservation gate has been run against "
+            "fp8 and it FAILED (0.21x perturbation against a <0.1x bar, top-3 "
+            "reordering). Use a staging hotkey only",
+            override=VALIDATOR_FP8_OVERRIDE_ENV,
+        )
+        return
+    # Raise through the same path so the explanation lives in one place.
+    quantize_eval_model_(config, nn.Module(), role="startup-check")
+
+
+def check_full_topology_eval_supported(config: ValidatorConfig) -> None:
+    """Reject an unworkable `full_topology_eval` combination at startup.
+
+    Each of these fails mid-round otherwise, after the roster is frozen:
+
+    * `quantization` — the fp8 foreground cache path (`resolve_foreground_
+      eval_model`) and the graft path would fight over which model
+      foreground scores against, and fp8 eval is gated on its own merits.
+    * `moe.partial_moe: false` — a full global model cannot merge (87.8 GiB
+      peak, measured); the whole point of the eval base is that the global
+      model stays partial.
+
+    Note what is NOT checked here: `background_worker_enabled`. An earlier
+    version required it false, on the grounds that bg-eval would need a second
+    full template. That is true of bg-*eval* and false of bg-*download*, which
+    the same flag gates — and foreground reads exclusively from the directory
+    bg-download fills. Requiring the flag off therefore starved the round it
+    was meant to protect: one full window, `discovered_total=0`, `scored=0`,
+    against four claimed foreground UIDs. bg-eval is now suppressed on its own
+    in `run()` and downloads keep flowing.
+    """
+    if not bool(get_nested_attr(config, "evaluation.full_topology_eval", False)):
+        return
+    problems = []
+    if get_nested_attr(config, "model.quantization", "off") != "off":
+        problems.append("model.quantization must be 'off'")
+    if not bool(get_nested_attr(config, "moe.partial_moe", True)):
+        problems.append("moe.partial_moe must stay true (the global model stays partial)")
+    if problems:
+        raise RuntimeError(
+            "evaluation.full_topology_eval=true is not supported with this "
+            "config: " + "; ".join(problems)
+        )
+
+
+def warn_on_full_expert_topology(config: ValidatorConfig) -> None:
+    """Announce a full-topology validator at startup, with its cost.
+
+    Not a refusal: the full topology is the deployment geometry the reference
+    experiment measures, and matching it is the point of the option. But it is
+    not a drop-in swap for `partial_moe: true`, and the failure mode is an OOM
+    part-way through the first round rather than at startup, so an operator who
+    set it deserves the numbers up front.
+
+    Where the memory goes, measured on an L40S (46 GB):
+
+      * The model itself. Full carries 14.39 B routed-expert params against
+        partial's 1.32 B — ~29 GB of fp16 weights instead of ~2.6 GB.
+      * `evaluator.load_model_from_path` builds each per-miner eval model with
+        `copy.deepcopy(global_model)` and `quantize_eval_model_` runs *after*
+        that copy, so the transient peak is two unquantized models. fp8 shrinks
+        the copy it produces, not the peak that produces it. This was measured
+        OOMing, not predicted.
+      * `global_model` must stay unquantized regardless: merge and the outer
+        optimizer walk `named_parameters()`, and fp8 weights live in buffers.
+
+    So `partial_moe: false` currently needs host RAM for the base model and a
+    card that can hold two copies of it. Treat 46 GB as not enough.
+    """
+    if bool(get_nested_attr(config, "moe.partial_moe", True)):
+        return
+    logger.warning(
+        "Validator built on the FULL expert topology — every routed expert is "
+        "materialised and scored. This is the reference experiment's geometry, "
+        "but it is ~29 GB of fp16 expert weights against partial's ~2.6 GB, and "
+        "each per-miner eval deepcopies the model before quantization can "
+        "shrink it. Expect OOM on a 46 GB card. Also note this is not a locked "
+        "field: a validator here scores on a different forward graph to a "
+        "validator on partial, and their weights will disagree",
+        partial_moe=False,
+        full_topk=get_nested_attr(config, "moe.full_topk", None),
+        quantization=get_nested_attr(config, "model.quantization", "off"),
+        precision=get_nested_attr(config, "model.precision", None),
+    )
+
+
+def quantize_eval_model_(config: ValidatorConfig, model: nn.Module, *, role: str) -> None:
+    """Apply `model.quantization` to a validator eval model, in place.
+
+    Only ever called on eval copies. `global_model` must stay fp16: merge and
+    the outer optimizer walk `named_parameters()`, and fp8 weights are
+    buffers, so quantizing it would make both silently skip every converted
+    tensor — no exception, no warning, just decaying vtrust.
+
+    Refuses to run without an explicit env override. This is a hard failure and
+    not a warning: both symptoms below are silent in production, and one of them
+    zeroes real miners' rewards.
+    """
+    if get_nested_attr(config, "model.quantization", "off") != "fp8":
+        return
+
+    if os.environ.get(VALIDATOR_FP8_OVERRIDE_ENV) != "1":
+        raise RuntimeError(
+            "model.quantization='fp8' is not permitted on a validator.\n"
+            "\n"
+            "The rank-preservation gate has only ever been run against per-row "
+            "int8, and int8 FAILED it. Measured on an L40S against 7 real miner "
+            "shards, production eval mix (C4 + Nemotron-CC-Math), 21 batches @ "
+            "seq 1024:\n"
+            "  - the top-3 ordering changed, and _RANK_TO_SCORE pays by position "
+            "(2.25/1.5/1.0), so this silently redistributes rewards;\n"
+            "  - quantization manufactured exact val_loss ties out of a tie-free "
+            "population (0 pairs under fp16 -> 2 pairs under int8). "
+            "finalize_round_scores zeroes every miner in an exact tie, so four "
+            "miners lost a round's reward to a quantization artefact — including "
+            "the two int8 itself ranked first and second;\n"
+            "  - per-miner perturbation was 0.36x the best-to-worst spread, "
+            "against a <0.1x bar.\n"
+            "\n"
+            "fp8 (e4m3) has since been gated in its own right, on the same 7 "
+            "shards and the same eval mix, and it FAILED the same way: top-3 "
+            "reordering, one exact val_loss tie manufactured out of a tie-free "
+            "population, and 0.21x perturbation against the <0.1x bar. That is "
+            "the expected result for a strictly coarser format — 2.654% mean "
+            "relative weight error against int8's 0.829%, at identical storage "
+            "(measured across all 4992 expert projections of DeepSeek-V2-Lite; "
+            "min 2.645%, max 2.660%).\n"
+            "\n"
+            "Do not read a small *loss* delta as a licence to enable this. On a "
+            "correctly loaded full model the absolute val_loss shift is only "
+            "~0.001 — negligible for training, and the reason the miner-side "
+            "toggle is safe. But the inter-miner spread the ranking has to "
+            "resolve is itself of that order, which is exactly how a harmless "
+            "loss delta becomes a reordered podium.\n"
+            "\n"
+            f"Set {VALIDATOR_FP8_OVERRIDE_ENV}=1 only to re-run that gate on a "
+            "staging hotkey. The miner-side toggle is unaffected and needs no "
+            "override."
+        )
+
+    model.eval()
+    model.requires_grad_(False)
+    # Experts only, backbone left at full precision. This matches the scope of
+    # the reference implementation in the experiment repo
+    # (`partial_moe.py:quantize_expert_fp8`, 17c878d), which quantizes expert
+    # projections and nothing else — a loss delta measured here is only
+    # comparable with one measured there if both are quantizing the same set of
+    # tensors. It also keeps most of the memory win: the routed experts dominate
+    # the model either way. Measured on an L40S against DeepSeek-V2-Lite —
+    # 15.71 B total, of which 14.39 B is the 1664 routed experts and 1.32 B is
+    # everything else — quantizing experts alone took the full model from
+    # 29.36 GiB resident to 16.98 GiB. The partial model this validator builds
+    # holds 430 of those experts (3.72 B), so the same ratio applies.
+    converted = quantize_model_(model, include_experts=True, include_linears=False)
+    logger.warning(
+        "fp8 quantization ACTIVE on validator eval model via "
+        f"{VALIDATOR_FP8_OVERRIDE_ENV} — scoring is expected to be corrupted: "
+        "val_loss is not comparable with an fp16 validator's, the podium is "
+        "likely to reorder, and exact-tie zeroing can fire on quantization "
+        "artefacts",
+        eval_role=role,
+        converted_modules=len(converted),
+        sample=converted[:8],
+    )
+
+
+def resolve_foreground_eval_model(
+    *,
+    config: ValidatorConfig,
+    global_model: nn.Module,
+    round_obj,
+    cache: dict,
+) -> nn.Module:
+    """Pick the model foreground eval scores this round's miners against.
+
+    With quantization off this returns `global_model` itself, exactly as before
+    — deliberately, so the toggle-off path builds no extra resident model. A
+    third full copy would cost every fp16 validator ~8-10 GB of VRAM for a
+    dormant feature, and off is the fleet-wide state throughout the shadow
+    period.
+
+    With fp8 on, foreground needs its own persistent quantized model, because
+    `global_model` cannot be quantized and scoring some of a round's miners in
+    fp8 (background) and others in fp16 (foreground) would rank them against
+    each other across mismatched baselines.
+    """
+    if get_nested_attr(config, "model.quantization", "off") != "fp8":
+        return global_model
+
+    model = cache.get("model")
+    if model is None:
+        model = copy.deepcopy(global_model)
+        quantize_eval_model_(config, model, role="foreground")
+        cache["model"] = model
+    else:
+        # Re-seed from the round snapshot. The snapshot is fp16 on CPU; the
+        # quantized modules re-quantize it on the way in via their
+        # `_load_from_state_dict`, so nothing here has to know about fp8.
+        model.load_state_dict(round_obj.model_snapshot_cpu, strict=False)
+    return model
+
+
+def _move_outer_optimizer_state(optimizer: torch.optim.Optimizer, device) -> float:
+    """Relocate SGD momentum buffers to `device`. Returns GiB moved.
+
+    The outer optimizer is DiLoCo-style SGD with momentum, so `step()`
+    allocates a `momentum_buffer` the same size as the parameter set on its
+    first call and holds it for the process lifetime. On the partial global
+    model that is a second ~9.5 GiB living on the card between rounds:
+
+        round start, pre-merge   allocated =  9,513.3 MB   (params)
+        steady, post-merge       allocated = 19,027.8 MB   (params + momentum)
+
+    That is fine on its own, and it was invisible for as long as the eval
+    model was a per-miner deepcopy sized to the partial topology. It stops
+    being fine with `evaluation.full_topology_eval`: the eval window then
+    wants the 29.3 GiB base resident too, and 19.0 + 29.3 = 48.3 GiB does not
+    fit a 44.39 GiB card. Observed as a CUDA OOM inside
+    `FullTopologyEvalBase.prepare_for_round`'s `model.to(device)` on the
+    *second* round of every process — first round fits because momentum has
+    not been allocated yet, so validators crash-looped on a ~2-cycle rhythm.
+
+    Nothing reads the buffer between steps, so it has no reason to occupy the
+    card while miners are being scored. Offloading after `step()` and
+    onloading before the next one restores the eval window to the 38.8 GiB
+    this design was budgeted at. Values are untouched — this is a relocation,
+    not a reset, so the momentum trajectory is bit-identical to before.
+
+    Cost is ~9.5 GiB over PCIe each way once per round, well under a second
+    against a multi-minute round, and it is skipped entirely when the buffers
+    are already where they need to be.
+    """
+    target = torch.device(device)
+    moved_bytes = 0
+    for state in optimizer.state.values():
+        buffer = state.get("momentum_buffer")
+        if buffer is None or buffer.device.type == target.type:
+            continue
+        moved_bytes += buffer.numel() * buffer.element_size()
+        state["momentum_buffer"] = buffer.to(target)
+    return moved_bytes / 1024 ** 3
 
 
 def _release_global_model_grads(model: nn.Module) -> None:
@@ -713,12 +978,15 @@ def run_global_optimization(
     outer_optimizer: torch.optim.Optimizer,
     miner_jobs: list[MinerEvalJob],
 ):
-    # global_model and outer_optimizer state are expected to already live on `device` (GPU).
+    # `global_model` is expected to already live on `device` (GPU). The outer
+    # optimizer's momentum is NOT — it is parked on the host between rounds
+    # (see `_move_outer_optimizer_state`) and brought back just for the step.
     old_shared_name, old_shared_sum = get_weight_sum(global_model, shared=True)
     old_expert_name, old_expert_sum = get_weight_sum(global_model, shared=False)
 
     logger.debug("start syncing shared weights")
 
+    onloaded_gb = _move_outer_optimizer_state(outer_optimizer, device)
     outer_optimizer.step()
     outer_optimizer.zero_grad(set_to_none=True)
     # Also release .grad on params not registered with the outer optimizer
@@ -726,6 +994,21 @@ def run_global_optimization(
     # populate_global_grads_from_local). Without this, the storage pins
     # ~model-size of VRAM across rounds.
     _release_global_model_grads(global_model)
+    # Park momentum on the host before the eval window wants the card. Paired
+    # with the onload above so the buffers are only ever resident during the
+    # step itself.
+    offloaded_gb = _move_outer_optimizer_state(outer_optimizer, "cpu")
+    if torch.cuda.is_available():
+        # Hand the freed blocks back to the driver rather than leaving them in
+        # the caching allocator: the next thing to ask for this memory is the
+        # eval base's `model.to(device)`, which needs large contiguous blocks.
+        torch.cuda.empty_cache()
+    if onloaded_gb or offloaded_gb:
+        logger.info(
+            "Outer optimizer momentum relocated",
+            onloaded_gb=round(onloaded_gb, 2),
+            offloaded_gb=round(offloaded_gb, 2),
+        )
 
     new_shared_name, new_shared_sum = get_weight_sum(global_model, shared=True)
     new_expert_name, new_expert_sum = get_weight_sum(global_model, shared=False)
@@ -757,6 +1040,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     Returns:
         None
     """
+    # Fail fast on a config that would be rejected later. Without this the
+    # refusal in `quantize_eval_model_` fires part-way through the first round,
+    # after the roster is frozen — an operator who set `quantization: fp8`
+    # deserves to find out at startup, not mid-cycle.
+    check_validator_quantization_supported(config)
+    check_full_topology_eval_supported(config)
+    warn_on_full_expert_topology(config)
+
     # Start the integrated Prometheus telemetry server
     telemetry_port = resolve_telemetry_port(rank)
     TelemetryManager().start_server(port=telemetry_port)
@@ -821,6 +1112,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         expert_manager,
         train_dataloader,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+
+    # === full-topology eval base ===
+    # Built once, on CPU (~38 GB host transient with build_at_dtype, ~29 GB
+    # resident after), parked there between eval windows. `global_model` above
+    # stays partial regardless — this base is scoring-only and disposable.
+    #
+    # `evaluation.full_topology_eval` is a locked field defaulting to true, so
+    # this is the fleet path, not an opt-in one. The guard stays because the
+    # flag is still readable-false on a host running
+    # `--no-auto_update_config`, and because `get_nested_attr`'s fallback has
+    # to be *false*: an old config that predates the field must not silently
+    # build a 29 GB base before the locked-field reset has had its say.
+    full_eval_base: FullTopologyEvalBase | None = None
+    if bool(get_nested_attr(config, "evaluation.full_topology_eval", False)):
+        full_eval_base = FullTopologyEvalBase.build(config, expert_manager)
 
     global_opt_step = start_step
     # Tracks whether this validator participated in the last allreduce.
@@ -975,19 +1281,42 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
 
     # === set up averager ===
-    group_grad_buff_meta = build_grad_buff_from_model(
-        model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
-    )
-    # Only keep this validator's expert group and shared; drop other groups
+    # Only this validator's own expert group is ever averaged. Ask for that one
+    # up front rather than building every group and deleting the rest a line
+    # later: each buffer is a real host-RAM allocation, so the discarded ones
+    # were 7.25 GB on the partial topology and 27.4 GB on the full one.
     active_group_id = config.task.exp.group_id
+    group_grad_buff_meta = build_grad_buff_from_model(
+        model=global_model,
+        expert_group_assignment=expert_manager.expert_group_assignment,
+        group_ids=[active_group_id],
+    )
+    # Belt and braces: `group_ids` is the allocation guard, this is the
+    # invariant. Anything other than the active group (or "shared", which the
+    # caller does not currently request) must not reach the averager.
     excluded = [gid for gid in group_grad_buff_meta if gid != active_group_id and gid != "shared"]
     for gid in excluded:
         logger.info("Disabling averager for non-active expert group", excluded_group_id=gid, active_group_id=active_group_id)
         del group_grad_buff_meta[gid]
 
-    dht = connect_with_peers(config, wallet, lite_subtensor)
+    if observer_mode_enabled():
+        # Staying out of the DHT entirely is the point: `HotkeyAuthorizer`
+        # admits any hotkey on the whitelist, so an observer sharing a live
+        # validator's hotkey would be accepted into the same
+        # `expert_averaging-group{id}` prefix and its gradients would be
+        # averaged into the fleet's global model. Handing hivemind a throwaway
+        # wallet does not work either — peers reject the unwhitelisted signer,
+        # DHT bootstrap exhausts its retries and raises, and this call sits
+        # outside the run loop's `try`, so the process dies at startup.
+        #
+        # `sync_grad_across_validators` iterates `group_averagers`, so an empty
+        # dict makes the merge phase a clean no-op.
+        logger.warning("OBSERVER MODE — not joining the DHT; no all-reduce")
+        group_averagers = {}
+    else:
+        dht = connect_with_peers(config, wallet, lite_subtensor)
 
-    group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
+        group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
 
     # Resolve this validator's UID so the poller can emit vtrust / consensus
     # for our own slot. Failing this lookup keeps the metagraph block of the
@@ -1015,6 +1344,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             uid=validator_uid,
             version=git_version,
             netuid=int(config.chain.netuid),
+            quantization=str(get_nested_attr(config, "model.quantization", "off")),
+            observer=observer_mode_enabled(),
         )
     except Exception as e:
         logger.warning("Failed to stamp connito_validator_info; continuing", error=str(e))
@@ -1077,6 +1408,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     download_worker: BackgroundDownloadWorker | None = None
     eval_worker: BackgroundEvalWorker | None = None
+    # bg-eval needs its own resident eval template; under full-topology
+    # scoring that would be a second full base (29.3 GiB) and does not fit.
+    # bg-*download* must keep running regardless: foreground reads from
+    # `miner_submission_path`, which only bg-download fills, so switching it
+    # off starves the round (observed — a full window with
+    # `discovered_total=0` and `scored=0` against 4 claimed foreground UIDs).
+    bg_eval_enabled = config.evaluation.background_worker_enabled and not bool(
+        get_nested_attr(config, "evaluation.full_topology_eval", False)
+    )
     if config.evaluation.background_worker_enabled:
         download_worker = BackgroundDownloadWorker(
             config=config,
@@ -1086,24 +1426,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
         # bg-eval idles until the main loop hands it a copy of
         # global_model after foreground eval completes (see below).
-        eval_worker = BackgroundEvalWorker(
-            config=config,
-            round_ref=round_ref,
-            device=device,
-            tokenizer=tokenizer,
-            merge_phase_active=merge_phase_active,
-            eval_window_active=eval_window_active,
-            gpu_eval_lock=gpu_eval_lock,
-            expert_group_assignment=expert_manager.expert_group_assignment,
-        )
+        if bg_eval_enabled:
+            eval_worker = BackgroundEvalWorker(
+                config=config,
+                round_ref=round_ref,
+                device=device,
+                tokenizer=tokenizer,
+                merge_phase_active=merge_phase_active,
+                eval_window_active=eval_window_active,
+                gpu_eval_lock=gpu_eval_lock,
+                expert_group_assignment=expert_manager.expert_group_assignment,
+            )
         download_worker.start()
-        eval_worker.start()
+        if eval_worker is not None:
+            eval_worker.start()
         logger.info(
             "Background workers launched",
             download_thread=download_worker.name,
             download_ident=download_worker.ident,
-            eval_thread=eval_worker.name,
-            eval_ident=eval_worker.ident,
+            eval_thread=eval_worker.name if eval_worker else None,
+            eval_ident=eval_worker.ident if eval_worker else None,
+            bg_eval_enabled=bg_eval_enabled,
         )
 
     logger.info("ChainSubmitter ready")
@@ -1120,6 +1463,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     )
     last_sync_grad_future: Future | None = None
     last_sync_grad_started_at: float | None = None
+    # Holds the persistent quantized foreground eval model. Stays empty —
+    # and no model is ever built — while model.quantization is "off".
+    foreground_eval_cache: dict = {}
 
     try:
         while True:
@@ -1550,6 +1896,21 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # scored is still here for the merge step.
             miner_jobs: list[MinerEvalJob] = []
 
+            if full_eval_base is not None:
+                # Full-topology scoring: onto the GPU, re-seeded from the
+                # current global state (post any prior merge). Foreground's
+                # baseline then runs on this base automatically, so baseline
+                # and miner losses share one topology.
+                full_eval_base.prepare_for_round(global_model, device)
+                foreground_base_model = full_eval_base.model
+            else:
+                foreground_base_model = resolve_foreground_eval_model(
+                    config=config,
+                    global_model=global_model,
+                    round_obj=new_round,
+                    cache=foreground_eval_cache,
+                )
+
             async def _bounded_foreground_eval():
                 return await asyncio.wait_for(
                     evaluate_foreground_round(
@@ -1558,12 +1919,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         subtensor=subtensor,
                         step=global_opt_step,
                         device=device,
-                        base_model=global_model,
+                        base_model=foreground_base_model,
                         tokenizer=tokenizer,
                         end_block=phase_response.phase_end_block,
                         expert_group_assignment=expert_manager.expert_group_assignment,
                         per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
                         completed_out=miner_jobs,
+                        graft_controller=full_eval_base,
                     ),
                     timeout=foreground_timeout_sec,
                 )
@@ -1599,7 +1961,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # only as an architecture template; per-round state comes from
             # round.model_snapshot_cpu.
             if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+                bg_eval_model = copy.deepcopy(global_model)
+                # Quantize the background worker's template to match the
+                # foreground one. If only one of the two were quantized, miners
+                # of the same round would be scored under different numerics
+                # against different baselines and then ranked against each
+                # other — a worse failure than cross-validator divergence.
+                quantize_eval_model_(config, bg_eval_model, role="background")
+                eval_worker.set_eval_base_model(bg_eval_model)
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 2
@@ -1632,6 +2001,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 score_aggregator.persist_atomic(score_path)
             except Exception as e:
                 logger.warning(f"Failed to persist score_aggregator: {e}")
+
+            # The merge window must not share the GPU with the eval base:
+            # partial merge peak (params + .grad + momentum, 27.6 GiB) plus a
+            # resident 29.3 GiB base does not fit 44.4. park() is idempotent
+            # and cheap when already parked, so it runs unconditionally here —
+            # including after a foreground timeout, when the base may hold a
+            # stale graft that the next prepare_for_round will discard.
+            if full_eval_base is not None:
+                full_eval_base.park()
 
             # === aggragate miner gradient change locally ===
             # Use global_model (partial) as template for loading miner checkpoints (also partial)
@@ -1833,6 +2211,31 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # worker uses round.model_snapshot_cpu (taken at freeze time) so
             # the post-Merge mutation of global_model does not affect it.
             eval_window_active.set()
+            # Publish when this window closes so the dedup pass will not
+            # START a merged pair it cannot finish. The window ends at
+            # MinerCommit1 - 5, which is where (4) finalizes scores and
+            # submits weights — a verdict produced after that misses the
+            # round. Best-effort: on failure the guard stays inactive and
+            # the pass behaves exactly as before.
+            try:
+                if eval_worker is None:
+                    raise RuntimeError("bg-eval worker disabled")
+                close_block = eval_window_close_block(
+                    config, phase_response.phase_start_block,
+                )
+                blocks_left = max(0, close_block - lite_subtensor.block)
+                eval_worker.set_window_deadline(
+                    time.monotonic() + blocks_left * BITTENSOR_BLOCK_TIME_SECONDS
+                )
+                logger.info(
+                    "(3) Published bg-eval window deadline",
+                    close_block=close_block,
+                    blocks_left=blocks_left,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not publish bg-eval window deadline", error=str(e),
+                )
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 3
@@ -1847,7 +2250,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             if model_ckpt is not None:
 
                 model_ckpt.expert_group = config.task.exp.group_id
-                model_ckpt.sign_hash(wallet=wallet)
+                if observer_mode_enabled():
+                    # The signature's only consumer is the commit below, which
+                    # observer mode suppresses — and this is the last thing in
+                    # the validator that needs the hotkey's *private* key.
+                    # Skipping it lets an observer run on a public-only
+                    # keyfile, so a live validator's key never has to be copied
+                    # onto the test host at all. Hash anyway: `model_hash` is
+                    # read on the next line and drives eval, and `sign_hash`
+                    # was what triggered it.
+                    if model_ckpt.model_hash is None:
+                        model_ckpt.hash_model()
+                else:
+                    model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 # Dashboard telemetry: the model's global optimization version
                 # (chain-committed `global_ver`) is the "steps" the leaderboard

@@ -53,11 +53,25 @@ CONNITO_VALIDATOR_INFO = Info(
 )
 
 
-def set_validator_identity(*, hotkey: str, uid: int | None, version: str, netuid: int) -> None:
+def set_validator_identity(
+    *,
+    hotkey: str,
+    uid: int | None,
+    version: str,
+    netuid: int,
+    quantization: str = "off",
+    observer: bool = False,
+) -> None:
     """Stamp the validator's identity onto the ``connito_validator_info``
     metric. Call once at validator startup, immediately after ``validator_uid``
     resolution. Safe to re-call (e.g. on UID change after a deregister/re-
     register cycle) — ``Info.info()`` replaces the labelset atomically.
+
+    ``quantization`` reports ``model.quantization``. It belongs here because a
+    validator running fp8 produces ``val_loss`` values that are not comparable
+    with an fp16 validator's for the same ``combined_seed`` — when weights
+    diverge across the fleet, this label is what makes the cause visible
+    without shelling into hosts.
     """
     CONNITO_VALIDATOR_INFO.info({
         "hotkey": str(hotkey),
@@ -66,6 +80,10 @@ def set_validator_identity(*, hotkey: str, uid: int | None, version: str, netuid
         "uid": str(uid if uid is not None else -1),
         "version": str(version),
         "netuid": str(netuid),
+        "quantization": str(quantization),
+        # An observer shares a hotkey with the live validator, so hotkey and
+        # uid alone do not distinguish this scrape from that one.
+        "observer": "1" if observer else "0",
     })
 
 
@@ -337,6 +355,19 @@ VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS = Gauge(
 VALIDATOR_BG_EVAL_RECYCLE_TOTAL = Counter(
     "validator_bg_eval_recycle_total",
     "Times bg-eval dropped its eval_base_model after a stuck-lock streak",
+)
+# Dedup (shadow) filter — pair counts only. Deliberately NO uid-pair or
+# round_id labels (cardinality); per-pair detail lives in the
+# "dedup-shadow: pair result" structured log lines.
+VALIDATOR_DEDUP_PAIRS_EVALUATED_TOTAL = Counter(
+    "validator_dedup_pairs_evaluated_total",
+    "Merged-pair evaluations completed by the dedup shadow pass",
+)
+VALIDATOR_DEDUP_WOULD_FLAG_TOTAL = Counter(
+    "validator_dedup_would_flag_total",
+    "Pairs the dedup filter WOULD flag as near-duplicates (shadow only; "
+    "'not strictly better' predicate) at a fixed threshold",
+    ["threshold"],
 )
 
 # Miner (Gauges)

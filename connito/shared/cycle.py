@@ -50,7 +50,10 @@ from connito.shared.helper import (
     h256_int,
     parse_dynamic_filename,
 )
-from connito.shared.hf_distribute import download_checkpoint_from_hf
+from connito.shared.hf_distribute import (
+    HFFileMissingError,
+    download_checkpoint_from_hf,
+)
 from connito.validator.evaluator import MinerEvalJob
 
 configure_logging()
@@ -175,6 +178,32 @@ _PHASE_PERIOD_ATTR: dict[str, str] = {
     PhaseNames.validator_commit_1: "commit_period",
     PhaseNames.validator_commit_2: "commit_period",
 }
+
+
+def eval_window_close_block(config, merge_phase_start_block: int) -> int:
+    """Block at which the validator closes the background-eval window.
+
+    The window opens immediately after Merge (`run.py` — `eval_window_active
+    .set()`) and closes 5 blocks before the next `MinerCommit1`, where
+    `finalize_round_scores` runs and miner weights are handed to the chain
+    submitter in the same step ("(4) Finalize round-K scoring and submit
+    weights"). Phase order after Merge is ValidatorCommit1 →
+    ValidatorCommit2 → Distribute → Train → MinerCommit1, and both
+    ValidatorCommit phases use `commit_period` (see `_PHASE_PERIOD_ATTR`).
+
+    Matters to the dedup filter: a merged-pair measurement that finishes
+    after this block is wasted work — finalize has already applied the
+    verdicts and the weights are on their way to chain.
+    """
+    c = config.cycle
+    return (
+        merge_phase_start_block
+        + c.merge_period
+        + 2 * c.commit_period
+        + c.distribute_period
+        + c.train_period
+        - 5
+    )
 
 
 def _synth_phase_response_for_test(
@@ -948,7 +977,12 @@ def hydrate_miner_submissions_from_hf(
     # download worker may have already placed the file, and we don't want to
     # re-download on subsequent polls.
     existing_hotkeys: set[str] = set()
-    for file_path in submission_dir.glob("*.pt"):
+    # Both suffixes: submissions have been `.safetensors` since #118, and the
+    # background download worker names them after whatever it fetched. Globbing
+    # `*.pt` alone saw none of them, so every poll re-downloaded every miner.
+    for file_path in (
+        p for suffix in MINER_CHECKPOINT_SUFFIXES for p in submission_dir.glob(f"*{suffix}")
+    ):
         if file_path.name.startswith(".tmp"):
             continue
         meta = parse_dynamic_filename(file_path.name)
@@ -964,7 +998,13 @@ def hydrate_miner_submissions_from_hf(
         return 0
 
     expert_group_id = config.task.exp.group_id
-    filename_in_hf = f"model_expgroup_{expert_group_id}.pt"
+    # `.safetensors` first, `.pt` only as a pre-#118 fallback. Requesting both
+    # in one call is not an option: `download_checkpoint_from_hf` raises on the
+    # first missing entry, so a repo carrying only one suffix would fail.
+    candidate_filenames = [
+        f"model_expgroup_{expert_group_id}{suffix}"
+        for suffix in MINER_CHECKPOINT_SUFFIXES
+    ]
 
     hydrated = 0
     for ckpt in chain_checkpoints.checkpoints:
@@ -976,17 +1016,37 @@ def hydrate_miner_submissions_from_hf(
             continue
 
         tmp_dir = submission_dir / f".tmp_hf_{ckpt.hotkey}"
-        dest_name = f"hotkey_{ckpt.hotkey}_block_{subtensor.block}.pt"
-        dest = submission_dir / dest_name
         try:
             tmp_dir.mkdir(parents=True, exist_ok=True)
-            download_checkpoint_from_hf(
-                repo_id=ckpt.hf_repo_id,
-                revision=ckpt.hf_revision,
-                filenames=[filename_in_hf],
-                dest_dir=tmp_dir,
-                token_env_var=config.hf.token_env_var,
+            filename_in_hf: str | None = None
+            last_error: Exception | None = None
+            for candidate in candidate_filenames:
+                try:
+                    download_checkpoint_from_hf(
+                        repo_id=ckpt.hf_repo_id,
+                        revision=ckpt.hf_revision,
+                        filenames=[candidate],
+                        dest_dir=tmp_dir,
+                        token_env_var=config.hf.token_env_var,
+                    )
+                    filename_in_hf = candidate
+                    break
+                except HFFileMissingError as exc:
+                    last_error = exc
+            if filename_in_hf is None:
+                raise last_error if last_error is not None else FileNotFoundError(
+                    f"no expert shard at {ckpt.hf_repo_id}@{ckpt.hf_revision}"
+                )
+
+            # The destination keeps the suffix we actually downloaded:
+            # `load_state_dict_from_path` dispatches on it, so writing
+            # safetensors bytes into a `.pt` name would route them to
+            # `torch.load` and fail.
+            dest_name = (
+                f"hotkey_{ckpt.hotkey}_block_{subtensor.block}"
+                f"{Path(filename_in_hf).suffix}"
             )
+            dest = submission_dir / dest_name
             # Atomic rename so gather_validation_job never sees a partial file.
             (tmp_dir / filename_in_hf).replace(dest)
             existing_hotkeys.add(ckpt.hotkey)

@@ -188,14 +188,68 @@ class RunCfg(BaseConfig):
 
 
 class ModelCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"model_path", "base_arch_model"})
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "model_path", "base_arch_model", "precision", "quantization",
+    })
     model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
     base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
     foundation: bool = True
     torch_compile: bool = False
     attn_implementation: str = "sdpa"
-    precision: str = "fp16-mixed"
+    # "fp16-mixed" | "bf16-mixed". `helper.resolve_precision` downgrades
+    # bf16 -> fp16 on a device without BF16 compute, so bf16 is safe to set
+    # anywhere — which is what makes this field safe to lock: an operator whose
+    # card lacks BF16 compute lands on fp16 through the resolver rather than
+    # through a broken config.
+    #
+    # bf16 follows the base checkpoint. DeepSeek-V2-Lite ships
+    # `torch_dtype: bfloat16` and the reference experiment runs bf16
+    # (`~/experiment/config.py:torch_dtype`), so any like-for-like comparison
+    # against its numbers needs bf16 here. This sat at fp16 while the full
+    # topology was opt-in, because moving it would have moved every existing
+    # validator's scoring on the *partial* topology too. It ships as the
+    # default now precisely because that fleet-wide move is the intent: see
+    # `evaluation.full_topology_eval`, which lands in the same release.
+    #
+    # CONSENSUS: locked. Two validators at different precision produce
+    # different `val_loss` for the same weights.
+    precision: str = "bf16-mixed"
     device: str = "cuda"
+    # Runtime weight-only fp8 quantization (float8_e4m3fn, scaled per output
+    # row). Weights are always *loaded* and *saved* at `precision`; "fp8" only
+    # changes how they are held in memory between those points. See
+    # connito/shared/modeling/quantization.py.
+    #
+    # What it covers differs by role, and not for want of trying:
+    #   validator -> the eval models only (never `global_model`, whose merge and
+    #                outer-optimizer paths walk `named_parameters()` and would
+    #                silently skip fp8 buffers). Covers the routed experts, so
+    #                this is where the memory actually drops.
+    #   miner     -> the frozen non-expert Linears only (~0.4 B params: MLA
+    #                projections, the first_k_dense_replace dense MLPs, shared
+    #                experts). The routed experts CANNOT be quantized here: the
+    #                trainable group and the frozen helper group are interleaved
+    #                in one stacked tensor per layer, which `freeze_parameters`
+    #                marks trainable as a whole. Expect a modest saving.
+    #
+    # CONSENSUS: this changes `val_loss`. A validator running "fp8" produces
+    # numbers that are not comparable with an fp16 validator's for the same
+    # `combined_seed`, exactly like the eval_source_* knobs above.
+    #
+    # Locked at "off", and the lock is load-bearing rather than a preference:
+    # `evaluation.full_topology_eval` (locked true) is rejected at startup
+    # alongside fp8 by `check_full_topology_eval_supported`, because the fp8
+    # foreground-cache path and the graft path disagree about which model
+    # foreground scores against. Leaving this unlocked would mean any operator
+    # who had ever set "fp8" crash-loops on the release that turns full-
+    # topology eval on. Locking both together is what makes the fleet land on
+    # one config instead of two.
+    #
+    # This does not contradict matching the reference experiment: its fp8 is
+    # training-side, applied to a miner's frozen helper experts, and its own
+    # full-topology evaluation runs bf16. Staging can still exercise fp8 with
+    # `--no-auto_update_config`, which suppresses the locked-field reset.
+    quantization: Literal["off", "fp8"] = "off"
 
 
 class DatasetSourceCfg(BaseConfig):
@@ -339,14 +393,53 @@ class DataloaderCfg(BaseConfig):
 class MoECfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
         "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
+        "partial_moe",
     })
     interleave: bool = True
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
     partial_topk: PositiveInt = 6
-    full_topk: PositiveInt = 2
+    # Routing width of the *full* topology, i.e. `num_experts_per_tok` when
+    # every routed expert is present. DeepSeek-V2-Lite's own config ships
+    # `num_experts_per_tok: 6`, and that is what the reference experiment
+    # measures its full-topology numbers at — it loads the checkpoint through
+    # `AutoModelForCausalLM.from_pretrained` and never overrides the gate, so
+    # its "full side" is the native 6 (`~/experiment/doc/
+    # partial-model-training-paper.md`, and `partial_moe.py` reads
+    # `top_k = getattr(self.gate, "top_k")` straight off the stock gate).
+    #
+    # This sat at 2 from the initial commit until 2026-08-17. Nothing ever read
+    # it: the only consumer is `mycelia.get_base_model(partial=False)`, and
+    # every call site in both roles hard-coded `partial=True`, so the value was
+    # never exercised and never reviewed. `partial_topk` got a deliberate
+    # 1 -> 6 bump in 917bb16; this field was missed.
+    full_topk: PositiveInt = 6
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
+    # Topology of the model the validator builds and scores on.
+    #
+    #   True  (default) - partial: only the trainable group's experts (plus an
+    #                     optional helper group) are materialised. ~1.3 B routed
+    #                     params; routed with `partial_topk`.
+    #   False           - full: every routed expert of the base checkpoint.
+    #                     ~14.4 B routed params; routed with `full_topk`.
+    #
+    # LOCKED at true, and note what that does and does not mean. It does not
+    # mean the fleet scores on the partial topology — `evaluation.
+    # full_topology_eval` (locked true) puts every routed expert in front of
+    # every miner. It means the model that *merges* stays partial, which is
+    # the whole memory argument: a full global model peaks at 87.8 GiB in the
+    # outer step against 27.6 GiB partial, measured.
+    #
+    # So this and `full_topology_eval` are locked as a pair.
+    # `check_full_topology_eval_supported` rejects the combination
+    # `full_topology_eval=true, partial_moe=false` at startup; unlocking
+    # either half hands an operator a config that crash-loops.
+    #
+    # Read the memory note in `validator.run.warn_on_full_expert_topology`
+    # before setting this false on a staging host with
+    # `--no-auto_update_config`: a full *global* model does not fit alongside
+    # the per-miner eval copy on a 46 GB card.
     partial_moe: bool = True
     num_worker_groups: PositiveInt = 2
 
@@ -987,13 +1080,40 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n",
+        "full_topology_eval",
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
     score_window: int = 8            # max number of phases (points) retained per miner in MinerScoreAggregator
     foreground_top_n: PositiveInt = 5
     background_worker_enabled: bool = True
+    # Score miners on the FULL expert topology: a separate frozen model with
+    # every routed expert resident, routed at `moe.full_topk` (the base
+    # checkpoint's native 6), grafted in place per miner and parked on CPU
+    # outside the eval window. The global model stays partial — merge, chain
+    # hash and peer sync are untouched. See validator/full_topology_eval.py
+    # for the design and the memory budget it exists to fit.
+    #
+    # LOCKED at true: this is the fleet default, and it has to be, because it
+    # changes `val_loss`. Full and partial topology rank miners *differently*
+    # — Spearman rho = -0.45 across 22 real submissions, per the reference
+    # experiment — so a fleet split across the two is not a fleet with some
+    # noise in it, it is two subnets disagreeing about who earns. There is no
+    # gradual rollout of this field that is better than no rollout.
+    #
+    # Locked as a set with `model.precision` (bf16), `model.quantization`
+    # (off) and `moe.partial_moe` (true): `check_full_topology_eval_supported`
+    # rejects the other combinations at startup, so leaving any of the four
+    # unlocked hands some operator a crash-loop on the release that turns this
+    # on. A staging host that needs to diverge uses `--no-auto_update_config`.
+    #
+    # Constraints enforced at startup by
+    # `check_full_topology_eval_supported`: model.quantization must be "off"
+    # and moe.partial_moe must stay true. `background_worker_enabled` is NOT
+    # among them — an earlier version required it false and starved the round
+    # it was meant to protect; see that function's docstring.
+    full_topology_eval: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
     # Round-group construction scheme. When true, Round.freeze() partitions
@@ -1023,6 +1143,79 @@ class EvalCfg(BaseConfig):
     # "delete-your-model-and-keep-earning" hole; set False to restore the
     # legacy EMA-preserving behavior.
     repo_unavailable_is_miner_fault: bool = True
+    # Duplicate-submission ("entropy") filter. "shadow" runs a merge-loss
+    # measurement pass over pairs of the round's top positive-scoring
+    # submissions and LOGS the results (loss of the averaged pair vs each
+    # side, plus delta-cosine similarity) without affecting any score,
+    # weight, or journal entry. Deliberately NOT a locked field while in
+    # shadow: auto_update_config resets locked fields to their defaults on
+    # every start, which would force "off" fleet-wide and make per-host
+    # opt-in impossible. Deliberately still unlocked in "enforce" so a
+    # single host can run enforcement ahead of the fleet.
+    #
+    # "enforce" additionally zeroes BOTH sides of every pair the filter
+    # confirms redundant, exactly as the exact-score-tie rule already
+    # does for bit-identical submissions.
+    dedup_filter_mode: Literal["off", "shadow", "enforce"] = "off"
+    # Compare the top-K positive-delta miners of the round...
+    dedup_top_k: int = 5
+    # ...but never spend more than this many merged-pair GPU evals per
+    # round (each costs about one miner eval).
+    dedup_max_pairs: int = 10
+    # Run one merged pair after every N completed miner evals. DEFAULT OFF
+    # (0), because interleaving DISPLACES miner evals rather than extending
+    # the window: the window is bounded by phase transitions, so a pair run
+    # mid-scoring costs one miner its evaluation, and an unevaluated miner
+    # scores 0 for the round. The honest miner pays for the filter.
+    #
+    # Not needed in the normal case either. The bg-eval window spans
+    # ValidatorCommit1 → Train, and measured on production the roster was
+    # graded in ~27 min of a ~68 min Train, leaving ~41 min idle with the
+    # model still resident — far more than the ~7 min ten pairs need. The
+    # idle-tick trigger covers that.
+    #
+    # Set > 0 only for a validator whose roster leaves no idle tail (where
+    # grading alone overruns Train), and accept the displacement knowingly.
+    dedup_eval_interval: int = 0
+    # Seconds a merged pair is assumed to need. The pass will not START a
+    # pair when less than this remains of the eval window, because the
+    # window closes at MinerCommit1 - 5 — exactly where finalize applies
+    # verdicts and weights go to chain, so a later result is wasted. ~120 s
+    # is generous against the ~41 s/eval measured on the RTX 6000 Ada.
+    dedup_pair_budget_sec: int = 120
+    # Enforcement threshold τ, in val_loss units: a pair is redundant when
+    # `merge_penalty >= -τ`. The default 0.0 makes this a pure SIGN test —
+    # redundant unless averaging beat the better side outright. Do not
+    # raise it casually: measured merge penalties on live submissions are
+    # ~5e-4, so any τ >= 0.01 flags 100% of pairs, honest ones included.
+    dedup_threshold: float = 0.0
+    # Reserve the tail of the eval window for the pairwise pass and stop
+    # claiming new miner evals once it opens, so the ranking the pass runs
+    # against cannot move underneath it.
+    #
+    # Without this, `select_pairs` re-reads the score map on every trigger,
+    # so "top K" means "top K of whoever happens to be graded right now".
+    # Miners are graded in stalest-first order, which is unrelated to
+    # quality, so an early sample is a RANDOM subset — and `dedup_max_pairs`
+    # is a per-ROUND budget while `dedup_top_k` bounds a single call. Pairs
+    # drawn from a half-filled scoreboard therefore burn the whole budget
+    # before the real top-K exists, and in `enforce` mode their verdicts
+    # still apply at finalize: `dedup_flagged_uids` is only ever added to,
+    # so a miner flagged against a neighbour who later fell away is zeroed
+    # on a comparison the final ranking would never have chosen to make.
+    #
+    # The reserved span is `dedup_max_pairs * dedup_pair_budget_sec` — the
+    # pass's own worst case for its own budget, so the last pair starts
+    # exactly at the point `_dedup_window_allows_pair` still permits. Tune
+    # by changing either of those two knobs; the round summary logs how
+    # much of the tail was actually used.
+    #
+    # Cost: miners still ungraded when the tail opens score 0 for the round.
+    # On a validator with a long idle tail (measured: roster graded in ~27
+    # min of a ~68 min Train) this costs nothing. On one whose grading
+    # already overruns the window it costs real coverage — the freeze log
+    # reports `unscored_at_freeze` so that is visible rather than silent.
+    dedup_freeze_field: bool = True
 
 
 class ValidatorConfig(WorkerConfig):

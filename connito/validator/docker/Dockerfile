@@ -51,7 +51,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CONNITO_GIT_VERSION=${GIT_VERSION}
 
 # System packages: python 3.10, build essentials (some wheels still need them),
-# git for the VCS-installed deps in requirements.txt (hivemind, unsloth),
+# git for the VCS-installed deps in requirements.txt (hivemind),
 # and curl for healthchecks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3.10-venv python3-pip \
