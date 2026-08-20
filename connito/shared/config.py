@@ -206,7 +206,9 @@ class ModelCfg(BaseConfig):
     # picks the format, the per-role fields pick the scope. See
     # connito/shared/modeling/quantization.py for the scope meanings.
     quantization: str = "fp8"
-    quantization_miner: str = "off"
+    # Not locked: a miner trades VRAM against training fidelity on its own box,
+    # and the choice affects nobody else's scoring.
+    quantization_miner: str = "all"
     # "all" fleet-wide. Locked, so every validator scores under the identical
     # scope; a mixed fleet would make val_loss incomparable across validators.
     quantization_validator: str = "all"
