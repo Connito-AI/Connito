@@ -141,18 +141,15 @@ def save_state_dict_by_expert_group(
     # output buckets — one per expert group only; non-expert params are not persisted.
     grouped_state = {gid: {} for gid in group_ids}
 
-    # Build fast-lookup structures:
-    # - org_expert_lookup uses original/global expert IDs (preferred, unambiguous)
-    # - my_expert_lookup is a fallback for backward compatibility with older
-    #   checkpoints that serialized local my_expert_idx IDs.
+    # Keyed on `org_expert_id` (the global id in parameter names). A
+    # `my_expert_id` fallback used to sit alongside it and claimed any expert
+    # whose global id fell in 0..K-1, whichever group owned it.
     org_expert_lookup: dict[tuple[int, int], int] = {}
-    my_expert_lookup: dict[tuple[int, int], int] = {}
-    ambiguous_my_expert_keys: set[tuple[int, int]] = set()
     selected_expert_groups = {gid: expert_groups[gid] for gid in group_ids}
     duplicate_org_assignments: list[tuple[int, int, int, int]] = []
     for gid, layer_map in selected_expert_groups.items():
         for layer_id, mappings in layer_map.items():
-            for my_eid, org_eid in mappings:
+            for _my_eid, org_eid in mappings:
                 org_key = (int(layer_id), int(org_eid))
                 prev_org_gid = org_expert_lookup.get(org_key)
                 if prev_org_gid is not None and prev_org_gid != gid:
@@ -168,16 +165,6 @@ def save_state_dict_by_expert_group(
                     continue
                 org_expert_lookup[org_key] = gid
 
-                my_key = (int(layer_id), int(my_eid))
-                prev_my_gid = my_expert_lookup.get(my_key)
-                if prev_my_gid is None:
-                    my_expert_lookup[my_key] = gid
-                elif prev_my_gid != gid:
-                    ambiguous_my_expert_keys.add(my_key)
-
-    for key in ambiguous_my_expert_keys:
-        my_expert_lookup.pop(key, None)
-
     if strict_sharding and duplicate_org_assignments:
         preview = ", ".join(
             f"(layer={layer}, expert={expert}, first_gid={first_gid}, dup_gid={dup_gid})"
@@ -188,18 +175,11 @@ def save_state_dict_by_expert_group(
             f"Sample duplicates: {preview}"
         )
 
-    logger.debug(
-        "Expert lookup built",
-        org_lookup_size=len(org_expert_lookup),
-        my_lookup_size=len(my_expert_lookup),
-        ambiguous_my_keys=len(ambiguous_my_expert_keys),
-    )
+    logger.debug("Expert lookup built", org_lookup_size=len(org_expert_lookup))
 
-    active_my_ids_by_layer: dict[int, set[int]] = {}
     active_org_ids_by_layer: dict[int, set[int]] = {}
     if active_expert_group_id is not None:
         for layer_id, mappings in selected_expert_groups[active_expert_group_id].items():
-            active_my_ids_by_layer[int(layer_id)] = {int(my_id) for my_id, _ in mappings}
             active_org_ids_by_layer[int(layer_id)] = {int(org_id) for _, org_id in mappings}
 
     # Track per-group counts and bytes for debugging
@@ -232,9 +212,7 @@ def save_state_dict_by_expert_group(
         if active_expert_group_id is not None:
             layer_key = int(layer_id)
             expert_key = int(expert_id)
-            allowed_my = active_my_ids_by_layer.get(layer_key, set())
-            allowed_org = active_org_ids_by_layer.get(layer_key, set())
-            if expert_key in allowed_my or expert_key in allowed_org:
+            if expert_key in active_org_ids_by_layer.get(layer_key, set()):
                 t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
                 grouped_state[active_expert_group_id][name] = t
                 group_param_count[active_expert_group_id] += 1
@@ -247,18 +225,14 @@ def save_state_dict_by_expert_group(
             continue
 
         # CASE 3: Check if this expert (layer_id, expert_id) belongs to any group.
-        # Prefer org/global expert IDs; use local-id fallback only when unique.
         key = (int(layer_id), int(expert_id))
         gid = org_expert_lookup.get(key, None)
-        if gid is None:
-            gid = my_expert_lookup.get(key, None)
 
         if gid is None:
             # Expert exists but not assigned to any group — drop. Previously these
             # went into the shared bucket as a fallback; that bucket no longer
             # exists, so unmapped experts are reported and skipped.
-            reason = "ambiguous_local_id" if key in ambiguous_my_expert_keys else "unmapped"
-            unassigned_experts.append(f"{name} (layer={layer_id}, expert={expert_id}, reason={reason})")
+            unassigned_experts.append(f"{name} (layer={layer_id}, expert={expert_id}, reason=unmapped)")
         else:
             t = tensor.detach().to(dtype=save_dtype, device="cpu", non_blocking=True).contiguous()
             grouped_state[gid][name] = t

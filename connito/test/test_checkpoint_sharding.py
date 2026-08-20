@@ -12,8 +12,8 @@ def _tensor() -> torch.Tensor:
 def test_strict_sharding_rejects_unassigned_expert(tmp_path):
     state_dict = {
         "model.embed_tokens.weight": _tensor(),
-        "model.layers.1.mlp.experts.0.gate_up_proj": _tensor(),
-        "model.layers.1.mlp.experts.7.gate_up_proj": _tensor(),
+        "model.layers.1.mlp.experts.0.gate_proj.weight": _tensor(),
+        "model.layers.1.mlp.experts.7.gate_proj.weight": _tensor(),
     }
     expert_groups = {
         0: {
@@ -37,7 +37,7 @@ def test_strict_sharding_rejects_unassigned_expert(tmp_path):
 def test_strict_sharding_rejects_duplicate_org_assignment(tmp_path):
     state_dict = {
         "model.embed_tokens.weight": _tensor(),
-        "model.layers.1.mlp.experts.0.gate_up_proj": _tensor(),
+        "model.layers.1.mlp.experts.0.gate_proj.weight": _tensor(),
     }
     expert_groups = {
         0: {1: [(0, 0)]},
@@ -60,8 +60,8 @@ def test_strict_sharding_rejects_duplicate_org_assignment(tmp_path):
 def test_non_strict_sharding_writes_only_expert_group_files(tmp_path):
     state_dict = {
         "model.embed_tokens.weight": _tensor(),
-        "model.layers.1.mlp.experts.0.gate_up_proj": _tensor(),
-        "model.layers.1.mlp.experts.7.gate_up_proj": _tensor(),
+        "model.layers.1.mlp.experts.0.gate_proj.weight": _tensor(),
+        "model.layers.1.mlp.experts.7.gate_proj.weight": _tensor(),
     }
     expert_groups = {
         0: {
@@ -132,7 +132,7 @@ def test_shared_experts_are_treated_as_shared_not_expert(tmp_path):
         "model.layers.1.mlp.shared_experts.gate_proj.weight": _tensor(),
         "model.layers.1.mlp.shared_experts.down_proj.weight": _tensor(),
         # Routed expert — owned by group 0, layer 1.
-        "model.layers.1.mlp.experts.0.gate_up_proj": _tensor(),
+        "model.layers.1.mlp.experts.0.gate_proj.weight": _tensor(),
     }
     expert_groups = {
         0: {1: [(0, 0)]},
@@ -148,7 +148,7 @@ def test_shared_experts_are_treated_as_shared_not_expert(tmp_path):
     # The expert-group shard exists and contains the routed expert only.
     assert 0 in paths
     expert_shard = load_file(str(tmp_path / "model_expgroup_0.safetensors"))
-    assert "model.layers.1.mlp.experts.0.gate_up_proj" in expert_shard
+    assert "model.layers.1.mlp.experts.0.gate_proj.weight" in expert_shard
     # Crucially: no `shared_experts.*` key leaked into the group shard.
     leaked_shared = [k for k in expert_shard if "shared_expert" in k]
     assert not leaked_shared, (
@@ -176,7 +176,7 @@ def test_strict_sharding_accepts_shared_experts_alongside_routed_experts(tmp_pat
     state_dict = {
         "model.embed_tokens.weight": _tensor(),
         "model.layers.1.mlp.shared_experts.gate_proj.weight": _tensor(),
-        "model.layers.1.mlp.experts.0.gate_up_proj": _tensor(),
+        "model.layers.1.mlp.experts.0.gate_proj.weight": _tensor(),
     }
     expert_groups = {
         0: {1: [(0, 0)]},
@@ -191,3 +191,35 @@ def test_strict_sharding_accepts_shared_experts_alongside_routed_experts(tmp_pat
     )
     assert 0 in paths
     assert "shared" not in paths
+    assert "shared" not in paths
+
+
+def test_local_expert_ids_do_not_claim_another_groups_experts(tmp_path):
+    """A shard must carry only the experts its group actually owns.
+
+    Assignment pairs are `(my_expert_id, org_expert_id)`: the first is a local
+    slot index, the second the global id that appears in parameter names. Group
+    0 owns global expert 5 and calls it slot 0; group 1 owns global expert 0.
+    Matching on either half — as the old local-id fallback did — put global
+    expert 0 in *both* shards, so group 0 shipped a expert it does not own.
+    """
+    state_dict = {
+        "model.layers.1.mlp.experts.0.gate_proj.weight": _tensor(),
+        "model.layers.1.mlp.experts.5.gate_proj.weight": _tensor(),
+    }
+    expert_groups = {
+        0: {1: [(0, 5)]},   # slot 0 -> global 5
+        1: {1: [(0, 0)]},   # slot 0 -> global 0
+    }
+
+    save_state_dict_by_expert_group(
+        state_dict=state_dict,
+        expert_groups=expert_groups,
+        save_dir=tmp_path,
+        active_expert_group_id=0,
+    )
+
+    from safetensors.torch import load_file
+
+    written = load_file(str(tmp_path / "model_expgroup_0.safetensors"))
+    assert set(written) == {"model.layers.1.mlp.experts.5.gate_proj.weight"}

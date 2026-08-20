@@ -229,10 +229,10 @@ class ModelCheckpoint(BaseModel):
 
             routed_expert_key_count += 1
 
+            # `org_expert_id` only — matching `my_expert_id` too let a
+            # submission smuggle in any expert with a global id in 0..K-1.
             expert_id_mapping = allowed_layers.get(layer_id, [])
-            allowed_expert_ids = {int(my_expert_id) for my_expert_id, _ in expert_id_mapping} | {
-                int(org_expert_id) for _, org_expert_id in expert_id_mapping
-            }
+            allowed_expert_ids = {int(org_expert_id) for _, org_expert_id in expert_id_mapping}
             if int(expert_id) not in allowed_expert_ids:
                 logger.debug(
                     "Expert group verification mismatch",
