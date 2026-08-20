@@ -24,7 +24,7 @@ class PhaseManager:
             {
                 "name": names.miner_commit_2,
                 "length": config.cycle.commit_period,
-            },  # miner commit model hash and validator commit seed
+            },  # miner commit model_hash
             {"name": names.submission, "length": config.cycle.submission_period},  # miner submit model to validator
             {"name": names.validate, "length": config.cycle.validate_period},  # validator validate models from miners
             {"name": names.merge, "length": config.cycle.merge_period},  # validator merge models

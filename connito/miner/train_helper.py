@@ -8,7 +8,6 @@ import torch
 from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.expert_manager import get_weight_sum
 
-# Configure the basic logging setup
 logger = logging.getLogger(__name__)
 
 
@@ -149,8 +148,6 @@ def get_status(
 
     expert_sum_value = float(expert_sum.detach().cpu().item())
 
-    # Extract current learning rate (assume one param group or take first)
-
     metrics: dict[str, Any] = {
         "step": step,
         "inner_opt_step": inner_opt_step,
@@ -198,7 +195,7 @@ def get_status(
     if hasattr(config, "local_par") and hasattr(config.local_par, "gradient_accumulation_steps"):
         metrics["gradient_accumulation_steps"] = config.local_par.gradient_accumulation_steps
         
-    # Attempt to calculate simple grad norm on the fly safely 
+    # Grad norm is best-effort — never fail metric collection over it.
     try:
         total_norm = 0.0
         for p in model.parameters():

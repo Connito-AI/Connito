@@ -76,8 +76,8 @@ def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: call
     Returns:
         None
     """
-    # world_size>1 spawns fresh processes, so cycle._TEST_MODE must be re-set
-    # inside each worker — not just the parent — for --test to take effect.
+    # world_size>1 spawns fresh processes, so --test must be re-applied in
+    # each worker, not just the parent.
     if test_mode:
         from connito.shared.cycle import set_test_mode
         set_test_mode(True)
@@ -148,7 +148,6 @@ def setup_training(
     """
     logger.info("(0) Setup training")
 
-    # === model & Experts manager ===
     logger.debug("init - model and expert manager")
     expert_manager = ExpertManager(config)
     model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet, partial=True)
@@ -175,7 +174,6 @@ def setup_training(
         )
         raise FloatingPointError("Model contains non-finite parameters after setup")
 
-    # === optimizers ===
     logger.debug("init - optimizer")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"trainable params: {len(trainable_params)} / total: {sum(1 for _ in model.parameters())}")
@@ -186,15 +184,10 @@ def setup_training(
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )
-    # Optimizer state precision — config.opt.adamw_optim_bits picks how
-    # exp_avg + exp_avg_sq are stored:
-    #   32: torch.optim.AdamW (fp32 state, 8 bytes/param).
-    #    8: bitsandbytes AdamW with optim_bits=8 — 8-bit blockwise-quantized
-    #       state, 4× smaller than fp32. Well-tested for LLM fine-tuning
-    #       (QLoRA/PEFT default) and required to fit this config on a 47GB A6000.
-    # Note: bitsandbytes does NOT support 16-bit AdamW state — it errors at
-    # init_state with NotImplementedError. Only 8 and 32 are valid. fp16-mixed
-    # autocast is orthogonal — it changes compute precision, not optimizer state.
+    # 32 = torch AdamW (fp32 state); 8 = bitsandbytes blockwise-quantized
+    # state, 4x smaller. No other value works — bitsandbytes raises
+    # NotImplementedError for 16-bit state. Orthogonal to fp16-mixed autocast,
+    # which changes compute precision rather than optimizer state.
     optim_bits = int(getattr(config.opt, "adamw_optim_bits", 8))
     if optim_bits == 8:
         import bitsandbytes as _bnb
@@ -217,7 +210,7 @@ def setup_training(
             f"bitsandbytes has no 16-bit AdamW state."
         )
 
-    # === scheduler === (for inner optimizer)
+    # For the inner optimizer.
     logger.debug("init - scheduler")
     scheduler = get_cosine_schedule_with_warmup(
         inner_optimizer,
@@ -225,7 +218,6 @@ def setup_training(
         num_training_steps=config.sched.total_steps,
     )
 
-    # === scaler ===
     logger.debug("init - inner scaler")
     precision = get_nested_attr(config, "model.precision", "fp16-mixed")
     if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
@@ -238,13 +230,11 @@ def setup_training(
     )
     logger.info("inner scaler configured", enabled=scaler_enabled, precision=precision, device=device.type)
 
-    # === dataloader ===
     logger.debug("init - train dataloader")
     train_dataloader = get_dataloader(
         config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
     )
 
-    # === load checkpoint (if any) ===
     logger.debug("init - load checkpoint")
     resume = False
 
@@ -290,7 +280,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     Returns:
         None
     """
-    # Start the integrated Prometheus telemetry server
     telemetry_port = 8100 + rank
     TelemetryManager().start_server(port=telemetry_port)
 
@@ -298,16 +287,13 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     if rank == 0:
         config.write()
 
-    # === set logging ===
     metric_logger = MetricLogger(config, rank)
 
-    # === set up chain worker ===
     # subtensor is the archive connection (needed for historical chain-commit
     # queries during load_model). lite_subtensor is unused here for now — miner
     # call sites can migrate onto it in a follow-up without breaking this one.
     wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
 
-    # Start telemetry sidecar poller
     poller = SystemStatePoller(
         subtensor=subtensor, 
         phase_manager=PhaseManager(config, subtensor),
@@ -315,11 +301,9 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     )
     poller.start()
 
-    # === mis ===
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = get_base_tokenizer(config)
 
-    # === set up training ===
     (
         model,
         inner_optimizer,
@@ -354,7 +338,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         
         for step, batch in enumerate(
             iterable=train_dataloader,
-            # start=max(0, current_model_meta.inner_opt) * config.local_par.gradient_accumulation_steps,
             start=max(0, start_inner_opt) * config.local_par.gradient_accumulation_steps,
         ):
             # for each step, we run 1 backward
@@ -363,9 +346,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
             inner_opt_step = step // config.local_par.gradient_accumulation_steps
             is_inner_optimizer_step = (step + 1) % config.local_par.gradient_accumulation_steps == 0
-            
-            # is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
-            # current_model_meta.inner_opt = inner_opt_step
             
             if current_model_meta:
                 is_start_step = step == current_model_meta.inner_opt * config.local_par.gradient_accumulation_steps
@@ -376,7 +356,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             # === Training and inner optimization ===
             if (
                 not is_start_step
-            ):  # skip training when it is the start step, so that we can benchamrk the original model first
+            ):  # skip training on the start step so the original model can be benchmarked first
                 model.train()
                 if training_start_time is None:
                     training_start_time = time.time()
@@ -450,7 +430,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         if len(sample_grads) >= 5:
                             break
 
-                # === Aggressively free intermediate tensors ===
                 del loss, aux_loss, batch_device, outputs
                 gc.collect()
 
@@ -503,13 +482,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
                 scale_after = None
-                # Defrag before the FIRST optimizer.step(): AdamW lazily
-                # allocates exp_avg + exp_avg_sq (2× fp32 per trainable param,
-                # hundreds of MiB on DeepSeek-V2-Lite) inside optimizer.step,
-                # and it OOMs against ~1 GiB of reserved-but-unallocated
-                # fragmentation on a fresh A6000. `empty_cache` is cheap
-                # (~a few ms) and always safe here since we've just finished
-                # backward.
+                # Defrag before the first optimizer.step(): AdamW lazily
+                # allocates its fp32 moment buffers there and OOMs against
+                # reserved-but-unallocated fragmentation. Safe here because
+                # backward has just finished.
                 gc.collect()
                 torch.cuda.empty_cache()
                 if inner_scaler.is_enabled():
@@ -565,7 +541,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 total_training_time += training_time
                 training_start_time = None
 
-                # === Clear memory after optimizer step ===
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -617,7 +592,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     
                         time.sleep(15)
                     
-                        # Rebuild ONLY the dataloader to recover the network stream
                         logger.info("Rebuilding dataloader after network timeout...")
                         train_dataloader = get_dataloader(
                             config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
@@ -634,7 +608,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     
                         time.sleep(15)
                     
-                        # Rebuild ONLY the dataloader to recover the network stream
                         logger.info("Rebuilding dataloader after network timeout...")
                         train_dataloader = get_dataloader(
                             config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
@@ -660,7 +633,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 metric_logger.log(metrics)
 
                 logger.info("reached barrier, waiting for partial validation and metric logging to complete")
-                # dist.barrier(device_ids=[rank])
 
             # === save checkpoint ===
             if (
@@ -670,11 +642,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             ):
                 logger.info("(4) Saving checkpoint")
 
-                # ckpt_path = os.path.join(
-                #     config.ckpt.checkpoint_path,
-                #     f"globalver_{current_model_meta.global_ver}_inneropt_{inner_opt_step}",
-                # )
-                
                 current_ver = current_model_meta.global_ver if current_model_meta else 0
 
                 ckpt_path = os.path.join(
@@ -704,14 +671,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         logger.info(f"Deleted old checkpoints: {ckpt_deleted}")
 
                 logger.info("reached barrier, waiting for complete checkpoint saving")
-                # dist.barrier(device_ids=[rank])
 
-            # === reload model ===
-            # Gated by ckpt.enable_peer_resync (default True). Standalone
-            # smoke/train runs — especially under use_pretrained_only=True —
-            # want this off, otherwise a stale validator_checkpoint dir on
-            # disk triggers a full setup_training rebuild every inner-opt
-            # step and optimizer state gets wiped.
+            # Standalone smoke/train runs want enable_peer_resync off:
+            # otherwise a stale validator_checkpoint dir triggers a full
+            # setup_training rebuild every inner-opt step and wipes optimizer
+            # state.
             if is_inner_optimizer_step and get_nested_attr(config, "ckpt.enable_peer_resync", True):
                 logger.info("(5) Reload Model")
 
@@ -726,7 +690,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         newest_checkpoint=newest_checkpoint,
                         current_model_meta=current_model_meta,
                     )
-                    # dist.barrier(device_ids=[rank])  # make sure everything is saved and everyone is ready to load
                     logger.info("freeing cuda memory")
                     free_cuda_models(models=[model], optimizers=[inner_optimizer], devices=[device])
                     logger.info(
@@ -810,7 +773,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
         logger.error("Quit training", exc_info=True)
         poller.stop()
-        # dist.destroy_process_group()
         torch.cuda.synchronize()
         metric_logger.close()
 

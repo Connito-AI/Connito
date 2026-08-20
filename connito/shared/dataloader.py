@@ -16,24 +16,11 @@ from transformers import DataCollator, DataCollatorForLanguageModeling, PreTrain
 from connito.shared.app_logging import structlog
 from connito.shared.helper import h256_int, import_from_string
 
-# Default per-request timeout for HuggingFace Hub network reads. Bg-eval's
-# dataloader streams from HF, and a hung connection inside the streaming
-# iterator can park a worker thread inside an uncancellable network read
-# — observed as the trigger for the bg-eval lock-leak wedges in
-# `notebooks/data/validator_a100_v0.1.38.log` (uid 82, 01:35:59) and
-# `validator_A6000_v0.1.38.log` (uid 50, 23:32:43).
-#
-# 120 s rationale:
-#   * Far above HF.co's healthy response time (<1 s per batch). A single
-#     batch taking 120 s already implies HF is degraded, not just slow.
-#   * Comfortably below the 300 s `per_miner_eval_timeout_sec` ceiling,
-#     so a stalled fetch still trips this and unwinds via the dataloader
-#     iterator long before `wait_for` cancels the awaiter.
-#   * Aligned with `bg-download`'s 180 s file-fetch timeout — both speak
-#     to "HF is unreachable" rather than "HF is slow."
-#   * `setdefault` so operators can override with `HF_HUB_DOWNLOAD_TIMEOUT`
-#     in the env without code changes (e.g. raise to 300 on a flaky
-#     network, or lower for faster failure-detection).
+# Per-request timeout for HF reads. A hung connection inside the streaming
+# iterator parks a bg-eval worker in an uncancellable read while it holds the
+# GPU lock, so this must trip well before `per_miner_eval_timeout_sec` (300 s)
+# and well above HF's healthy sub-second response. `setdefault` leaves
+# operators free to override via the environment.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 logger = structlog.get_logger(__name__)
@@ -77,10 +64,8 @@ class _PrefixDedupFilter:
 
     def __init__(self, prefix_chars: int):
         self.prefix_chars = int(prefix_chars)
-        # Exact prefixes, not `hash()` digests: builtin str hashing is
-        # per-process randomized, so two validators could disagree on a
-        # collision. The eval stream retains only ~thousands of rows, so
-        # exact storage is a few hundred KB at worst.
+        # Exact prefixes, not `hash()`: builtin str hashing is per-process
+        # randomized, so two validators could disagree on a collision.
         self.seen: set[str] = set()
 
     def __call__(self, example: dict[str, Any]) -> bool:
@@ -159,9 +144,9 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
     def __iter__(self):
         format_example = partial(self.tokenize_and_format, tokenizer=self.tokenizer, sequence_length=self.seq_length)
 
-        # Explicit per-example iteration avoids surprises with HF's streaming `map` api (which
-        # can leave original string columns attached when `column_names` is missing), ensuring
-        # we only yield the tokenized dict expected by the collator.
+        # HF's streaming `map` can leave the original string columns attached
+        # when `column_names` is missing; iterate explicitly so only the
+        # tokenized dict reaches the collator.
         for example in self.hf_iterable:
             yield format_example(example)
 
@@ -286,12 +271,9 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         # be available before the per-source load loop.
         int_seed = int(str(seed)[:8], 16) if seed else 42
 
-        # Switch to seeded shard-pick when the operator has flipped the
-        # gate AND the caller passed a seed (i.e. validator eval, not
-        # miner training). See `connito/shared/eval_shard_pick.py` for
-        # the consensus assumptions; in particular, every configured
-        # source must have a registered policy and (ideally) a pinned
-        # revision SHA in `eval_source_revision_pin`.
+        # Seeded shard-pick applies on the eval path only. Every configured
+        # source needs a registered policy and a pinned revision — see
+        # `connito/shared/eval_shard_pick.py`.
         seeded_pick_enabled = (
             seed is not None
             and bool(getattr(config.task.exp.data, "eval_source_seeded_shard_pick", False))
@@ -356,12 +338,9 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 features=common_features,
             )
 
-            # Eval-path data-quality gate (seed is None on the miner
-            # training path, which stays byte-identical). Applied
-            # per-source and before interleave so the source weights
-            # keep describing *usable* rows — an unfiltered source with
-            # 38% empty rows would otherwise contribute 38% NaN batches
-            # at its configured weight.
+            # Eval-path gate, applied per source before interleave so the
+            # configured weights keep describing usable rows rather than
+            # rows that tokenize to NaN.
             eval_min_text_chars = int(
                 getattr(config.task.exp.data, "eval_min_text_chars", 0) or 0
             )
@@ -371,11 +350,8 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 )
 
             if pick is not None:
-                # In-shard offset goes here so the validator's read
-                # window lands at a random depth inside the chosen
-                # shard rather than at row 0. Bounded by the chosen
-                # shard's own row count — no min-across-sources to
-                # maintain, no over-skip risk past end-of-stream.
+                # Offset is bounded by the chosen shard's own row count, so
+                # there is no over-skip past end-of-stream.
                 source_split = source_split.skip(pick.in_shard_offset)
 
             dataset_splits.append(source_split)
@@ -384,26 +360,12 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         if not dataset_splits:
             raise ValueError("No dataset sources were configured.")
 
-        # Streaming-shuffle each source BEFORE interleave when the caller
-        # passed a seed (validator eval path; miners pass seed=None so this
-        # is a no-op for training).
-        #
-        # Without this, the eval pool is bounded by the HEAD of each
-        # source's stream: HF reads shards in file order, `interleave`
-        # only changes which source supplies each position, and the
-        # `_fractional_index_filter` + `split_dataset_by_node` together
-        # consume ~max_eval_batches * world_size / vali_fraction
-        # positions per round — for the default config (50, 10, 0.1)
-        # that's ~5,000 positions, drawn from ~2,500 head rows of each
-        # source regardless of seed. A 50-seed probe over
-        # (allenai/c4 en, nvidia/Nemotron-CC-Math-v1 4plus) found only
-        # ~2,000 distinct samples ever drawn — small enough for a miner
-        # to memorize and reach near-zero validation loss without ever
-        # generalizing. `.shuffle()` on a streaming dataset both permutes
-        # shard order (so different shards lead each round) and
-        # buffer-shuffles within the active window — together that turns
-        # the candidate pool into the full source for any seed that lands
-        # on a different shard permutation.
+        # Shuffle each source before interleave, on the eval path only (miners
+        # pass seed=None). Without it the eval pool is the head of each
+        # source's stream — a few thousand rows per round regardless of seed,
+        # small enough for a miner to memorize and score near-zero without
+        # generalizing. `.shuffle()` permutes shard order and buffer-shuffles
+        # within the window, so the pool spans the whole source.
         shuffle_buffer = int(
             getattr(config.task.exp.data, "eval_source_shuffle_buffer", 0) or 0
         )
@@ -417,16 +379,10 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 for ds in dataset_splits
             ]
 
-        # Random per-source read offset, applied AFTER the buffer shuffle.
-        # `.shuffle(seed, buffer_size=B)` alone leaves the read locked to the
-        # first ~B rows of whichever shard ended up at position 0 of the
-        # permuted shard list — the validator only consumes ~5K rows per
-        # round and the buffer never slides deeper than that. `.skip(N)`
-        # advances the read into the body of the lead shard, so the
-        # reachable pool spans the full shard rather than just its head.
-        # Different `int_seed` → different offset per source (RNG seeded
-        # off `int_seed` advances per source) → window lands at a
-        # different depth each round.
+        # Read offset applied after the shuffle. The shuffle alone leaves the
+        # read locked to the head of whichever shard leads, because the buffer
+        # never slides deeper than a round consumes; `.skip(N)` moves it into
+        # the shard body, at a seed-dependent depth each round.
         skip_max = int(
             getattr(config.task.exp.data, "eval_source_skip_max", 0) or 0
         )
@@ -449,12 +405,9 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             logger.debug("Interleaving dataset sources", probabilities=probabilities)
             split = interleave_datasets(dataset_splits, probabilities=probabilities, seed=int_seed)
 
-        # Eval-path template dedup: drop rows repeating an already-seen
-        # text prefix (templated corpora open millions of documents with
-        # the same boilerplate — see `_PrefixDedupFilter`). Runs after
-        # interleave so the dedup window spans the whole eval stream, and
-        # before the fractional filter so surviving indices stay
-        # deterministic for every validator.
+        # Drop rows repeating an already-seen prefix. After interleave so the
+        # window spans the whole eval stream, before the fractional filter so
+        # surviving indices stay deterministic across validators.
         eval_dedup_prefix_chars = int(
             getattr(config.task.exp.data, "eval_dedup_prefix_chars", 0) or 0
         )
@@ -554,20 +507,19 @@ def get_dataloader(
         world_size=world_size,
         train=train,
         seed=seed,  # e.g. combined validator seed
-        fraction=config.task.exp.data.vali_fraction,  # use ~20% of the dataset
+        fraction=config.task.exp.data.vali_fraction,
     )
 
     # Collator for causal LM (no MLM)
     if data_collator is None:
         data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Build loader
     num_workers = int(getattr(config.task.exp.data, "num_workers", 1))
     if num_workers < 0:
         num_workers = 0
 
     loader = StatefulDataLoader(
-        tokenised_dataset,  # split
+        tokenised_dataset,
         collate_fn=data_collator,
         batch_size=config.task.exp.data.per_device_train_batch_size,
         num_workers=num_workers,

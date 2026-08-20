@@ -1,4 +1,3 @@
-# llm_weightnet/shared/logging.py
 from __future__ import annotations
 
 import logging
@@ -19,7 +18,7 @@ def configure_logging() -> None:
     fmt = "pretty"
     use_utc = True
 
-    # # 1) stdlib baseline so third-party libs (uvicorn, requests) show up
+    # 1) stdlib baseline so third-party libs (uvicorn, requests) show up
     logging.basicConfig(stream=sys.stdout, level=level, format="%(message)s")
 
     # Silence noisy third-party logs
@@ -28,12 +27,9 @@ def configure_logging() -> None:
     logging.getLogger("datasets").setLevel(logging.WARNING)
     logging.getLogger("datasets.builder").setLevel(logging.WARNING)
 
-    # Drop huggingface_hub's per-download "Could not set the permissions" warning.
-    # It fires from `file_download._chmod_and_move` when chmod loses a race with
-    # the `.incomplete` tmp file being cleaned up — harmless, but emits two
-    # multi-line warnings per fetched file. Over a validator's day that's tens
-    # of thousands of lines that drown the rest of the log. We target the
-    # specific message rather than silencing the whole logger so genuine HF
+    # huggingface_hub emits two multi-line warnings per fetched file when
+    # chmod races the `.incomplete` cleanup — harmless, but tens of thousands
+    # of lines a day. Target the message, not the logger, so genuine HF
     # warnings still surface.
     class _HfPermissionsNoise(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
@@ -56,7 +52,7 @@ def configure_logging() -> None:
         processors = common + [
             structlog.dev.ConsoleRenderer(
                 colors=True,
-                pad_event=28,  # adjust to your taste
+                pad_event=28,
                 exception_formatter=structlog.dev.plain_traceback,
             )
         ]
@@ -69,7 +65,7 @@ def configure_logging() -> None:
     )
 
 
-# Module-level logger you can import directly
+# Default configuration for importers that never call configure_logging().
 structlog.configure_once(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),

@@ -59,16 +59,10 @@ def evaluate_model(
     model.eval()
     loss_sum: float = 0.0
     aux_loss_sum: float = 0.0
-    # Count of batches that produced a finite loss. The previous
-    # implementation skipped NaN-loss batches from `loss_sum` but still
-    # included them in the divisor, so a miner that crafts weights to
-    # overflow logits to inf/NaN under bf16 autocast on a fraction `p` of
-    # batches would report `(1 - p) * honest_loss` instead of
-    # `honest_loss` — gaming the val_loss downward and inflating their
-    # reward. Divide by `scored_batches` instead so a NaN/Inf batch
-    # contributes nothing to either side of the ratio. Also skip
-    # `aux_loss_sum` on NaN/Inf batches so a related variant (subtract
-    # aux_loss but skip loss) cannot replicate the same exploit.
+    # Divisor must count only finite-loss batches. Counting NaN batches while
+    # excluding them from `loss_sum` lets a miner overflow logits on a fraction
+    # p of batches and report `(1 - p) * honest_loss`. `aux_loss_sum` skips the
+    # same batches, closing the mirror-image exploit.
     scored_batches: int = 0
     nan_batches: int = 0
     batch_step = -1

@@ -237,7 +237,6 @@ class MinerScoreAggregator:
                 state.series.clear()
 
             state.series.add(ts, float(score), round_id)
-            # Push metric update to prometheus
             try:
                 VALIDATOR_MINER_SCORE.labels(miner_uid=str(uid)).set(float(score))
             except Exception:
@@ -264,7 +263,6 @@ class MinerScoreAggregator:
         with self._lock:
             state = self._miners.get(uid)
             if state is None:
-                # create empty series for new uid
                 self._miners[uid] = MinerState(
                     uid=uid,
                     hotkey=new_hotkey,
@@ -334,7 +332,7 @@ class MinerScoreAggregator:
             ema_val = alpha * v + (1 - alpha) * ema_val
         return float(ema_val)
 
-    # ---------- New: UID → score map ----------
+    # ---------- UID → score map ----------
     def uid_score_pairs(
         self,
         how: Literal["latest", "sum", "avg", "ema"] = "latest",
@@ -391,14 +389,12 @@ class MinerScoreAggregator:
             if uid not in scores:
                 return False
 
-        # Sort all scores descending
         sorted_scores = sorted(scores.values(), reverse=True)
 
         # If there are fewer miners than the cutoff, all are "in top"
         if len(sorted_scores) <= cutoff:
             return True
 
-        # Find the cutoff score for the top N
         cutoff_score = sorted_scores[cutoff - 1]
         return scores[uid] >= cutoff_score
 

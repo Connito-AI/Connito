@@ -115,7 +115,6 @@ def parse_dynamic_filename(filename: str) -> dict:
         uid_13_hotkey_5FnRrH_block_5759026.pt
     → {"uid": 13, "hotkey": "5FnRrH", "block": 5759026}
     """
-    # Remove .pt extension
     name = Path(filename).stem
 
     parts = name.split("_")
@@ -125,13 +124,10 @@ def parse_dynamic_filename(filename: str) -> dict:
         key = parts[i]
         value = parts[i + 1]
 
-        # Handle potential composite keys (non-even splits)
-        # Example: if filename has uneven underscores
         if key in meta:  # duplicate key, skip
             i += 1
             continue
 
-        # Try to cast numeric values to int
         try:
             value = int(value)
         except ValueError:
@@ -184,13 +180,8 @@ def hash_model_bytes(model_bytes: bytes) -> bytes:
 
 
 def get_model_hash(state, hex=False):
-    """
-    Create a model hash from model mocated at specified path.
-    """
-    # 1. Serialize model → bytes
+    """Hash a model or state_dict to 32 bytes (hex string when `hex=True`)."""
     model_bytes = serialize_torch_model_path(state)
-
-    # 2. Hash model to 32 bytes
     model_hash = hash_model_bytes(model_bytes)
     if hex:
         return model_hash.hex()

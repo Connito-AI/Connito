@@ -103,13 +103,11 @@ class ModelCheckpoint(BaseModel):
         except AttributeError:
             return NotImplemented
 
-        # Compare by global_ver first
         self_global_ver = self.global_ver if isinstance(self.global_ver, int) else -1
         other_global_ver = other_global_ver if isinstance(other_global_ver, int) else -1
         if self_global_ver != other_global_ver:
             return self_global_ver < other_global_ver
 
-        # Then compare by inner_opt
         self_inner_opt = self.inner_opt if isinstance(self.inner_opt, int) else -1
         other_inner_opt = other_inner_opt if isinstance(other_inner_opt, int) else -1
         return self_inner_opt < other_inner_opt
@@ -215,7 +213,6 @@ class ModelCheckpoint(BaseModel):
         allowed_layers = expert_group_assignment.get(self.expert_group, {})
         routed_expert_key_count = 0
         for name, tensor in state_dict.items():
-            # Check for non-finite weights (NaN, Inf)
             if torch.is_tensor(tensor) and torch.is_floating_point(tensor) and not torch.isfinite(tensor).all():
                 non_finite_count = (~torch.isfinite(tensor)).sum().item()
                 logger.warning("expert group verification failed: non-finite weights detected", key=name, non_finite_count=non_finite_count, total_elements=tensor.numel())
@@ -260,20 +257,16 @@ class ModelCheckpoint(BaseModel):
 
     def validate(self, expert_group_assignment: ExpertAssignments | None) -> bool:
 
-        # --- verify signature ---
         self._verify_signature()
 
-        # --- get state dict ---
         if self.path is None:
             logger.warning("Hash verification failed: missing checkpoint path", checkpoint=self)
             return False
     
         state_dict = compile_full_state_dict_from_path(self.path, expert_groups=[self.expert_group])
         
-        # --- verify hash ---
         self._verify_hash(state_dict = state_dict)
 
-        # --- verify expert group ---
         if expert_group_assignment is not None:
             self._verify_expert_group(state_dict = state_dict, expert_group_assignment = expert_group_assignment)
         
@@ -414,18 +407,11 @@ class ChainCheckpoints(BaseModel):
         if not filtered:
             return ChainCheckpoints(checkpoints=[])
 
-        # Skip the global_ver range filter for the miner role. The chain
-        # commit block can race against the allowed-version window by 1-2
-        # blocks (we observed ckpt_ver=8338209 vs max_allowed=8338208 in
-        # SN102 staging logs — a miner that committed one block after the
-        # window was excluded), which silently drops fresh, otherwise-valid
-        # miner submissions. Validators downstream do their own
-        # evaluation-driven gating, so excluding here is strictly
-        # pessimistic.
-        #
-        # The filter still applies when for_role == "validator" — validators
-        # cross-check each other's commits and the version range there
-        # protects the chosen majority hash from stale validator state.
+        # Miners skip the global_ver range filter: the commit block can race
+        # the allowed-version window by a block or two, silently dropping fresh
+        # submissions, and validators gate on evaluation anyway. The filter
+        # still applies to validators, where it protects the majority hash from
+        # stale peer state.
         if for_role == "miner":
             logger.debug(
                 "filter_checkpoints: skipping version range gate (miner role)",
@@ -736,7 +722,7 @@ def build_chain_checkpoints_from_previous_phase(
     else:
         raise ValueError(f"Invalid type: {for_role}. Must be 'miner' or 'validator'.")
 
-    # --- Make sure we are not inbetween commit 1 and 2---    
+    # --- Make sure we are not between commit 1 and 2 ---
     current_phase: PhaseResponse | None = get_phase_from_api(config)
     if current_phase is not None and (current_phase.phase_name == phase_name_1 or current_phase.phase_name == phase_name_2):
         logger.info(f"In between hash commit phase, waiting till {next_phase}")
@@ -765,13 +751,10 @@ def build_chain_checkpoints_from_previous_phase(
         hash_chain_commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(
             config, subtensor, block=commit_2_end_block
         )
-        # Log the source blocks at info: when two validators disagree on which
-        # miner revision to download (the chain-read divergence we saw in SN102
-        # validator/yuma logs around 2026-06-08, where the same UID produced
-        # different `hf_revision` per validator), the first thing to check is
-        # whether their substrate clients agreed on the historical block they
-        # pulled. Without these fields that information is unrecoverable after
-        # the fact.
+        # Log the source blocks at info. When two validators disagree on a
+        # miner's revision, the first thing to check is whether their substrate
+        # clients read the same historical block — unrecoverable after the fact
+        # without these fields.
         if not signed_hash_chain_commits or not hash_chain_commits:
             logger.warning(
                 "Chain commits fetched but some are missing",
@@ -978,7 +961,6 @@ def archive_top_miner_submissions(
 
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect all submission files with their hotkey
     submissions: dict[str, Path] = {}
     submission_files = [
         p for suffix in MINER_CHECKPOINT_SUFFIXES
@@ -993,10 +975,9 @@ def archive_top_miner_submissions(
     if not submissions:
         return
 
-    # Get scores for ranking
     uid_scores = score_aggregator.uid_score_pairs(how="avg")
 
-    # Map hotkey -> best score (lower val_loss = better)
+    # Map hotkey -> the miner's rolling average score.
     hotkey_scores: dict[str, float] = {}
     for hotkey in submissions:
         for uid, score in uid_scores.items():
@@ -1005,7 +986,7 @@ def archive_top_miner_submissions(
                 hotkey_scores[hotkey] = score
                 break
 
-    # Rank by score (lower val_loss is better)
+    # Rank by average score, ascending.
     ranked_hotkeys = sorted(
         hotkey_scores.keys(),
         key=lambda hk: hotkey_scores.get(hk, float("inf")),

@@ -2,7 +2,7 @@
 
 No chain RPCs, no fixtures from `Round.freeze`. Each test exercises one
 selection rule from the spec
-(`_specs/round-group-construction-scheme.md`) against a synthetic
+(`docs/miner-validation-group-promotion.md`) against a synthetic
 metagraph or score map.
 """
 

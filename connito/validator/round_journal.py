@@ -25,19 +25,12 @@ import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# v2 adds `uid_to_commit` (uid -> (hf_repo_id, hf_revision)) so the
-# journal-recovery finalize can re-publish evaluated-commit telemetry.
-# v3 adds `roster_size` + `lifecycle_step` so recovery can also restore the
-# round-level gauges (validator_round_miners_{scored,pending,failed},
-# lifecycle_step, current_round_id) — those are written only by the live
-# eval workers, so without persistence the dashboard's "Evaluated N of M"
-# column blanks for a full cycle after every restart. v3 also adds
-# `uid_to_val_loss`, the only per-miner field with no recovery path at all:
-# `validator_miner_val_loss` is emitted at eval time and cannot be derived
-# from `scores`, because `delta = max(0.0, baseline - val_loss)` clamps at
-# zero, so every miner scoring 0 would be underivable.
-# `from_json` accepts v1/v2 files (missing fields default) so leftover
-# journals written by an older build still recover.
+# v2 added `uid_to_commit`; v3 added `roster_size`, `lifecycle_step` and
+# `uid_to_val_loss`. All exist because the live eval workers are their only
+# other source, so without persistence a restart blanks the round-level
+# dashboard gauges for a full cycle and loses the cycle's val_losses
+# permanently (`scores` clamps the delta at zero). `from_json` still accepts
+# v1/v2 files so older journals recover.
 SCHEMA_VERSION = 3
 JOURNAL_DIR_NAME = "round_journal"
 JOURNAL_FILENAME_PREFIX = "round_"
@@ -68,12 +61,8 @@ class RoundJournal:
     # v2: uid -> (hf_repo_id, hf_revision) evaluated for the round. Only
     # uids whose chain checkpoint carried BOTH values are recorded.
     uid_to_commit: dict[int, tuple[str, str]] = field(default_factory=dict)
-    # v3: round-level gauge inputs. `roster_size` = len(foreground_uids) +
-    # len(background_uids) at freeze; `lifecycle_step` = the last live
-    # lifecycle step the round reached (0 freeze / 2 post-foreground /
-    # 3 eval-window). Both let startup recovery restore the round-level
-    # gauges. Default 0 for v1/v2 journals (recovery then leaves pending at
-    # 0 rather than inventing a roster).
+    # Round-level gauge inputs for startup recovery. Default 0 on v1/v2
+    # journals, so recovery leaves pending at 0 rather than inventing a roster.
     roster_size: int = 0
     lifecycle_step: int = 0
     # v3: uid -> raw evaluation loss, recorded at `mark_scored`. Only

@@ -44,9 +44,8 @@ class TelemetryManager:
 # Metric Definitions
 # ==============================================================================
 
-# Identity — stamps every scrape with which validator emitted these metrics.
-# Set once at startup via set_validator_identity(); central Prometheus joins
-# this with measurement metrics via PromQL `* on(instance) group_left(...)`.
+# Stamps every scrape with which validator emitted it. Central Prometheus joins
+# on it via `* on(instance) group_left(...)`.
 CONNITO_VALIDATOR_INFO = Info(
     "connito_validator",
     "Identity of the validator emitting these metrics (one labelset per process)",
@@ -94,46 +93,32 @@ MODEL_PARAMETER_COUNT = Gauge("system_model_parameter_count", "Total loaded para
 # Validator (Gauges & Counters)
 VALIDATOR_ACTIVE_MINER_EVALS = Gauge("validator_active_miner_evaluations", "Number of miner_jobs being evaluated")
 VALIDATOR_MINER_SCORE = Gauge("validator_miner_score", "Validation score assigned to a miner", ["miner_uid"])
-# Rolling EMA score actually voted on chain (i.e. the value
-# `score_aggregator.uid_score_pairs(how="avg")` returns and that
-# `chain_submitter.async_submit_weight` consumes). Distinct from
-# `validator_miner_score`, which is the latest *raw* per-round score
-# fed into the aggregator. Set per-round right before chain submission;
-# absent for UIDs the validator hasn't scored yet (no entry rather than 0).
+# Rolling average actually voted on chain, as opposed to
+# `validator_miner_score` (the latest raw per-round score). Unscored UIDs get
+# no sample rather than a zero.
 VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
     "validator_miner_weight_submitted",
     "Rolling EMA voted on chain for a miner",
     ["miner_uid"],
 )
-# Per-miner validation loss measured against this validator's foreground
-# eval set. High-cardinality (one series per miner UID) but bounded by
-# subnet size (~100s); same shape as `validator_miner_score`. Set inside
-# `evaluate_one_miner` immediately after the val_loss is computed.
-# Aggregators compute `delta_loss = max(0, validator_baseline_loss -
-# validator_miner_val_loss)` as needed.
+# Per-miner validation loss from this validator's eval set. One series per
+# miner UID — bounded by subnet size. Aggregators derive
+# `delta_loss = max(0, baseline - val_loss)` from this and the baseline gauge.
 VALIDATOR_MINER_VAL_LOSS = Gauge(
     "validator_miner_val_loss",
     "Per-miner validation loss measured against this validator's foreground eval set",
     ["miner_uid"],
 )
-# Round-level baseline loss: this validator's eval loss against the
-# pre-merge global model, computed once per round at the start of the
-# foreground pass (see `evaluate_foreground_round`). Single value (no
-# labels) — the latest write wins. Distinct from
-# `validator_eval_loss{expert_group=...}` which tracks training-side
-# eval loss reported via MetricLogger.
+# This validator's eval loss against the pre-merge global model, once per
+# round. Unlabeled, so the latest write wins. Distinct from
+# `validator_eval_loss{expert_group=...}`, which is the training-side loss.
 VALIDATOR_BASELINE_LOSS = Gauge(
     "validator_baseline_loss",
     "Round baseline loss against this validator's foreground eval set",
 )
-# Per-round baseline loss, labeled by the round it belongs to. The unlabeled
-# gauge above is overwritten every round, so a scraper can only sample it and
-# a cycle's baseline ends up timing-dependent; this labeled family lets the
-# gateway attribute the right baseline to the right round, freeze it after
-# finalize, and naturally exclude a warming-up validator that has no value for
-# a given round. Evicted on the same cutoff as the other per-round families
-# (see evict_round_series_before). The unlabeled family is retained for
-# backward compat during rollout.
+# Same value, labeled by round, so the gateway can attribute a baseline to a
+# specific round instead of sampling the overwritten gauge above. Evicted on
+# the same cutoff as the other per-round families.
 VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
     "validator_baseline_loss_by_round",
     "Round baseline loss (this validator's foreground eval set), labeled by the "
@@ -141,10 +126,8 @@ VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
     "is retained for backward compat.",
     ["round_id"],
 )
-# Numeric ID of the current round, set when `Round.freeze` returns and
-# the round becomes active. Lets aggregators key per-miner score and
-# val_loss readings to a specific round without parsing the round_id
-# label off `validator_round_lifecycle_step`.
+# Set when `Round.freeze` returns, so aggregators can key per-miner readings
+# to a round without parsing labels off the lifecycle gauge.
 VALIDATOR_CURRENT_ROUND_ID = Gauge(
     "validator_current_round_id",
     "Numeric ID of the round this validator is currently evaluating",
@@ -171,10 +154,8 @@ VALIDATOR_MINER_EVAL_FAILURES = Counter(
     "Failures encountered while evaluating a miner submission, by reason",
     ["miner_uid", "reason"],
 )
-# Per-miner aggregator snapshot. Set right before chain submission alongside
-# VALIDATOR_MINER_WEIGHT_SUBMITTED so a single Prometheus scrape carries
-# everything the leaderboard needs without re-deriving from per-round samples.
-# Absent for UIDs the validator has never scored (no entry rather than 0).
+# Per-miner aggregator snapshot, published with the submitted weights so one
+# scrape carries everything the leaderboard needs. No entry for unscored UIDs.
 VALIDATOR_MINER_SCORE_LATEST = Gauge(
     "validator_miner_score_latest",
     "Most recent per-round rank score the aggregator holds for a miner",
@@ -190,28 +171,17 @@ VALIDATOR_MINER_SCORE_SAMPLES = Gauge(
     "Number of score samples retained for a miner within the aggregator window",
     ["miner_uid"],
 )
-# Unix-seconds timestamp of the moment this validator last published a score
-# snapshot for the miner. Set by `set_miner_score_snapshot` alongside
-# VALIDATOR_MINER_SCORE_LATEST/_AVG/_SAMPLES, so it advances exactly once per
-# cycle at the chain-submit boundary. The gateway computes "score age" as
-# `time() - validator_miner_score_latest_emitted_at` — `timestamp(score_latest)`
-# alone is misleading because Prometheus updates the sample-timestamp on every
-# scrape (every ~5s) even when the underlying value hasn't changed, making the
-# score look freshly emitted when in fact it hasn't been updated for almost a
-# whole cycle. This gauge is the "value last changed" signal the dashboard
-# needs to render meaningful "scored Xm ago" labels.
+# When the score snapshot above was last published — the "value last changed"
+# signal. Needed because `timestamp(score_latest)` advances on every scrape
+# even when the value has not, so score age computed from it is meaningless.
 VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT = Gauge(
     "validator_miner_score_latest_emitted_at",
     "Unix seconds when this validator last published a score_latest snapshot for the miner",
     ["miner_uid"],
 )
-# Last-known per-miner eval outcome on THIS validator. Integer-coded so the
-# gateway can render miner-facing strings without label cardinality blowing
-# up (one series per miner_uid, value = code from EVAL_STATUS_CODES below).
-# 0 == ok; non-zero codes correspond to the failure reason the validator
-# observed most recently. Stable across rounds — the gateway is expected
-# to read `last_over_time(...)` so this remains queryable even on cycles
-# where the miner is not in the eval set.
+# Last-known per-miner eval outcome. Integer-coded (see EVAL_STATUS_CODES) so
+# the gateway can render strings without label-cardinality churn; 0 == ok.
+# Stable across rounds — read it with `last_over_time(...)`.
 VALIDATOR_MINER_EVAL_STATUS = Gauge(
     "validator_miner_eval_status",
     "Current per-miner eval status code (0=ok; see EVAL_STATUS_CODES)",
@@ -231,37 +201,30 @@ VALIDATOR_COHORT_EPOCH = Gauge(
     "validator_cohort_epoch",
     "Current cohort epoch index for the round-group construction scheme",
 )
-# Per-miner cohort validation group for the active round. Integer-coded (like
-# eval_status) so the gateway renders the letter without label-cardinality
-# churn when a miner rotates groups. Reset for every metagraph uid each round
-# (0 for miners in no group) so stale membership never lingers across epochs.
+# Per-miner validation group for the active round, integer-coded. Reset for
+# every metagraph uid each round so stale membership never lingers.
 VALIDATOR_MINER_COHORT_GROUP = Gauge(
     "validator_miner_cohort_group",
     "Cohort validation group for a miner this round (see COHORT_GROUP_CODES)",
     ["miner_uid"],
 )
-# Per-miner assignment role for THIS validator's roster this round. Each
-# validator emits its own slice; the gateway unions across validators by the
-# scrape instance label. Reset for every metagraph uid each round.
+# This validator's roster role per miner; the gateway unions the slices across
+# validators. Reset for every metagraph uid each round.
 VALIDATOR_MINER_ASSIGNMENT_ROLE = Gauge(
     "validator_miner_assignment_role",
     "This validator's assignment role for a miner this round (see ASSIGNMENT_ROLE_CODES)",
     ["miner_uid"],
 )
-# Round (freeze) block at which this validator last observed a valid chain
-# commit for the miner. Answers "do validators see my submission?" — set to the
-# round_id of the most recent freeze where the miner had a valid (hf_repo_id,
-# hf_revision) commit.
+# round_id of the last freeze where this miner had a valid (hf_repo_id,
+# hf_revision) commit. Answers "do validators see my submission?".
 VALIDATOR_MINER_LAST_OBSERVED_COMMIT_BLOCK = Gauge(
     "validator_miner_last_observed_commit_block",
     "Round (freeze) block at which this validator last observed a valid chain commit for the miner",
     ["miner_uid"],
 )
 
-# --- Cycle-consistent per-miner attribution (dashboard contract) -----------
-# The gateway attributes every per-miner sample to the exact evaluation
-# round via these three families. All are set from `finalize_round_scores`
-# (including its journal-recovery replay path) so a validator restart
+# Cycle-consistent per-miner attribution (dashboard contract). Set from
+# `finalize_round_scores`, including its journal-recovery replay, so a restart
 # re-publishes them without waiting for a fresh round.
 VALIDATOR_MINER_LAST_SCORED_ROUND_ID = Gauge(
     "validator_miner_last_scored_round_id",
@@ -283,11 +246,9 @@ VALIDATOR_MINER_EVALUATED_COMMIT_INFO = Gauge(
     "labelsets are evicted on change).",
     ["miner_uid", "hf_repo_id", "hf_revision"],
 )
-# uid -> (hf_repo_id, hf_revision) currently exposed on
-# VALIDATOR_MINER_EVALUATED_COMMIT_INFO. Guarded by _COMMIT_INFO_LOCK; used
-# to evict the previous labelset when a miner's commit changes, keeping the
-# "<= 1 labelset per uid" invariant. After a restart both this dict and the
-# registry start empty, so correctness holds without persistence.
+# uid -> the commit currently exposed on VALIDATOR_MINER_EVALUATED_COMMIT_INFO.
+# Used under _COMMIT_INFO_LOCK to evict the old labelset when a miner's commit
+# changes, preserving the "<= 1 labelset per uid" invariant.
 _COMMIT_INFO_LOCK = threading.Lock()
 _COMMIT_INFO_LABELS: dict[str, tuple[str, str]] = {}
 
@@ -312,11 +273,9 @@ VALIDATOR_ROUND_MINERS_FAILED = Gauge(
     "Roster miners that failed download/eval for the round",
     ["round_id"],
 )
-# round_id label values ever emitted on the per-round families above (and on
-# VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL). Call sites register via
-# `note_round_series`; `evict_round_series_before` removes stale labelsets on
-# the same cutoff run.py already uses to prune journals/aggregator entries —
-# without this, every round leaves four-plus permanent series behind.
+# round_id labels ever emitted on the per-round families. Without eviction on
+# the same cutoff run.py uses for journals, every round would leave several
+# permanent series behind.
 _ROUND_SERIES_LOCK = threading.Lock()
 _EMITTED_ROUND_IDS: set[int] = set()
 VALIDATOR_BG_WORKER_PAUSED = Gauge(
@@ -765,7 +724,7 @@ def count_rpc_errors():
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                # Naively cast everything as an RPC error count, or you could filter by exception type
+                # Every exception counts as one RPC error; no per-type filtering.
                 RPC_ERRORS_TOTAL.inc()
                 raise e
         return wrapper
@@ -814,9 +773,7 @@ class SystemStatePoller(threading.Thread):
         # Stays empty until the first metagraph sync runs successfully; we
         # skip emitting the deregistration counter on that first tick.
         self._prior_uids: set[int] = set()
-        # psutil.cpu_percent(interval=None) returns 0.0 on its very first call
-        # because it has no previous sample to diff against. Prime it here so
-        # the first real poll already has a usable baseline.
+        # cpu_percent(interval=None) returns 0.0 on its first call; prime it.
         try:
             psutil.cpu_percent(interval=None)
         except Exception:
@@ -879,8 +836,7 @@ class SystemStatePoller(threading.Thread):
             pass
 
         # 5. Throttled metagraph fetch (vtrust / consensus / deregistration churn).
-        # Fetching the metagraph is a multi-second RPC, so we only do it every
-        # Nth poll. We also fire on the very first tick (poll_count == 0) so
+        # Multi-second RPC, so throttle it — but fire on the first tick so
         # dashboards aren't blank at startup.
         is_metagraph_tick = (
             self._poll_count == 0

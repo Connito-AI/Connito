@@ -58,9 +58,8 @@ logger = structlog.get_logger(__name__)
 
 
 BITTENSOR_BLOCK_TIME_SECONDS: int = 12
-# Cap wait_till sleeps so a long phase-distance doesn't leave the process idle
-# for half an hour without re-checking the chain — it should wake up at least
-# every 15 minutes to handle phase resets, clock drift, and chain hiccups.
+# Re-check the chain at least this often, so phase resets, clock drift and
+# chain hiccups are picked up even when the target phase is far away.
 WAIT_TILL_MAX_SLEEP_SECONDS: int = 15 * 60
 
 # Test toggle: when set, `wait_till` returns a synthetic PhaseResponse
@@ -140,22 +139,22 @@ class PhaseResponseLite(BaseModel):
     phase_end_block: int
 class PhaseResponse(BaseModel):
     block: int
-    cycle_length: int  # how long is one cycle
-    cycle_index: int  # which cycle are we in
-    cycle_block_index: int  # how far in block are we into a cycle
-    phase_name: str  # what is the name of the current phase
-    phase_index: int  # what is the id of the phase
-    phase_start_block: int  # the start block of the phase
-    phase_end_block: int  # the end block of the phase
-    blocks_into_phase: int  # how far in block are we in the current phase
-    blocks_remaining_in_phase: int  # how manuy block left in the phase
+    cycle_length: int  # blocks per cycle
+    cycle_index: int
+    cycle_block_index: int  # blocks elapsed in the current cycle
+    phase_name: str
+    phase_index: int
+    phase_start_block: int
+    phase_end_block: int
+    blocks_into_phase: int
+    blocks_remaining_in_phase: int
 
 
 @dataclass
 class PhaseNames:
     distribute: str = "Distribute"  # miner download from validator
-    train: str = "Train"  # miner trian
-    miner_commit_1: str = "MinerCommit1"  # miner commit signed_model_hash and vlaidators commit seed
+    train: str = "Train"  # miner train
+    miner_commit_1: str = "MinerCommit1"  # miner commits signed_model_hash, validators commit seed
     miner_commit_2: str = "MinerCommit2"  # miner commit model_hash
     submission: str = "Submission"  # miner submit model to validator
     validate: str = "Validate"  # validator validate
@@ -256,11 +255,8 @@ def wait_till(
 
     phase_response: PhaseResponse | None = None
     first_print = True
-    # Wall-clock anchor for the wait-heartbeat: every ~15 min of real time
-    # we emit a proof-of-life line via log_phase regardless of how the outer
-    # poll loop happens to slice its sleeps. Anchoring to monotonic() rather
-    # than per-iteration `slept` means short sleep_sec values (when the target
-    # is close) don't suppress the heartbeat.
+    # Anchored to monotonic() rather than per-iteration `slept`, so short
+    # sleeps near the target don't suppress the heartbeat.
     heartbeat_interval = 900.0
     last_heartbeat_at = time.monotonic()
     while True:
@@ -284,10 +280,8 @@ def wait_till(
             blocks_remaining,
             max(poll_fallback_block, blocks_remaining * 0.9),
         ) * BITTENSOR_BLOCK_TIME_SECONDS
-        # Same cap as the early-return branch above: don't sleep past the
-        # max so we re-poll the chain at least every WAIT_TILL_MAX_SLEEP_SECONDS
-        # seconds. Without this, a wait with blocks_remaining > ~75 would sleep
-        # past the cap (e.g. blocks_remaining=316 → ~57 min single sleep).
+        # Same cap as the early-return branch: without it a long wait becomes
+        # a single sleep of nearly an hour.
         sleep_sec = min(sleep_sec, WAIT_TILL_MAX_SLEEP_SECONDS)
 
         if first_print:
@@ -302,13 +296,10 @@ def wait_till(
                 f"at {expect_time.strftime('%H:%M:%S')}"
             )
         first_print = False
-        # Sleep in <=60 s slices so a heartbeat / external kill can be
-        # observed within ~60 s. Heartbeat emission is anchored to wall-clock
-        # (last_heartbeat_at, declared above the outer loop) so it fires on
-        # a 15-min cadence regardless of how the outer loop slices sleeps.
-        # Use log_phase (stdout, always visible) rather than logger.debug —
-        # operators watching the validator should see proof-of-life even
-        # when debug logs are filtered out.
+        # Sleep in <=60 s slices so a kill is observed promptly. The heartbeat
+        # is anchored to wall-clock, so its 15-min cadence is independent of
+        # how the loop slices sleeps, and goes to stdout so proof-of-life
+        # survives debug-log filtering.
         slept = 0.0
         slice_sec = 60.0
         while slept < sleep_sec:
@@ -569,21 +560,15 @@ def get_combined_validator_seed(
     but is no longer read here. The argument is kept (and accepted)
     so call sites in `Round.freeze` and tests need not change.
     """
-    # `commits` is no longer needed for the seed itself (the legacy
-    # validator_seeds mix is gone) — but the parameter is preserved so
-    # callers that share a head-block commits fetch with sibling
-    # helpers like `get_validator_miner_assignment` don't have to
-    # change their signature.
+    # Unused, but kept in the signature so callers can share one head-block
+    # commits fetch with sibling helpers.
     _ = commits
 
     block_hash = _get_minercommit2_block_hash(config, subtensor)
     if not block_hash:
-        # Hard guard. The previous fallback (`sha256("")`) was the
-        # known deficiency flagged in the original mixed-seed PR; it
-        # let miners win the round trivially whenever the phase API
-        # or chain RPC blipped. Raise so the validator framework
-        # retries / skips the round instead of running on a guessable
-        # seed.
+        # Never fall back to a constant seed: a guessable seed lets miners win
+        # the round trivially whenever the phase API or chain RPC blips. Raise
+        # so the caller retries or skips the round.
         raise RuntimeError(
             "Cannot derive combined validator seed: MinerCommit2 "
             "block hash unavailable (phase API or chain RPC failure). "
@@ -644,10 +629,8 @@ def get_validator_miner_assignment(
         )
     miners = [m for m in miners if m in miners_with_checkpoint]
 
-    # Rank miners by incentive desc and keep only the top
-    # foreground_top_n * num_validators. The remainder is dropped
-    # before assignment so validators do not waste cycles on low-incentive
-    # miners that would never be reached anyway.
+    # Truncate to the top `foreground_top_n * num_validators` by incentive;
+    # the rest would never be reached anyway.
     if metagraph is None:
         metagraph = subtensor.metagraph(netuid=config.chain.netuid)
     hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
@@ -664,9 +647,8 @@ def get_validator_miner_assignment(
     # Tie-break on hotkey for determinism across validators.
     miners.sort(key=lambda hk: (-_incentive(hk), hk))
 
-    # Snapshot the full incentive-ordered checkpoint set before truncation —
-    # callers that want subnet-wide coverage (e.g. bg-download/eval) need
-    # this; foreground assignment still uses the truncated slice.
+    # Untruncated set, for callers that need subnet-wide coverage such as
+    # bg-download/eval.
     all_miners_with_checkpoint = list(miners)
 
     cap = config.evaluation.foreground_top_n * max(len(validator_seeds), 1)
@@ -776,7 +758,6 @@ def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tupl
     try:
         return resp.json()
     except ValueError as e:
-        # JSON decoding failed
         logger.exception("Invalid JSON from %s: %s", url, e)
         return None
 
@@ -798,7 +779,6 @@ def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None
     try:
         return resp.json()
     except ValueError as e:
-        # JSON decoding failed
         logger.exception("Invalid JSON from %s: %s", url, e)
         return None
 
@@ -857,7 +837,6 @@ def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | N
 
     max_version = miner_commit_1_range[0]  # start block
 
-    # derive cycle_length as sum of all phase lengths
     cycle_length = sum((end - start + 1) for start, end in previous_ranges.values())
 
     min_version = max_version - int(cycle_length * config.cycle.version_range_cycles)
@@ -885,7 +864,6 @@ def get_init_peer_id(config: WorkerConfig) -> str | None:
     try:
         return resp.json()
     except ValueError as e:
-        # JSON decoding failed
         logger.exception("Invalid JSON from %s: %s", url, e)
         return None
 
@@ -944,9 +922,7 @@ def hydrate_miner_submissions_from_hf(
     submission_dir = Path(config.ckpt.miner_submission_path)
     submission_dir.mkdir(parents=True, exist_ok=True)
 
-    # A miner with any existing submission file is skipped — the background
-    # download worker may have already placed the file, and we don't want to
-    # re-download on subsequent polls.
+    # bg-download may already have placed the file; don't re-fetch it.
     existing_hotkeys: set[str] = set()
     for file_path in submission_dir.glob("*.pt"):
         if file_path.name.startswith(".tmp"):
@@ -1039,10 +1015,8 @@ def gather_validation_job(
     outdated_submissions = []
     unexpected_submissions = []
     for file_name, submission_meta in miner_submission_files.items():
-        # Guard against filenames that don't match the uid_*_hotkey_*_block_*.pt
-        # template (partial uploads, stale files from older miner versions,
-        # manually placed debug checkpoints). Without this, a single bad file
-        # raises KeyError and aborts the whole scan, losing valid submissions.
+        # One off-template filename (partial upload, stale file, manual debug
+        # checkpoint) would otherwise KeyError and abort the whole scan.
         if "hotkey" not in submission_meta or "block" not in submission_meta:
             logger.warning(
                 "Skipping submission file: missing required filename fields",
@@ -1070,7 +1044,6 @@ def gather_validation_job(
                         "file_name": file_name,
                         "hotkey": submission_meta["hotkey"],
                         "block": submission_meta["block"],
-                        # "reason": reason,
                     }
                 )
 
@@ -1080,7 +1053,6 @@ def gather_validation_job(
                         "file_name": file_name,
                         "hotkey": submission_meta["hotkey"],
                         "block": submission_meta["block"],
-                        # "reason": reason,
                     }
                 )
 

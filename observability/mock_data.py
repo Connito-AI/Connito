@@ -34,14 +34,14 @@ def run_mock():
     try:
         cur_loss = 3.5
         for i in range(1000):
-            # Training stuff
+            # Training metrics
             cur_loss = cur_loss * 0.98 + random.uniform(-0.05, 0.05)
             MINER_TRAINING_LOSS.labels(expert_group="math").set(cur_loss)
             MINER_TRAINING_LOSS.labels(expert_group="logic").set(cur_loss * 1.2)
             MINER_LEARNING_RATE.set(0.001 * (0.99 ** i))
             MINER_TOKENS_PER_SEC.set(2400 + random.uniform(-100, 100))
             
-            # Validation stuff
+            # Validation metrics
             VALIDATOR_EVAL_LOSS.labels(expert_group="math").set(cur_loss + 0.1)
             VALIDATOR_MINER_SCORE.labels(miner_uid="10").set(0.85 + random.uniform(-0.02, 0.02))
             VALIDATOR_MINER_SCORE.labels(miner_uid="11").set(0.0) # Bad miner
