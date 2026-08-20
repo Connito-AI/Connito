@@ -121,7 +121,7 @@ from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
-from connito.validator.chain_submitter import ChainSubmitter
+from connito.validator.chain_submitter import ChainSubmitter, observer_mode_enabled
 from connito.validator.evaluator import (
     MinerEvalJob,
     build_submission_uid_weights,
@@ -987,9 +987,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         logger.info("Disabling averager for non-active expert group", excluded_group_id=gid, active_group_id=active_group_id)
         del group_grad_buff_meta[gid]
 
-    dht = connect_with_peers(config, wallet, lite_subtensor)
+    if observer_mode_enabled():
+        # Staying out of the DHT entirely is the point: `HotkeyAuthorizer`
+        # admits any hotkey on the whitelist, so an observer sharing a live
+        # validator's hotkey would be accepted into the same
+        # `expert_averaging-group{id}` prefix and its gradients would be
+        # averaged into the fleet's global model. Handing hivemind a throwaway
+        # wallet does not work either — peers reject the unwhitelisted signer,
+        # DHT bootstrap exhausts its retries and raises, and this call sits
+        # outside the run loop's `try`, so the process dies at startup.
+        #
+        # `sync_grad_across_validators` iterates `group_averagers`, so an empty
+        # dict makes the merge phase a clean no-op.
+        logger.warning("OBSERVER MODE — not joining the DHT; no all-reduce")
+        group_averagers = {}
+    else:
+        dht = connect_with_peers(config, wallet, lite_subtensor)
 
-    group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
+        group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
 
     # Resolve this validator's UID so the poller can emit vtrust / consensus
     # for our own slot. Failing this lookup keeps the metagraph block of the
@@ -1017,6 +1032,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             uid=validator_uid,
             version=git_version,
             netuid=int(config.chain.netuid),
+            observer=observer_mode_enabled(),
         )
     except Exception as e:
         logger.warning("Failed to stamp connito_validator_info; continuing", error=str(e))
@@ -1849,7 +1865,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             if model_ckpt is not None:
 
                 model_ckpt.expert_group = config.task.exp.group_id
-                model_ckpt.sign_hash(wallet=wallet)
+                if observer_mode_enabled():
+                    # The signature's only consumer is the commit below, which
+                    # observer mode suppresses — and this is the last thing in
+                    # the validator that needs the hotkey's *private* key.
+                    # Skipping it lets an observer run on a public-only
+                    # keyfile, so a live validator's key never has to be copied
+                    # onto the test host at all. Hash anyway: `model_hash` is
+                    # read on the next line and drives eval, and `sign_hash`
+                    # was what triggered it.
+                    if model_ckpt.model_hash is None:
+                        model_ckpt.hash_model()
+                else:
+                    model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 # Dashboard telemetry: the model's global optimization version
                 # (chain-committed `global_ver`) is the "steps" the leaderboard
