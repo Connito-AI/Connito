@@ -12,11 +12,16 @@ The validator's main loop stays sync; it only calls:
     chain_submitter.async_submit_fallback_weights()
 
 Each method is fire-and-forget — the returned `Future` can be ignored.
+
+Setting `CONNITO_VALIDATOR_OBSERVER=1` turns every one of those three into a
+no-op. This exists so a test validator can share a hotkey with a live one
+without writing to chain under that identity — see `OBSERVER_ENV` below.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 from concurrent.futures import Future
 
 import bittensor
@@ -36,6 +41,29 @@ from connito.shared.chain import (
 from connito.validator.round import Round
 
 logger = structlog.get_logger(__name__)
+
+# Suppresses every chain extrinsic this submitter would issue. Set it when a
+# second validator process shares a hotkey with a live one — two processes on
+# one hotkey collide on more than the obvious `set_weights`: the per-cycle
+# `miner_seed` in `ValidatorChainCommit` feeds the seed every validator hashes
+# to derive miner assignment, and the commit-1 signature is paired with the
+# commit-2 hash by hotkey, so interleaved writes make the live validator's own
+# checkpoint fail signature verification.
+#
+# An env var rather than a config field because `check_and_prompt_locked`
+# rewrites the YAML on startup, and because a deployment that does not set it
+# cannot inherit it.
+OBSERVER_ENV = "CONNITO_VALIDATOR_OBSERVER"
+
+
+def observer_mode_enabled() -> bool:
+    return os.environ.get(OBSERVER_ENV) == "1"
+
+
+def _completed_future(value: bool) -> Future:
+    future: Future = Future()
+    future.set_result(value)
+    return future
 
 
 class ChainSubmitter:
@@ -64,6 +92,21 @@ class ChainSubmitter:
         # this, back-to-back submissions land in the substrate tx pool with
         # the same nonce and collide ("Priority is too low (1 vs 1)").
         self.post_submit_delay_s = post_submit_delay_s
+
+        self.observer = observer_mode_enabled()
+        if self.observer:
+            logger.warning(
+                "OBSERVER MODE — this validator will submit no chain extrinsic",
+                env_var=OBSERVER_ENV,
+                hotkey=wallet.hotkey.ss58_address,
+            )
+            # No runner and no subtensor: nothing will ever be queued, so the
+            # thread and the WebSocket would both sit idle for the process
+            # lifetime.
+            self._runner = None
+            self._async_subtensor = None
+            self._submit_lock = None
+            return
 
         self._runner = AsyncRunner(name=runner_name)
         self._async_subtensor = bittensor.AsyncSubtensor(
@@ -120,6 +163,12 @@ class ChainSubmitter:
         self,
         status: ValidatorChainCommit | MinerChainCommit | SignedModelHashChainCommit,
     ) -> Future:
+        if self.observer:
+            logger.info(
+                "observer mode: suppressed commit",
+                commit_type=type(status).__name__,
+            )
+            return _completed_future(False)
         return self._runner.submit(self._commit_locked(status))
 
     def async_submit_weight(
@@ -127,6 +176,12 @@ class ChainSubmitter:
         round_obj: Round,
         uid_weights: dict[int | str, float],
     ) -> Future:
+        if self.observer:
+            logger.info(
+                "observer mode: suppressed weight submission",
+                round_id=round_obj.round_id,
+            )
+            return _completed_future(False)
         nonzero = sum(1 for v in uid_weights.values() if v > 0)
         logger.info(
             "ChainSubmitter: scheduling weight submission",
@@ -140,6 +195,9 @@ class ChainSubmitter:
         return self._runner.submit(coro)
 
     def async_submit_fallback_weights(self) -> Future:
+        if self.observer:
+            logger.info("observer mode: suppressed fallback weight submission")
+            return _completed_future(False)
         logger.info(
             "ChainSubmitter: scheduling fallback weight submission",
             wait_for_inclusion=self.wait_for_inclusion,
@@ -148,7 +206,8 @@ class ChainSubmitter:
         return self._runner.submit(self._submit_fallback_locked())
 
     def stop(self) -> None:
-        self._runner.stop()
+        if self._runner is not None:
+            self._runner.stop()
 
     async def _submit_weight_one(
         self,
