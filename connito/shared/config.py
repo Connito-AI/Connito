@@ -205,9 +205,11 @@ class ModelCfg(BaseConfig):
     # fp8 weight-only storage for modules a role never trains. `quantization`
     # picks the format, the per-role fields pick the scope. See
     # connito/shared/modeling/quantization.py for the scope meanings.
-    quantization: str = "off"
+    quantization: str = "fp8"
     quantization_miner: str = "off"
-    quantization_validator: str = "off"
+    # "all" fleet-wide. Locked, so every validator scores under the identical
+    # scope; a mixed fleet would make val_loss incomparable across validators.
+    quantization_validator: str = "all"
 
     @model_validator(mode="after")
     def _validate_quantization(self) -> ModelCfg:

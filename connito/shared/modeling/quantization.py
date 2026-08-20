@@ -93,9 +93,6 @@ class FP8Linear(nn.Module):
         self.weight_fp8.copy_(values)
         self.scale.copy_(scale)
 
-    def extra_repr(self) -> str:
-        return f"in={self.in_features}, out={self.out_features}, dtype=fp8_e4m3"
-
 
 def _denied(name: str) -> bool:
     parts = name.split(".")
@@ -147,10 +144,6 @@ def quantize_(model: nn.Module, scope: str, assignment: dict) -> list[str]:
 
     logger.info("fp8 quantization applied", scope=scope, converted_modules=len(converted))
     return sorted(converted)
-
-
-def is_quantized(model: nn.Module) -> bool:
-    return any(isinstance(m, FP8Linear) for m in model.modules())
 
 
 def apply_from_config(model: nn.Module, config, expert_manager, role: str) -> list[str]:

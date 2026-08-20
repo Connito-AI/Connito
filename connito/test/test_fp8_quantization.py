@@ -19,12 +19,7 @@ from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2Confi
 
 from connito.shared.expert_manager import get_layer_expert_id
 from connito.shared.modeling.custom_deepseek_v2_lite import CustomDeekSeekMoE
-from connito.shared.modeling.quantization import (
-    FP8_DTYPE,
-    FP8Linear,
-    is_quantized,
-    quantize_,
-)
+from connito.shared.modeling.quantization import FP8_DTYPE, FP8Linear, quantize_
 
 GROUP, HELPER_GROUP, LAYER_ID = 0, 2, 1
 # (my_expert_id, org_expert_id) — selection must key off the global id.
@@ -102,7 +97,7 @@ def test_gate_proj_is_converted_but_gate_is_not():
 def test_state_dict_and_named_parameters_are_unchanged(baseline):
     model = _model()
     quantize_(model, "all", ASSIGNMENT[GROUP])
-    assert is_quantized(model)
+    assert any(isinstance(m, FP8Linear) for m in model.modules())
 
     base_sd, sd = baseline.state_dict(), model.state_dict()
     assert set(sd) == set(base_sd)
