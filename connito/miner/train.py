@@ -136,9 +136,6 @@ def setup_training(
         scaler (torch.cuda.amp.GradScaler): GradScaler (enabled iff `config.model.precision == "fp16-mixed"`).
         scheduler (LRScheduler): LR scheduler attached to `inner_optimizer`.
         start_step (int): Step to resume from (0 if starting fresh).
-        expert_groups (Sequence[Sequence[int]]): Grouping returned by `create_expert_groups`; typically a list
-            (or other sequence) of groups where each group lists the ranks/experts belonging to it.
-        group_ids (int): This rank’s group id from `create_expert_groups`.
         expert_manager (ExpertManager): The instantiated ExpertManager for this model/rank.
 
     Notes:

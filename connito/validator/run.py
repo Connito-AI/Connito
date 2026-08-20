@@ -192,7 +192,6 @@ from connito.shared.telemetry import (
     evict_round_series_before,
     track_metagraph_sync_latency,
 )
-from datetime import datetime
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -268,35 +267,6 @@ def _sync_lite_metagraph(subtensor, netuid: int):
     ``validator_metagraph_last_sync_timestamp`` on success.
     """
     return subtensor.metagraph(netuid=netuid)
-
-
-def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
-    if not torch.cuda.is_available():
-        print(f"[{tag}] CUDA not available")
-        return
-
-    if device is None:
-        device = torch.cuda.current_device()
-
-    torch.cuda.synchronize(device)
-
-    allocated = torch.cuda.memory_allocated(device)
-    reserved = torch.cuda.memory_reserved(device)
-
-    free, total = torch.cuda.mem_get_info(device)  # bytes
-
-    def mb(x):
-        return x / 1024**2
-
-    log_phase(
-        f"[{tag}] cuda:{device}",
-        allocated=f"{mb(allocated):.1f}MB",
-        reserved=f"{mb(reserved):.1f}MB",
-        free=f"{mb(free):.1f}MB",
-        total=f"{mb(total):.1f}MB",
-        alloc_pct=f"{allocated/total*100:.1f}%",
-        reserved_pct=f"{reserved/total*100:.1f}%",
-    )
 
 
 def _install_signal_logging() -> None:

@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import json
-import random
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
 from connito.shared.config import ExpertCfg, WorkerConfig
-from connito.shared.helper import sum_model_gradients
 
 logger = structlog.getLogger(__name__)
 
@@ -337,86 +334,6 @@ def get_layer_expert_id(layer_name: str) -> tuple[int | None, int | None]:
     return layer_id, expert_id
 
 
-def split_into_groups(
-    lst: list[int], num_groups: int, shuffle: bool = False, seed: int | None = 123
-) -> dict[int, list[int]]:
-    """
-    Deterministically split a list of items into `num_groups` interleaved buckets.
-
-    Parameters
-    ----------
-    lst : list[int]
-        Items to split (e.g., ranks or expert IDs).
-    num_groups : int
-        Number of buckets to produce.
-    seed : Optional[int]
-        Seed for reproducible shuffling. If None, keeps original order.
-
-    Returns
-    -------
-    Dict[int, list[int]]
-        Mapping: group_id -> sublist of items.
-
-    Notes
-    -----
-    Uses a local RNG so global randomness is unaffected.
-    """
-    if num_groups <= 0:
-        raise ValueError("num_groups must be >= 1")
-
-    if shuffle:
-        shuffled = lst[:]
-        if seed is not None:
-            rnd = random.Random(seed)
-            rnd.shuffle(shuffled)
-
-        return {i: shuffled[i::num_groups] for i in range(num_groups)}
-
-    else:
-        return {i: lst[i * (len(lst) // num_groups) : (i + 1) * (len(lst) // num_groups)] for i in range(num_groups)}
-
-
-def create_expert_groups(
-    my_rank: int, rank_group_assignment: Mapping[int, Iterable[int]]
-) -> tuple[int, dict[int, dist.ProcessGroup]]:
-    """
-    Create torch.distributed process groups for each expert group.
-
-    Parameters
-    ----------
-    my_rank : int
-        This process' global rank.
-    rank_group_assignment : Mapping[int, Iterable[int]]
-        Mapping of group_id -> ranks in that group.
-
-    Returns
-    -------
-    tuple[int, Dict[int, ProcessGroup]]
-        (group_ids, groups_by_id)
-
-    Notes
-    -----
-    * Requires `dist.is_initialized()` to be True.
-    * Each call will create new groups; reuse the returned dict across calls in your job.
-    """
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized before creating groups")
-
-    expert_groups: dict[int, dist.ProcessGroup] = {}
-    group_ids: int | None = None
-
-    for group_id, ranks in rank_group_assignment.items():
-        group = dist.new_group(ranks=ranks)
-        expert_groups[group_id] = group
-        if my_rank in ranks:
-            group_ids = group_id
-
-    if group_ids is None:
-        raise ValueError(f"Rank {my_rank} not present in any provided group assignment")
-
-    return group_ids, expert_groups
-
-
 # ------------------------------------------------------------
 # Synchronization primitives
 # ------------------------------------------------------------
@@ -466,59 +383,6 @@ def populate_global_grads_from_local(
             g.grad = diff * weight
         else:
             g.grad += diff * weight
-
-
-def sync_weights(rank: int, global_model: nn.Module, shared_only: bool = False) -> None:
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized before sync")
-
-    global_named = _named_params(global_model)
-
-    for name, g in global_named.items():
-        if shared_only and is_expert_param(name):
-            continue
-
-        dist.all_reduce(g.grad, op=dist.ReduceOp.AVG)
-
-
-def sync_expert_weights(
-    rank: int,
-    global_model: nn.Module,
-    model: nn.Module,
-    group_ids: int,
-    expert_groups: Mapping[int, dist.ProcessGroup],
-) -> None:
-    """
-    Average the differences for *expert* parameters within this expert group only.
-
-    Parameters
-    ----------
-    group_ids : int
-        ID of the group this rank belongs to.
-    expert_groups : Mapping[int, ProcessGroup]
-        Mapping from group ID to its ProcessGroup.
-    """
-    if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized before sync")
-
-    group = expert_groups.get(group_ids)
-    if group is None:
-        raise KeyError(f"No process group for group_ids={group_ids}")
-
-    local_named = _named_params(model)
-    global_named = _named_params(global_model)
-
-    for name, p in local_named.items():
-        if not is_expert_param(name):
-            continue
-        g = global_named.get(name)
-        if g is None:
-            logger.warning(f"[rank {rank}] Expert param '{name}' not found in global model; skipping.")
-            continue
-
-        diff = g.data - p.data
-        g.grad = diff
-        dist.all_reduce(g.grad, op=dist.ReduceOp.AVG, group=group)
 
 
 # def broadcast_weights(

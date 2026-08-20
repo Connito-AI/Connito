@@ -5,9 +5,7 @@ Tests for validator gradient safety guards introduced in dev-3:
   3. reload_model_inplace happy path and failure modes
 """
 
-import asyncio
 import math
-import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
