@@ -121,7 +121,11 @@ def freeze_parameters(
 
         # `org_expert_id`: the name carries the global id, not the local slot.
         allowed = {int(org_expert_id) for _, org_expert_id in assignment.get(layer_id, [])}
-        param.requires_grad_(expert_id in allowed)
+        if expert_id in allowed:
+            param.requires_grad_(True)
+        else:
+            # Helper group, and any expert not assigned to this group.
+            param.requires_grad_(False)
 
     # Optionally upcast trainable parameters to float32 for stable mixed-precision optimization.
     # Needed for AdamW (moment estimates need fp32 precision), but not for SGD.
