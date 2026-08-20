@@ -188,7 +188,13 @@ class RunCfg(BaseConfig):
 
 
 class ModelCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"model_path", "base_arch_model"})
+    # `quantization` and `quantization_validator` are locked so the fleet cannot
+    # drift into validators scoring under different scopes, which breaks
+    # cross-validator val_loss comparability. `quantization_miner` is not locked
+    # — it only affects that miner's own VRAM.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "model_path", "base_arch_model", "quantization", "quantization_validator",
+    })
     model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
     base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
     foundation: bool = True
@@ -196,6 +202,27 @@ class ModelCfg(BaseConfig):
     attn_implementation: str = "sdpa"
     precision: str = "fp16-mixed"
     device: str = "cuda"
+    # fp8 weight-only storage for modules a role never trains. `quantization`
+    # picks the format, the per-role fields pick the scope. See
+    # connito/shared/modeling/quantization.py for the scope meanings.
+    quantization: str = "off"
+    quantization_miner: str = "off"
+    quantization_validator: str = "off"
+
+    @model_validator(mode="after")
+    def _validate_quantization(self) -> ModelCfg:
+        # Imported here: quantization.py -> expert_manager.py -> config.py.
+        from connito.shared.modeling.quantization import SCOPES
+
+        if self.quantization not in ("off", "fp8"):
+            raise ValueError(
+                f"model.quantization must be 'off' or 'fp8', got {self.quantization!r}"
+            )
+        for field in ("quantization_miner", "quantization_validator"):
+            value = getattr(self, field)
+            if value not in SCOPES:
+                raise ValueError(f"model.{field} must be one of {SCOPES}, got {value!r}")
+        return self
 
 
 class DatasetSourceCfg(BaseConfig):

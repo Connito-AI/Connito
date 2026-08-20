@@ -115,6 +115,7 @@ from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gra
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model, reload_model_inplace
 from connito.shared.modeling.mycelia import get_base_tokenizer
+from connito.shared.modeling.quantization import apply_from_config
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator import cohort_state as cohort_state_module
@@ -411,6 +412,7 @@ def setup_training(
         partial=True, checkpoint_device=device,
         load_global_checkpoint=False,
     )
+    apply_from_config(global_model, config, expert_manager, role="validator")
 
     # === optimizers ===
     logger.debug("setup training - load optimizer")
