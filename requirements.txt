@@ -29,7 +29,10 @@ safetensors==0.4.5
 torchdata==0.11.0
 scipy==1.15.3
 prefetch_generator==1.0.3
-unsloth @ git+https://github.com/unslothai/unsloth.git; platform_system == "Linux"
+# Miner inner optimizer when `opt.adamw_optim_bits: 8` — 8-bit AdamW state,
+# ~4x smaller than fp32 and the main lever for fitting a training step on a
+# smaller card. Previously arrived only as an unsloth transitive dependency.
+bitsandbytes==0.50.1
 
 # -----------------------------
 # API / server (validator)
