@@ -31,7 +31,14 @@ on:
     # Build (and push to GHCR as :pr-<N>) on any PR targeting master or
     # staging so reviewers can confirm the image actually builds before
     # merging, and pull the PR image for test deploys if needed.
-    branches: [master, staging]
+    #
+    # `staging_v3` is the rebuilt staging line. It is listed here only, NOT
+    # under `push:` — the tag rules below key off `refs/heads/staging` and
+    # `is_default_branch`, so a push to it would compute zero image tags and
+    # fail the build. PRs are unaffected: `type=ref,event=pr` tags them
+    # `:pr-<N>` whatever the base branch is. Drop this entry once the rebuilt
+    # branch is promoted onto `staging`.
+    branches: [master, staging, staging_v3]
     paths:
       - "connito/validator/**"
       - "connito/shared/**"
