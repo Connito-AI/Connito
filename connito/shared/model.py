@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import time
-import traceback
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
@@ -11,26 +10,18 @@ import torch
 from torch import nn
 
 from connito.shared.app_logging import structlog
-from connito.shared.chain import (
-    SignedModelHashChainCommit,
-    get_chain_commits,
-)
+from connito.shared.chain import get_chain_commits
 from connito.shared.checkpoint_helper import compile_full_state_dict_from_path, load_checkpoint
 from connito.shared.checkpoints import (
     ChainCheckpoints,
     ModelCheckpoint,
-    build_chain_checkpoints,
     build_chain_checkpoints_from_previous_phase,
     delete_old_checkpoints,
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeout
-from connito.shared.cycle import (
-    PhaseNames,
-    get_blocks_from_previous_phase_from_api,
-    get_validator_seed_from_commit,
-)
+from connito.shared.cycle import get_validator_seed_from_commit
 from connito.shared.expert_manager import (
     ExpertManager,
     get_layer_expert_id,
@@ -39,7 +30,6 @@ from connito.shared.expert_manager import (
 from connito.shared.helper import get_model_hash, get_nested_attr
 from connito.shared.memory import cleanup
 from connito.shared.modeling.mycelia import get_base_model
-from connito.shared.schema import verify_message
 
 logger = structlog.get_logger(__name__)
 
@@ -85,15 +75,6 @@ def _download_checkpoint_from_hf_with_timeout(
         timeout_sec=timeout_sec,
     )
 
-
-def grad_hook(name):
-    def h(grad):
-        if grad is not None and not torch.isfinite(grad).all():
-            print("❌ grad NaN/Inf at", name)
-            raise RuntimeError(name)
-        return grad
-
-    return h
 
 def freeze_parameters(
     model: nn.Module,

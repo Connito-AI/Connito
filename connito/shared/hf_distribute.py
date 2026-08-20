@@ -44,10 +44,6 @@ def _resolve_token(token: str | None, env_var: str) -> str | None:
     return os.environ.get(env_var) or None
 
 
-def resolve_hf_token(token: str | None = None, token_env_var: str = "HF_TOKEN") -> str | None:
-    return _resolve_token(token, token_env_var)
-
-
 @lru_cache(maxsize=8)
 def _resolve_default_checkpoint_repo_from_token(resolved_token: str, default_repo_name: str) -> str | None:
     api = HfApi(token=resolved_token)

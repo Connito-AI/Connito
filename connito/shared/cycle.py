@@ -42,7 +42,6 @@ from connito.shared.chain import (
     ValidatorChainCommit,
     WorkerChainCommit,
     get_chain_commits,
-    serve_axon,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.helper import (
@@ -134,10 +133,6 @@ def _get_with_retry(
     logger.error("Request failed after retries", url=url, total_attempts=retries + 1)
     return None
 
-class PhaseResponseLite(BaseModel):
-    phase_name: str
-    phase_start_block: int
-    phase_end_block: int
 class PhaseResponse(BaseModel):
     block: int
     cycle_length: int  # how long is one cycle
@@ -382,29 +377,6 @@ def should_act(config: MinerConfig | ValidatorConfig, phase_name: str, retry_blo
         blocks_till = blocks_till_next_phase[phase_name][2]
 
     return ready, blocks_till, phase_response
-
-
-def search_model_submission_destination(
-    wallet: bittensor.Wallet, config: MinerConfig, subtensor: bittensor.Subtensor
-) -> bittensor.Axon:
-    
-    validator_miner_assignment = get_validator_miner_assignment(config, subtensor).assignment
-
-    assigned_validator_hotkey = None
-    for validator, miners in validator_miner_assignment.items():
-        if wallet.hotkey.ss58_address in miners:
-            assigned_validator_hotkey = validator
-            break
-
-    if assigned_validator_hotkey is None:
-        return None
-
-    metagraph = subtensor.metagraph(netuid=config.chain.netuid)
-    uid = metagraph.hotkeys.index(assigned_validator_hotkey)
-
-    logger.debug("Resolved validator axon", hotkey=f"{assigned_validator_hotkey[:4]}...{assigned_validator_hotkey[-4:]}", uid=uid)
-
-    return metagraph.axons[uid]
 
 
 def assign_miners_to_validators(

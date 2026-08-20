@@ -5,7 +5,6 @@ import json
 import math
 import threading
 import time
-from typing import Literal
 
 import bittensor
 try:
