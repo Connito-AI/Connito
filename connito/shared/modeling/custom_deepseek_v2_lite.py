@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
-import re
 
 import torch
 import torch.nn as nn
@@ -10,23 +8,10 @@ from transformers import (
     AutoConfig,
     PretrainedConfig,
 )
-from transformers.utils import (
-    SAFE_WEIGHTS_INDEX_NAME,
-    SAFE_WEIGHTS_NAME,
-    WEIGHTS_NAME,
-    cached_file,
-)
-# transformers 4.x (<5) compatibility:
-#   - `DeepseekV2Experts` does not exist on 4.x — experts there are an
-#     `nn.ModuleList` of MLPs. We keep our own fused 3D-tensor expert design
-#     (see `CustomDeepseekV2Experts`) and subclass `nn.Module` directly, so this
-#     symbol is intentionally not imported.
-#   - The MoE block is named `DeepseekV2MoE` on 4.x (vs `DeepseekV2Moe` on v5)
-#     and its `forward` uses a `DeepseekV2MoEGate` + ModuleList loop that would
-#     bypass our routing/fused experts. `CustomDeepseekV2Moe` therefore also
-#     subclasses `nn.Module` and defines its own `forward`.
+# transformers 4.x names the MoE block `DeepseekV2MoE` (vs `DeepseekV2Moe` on
+# v5) and its `forward` routes through a `DeepseekV2MoEGate` that would bypass
+# our masked routing, so `CustomDeepseekV2Moe` defines its own.
 from transformers.models.deepseek_v2.modeling_deepseek_v2 import (
-    ACT2FN,
     DeepseekV2Attention,
     DeepseekV2Config,
     DeepseekV2DecoderLayer,
@@ -41,8 +26,6 @@ from transformers.models.deepseek_v2.modeling_deepseek_v2 import (
 from connito.shared.app_logging import structlog
 from connito.shared.helper import *
 
-from connito.shared.expert_manager import get_layer_expert_id
-
 if TYPE_CHECKING:
     from connito.shared.config import MinerConfig
     from connito.shared.expert_manager import ExpertManager
@@ -50,7 +33,6 @@ else:
     MinerConfig = Any
 
 logger = structlog.get_logger(__name__)
-_EXPERT_PREFIX_LAYER_RE = re.compile(r"layers\.(\d+)\.mlp\.experts\.$")
 
 
 def _validate_assignment_bounds(
@@ -110,233 +92,16 @@ def _validate_assignment_bounds(
         )
 
 
-class CustomDeepseekV2Experts(nn.Module):
-    """Collection of expert weights stored as 3D tensors.
 
-    Subclasses ``nn.Module`` (not transformers' ``DeepseekV2Experts``, which is
-    v5-only) so the fused ``gate_up_proj``/``down_proj`` design and its custom
-    state-dict serialization work identically on transformers 4.x and 5.x.
+
+class CustomDeepseekV2Moe(nn.Module):
+    """MoE block whose experts are `DeepseekV2MLP` modules keyed by global id.
+
+    Keying the `ModuleDict` by global id makes parameter names identical to the
+    checkpoint's, so `from_pretrained` and `load_state_dict` fill a partial model
+    with no key translation — the subset is chosen by which experts are declared.
     """
 
-    def __init__(self, config, expert_indices):
-        nn.Module.__init__(self)
-        self.num_experts = config.n_routed_experts
-        self.num_local_experts = len(expert_indices)
-        self.expert_indices = expert_indices
-        self.first_moe_layer = int(getattr(config, "first_k_dense_replace", 0))
-        num_hidden_layers = getattr(config, "num_hidden_layers", None)
-        self.last_moe_layer = int(num_hidden_layers) - 1 if num_hidden_layers is not None else None
-
-        # Map Global ID -> Local Tensor Index
-        self.global_to_local_map = torch.full((config.num_experts,), -1, dtype=torch.long)
-
-        for local_idx, global_idx in enumerate(expert_indices):
-            self.global_to_local_map[global_idx] = local_idx
-
-        self.hidden_dim = config.hidden_size
-        self.intermediate_dim = config.moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_local_experts, 2 * self.intermediate_dim, self.hidden_dim)
-        )
-        self.down_proj = nn.Parameter(torch.empty(self.num_local_experts, self.hidden_dim, self.intermediate_dim))
-        self._reset_expert_parameters(config)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def _reset_expert_parameters(self, config: DeepseekV2Config) -> None:
-        """Initialize stacked expert parameters to finite values."""
-        init_std = float(getattr(config, "initializer_range", 0.02))
-        with torch.no_grad():
-            nn.init.normal_(self.gate_up_proj, mean=0.0, std=init_std)
-            nn.init.normal_(self.down_proj, mean=0.0, std=init_std)
-
-    # ── State-dict compatibility ──────────────────────────────────────────
-    # The stacked parameters (shape [num_local_experts, ...]) are serialised
-    # as individual per-expert slices so that checkpoints look like:
-    #   prefix.experts.0.gate_up_proj   shape [2*D, H]
-    #   prefix.experts.1.gate_up_proj   shape [2*D, H]
-    #   ...
-    # This lets us load weights saved from per-expert Linear modules directly.
-
-    # nn.Parameter names (no .weight suffix — these are raw 3D tensors, not nn.Linear)
-    _STACKED_PARAMS = ("gate_up_proj", "down_proj")
-
-    # ── Save: expand stacked 3D tensors into per-expert slices ────────────
-    # Override _save_to_state_dict (not state_dict) so expansion works
-    # when called from the parent model's state_dict() traversal.
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        super()._save_to_state_dict(destination, prefix, keep_vars)
-        for name in self._STACKED_PARAMS:
-            stacked_key = f"{prefix}{name}"
-            if stacked_key not in destination:
-                continue
-            stacked = destination.pop(stacked_key)
-            for local_idx, global_idx in enumerate(self.expert_indices):
-                destination[f"{prefix}{global_idx}.{name}"] = stacked[local_idx]
-
-    # ── Load: overlay per-expert checkpoint weights onto existing stacked tensors ──
-    # Uses the current model weights as defaults. For each expert found in the
-    # checkpoint, replaces that expert's slice in the stacked tensor.
-    # Checkpoint format: prefix.{idx}.gate_up_proj / prefix.{idx}.down_proj
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        logger.debug(
-            "_load_from_state_dict called",
-            prefix=prefix,
-            expert_indices=self.expert_indices,
-            num_state_dict_keys=len(state_dict),
-        )
-        merge_events: list[dict[str, int | float | str]] = []
-        for name in self._STACKED_PARAMS:
-            stacked_key = f"{prefix}{name}"
-            if stacked_key in state_dict:
-                incoming = state_dict[stacked_key]
-                target_param = getattr(self, name)
-                incoming_shape = tuple(incoming.shape)
-                target_shape = tuple(target_param.shape)
-
-                if incoming_shape == target_shape:
-                    logger.debug(
-                        "stacked key present with matching shape",
-                        stacked_key=stacked_key,
-                        shape=incoming_shape,
-                    )
-                    continue
-
-                # Adapt full stacked tensor [global_experts, ...] to this module's local experts.
-                if (
-                    incoming.ndim == target_param.ndim
-                    and incoming_shape[1:] == target_shape[1:]
-                    and len(self.expert_indices) == target_shape[0]
-                ):
-                    if all(0 <= int(expert_id) < incoming_shape[0] for expert_id in self.expert_indices):
-                        adapted = incoming[self.expert_indices].to(
-                            device=target_param.device,
-                            dtype=target_param.dtype,
-                        )
-                        state_dict[stacked_key] = adapted
-                        logger.info(
-                            "Adapted stacked expert tensor using global expert indices",
-                            stacked_key=stacked_key,
-                            source_shape=incoming_shape,
-                            target_shape=target_shape,
-                            sample_expert_indices=self.expert_indices[:8],
-                        )
-                        continue
-
-                    # Backward compatibility for older local-id checkpoints.
-                    if incoming_shape[0] >= target_shape[0]:
-                        adapted = incoming[: target_shape[0]].to(
-                            device=target_param.device,
-                            dtype=target_param.dtype,
-                        )
-                        state_dict[stacked_key] = adapted
-                        logger.warning(
-                            "Adapted stacked expert tensor using local-index fallback",
-                            stacked_key=stacked_key,
-                            source_shape=incoming_shape,
-                            target_shape=target_shape,
-                        )
-                        continue
-
-                logger.warning(
-                    "Dropping incompatible stacked expert tensor",
-                    stacked_key=stacked_key,
-                    source_shape=incoming_shape,
-                    target_shape=target_shape,
-                )
-                state_dict.pop(stacked_key, None)
-                continue
-
-            # Start from the current (base) model weights as default
-            base_param = getattr(self, name)  # [num_local_experts, ...]
-            stacked = base_param.data.clone()
-            found_any = False
-            loaded_experts = []
-
-            for local_idx, global_idx in enumerate(self.expert_indices):
-                expert_key = f"{prefix}{global_idx}.{name}"
-                if expert_key in state_dict:
-                    stacked[local_idx] = state_dict.pop(expert_key)
-                    found_any = True
-                    loaded_experts.append(global_idx)
-
-
-            if found_any:
-                state_dict[stacked_key] = stacked
-                # Explicitly write to the parameter as well
-                param = getattr(self, name)
-                org_param_sum = param.sum()
-                param.data.copy_(stacked)
-                merge_events.append(
-                    {
-                        "param": name,
-                        "loaded_count": len(loaded_experts),
-                        "loaded_first": loaded_experts[0],
-                        "loaded_last": loaded_experts[-1],
-                        "prev": round(org_param_sum.item(), 4),
-                        "new": round(param.sum().item(), 4),
-                    }
-                )
-
-        if merge_events:
-            prefix_match = _EXPERT_PREFIX_LAYER_RE.search(prefix)
-            layer_id = int(prefix_match.group(1)) if prefix_match is not None else None
-            should_log_merge = True
-            first_or_last = "single"
-            if layer_id is not None and self.last_moe_layer is not None:
-                should_log_merge = layer_id in {self.first_moe_layer, self.last_moe_layer}
-                if layer_id == self.first_moe_layer and layer_id == self.last_moe_layer:
-                    first_or_last = "single"
-                elif layer_id == self.first_moe_layer:
-                    first_or_last = "first"
-                elif layer_id == self.last_moe_layer:
-                    first_or_last = "last"
-
-            if should_log_merge:
-                logger.debug(
-                    "merged expert weights into param",
-                    **merge_events[0],
-                    position=first_or_last,
-                    layer_id=layer_id,
-                    total_merged=len(merge_events),
-                )
-
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
-
-    # ─────────────────────────────────────────────────────────────────────
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for global_expert_idx in expert_hit:
-        
-            global_expert_idx = global_expert_idx[0].item()
-
-            local_expert_idx = self.global_to_local_map[global_expert_idx]
-            
-            if local_expert_idx == -1:
-                continue
-
-            top_k_pos, token_idx = torch.where(expert_mask[global_expert_idx])
-
-            current_state = hidden_states[token_idx]
-            gate, up = nn.functional.linear(current_state, self.gate_up_proj[local_expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[local_expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
-    
-class CustomDeepseekV2Moe(nn.Module):
     def __init__(self, config: DeepseekV2Config, layer_id: int | None = None):
         nn.Module.__init__(self)
         self.config = config
@@ -454,7 +219,14 @@ class CustomDeepseekV2Moe(nn.Module):
             )
 
         # --- Initialize experts and router ---
-        self.experts = CustomDeepseekV2Experts(config, expert_indices=available_experts)
+        self.experts = nn.ModuleDict(
+            {
+                str(expert_id): DeepseekV2MLP(
+                    config=config, intermediate_size=config.moe_intermediate_size
+                )
+                for expert_id in available_experts
+            }
+        )
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -548,12 +320,50 @@ class CustomDeepseekV2Moe(nn.Module):
         topk_weight = topk_weight * self.routed_scaling_factor
         return topk_idx, topk_weight
 
+    def moe_infer(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch each token to the experts it was routed to.
+
+        Moved here from `CustomDeepseekV2Experts.forward`. The only change is
+        that one expert's compute is `self.experts[str(gid)](x)` — a plain
+        `DeepseekV2MLP` — instead of two `F.linear` calls against slices of a
+        stacked parameter. Experts not materialised on this module are skipped,
+        as the `global_to_local_map == -1` check used to do.
+        """
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for global_expert_idx in expert_hit:
+
+            global_expert_idx = global_expert_idx[0].item()
+
+            expert_key = str(global_expert_idx)
+
+            if expert_key not in self.experts:
+                continue
+
+            top_k_pos, token_idx = torch.where(expert_mask[global_expert_idx])
+
+            current_state = hidden_states[token_idx]
+            current_hidden_states = self.experts[expert_key](current_state)
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Explicit forward replicating transformers v5 `DeepseekV2Moe.forward`.
         # On v5 this was inherited; on 4.x the base `DeepseekV2MoE.forward`
         # routes via a `DeepseekV2MoEGate` + ModuleList loop and would bypass our
-        # masked routing and fused experts, so we define it ourselves to keep
-        # numerics identical across transformers versions.
+        # masked routing, so we define it ourselves to keep numerics identical
+        # across transformers versions.
         residuals = hidden_states
         orig_shape = hidden_states.shape
         router_logits = nn.functional.linear(
@@ -561,7 +371,7 @@ class CustomDeepseekV2Moe(nn.Module):
         )
         topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
+        hidden_states = self.moe_infer(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         if getattr(self, "shared_experts", None) is not None:
             hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
@@ -596,46 +406,15 @@ class CustomDeepseekV2Model(DeepseekV2Model):
         self.gradient_checkpointing = False
 
 
+
+
 class CustomDeekSeekMoE(DeepseekV2ForCausalLM):
+    """DeepSeek-V2-Lite with `CustomDeepseekV2Moe` on every MoE layer.
+
+    Parameter names match the stock checkpoint, so nothing here translates keys:
+    `from_pretrained` fills the declared experts and a miner shard overlays with
+    `strict=False`.
     """
-    DeepseekV3 variant that interleaves MoE and dense blocks and optionally restricts experts
-    to those owned by the calling group.
-
-    If `partial=True`, MoE blocks become `myceliaSparseMoeBlock` limited to the group’s experts.
-    Otherwise, standard `SparseMoeBlock` is used for MoE layers.
-    """
-
-    _keys_to_ignore_on_load_missing = [
-        r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_up_proj|down_proj)$",
-    ]
-    _keys_to_ignore_on_load_unexpected = [
-        r"model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)$",
-    ]
-    _virtual_expert_key_pattern = re.compile(
-        r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_up_proj|down_proj)$"
-    )
-
-    def _move_missing_keys_from_meta_to_device(self, missing_keys, device_map, device_mesh, hf_quantizer) -> None:
-        filtered_missing_keys = []
-        ignored_virtual = 0
-        for key in missing_keys:
-            if self._virtual_expert_key_pattern.fullmatch(str(key)):
-                ignored_virtual += 1
-                continue
-            filtered_missing_keys.append(key)
-
-        if ignored_virtual > 0:
-            logger.debug(
-                "Skipping virtual expert missing keys during meta-to-device materialization",
-                ignored_virtual=ignored_virtual,
-            )
-
-        return super()._move_missing_keys_from_meta_to_device(
-            filtered_missing_keys,
-            device_map,
-            device_mesh,
-            hf_quantizer,
-        )
 
     def __init__(self, config):
         # IMPORTANT: avoid constructing the full DeepseekV2Model twice.
@@ -648,357 +427,6 @@ class CustomDeekSeekMoE(DeepseekV2ForCausalLM):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
-
-
-def convert_full_to_partial_model(
-    partial_model: CustomDeekSeekMoE,
-    full_model: DeepseekV2ForCausalLM | str | Path,
-    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
-    target_group: int,
-) -> CustomDeekSeekMoE:
-    """
-    Convert/load a full DeepSeek-V2-lite checkpoint into a partial model.
-    Supports either:
-    - `source` as an instantiated full model, or
-    - `source` as a local/remote pretrained checkpoint path (possibly sharded).
-    """
-    partial_state = partial_model.state_dict()
-    assignments = expert_group_assignment.get(target_group, {})
-    loaded_counts = {"full": 0, "sliced": 0, "transposed": 0}
-    assignments = expert_group_assignment.get(target_group, {})
-    source_state = full_model.state_dict()
-
-    for key, source_tensor in source_state.items():
-        if key not in partial_state:
-            continue
-
-        dst_tensor = partial_state[key]
-
-        # CASE 1: exact shape match for shared weights.
-        if tuple(source_tensor.shape) == tuple(dst_tensor.shape):
-            dst_tensor.copy_(source_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype))
-            loaded_counts["full"] += 1
-            continue
-
-        layer_idx, expert_idx = get_layer_expert_id(key)
-        if layer_idx is None:
-            continue
-
-        # CASE 2: [not used] MoE gate row slicing (if partial gate shape differs).
-        if ".mlp.gate.weight" in key and source_tensor.ndim == 2:
-            layer_map = assignments.get(layer_idx, [])
-            if not layer_map:
-                continue
-
-            for my_expert_id, org_expert_id in layer_map:
-                if my_expert_id < dst_tensor.shape[0] and org_expert_id < source_tensor.shape[0]:
-                    dst_tensor[my_expert_id] = source_tensor[org_expert_id].to(
-                        device=dst_tensor.device, dtype=dst_tensor.dtype
-                    )
-                    loaded_counts["sliced"] += 1
-            continue
-
-        # CASE 3: expert tensor slicing from full tensors.
-        if ".mlp.experts." in key and source_tensor.ndim >= 2:
-            layer_assignments = assignments.get(layer_idx, [])
-
-            valid_src_indices: list[int] = []
-            valid_dst_indices: list[int] = []
-
-            for dst_local_idx, org_expert_id in layer_assignments:
-                org_expert_id = int(org_expert_id)
-                dst_local_idx = int(dst_local_idx)
-
-                if 0 <= org_expert_id < source_tensor.shape[0]:
-                    valid_src_indices.append(org_expert_id)
-                    valid_dst_indices.append(dst_local_idx)
-
-            if not valid_src_indices:
-                continue
-
-            extracted = source_tensor[valid_src_indices]
-
-            target_slice_shape = dst_tensor[valid_dst_indices].shape
-            if tuple(extracted.shape) != tuple(target_slice_shape):
-                logger.warning(
-                    "Skipping expert slice due to shape mismatch",
-                    key=key,
-                    source_shape=tuple(extracted.shape),
-                    target_shape=tuple(target_slice_shape),
-                )
-                continue
-
-            dst_tensor[valid_dst_indices] = extracted.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
-            loaded_counts["sliced"] += 1
-
-    partial_model.load_state_dict(partial_state, strict=False)
-    logger.info("Converted full model to partial model", loaded_counts=loaded_counts, target_group=target_group)
-    return partial_model
-
-
-_EXPERT_PROJ_RE = re.compile(
-    r"^(.*\.mlp\.experts\.\d+\.)(gate_proj|up_proj|down_proj)\.weight$"
-)
-
-
-def _apply_pretrained_tensor_to_partial(
-    key: str,
-    source_tensor: torch.Tensor,
-    partial_state: dict[str, torch.Tensor],
-    assignments: dict[int, list[tuple[int, int]]],
-    loaded_counts: dict[str, int],
-    gate_up_buf: dict[str, dict[str, torch.Tensor]] | None = None,
-) -> None:
-    """Route one pretrained `(key, tensor)` into `partial_state` via the
-    same logic as `convert_full_to_partial_model`: backbone shape-match
-    copy, MoE gate row-slicing, or expert tensor slicing. Mutates
-    `partial_state` (via destination `.copy_` / indexed assignment) and
-    `loaded_counts` in place.
-
-    Also handles raw deepseek MoE per-expert keys:
-      `model.layers.{L}.mlp.experts.{global_id}.{gate_proj|up_proj|down_proj}.weight`
-    by routing into partial_state's fused `gate_up_proj` (concat gate+up
-    along intermediate dim) and `down_proj` per-expert slices. Uses
-    `gate_up_buf` to defer fusion until both `gate_proj` and `up_proj`
-    arrive for the same expert. Shared_experts keys keep their `.weight`
-    suffix in both src and partial so they hit the standard shape-match
-    path; this case only catches the routed-experts mismatch."""
-    if key not in partial_state:
-        # Try per-expert routed-experts conversion.
-        m = _EXPERT_PROJ_RE.match(key)
-        if m is not None:
-            expert_prefix = m.group(1)   # `model.layers.L.mlp.experts.N.`
-            proj_name = m.group(2)
-
-            if proj_name == "down_proj":
-                target_key = expert_prefix + "down_proj"
-                if target_key in partial_state:
-                    dst = partial_state[target_key]
-                    dst.copy_(source_tensor.to(device=dst.device, dtype=dst.dtype))
-                    loaded_counts["sliced"] += 1
-                return
-
-            # gate_proj or up_proj — fuse with its pair via gate_up_buf.
-            target_key = expert_prefix + "gate_up_proj"
-            if target_key not in partial_state:
-                return  # expert not owned by this group
-            if gate_up_buf is None:
-                return  # caller did not supply buffer; can't fuse safely
-            slot = gate_up_buf.setdefault(expert_prefix, {})
-            slot[proj_name] = source_tensor
-            if "gate_proj" in slot and "up_proj" in slot:
-                gate = slot.pop("gate_proj")
-                up = slot.pop("up_proj")
-                fused = torch.cat([gate, up], dim=0)
-                dst = partial_state[target_key]
-                dst.copy_(fused.to(device=dst.device, dtype=dst.dtype))
-                loaded_counts["sliced"] += 1
-                if not slot:
-                    gate_up_buf.pop(expert_prefix, None)
-            return
-        return
-    dst_tensor = partial_state[key]
-
-    if tuple(source_tensor.shape) == tuple(dst_tensor.shape):
-        dst_tensor.copy_(
-            source_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
-        )
-        loaded_counts["full"] += 1
-        return
-
-    layer_idx, _ = get_layer_expert_id(key)
-    if layer_idx is None:
-        return
-
-    if ".mlp.gate.weight" in key and source_tensor.ndim == 2:
-        layer_map = assignments.get(layer_idx, [])
-        if not layer_map:
-            return
-        for my_expert_id, org_expert_id in layer_map:
-            if my_expert_id < dst_tensor.shape[0] and org_expert_id < source_tensor.shape[0]:
-                dst_tensor[my_expert_id] = source_tensor[org_expert_id].to(
-                    device=dst_tensor.device, dtype=dst_tensor.dtype
-                )
-                loaded_counts["sliced"] += 1
-        return
-
-    if ".mlp.experts." in key and source_tensor.ndim >= 2:
-        layer_assignments = assignments.get(layer_idx, [])
-        valid_src_indices: list[int] = []
-        valid_dst_indices: list[int] = []
-        for dst_local_idx, org_expert_id in layer_assignments:
-            org_expert_id = int(org_expert_id)
-            dst_local_idx = int(dst_local_idx)
-            if 0 <= org_expert_id < source_tensor.shape[0]:
-                valid_src_indices.append(org_expert_id)
-                valid_dst_indices.append(dst_local_idx)
-        if not valid_src_indices:
-            return
-        extracted = source_tensor[valid_src_indices]
-        target_slice_shape = dst_tensor[valid_dst_indices].shape
-        if tuple(extracted.shape) != tuple(target_slice_shape):
-            logger.warning(
-                "Skipping expert slice due to shape mismatch",
-                key=key,
-                source_shape=tuple(extracted.shape),
-                target_shape=tuple(target_slice_shape),
-            )
-            return
-        dst_tensor[valid_dst_indices] = extracted.to(
-            device=dst_tensor.device, dtype=dst_tensor.dtype
-        )
-        loaded_counts["sliced"] += 1
-
-
-def merge_group_assignments_for_streaming(
-    expert_group_assignment: dict[int, dict[int, list[tuple[int, int]]]],
-    group_ids: list[int],
-) -> dict[int, list[tuple[int, int]]]:
-    """Union the per-layer expert assignments across `group_ids` and
-    recompute my_expert_id as the position in the sorted merged org_expert_id
-    set. This matches CustomDeepseekV2Moe's local-slot layout
-    (`expert_indices = sorted(unique org_expert_ids)`), so streaming can
-    write once into the merged partial model without collisions between
-    per-group my_expert_ids that both start at 0."""
-    per_layer_orgs: dict[int, set[int]] = {}
-    for group_id in group_ids:
-        layer_assignments = expert_group_assignment.get(int(group_id), {})
-        for layer_id, mappings in layer_assignments.items():
-            per_layer_orgs.setdefault(int(layer_id), set()).update(
-                int(org) for _, org in mappings
-            )
-    return {
-        layer_id: [(idx, org) for idx, org in enumerate(sorted(orgs))]
-        for layer_id, orgs in per_layer_orgs.items()
-    }
-
-
-def stream_pretrained_state_dict_to_partial_model(
-    partial_model: CustomDeekSeekMoE,
-    state_dict: dict[str, torch.Tensor],
-    assignments: dict[int, list[tuple[int, int]]],
-) -> CustomDeekSeekMoE:
-    """Stream a pretrained state dict into a partial model, popping
-    each source entry from `state_dict` as it lands so its host RAM is
-    released before the next tensor is processed.
-
-    Replicates `convert_full_to_partial_model`'s per-key logic
-    (backbone shape-match, MoE gate slicing, expert tensor slicing)
-    but does not require a full pretrained model to be materialized.
-    Combined with placing `partial_model` on its target device (GPU)
-    *before* this call, the working sets of the pretrained tensors
-    (CPU) and the partial parameters (GPU) live in separate memory
-    pools, avoiding the previous full+partial-on-CPU peak.
-
-    `assignments` is `{layer_id: [(my_expert_id, org_expert_id), ...]}`
-    for the merged partial (see `merge_group_assignments_for_streaming`).
-    The caller's `state_dict` is consumed: it ends empty.
-    """
-    partial_state = partial_model.state_dict()
-    loaded_counts = {"full": 0, "sliced": 0}
-    gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
-
-    for key in list(state_dict.keys()):
-        source_tensor = state_dict.pop(key)
-        _apply_pretrained_tensor_to_partial(
-            key=key,
-            source_tensor=source_tensor,
-            partial_state=partial_state,
-            assignments=assignments,
-            loaded_counts=loaded_counts,
-            gate_up_buf=gate_up_buf,
-        )
-
-    partial_model.load_state_dict(partial_state, strict=False)
-    logger.info(
-        "Streamed pretrained state dict into partial model",
-        loaded_counts=loaded_counts,
-        num_layers=len(assignments),
-    )
-    return partial_model
-
-
-def stream_safetensors_to_partial_model(
-    partial_model: CustomDeekSeekMoE,
-    model_path: str,
-    assignments: dict[int, list[tuple[int, int]]],
-    dtype: torch.dtype,
-) -> CustomDeekSeekMoE:
-    """Stream a pretrained checkpoint directly from its safetensors shards
-    into `partial_model`, materializing one source tensor at a time
-    instead of holding the full state dict in host RAM.
-
-    Peak host RAM is bounded by one shard's file-backed mmap (~6 GB for
-    DeepSeek-V2-Lite, reclaimable by the kernel under pressure) plus a
-    single materialized source tensor. Compared to
-    `load_pretrained_state_dict` + `stream_pretrained_state_dict_to_partial_model`,
-    this avoids holding the entire ~30 GB state dict on CPU during
-    validator/miner startup.
-
-    `model_path` may be a local directory or an HF hub repo id;
-    `cached_file` resolves either.
-    """
-    import gc
-    import json
-
-    from safetensors import safe_open
-
-    index_path = cached_file(
-        model_path,
-        SAFE_WEIGHTS_INDEX_NAME,
-        _raise_exceptions_for_missing_entries=False,
-    )
-    if index_path is not None:
-        with open(index_path, "r") as fh:
-            index = json.load(fh)
-        weight_map = index["weight_map"]
-        shard_filenames = sorted(set(weight_map.values()))
-    else:
-        # Single-file (non-sharded) checkpoint.
-        single_path = cached_file(
-            model_path,
-            SAFE_WEIGHTS_NAME,
-            _raise_exceptions_for_missing_entries=False,
-        )
-        if single_path is None:
-            raise FileNotFoundError(
-                f"No safetensors files found for model_path={model_path!r} "
-                f"(looked for {SAFE_WEIGHTS_INDEX_NAME} and {SAFE_WEIGHTS_NAME})",
-            )
-        shard_filenames = [SAFE_WEIGHTS_NAME]
-
-    partial_state = partial_model.state_dict()
-    loaded_counts = {"full": 0, "sliced": 0}
-    gate_up_buf: dict[str, dict[str, torch.Tensor]] = {}
-
-    for shard_filename in shard_filenames:
-        shard_path = cached_file(model_path, shard_filename)
-        with safe_open(shard_path, framework="pt", device="cpu") as shard:
-            for key in shard.keys():
-                source_tensor = shard.get_tensor(key)
-                if source_tensor.dtype != dtype:
-                    source_tensor = source_tensor.to(dtype=dtype)
-                _apply_pretrained_tensor_to_partial(
-                    key=key,
-                    source_tensor=source_tensor,
-                    partial_state=partial_state,
-                    assignments=assignments,
-                    loaded_counts=loaded_counts,
-                    gate_up_buf=gate_up_buf,
-                )
-                del source_tensor
-        # Drop the shard's file handle + force a GC sweep so the OS can
-        # reclaim file-backed pages before the next shard is mapped.
-        gc.collect()
-
-    partial_model.load_state_dict(partial_state, strict=False)
-    logger.info(
-        "Streamed pretrained safetensors shards into partial model",
-        loaded_counts=loaded_counts,
-        num_layers=len(assignments),
-        shards=len(shard_filenames),
-    )
-    return partial_model
 
 
 def get_moe_model_config(

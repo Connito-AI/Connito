@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import time
 import traceback
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -102,60 +101,31 @@ def freeze_parameters(
     upcast_trainable: bool = False,
 ) -> nn.Module:
     """
-    Freeze all parameters except those belonging to expert_group_id.
+    Freeze all parameters except the routed experts belonging to expert_group_id.
 
-    Two modes depending on how experts are stored in the model:
+    Expert parameters carry the global expert id in the name
+    (``experts.7.gate_proj.weight``), so the id is read straight off it.
 
-    - Per-expert names (e.g. ``experts.7.gate_up_proj``): expert_id is
-      parsed from the parameter name; only the specific experts assigned to
-      expert_group_id are kept trainable.
-
-    - Stacked tensors (e.g. ``experts.gate_up_proj``, shape
-      [num_local_experts, ...]): no expert_id is embedded in the name.
-      In this case every expert-layer param for layers assigned to
-      expert_group_id is kept trainable (the whole stacked tensor trains
-      together; individual expert slices cannot be selectively frozen).
+    Experts used to share one stacked tensor per layer, and `requires_grad` is
+    per-tensor, so the helper group trained alongside the assigned one — the
+    miner's trainable set was ~2x what the assignment asks for.
     """
     assignment = expert_manager.expert_group_assignment.get(expert_group_id, {})
 
-    # Detect which mode the model uses by scanning for a param that has an
-    # expert index in its name.
-    uses_per_expert_names = any(
-        get_layer_expert_id(name)[1] is not None
-        for name, _ in model.named_parameters()
-    )
-
-    logger.debug(
-        "freeze_parameters: detected naming mode",
-        mode="per-expert" if uses_per_expert_names else "stacked",
-        expert_group_id=expert_group_id,
-        assigned_layers=sorted(assignment.keys()),
-    )
-
     for name, param in model.named_parameters():
         layer_id, expert_id = get_layer_expert_id(name)
-        
-        # Check specifically for 3D fused expert blocks (e.g., Qwen3-VL-MoE)
-        is_3d_expert_block = bool(re.search(r"layers\.\d+\.mlp\.experts\.(?:gate_up_proj|down_proj)", name))
 
-        if uses_per_expert_names:
-            # ── per-expert mode ──────────────────────────────────────────────
-            if layer_id is not None and expert_id is not None:
-                allowed = {
-                    eid for eid, _ in assignment.get(layer_id, [])
-                }
-                param.requires_grad_(expert_id in allowed)
-            else:
-                param.requires_grad_(False)
+        if layer_id is None or expert_id is None:
+            param.requires_grad_(False)
+            continue
+
+        # `org_expert_id`: the name carries the global id, not the local slot.
+        allowed = {int(org_expert_id) for _, org_expert_id in assignment.get(layer_id, [])}
+        if expert_id in allowed:
+            param.requires_grad_(True)
         else:
-            # ── stacked mode ─────────────────────────────────────────────────
-            # Trainable iff: the param belongs to a routed expert layer AND
-            # that layer has at least one expert assigned to this group.
-            # Shared experts (shared_experts.*) are always frozen — they are
-            # not group-specific.
-            is_routed_expert_param = "expert" in name and "shared_expert" not in name and layer_id is not None
-            layer_has_assignment = layer_id in assignment if layer_id is not None else False
-            param.requires_grad_(is_routed_expert_param and layer_has_assignment)
+            # Helper group, and any expert not assigned to this group.
+            param.requires_grad_(False)
 
     # Optionally upcast trainable parameters to float32 for stable mixed-precision optimization.
     # Needed for AdamW (moment estimates need fp32 precision), but not for SGD.
@@ -173,7 +143,6 @@ def freeze_parameters(
         trainable=trainable,
         total=total,
         upcast_trainable_to_fp32=upcast_count,
-        mode="per-expert" if uses_per_expert_names else "stacked",
     )
     if hasattr(model, 'enable_input_require_grads'):
         model.enable_input_require_grads()

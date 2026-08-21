@@ -30,9 +30,6 @@ if MODEL_BACKEND == "deepseek_v2":
     from connito.shared.modeling.custom_deepseek_v2_lite import (
         CustomDeekSeekMoE as _CausalLMClass,
         get_moe_model_config as _get_moe_model_config_impl,
-        merge_group_assignments_for_streaming as _merge_group_assignments_for_streaming_impl,
-        stream_pretrained_state_dict_to_partial_model as _stream_pretrained_to_partial_impl,
-        stream_safetensors_to_partial_model as _stream_safetensors_to_partial_impl,
     )
 
     def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = False):
@@ -92,20 +89,6 @@ def load_pretrained_model_low_mem(
     model_dtype: torch.dtype = torch.float16,
 ) -> nn.Module:
     """Load pretrained weights directly into the custom model with low CPU memory usage."""
-    if bool(getattr(moe_config, "full", False)):
-        logger.info(
-            "Using direct explicit state_dict load for full model to avoid meta-tensor finalize issues",
-            path=model_path,
-        )
-        # Build at `model_dtype` from the start: a fp32 default + later
-        # cast would peak at ~2x the final size for a 15B-param model.
-        model = model_class(moe_config).to(dtype=model_dtype)
-        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
-        model.load_state_dict(pretrained_sd, strict=False)
-        del pretrained_sd
-        logger.info("Loaded full model via explicit state_dict", path=model_path, dtype=str(model_dtype))
-        return model
-
     model = model_class.from_pretrained(
         model_path,
         config=moe_config,
@@ -113,8 +96,12 @@ def load_pretrained_model_low_mem(
         # `from_pretrained`, so passing `dtype` there is silently ignored and the
         # model loads at the default fp32 — doubling host RAM on this low-mem path.
         torch_dtype=model_dtype,
-        low_cpu_mem_usage=False,
-        ignore_mismatched_sizes=True,
+        # Materialises shard by shard, so host RAM stays bounded by one shard
+        # rather than a whole state dict (~31 GB for the 64-expert topology).
+        # False previously because the custom `_load_from_state_dict` that
+        # translated per-expert keys needed a materialised state dict; parameter
+        # names are the checkpoint's own now, so nothing translates.
+        low_cpu_mem_usage=True,
     )
 
     meta_expert_params = [
@@ -141,7 +128,6 @@ def load_pretrained_model_low_mem(
     return model
 
 
-
 def get_base_model(
     config: MinerConfig | ValidatorConfig,
     expert_manager: ExpertManager,
@@ -150,183 +136,31 @@ def get_base_model(
     partial=False,
 ) -> nn.Module | None:
     """
-    Load base model with role-specific optimizations.
+    Load the pretrained base model for this role's expert topology.
 
-    Validators: Load with 4-bit quantization + Unsloth for memory efficiency
-    Miners: Load standard model for training
+    Miners and validators take the same path; `partial` and the group ids pick
+    the routing top-k and which experts are declared.
     """
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-
     precision = getattr(config.model, "precision", "fp16-mixed")
     if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
         precision = "fp16-mixed"
     model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
     topk = config.moe.partial_topk if partial else config.moe.full_topk
-    model_path = config.model.model_path.lower()
-    
+
     moe_config = get_moe_model_config(
         config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = not partial,
     )
-        
-    is_validator = config.role == "validator"
-    use_quantization = get_nested_attr(config, "model.use_quantization", False) and is_validator
-    use_unsloth = get_nested_attr(config, "model.use_unsloth", False) and is_validator
 
-    # === QUANTIZED PATH (Validators only) ===
-    if use_quantization:
-        logger.info("Loading with 4-bit quantization for validator")
-
-        # Try Unsloth first (fastest)
-        if use_unsloth:
-            try:
-                from unsloth import FastLanguageModel
-
-                model, _ = FastLanguageModel.from_pretrained(
-                    model_name=config.model.model_path,
-                    max_seq_length=moe_config.max_position_embeddings,
-                    dtype=model_dtype,
-                    load_in_4bit=True,
-                    device_map="auto",
-                )
-                FastLanguageModel.for_inference(model)
-                logger.info("✓ Loaded with Unsloth optimizations")
-                return model
-            except Exception as e:
-                logger.warning(f"Unsloth failed, falling back to BitsAndBytes: {e}")
-
-        # Fallback to BitsAndBytes
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=model_dtype,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-
-        max_memory = get_nested_attr(config, "model.max_memory", None)
-        if max_memory is None:
-            max_memory = {0: "46GB", "cpu": "100GB"}
-
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model.model_path,
-            config=moe_config,
-            quantization_config=bnb_config,
-            device_map="auto",
-            max_memory=max_memory,
-            low_cpu_mem_usage=True,
-            torch_dtype=model_dtype,
-        )
-        logger.info("✓ Loaded with BitsAndBytes quantization")
-        return model
-
-    # === STANDARD PATH (Miners / non-quantized validators) ===
-    # For full models, load directly into the custom class with low_cpu_mem_usage
-    # to avoid materializing an extra full HF model + full intermediate state_dict.
-    if not partial:
-        model = load_pretrained_model_low_mem(
-            model_class=_CausalLMClass,
-            model_path=config.model.model_path,
-            moe_config=moe_config,
-            model_dtype=model_dtype,
-        )
-    else:
-        # Partial path: a bare `_CausalLMClass(moe_config)` would leave every
-        # parameter at its random `_init_weights` default. Downstream
-        # `load_checkpoint` only restores the active expert group, so the
-        # backbone / embeddings / lm_head / attention / dense MLPs / shared
-        # experts would all stay random.
-        #
-        # Strategy (keeps peak memory bounded for DeepSeek-V2-Lite — the
-        # earlier "build full model on CPU + convert" approach peaked at
-        # ~76 GB host RAM):
-        #   1. Build the partial model and move it to its target device
-        #      (typically GPU) at `model_dtype` before any pretrained data
-        #      is loaded. Partial parameters live in VRAM; host RAM for
-        #      the partial model returns to 0.
-        #   2. Open each safetensors shard directly via `safe_open` and
-        #      stream one tensor at a time into the partial model,
-        #      slicing owned experts in the same per-key pass. The full
-        #      state dict is never materialized in CPU RAM, so host RAM
-        #      stays bounded by a single shard's file-backed mmap
-        #      (~6 GB) plus one materialized tensor.
-        #   3. Fall back to `load_pretrained_state_dict` + in-RAM
-        #      streaming only if the safetensors-direct path is not
-        #      available for the current backend.
-        target_device = getattr(config.model, "device", "cpu")
-        if target_device == "cuda" and not torch.cuda.is_available():
-            logger.warning(
-                "config.model.device='cuda' but CUDA not available; keeping partial model on CPU",
-            )
-            target_device = "cpu"
-
-        model = _CausalLMClass(moe_config)
-        # Merge every loaded group's per-layer expert assignment into a single
-        # mapping whose my_expert_ids match the merged partial model's local
-        # slot layout (sorted-by-org_expert_id). This lets us stream pretrained
-        # weights in ONE pass instead of once per group — no overlapping writes
-        # from per-group my_expert_ids that both start at 0.
-        stream_targets: list[int] = [
-            *(int(gid) for gid in (group_ids_trainable or [])),
-            *(int(gid) for gid in (group_ids_helper or [])),
-        ]
-
-        if stream_targets and _merge_group_assignments_for_streaming_impl is not None:
-            merged_assignments = _merge_group_assignments_for_streaming_impl(
-                expert_manager.expert_group_assignment,
-                stream_targets,
-            )
-        else:
-            merged_assignments = None
-
-        if _stream_safetensors_to_partial_impl is not None and merged_assignments is not None:
-            model = model.to(device=target_device, dtype=model_dtype)
-            model = _stream_safetensors_to_partial_impl(
-                partial_model=model,
-                model_path=config.model.model_path,
-                assignments=merged_assignments,
-                dtype=model_dtype,
-            )
-            gc.collect()
-            logger.info(
-                "Streamed pretrained safetensors directly into partial model",
-                stream_targets=stream_targets,
-                num_layers=len(merged_assignments),
-                device=str(target_device),
-                dtype=str(model_dtype),
-            )
-        elif _stream_pretrained_to_partial_impl is not None and merged_assignments is not None:
-            # Backend has a state-dict streaming helper but no safetensors-direct
-            # path. Higher CPU peak (~30 GB for DeepSeek-V2-Lite) but still
-            # better than the legacy full-model-on-CPU approach. Load once and
-            # consume in one pass.
-            model = model.to(device=target_device, dtype=model_dtype)
-            pretrained_sd = load_pretrained_state_dict(
-                config.model.model_path, dtype=model_dtype,
-            )
-            try:
-                model = _stream_pretrained_to_partial_impl(
-                    partial_model=model,
-                    state_dict=pretrained_sd,
-                    assignments=merged_assignments,
-                )
-            finally:
-                del pretrained_sd
-                gc.collect()
-            logger.info(
-                "Streamed pretrained backbone + owned-expert slices into partial model",
-                stream_targets=stream_targets,
-                num_layers=len(merged_assignments),
-                device=str(target_device),
-                dtype=str(model_dtype),
-            )
-        else:
-            logger.warning(
-                "Partial model returned with random weights — no pretrained-state-dict "
-                "streaming helper available for this backend or no groups provided",
-                backend=MODEL_BACKEND,
-                group_ids_trainable=group_ids_trainable,
-                group_ids_helper=group_ids_helper,
-            )
+    # `partial` no longer selects which experts exist — the model declares the
+    # experts its group assignment names, and `from_pretrained` fills them by
+    # name. It picks the routing top-k and which group stays trainable.
+    model = load_pretrained_model_low_mem(
+        model_class=_CausalLMClass,
+        model_path=config.model.model_path,
+        moe_config=moe_config,
+        model_dtype=model_dtype,
+    )
 
     if model is not None and get_nested_attr(config, "model.torch_compile", False):
         model = torch.compile(model)

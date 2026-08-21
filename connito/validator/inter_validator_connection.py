@@ -234,31 +234,18 @@ def build_grad_buff_from_model(
     name_to_tensor = dict(all_named)
     expert_group_to_names = {group_id: [] for group_id in list(expert_group_assignment.keys())}
 
-    # Detect naming mode: per-expert (expert index embedded in name) vs stacked
-    uses_per_expert_names = any(
-        get_layer_expert_id(name)[1] is not None
-        for name in name_to_tensor
-    )
-
+    # Bucket by the expert id in the name, matching `org_expert_id` only —
+    # unioning in `my_expert_id` put experts in 0..K-1 into every group.
+    # Stacked storage could only match by layer, so every group claimed every
+    # expert of a layer it owned any expert in.
     for name, _ in name_to_tensor.items():
         layer_id, expert_id = get_layer_expert_id(name)
-
-        if uses_per_expert_names:
-            # ── per-expert mode: match by explicit expert_id ─────────────────
-            if layer_id is not None and expert_id is not None:
-                for group_id, layer_to_expert_ids in expert_group_assignment.items():
-                    allowed_expert_ids = {int(a) for a, _ in layer_to_expert_ids.get(layer_id, [])} | {
-                        int(b) for _, b in layer_to_expert_ids.get(layer_id, [])
-                    }
-                    if int(expert_id) in allowed_expert_ids:
-                        expert_group_to_names[group_id].append(name)
-        else:
-            # ── stacked mode: match by layer_id, exclude shared_experts ──────
-            is_routed_expert = "experts" in name and "shared_experts" not in name and layer_id is not None
-            if is_routed_expert:
-                for group_id, layer_to_expert_ids in expert_group_assignment.items():
-                    if layer_id in layer_to_expert_ids:
-                        expert_group_to_names[group_id].append(name)
+        if layer_id is None or expert_id is None:
+            continue
+        for group_id, layer_to_expert_ids in expert_group_assignment.items():
+            owned = {int(org_expert_id) for _, org_expert_id in layer_to_expert_ids.get(layer_id, [])}
+            if int(expert_id) in owned:
+                expert_group_to_names[group_id].append(name)
 
     # 2) Build gradient buffer per expert group
     group_buff_metas: dict[str | int, Any] = {}
