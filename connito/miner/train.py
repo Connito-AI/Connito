@@ -39,6 +39,7 @@ from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import freeze_parameters, load_model
+from connito.shared.modeling.quantization import apply_from_config
 from connito.shared.modeling.mycelia import get_base_tokenizer
 
 configure_logging()
@@ -159,6 +160,7 @@ def setup_training(
         expert_group_id=config.task.exp.group_id,
         upcast_trainable=True,
     )
+    apply_from_config(model, config, expert_manager, role="miner")
 
     non_finite_param_names = []
     with torch.no_grad():
