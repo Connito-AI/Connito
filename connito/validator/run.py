@@ -103,6 +103,8 @@ from connito.shared.hf_distribute import (
 from connito.shared.cycle import (
     BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
+    get_blocks_from_previous_phase_from_api,
+    get_phase_from_api,
     wait_till,
 )
 from connito.shared.dataloader import get_dataloader
@@ -337,6 +339,188 @@ def _install_signal_logging() -> None:
             # Signals can't be installed from non-main threads; harmless here
             # because we install at module import time, but guard regardless.
             pass
+
+
+# Phases where a round's eval window can still be open. MinerCommit1/2 are
+# excluded for liveness: `build_chain_checkpoints_from_previous_phase` blocks
+# on `wait_till(next_phase)` during a commit phase, which would stall startup.
+_RESUMABLE_PHASES = frozenset({
+    PhaseNames.validate,
+    PhaseNames.merge,
+    PhaseNames.validator_commit_1,
+    PhaseNames.validator_commit_2,
+    PhaseNames.distribute,
+    PhaseNames.train,
+})
+
+
+def _finalize_journal_file(journal_file, score_aggregator, score_path) -> bool:
+    """Replay one unfinalized journal through `finalize_round_scores`.
+
+    Shared by the startup-recovery sweep and by the deferred finalize that
+    runs when `resume_open_round` declines the round it held back, so both
+    paths produce identical aggregator state.
+    """
+    from connito.validator import round_journal as _rj_recover
+    from connito.validator.round_journal import _RecoveryRound
+
+    try:
+        journal = _rj_recover.load(journal_file)
+        if journal is None or journal.finalized:
+            return False
+        logger.info(
+            "Startup recovery: replaying unfinalized round journal",
+            path=str(journal_file),
+            round_id=journal.round_id,
+            scored=len(journal.scored_uids),
+            failed=len(journal.failed_uids),
+            validation_failed=len(journal.validation_failed_uids),
+            freeze_zero=len(journal.freeze_zero_uids),
+        )
+        finalize_round_scores(
+            round_obj=_RecoveryRound.from_journal(journal, journal_file),
+            score_aggregator=score_aggregator,
+            score_path=score_path,
+        )
+        logger.info("Startup recovery: finalized journal", round_id=journal.round_id)
+        return True
+    except Exception as e:
+        logger.warning(
+            "Startup recovery: failed to replay journal",
+            path=str(journal_file), error=str(e),
+        )
+        return False
+
+
+def resume_open_round(
+    *,
+    config,
+    subtensor,
+    lite_subtensor,
+    global_model: nn.Module,
+    score_aggregator,
+    score_path,
+    round_ref: RoundRef,
+    eval_worker,
+    eval_window_active: threading.Event,
+    download_window_closed: threading.Event,
+) -> int | None:
+    """Rebuild the round whose eval window is still open and hand it to the workers.
+
+    Reuses `Round.freeze` for everything chain-derived; only the base model
+    cannot be reproduced, so it is read back from the file freeze wrote. Every
+    refusal below exists to keep one round's deltas on one base.
+
+    Returns the resumed round_id, or None if refused (caller then finalizes).
+    """
+    from connito.validator import round_journal as _rj
+
+    phase = get_phase_from_api(config)
+    if phase is None or phase.phase_name not in _RESUMABLE_PHASES:
+        return None
+    previous = get_blocks_from_previous_phase_from_api(config)
+    # The API serves each phase as a [start, end] pair.
+    sub_range = (previous or {}).get(PhaseNames.submission)
+    if not sub_range or len(sub_range) < 2:
+        return None
+    sub_start, sub_end = int(sub_range[0]), int(sub_range[1])
+
+    checkpoint_path = Path(config.ckpt.checkpoint_path)
+    journal = _rj.load(_rj.journal_path_for(checkpoint_path, sub_start))
+    if journal is None or journal.finalized or journal.roster_size <= 0:
+        return None
+    remaining = journal.roster_size - len(journal.scored_uids) - len(journal.failed_uids)
+    if remaining <= 0:
+        return None
+
+    base_path = _rj.base_snapshot_path_for(checkpoint_path, sub_start)
+    if not base_path.exists():
+        logger.warning(
+            "resume: no base snapshot — refusing to resume",
+            round_id=sub_start, path=str(base_path),
+        )
+        return None
+    base_params = torch.load(base_path, map_location="cpu", weights_only=True)
+
+    current_cohort_state = None
+    if config.evaluation.enable_round_group_construction:
+        _exp = getattr(getattr(config, "task", None), "exp", None)
+        current_cohort_state = cohort_state_module.load(
+            Path(config.ckpt.checkpoint_path) / config.evaluation.cohort_state_filename,
+            expected_expert_group=str(_exp.group_id) if _exp is not None else "",
+        )
+
+    # `checkpoint_path=None` so freeze skips its initial journal write, which
+    # would briefly overwrite the on-disk verdicts with empty sets.
+    resumed = Round.freeze(
+        config=config,
+        subtensor=subtensor,
+        metagraph=lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False),
+        global_model=global_model,
+        round_id=sub_start,
+        submission_block_range=(sub_start, sub_end),
+        last_evaluated=score_aggregator.last_evaluated_per_uid(),
+        prior_avg_scores=score_aggregator.uid_score_pairs(how="avg"),
+        # The live PhaseResponse describes cycle K+1; let freeze derive K.
+        cycle_index=None,
+        cycle_length=phase.cycle_length,
+        cohort_state=current_cohort_state,
+        score_aggregator=score_aggregator,
+        score_path=score_path,
+        checkpoint_path=None,
+        advance_cohort=False,
+    )
+
+    if journal.seed and resumed.seed != journal.seed:
+        logger.warning(
+            "resume: seed mismatch — refusing to resume",
+            round_id=sub_start, journal_seed=journal.seed, rebuilt_seed=resumed.seed,
+        )
+        return None
+
+    resumed.model_snapshot_cpu = base_params
+    resumed.journal_path = _rj.journal_path_for(checkpoint_path, sub_start)
+
+    # A uid that deregistered and re-registered mid-cycle must not inherit the
+    # old miner's verdict: `add_score` resets a uid's whole history on hotkey
+    # mismatch, so mis-attribution is not a local error.
+    stale = {
+        uid for uid, hk in journal.uid_to_hotkey.items()
+        if resumed.uid_to_hotkey.get(uid) not in (None, hk)
+    }
+    with resumed._lock:  # noqa: SLF001
+        resumed.scored_uids |= set(journal.scored_uids)
+        resumed.failed_uids |= set(journal.failed_uids) | stale
+        resumed.validation_failed_uids |= set(journal.validation_failed_uids)
+        resumed.scores.update(journal.scores)
+        resumed.val_losses.update(journal.uid_to_val_loss)
+        # Round K's freeze-time decision is authoritative — a union would
+        # over-penalize uids that only look uncommitted now.
+        resumed.freeze_zero_uids = set(journal.freeze_zero_uids)
+        resumed.freeze_zero_hotkeys = dict(journal.freeze_zero_hotkeys)
+        resumed.lifecycle_step = int(journal.lifecycle_step)
+    resumed._persist_journal()  # noqa: SLF001
+
+    round_ref.swap(new_current=resumed)
+    download_window_closed.clear()
+    if eval_worker is not None and not eval_worker.has_eval_base_model():
+        eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+    eval_window_active.set()
+
+    try:
+        # Registers the round's label for later eviction; `publish_progress`
+        # emits the series but does not register it.
+        note_round_series(resumed.round_id)
+        resumed.publish_progress()
+    except Exception:
+        pass
+
+    logger.info(
+        "resume: round resumed",
+        round_id=resumed.round_id, phase=phase.phase_name, remaining=remaining,
+        already_scored=len(resumed.scored_uids), stale_hotkeys=len(stale),
+    )
+    return resumed.round_id
 
 
 def _shutdown_background_workers(
@@ -880,49 +1064,37 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         )
 
     # === startup recovery: replay any unfinalized round journals ===
-    # If a previous run died before `finalize_round_scores` could run
-    # (SIGKILL, OOM, validator crash), the per-round journal on disk
-    # holds the partial scoring state. Replay each unfinalized journal
-    # through `finalize_round_scores` so the aggregator on disk gets
-    # the same rank-based entries it would have had without the kill.
-    # A failure on a single journal logs a warning and continues — never
-    # abort startup.
+    # If a previous run died before `finalize_round_scores` could run, the
+    # per-round journal holds the partial state — see `_finalize_journal_file`.
+    # The one round whose eval window may still be open is held back and
+    # offered to `resume_open_round` once the model and workers exist; if that
+    # declines it is finalized then instead. Finalize must run exactly once per
+    # round, because `add_score` stamps `_utc_now()` and a second pass would
+    # re-timestamp the round's points and reshuffle the scoring window.
+    _skipped_live_journal = None
     try:
         from connito.validator import round_journal as _rj_recover
-        from connito.validator.round_journal import _RecoveryRound
         _journals = _rj_recover.scan(config.ckpt.checkpoint_path)
+        _live_round_id = None
+        try:
+            _prev = get_blocks_from_previous_phase_from_api(config)
+            if _prev and PhaseNames.submission in _prev:
+                _live_round_id = int(_prev[PhaseNames.submission][0])
+        except Exception:
+            pass
         _recovered = 0
         for _journal_file in _journals:
-            try:
-                _journal = _rj_recover.load(_journal_file)
-                if _journal is None or _journal.finalized:
-                    continue
+            if _live_round_id is not None and _journal_file.name == (
+                _rj_recover.journal_path_for(config.ckpt.checkpoint_path, _live_round_id).name
+            ):
+                _skipped_live_journal = _journal_file
                 logger.info(
-                    "Startup recovery: replaying unfinalized round journal",
-                    path=str(_journal_file),
-                    round_id=_journal.round_id,
-                    scored=len(_journal.scored_uids),
-                    failed=len(_journal.failed_uids),
-                    validation_failed=len(_journal.validation_failed_uids),
-                    freeze_zero=len(_journal.freeze_zero_uids),
+                    "Startup recovery: skipping live round — deferring to resume",
+                    round_id=_live_round_id,
                 )
-                _stub = _RecoveryRound.from_journal(_journal, _journal_file)
-                finalize_round_scores(
-                    round_obj=_stub,
-                    score_aggregator=score_aggregator,
-                    score_path=score_path,
-                )
+                continue
+            if _finalize_journal_file(_journal_file, score_aggregator, score_path):
                 _recovered += 1
-                logger.info(
-                    "Startup recovery: finalized journal",
-                    round_id=_journal.round_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Startup recovery: failed to replay journal",
-                    path=str(_journal_file),
-                    error=str(e),
-                )
         if _recovered:
             logger.info(
                 "Startup recovery: complete",
@@ -1095,6 +1267,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     download_worker: BackgroundDownloadWorker | None = None
     eval_worker: BackgroundEvalWorker | None = None
+    resumed_round_id: int | None = None
     if config.evaluation.background_worker_enabled:
         download_worker = BackgroundDownloadWorker(
             config=config,
@@ -1123,6 +1296,33 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             eval_thread=eval_worker.name,
             eval_ident=eval_worker.ident,
         )
+
+        # Pick up a round whose eval window was still open at restart. Must be
+        # here, not in the loop: the loop opens with `wait_till(miner_commit_1,
+        # -5)`, which would block through the whole window. The workers are
+        # already parked on their gates, so handing them the round starts them
+        # during that wait; the loop's finalize then closes it out.
+        try:
+            resumed_round_id = resume_open_round(
+                config=config,
+                subtensor=subtensor,
+                lite_subtensor=lite_subtensor,
+                global_model=global_model,
+                score_aggregator=score_aggregator,
+                score_path=score_path,
+                round_ref=round_ref,
+                eval_worker=eval_worker,
+                eval_window_active=eval_window_active,
+                download_window_closed=download_window_closed,
+            )
+        except Exception as e:
+            logger.warning("resume: failed — continuing without", error=str(e), exc_info=True)
+
+    # Resume declined, failed, or never ran (workers disabled): finalize the
+    # journal held back above, so the outcome matches the pre-resume behaviour
+    # exactly. Unconditional so a held-back journal can never leak unfinalized.
+    if resumed_round_id is None and _skipped_live_journal is not None:
+        _finalize_journal_file(_skipped_live_journal, score_aggregator, score_path)
 
     logger.info("ChainSubmitter ready")
 
