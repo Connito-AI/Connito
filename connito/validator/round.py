@@ -875,16 +875,15 @@ class RoundRef:
     """Mutable holder for the workers to follow as the main loop swaps rounds.
 
     Workers re-read `current` on every iteration so a swap takes effect
-    without restarting the thread.
+    without restarting the thread. The finished round is deliberately not
+    retained — `model_snapshot_cpu` is multi-GB and nothing reads it back.
     """
 
     current: Round | None = None
-    previous: Round | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def swap(self, new_current: Round) -> Round | None:
         with self._lock:
             old = self.current
-            self.previous = old
             self.current = new_current
             return old
