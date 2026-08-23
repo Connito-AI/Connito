@@ -8,11 +8,13 @@ and HF; everything else is exercised against the real classes.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sys
 import threading
 import time
 import types
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -634,7 +636,7 @@ class TestAggregatorSchema:
 # ---------------------------------------------------------------------------
 
 class TestRoundRefSwap:
-    def test_swap_moves_current_to_previous(self) -> None:
+    def test_swap_releases_the_finished_round(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5})
         assignment = {"vhk": ["hk_a"]}
@@ -643,12 +645,16 @@ class TestRoundRefSwap:
         r1 = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=100)
         ref.swap(new_current=r1)
         assert ref.current is r1
-        assert ref.previous is None
 
         r2 = _freeze_round(config=config, metagraph=metagraph, assignment=assignment, round_id=200)
-        ref.swap(new_current=r2)
+        finished = weakref.ref(r1)
+        assert ref.swap(new_current=r2) is r1
         assert ref.current is r2
-        assert ref.previous is r1
+
+        # The multi-GB `model_snapshot_cpu` must go with it.
+        del r1
+        gc.collect()
+        assert finished() is None
 
 
 # ---------------------------------------------------------------------------
