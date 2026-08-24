@@ -1906,7 +1906,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 merged_uids=merged_uids,
                 grad_sum=round(grad_sum_after_aggregation, 6) if math.isfinite(grad_sum_after_aggregation) else str(grad_sum_after_aggregation),
                 grad_is_valid=grad_is_valid,
-                model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
+                # Parameters, not `state_dict()`: the latter emits every fp8 weight
+                # dequantized to fp32 and the serializer then buffers it twice more,
+                # ~43 GB transient for six hex characters. `.detach()` because the
+                # serializer calls `.numpy()`, which rejects requires_grad tensors.
+                model_hash=get_model_hash({k: v.detach() for k, v in global_model.named_parameters()}, hex=True)[:6],
             )
 
             if not grad_is_valid:
@@ -1990,8 +1994,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         # === global optimizer ===
                         logger.info("Running global model optimization step")
 
-                        org_model_hash = get_model_hash(global_model.state_dict(), hex=True)
-
                         run_global_optimization(
                             global_model=global_model,
                             device=device,
@@ -2000,11 +2002,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             miner_jobs=miner_jobs,
                         )
 
-                        logger.info(
-                            "Optimization step complete",
-                            org_model_hash=org_model_hash,
-                            new_model_hash=get_model_hash(global_model.state_dict(), hex=True)[:6],
-                        )
+                        logger.info("Optimization step complete")
                         _participated_in_merge = True
                     else:
                         # Sync was orphaned or skipped: don't run the outer
