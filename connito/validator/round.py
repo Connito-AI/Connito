@@ -158,6 +158,7 @@ class Round:
         score_aggregator: "MinerScoreAggregator | None" = None,
         score_path: "Path | None" = None,
         checkpoint_path: "Path | None" = None,
+        advance_cohort: bool = True,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -284,12 +285,30 @@ class Round:
             *stale_tail,
         ])
 
-        # CPU-resident clone of global_model.state_dict(). Detach + clone +
-        # move to CPU so subsequent in-place mutations of global_model
-        # cannot leak into the snapshot.
+        # CPU-resident clone of the model parameters. Detach + clone + move to
+        # CPU so in-place mutations of global_model cannot leak into it.
+        #
+        # Parameters, not `state_dict()`: the rest is fp8 buffers, which no
+        # runtime path mutates and every boot rebuilds identically, and which
+        # `state_dict()` emits dequantized to fp32 — 14.5 GB held all round
+        # against 3.9 GB here. The one consumer (`background_eval_worker`)
+        # loads with `strict=False`, so the absent keys are a no-op.
         snapshot = {
-            k: v.detach().clone().cpu() for k, v in global_model.state_dict().items()
+            k: v.detach().clone().cpu() for k, v in global_model.named_parameters()
         }
+        # Only the `named_parameters()` subset needs persisting for a resume.
+        # Everything else in the state_dict is a buffer — under
+        # `quantization_validator="all"` that is the fp8 weights, which sit
+        # outside the outer optimizer and outside
+        # `populate_global_grads_from_local`, so nothing mutates them at
+        # runtime and every boot rebuilds them identically. They also
+        # serialize dequantized to fp32, so they dominate the dump by volume
+        # while carrying nothing process-specific.
+        param_keys = set(dict(global_model.named_parameters()).keys())
+        base_params = {k: v for k, v in snapshot.items() if k in param_keys}
+
+        def _nbytes(d):
+            return sum(t.numel() * t.element_size() for t in d.values())
 
         logger.info(
             "Round.freeze: roster locked",
@@ -297,6 +316,8 @@ class Round:
             roster_size=len(uid_to_hotkey),
             foreground_size=len(foreground_uids),
             background_size=len(background_uids),
+            base_param_bytes=_nbytes(base_params),
+            base_full_bytes=_nbytes(snapshot),
         )
         logger.info(
             "Round.freeze: foreground",
@@ -357,24 +378,32 @@ class Round:
                     for hk in assignment.keys()
                     if hk in hotkey_to_uid
                 ]
-                # Validator seeds for the seeded `assign_miners_to_validators`
-                # partitions used to construct Group C and Foreground.
-                validator_seeds = get_validator_seed_from_commit(config, commits)
-                new_cohort_state = round_groups.maybe_advance_cohort(
-                    cycle_index=int(effective_cycle_index),
-                    round_id=rid,
-                    cycle_length=int(effective_cycle_length),
-                    current_state=cohort_state,
-                    score_aggregator=score_aggregator,
-                    metagraph=metagraph,
-                    qualified_validator_uids=qualified_validator_uids,
-                    validator_seeds=validator_seeds,
-                    all_miner_hotkeys=list(assignment_result.miners_with_checkpoint),
-                    my_hotkey=config.chain.hotkey_ss58,
-                    hotkey_to_uid=hotkey_to_uid,
-                    expert_group=expert_group,
-                    cfg=config.evaluation,
-                )
+                # `maybe_advance_cohort` always re-runs the election (see its
+                # docstring). On a resume the on-disk state is already this
+                # round's, so re-electing would build a different A/B/C roster
+                # than the round actually ran with.
+                if not advance_cohort and cohort_state is not None:
+                    new_cohort_state = cohort_state
+                else:
+                    # Validator seeds for the seeded
+                    # `assign_miners_to_validators` partitions used to
+                    # construct Group C and Foreground.
+                    validator_seeds = get_validator_seed_from_commit(config, commits)
+                    new_cohort_state = round_groups.maybe_advance_cohort(
+                        cycle_index=int(effective_cycle_index),
+                        round_id=rid,
+                        cycle_length=int(effective_cycle_length),
+                        current_state=cohort_state,
+                        score_aggregator=score_aggregator,
+                        metagraph=metagraph,
+                        qualified_validator_uids=qualified_validator_uids,
+                        validator_seeds=validator_seeds,
+                        all_miner_hotkeys=list(assignment_result.miners_with_checkpoint),
+                        my_hotkey=config.chain.hotkey_ss58,
+                        hotkey_to_uid=hotkey_to_uid,
+                        expert_group=expert_group,
+                        cfg=config.evaluation,
+                    )
 
                 new_weight_group_1 = new_cohort_state.weight_group_1
                 new_weight_group_2 = new_cohort_state.weight_group_2
@@ -548,6 +577,19 @@ class Round:
                     "Round.freeze: initial journal write failed",
                     error=str(e), round_id=rid, path=str(resolved_journal_path),
                 )
+            # Base parameters for a mid-round restart. Without these a resumed
+            # round would score later miners against a different base than the
+            # ones already in `scores` — `delta = max(0, baseline - val_loss)`
+            # is only comparable within one base.
+            try:
+                base_path = _rj.base_snapshot_path_for(checkpoint_path, rid)
+                base_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(base_params, base_path)
+            except Exception as e:
+                logger.warning(
+                    "Round.freeze: base snapshot write failed",
+                    error=str(e), round_id=rid,
+                )
 
         return new_round
 
@@ -601,6 +643,7 @@ class Round:
             "uid_to_val_loss": dict(self.val_losses),
             "roster_size": len(self.foreground_uids) + len(self.background_uids),
             "lifecycle_step": int(self.lifecycle_step),
+            "seed": str(self.seed),
             "finalized": False,
         }
 
