@@ -360,9 +360,16 @@ def finalize_round_scores(
                     ),
                     lifecycle_step=int(getattr(round_obj, "lifecycle_step", 0)),
                     uid_to_val_loss=dict(getattr(round_obj, "val_losses", None) or {}),
+                    seed=str(getattr(round_obj, "seed", "") or ""),
                     finalized=True,
                 ),
             )
+            # The round is over, so its base snapshot can never be resumed
+            # from again. `prune_before_round` is the backstop for a round
+            # that never reached finalize.
+            _rj.base_snapshot_path_for(
+                Path(journal_path).parent.parent, round_obj.round_id
+            ).unlink(missing_ok=True)
         except Exception as e:
             logger.warning(
                 "finalize_round_scores: journal flip-to-finalized failed",
