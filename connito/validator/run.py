@@ -415,23 +415,34 @@ def resume_open_round(
     """
     from connito.validator import round_journal as _rj
 
+    def _decline(reason: str, **fields) -> None:
+        # Most restarts land outside an eval window and decline here, so this
+        # is info, not warning. Without it a refusal is indistinguishable from
+        # a resume that never ran.
+        logger.info("resume: declined", reason=reason, **fields)
+
     phase = get_phase_from_api(config)
     if phase is None or phase.phase_name not in _RESUMABLE_PHASES:
-        return None
+        return _decline("phase not resumable", phase=getattr(phase, "phase_name", None))
     previous = get_blocks_from_previous_phase_from_api(config)
     # The API serves each phase as a [start, end] pair.
     sub_range = (previous or {}).get(PhaseNames.submission)
     if not sub_range or len(sub_range) < 2:
-        return None
+        return _decline("no submission range from phase API", phase=phase.phase_name)
     sub_start, sub_end = int(sub_range[0]), int(sub_range[1])
 
     checkpoint_path = Path(config.ckpt.checkpoint_path)
     journal = _rj.load(_rj.journal_path_for(checkpoint_path, sub_start))
     if journal is None or journal.finalized or journal.roster_size <= 0:
-        return None
+        return _decline(
+            "journal unusable",
+            round_id=sub_start,
+            finalized=journal.finalized if journal else None,
+            roster_size=journal.roster_size if journal else None,
+        )
     remaining = journal.roster_size - len(journal.scored_uids) - len(journal.failed_uids)
     if remaining <= 0:
-        return None
+        return _decline("roster already complete", round_id=sub_start)
 
     base_path = _rj.base_snapshot_path_for(checkpoint_path, sub_start)
     if not base_path.exists():
