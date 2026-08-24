@@ -190,19 +190,14 @@ def test_parameters_only_snapshot_restores_params_and_leaves_fp8_intact():
             assert torch.equal(module.weight_fp8.view(torch.int8), fp8_before[name])
 
 
-def test_param_hash_skips_state_dict_and_still_tracks_changes():
-    """Merge hashed `global_model.state_dict()` three times per round to log six
-    hex characters. `state_dict()` dequantizes every fp8 weight to fp32 and the
-    serializer then buffers it twice — the spike that was killing the A6000."""
-    from connito.validator.run import _param_hash
+def test_merge_hash_must_detach_live_parameters():
+    """Merge hashes `named_parameters()` rather than `state_dict()`, which would
+    dequantize every fp8 weight to fp32. The catch: `state_dict()` returns
+    detached tensors and `named_parameters()` does not, and the serializer calls
+    `.numpy()` — so dropping the detach crashes the validator mid-Merge."""
+    from connito.shared.helper import get_model_hash
 
-    model, _ = _quantized_pair()
-    calls = []
-    model.state_dict = lambda *a, **kw: calls.append(1)  # noqa: ARG005
-
-    before = _param_hash(model)
-    assert calls == [], "_param_hash must not materialize state_dict"
-
-    with torch.no_grad():
-        next(iter(model.parameters())).add_(1.0)
-    assert _param_hash(model) != before, "digest must still track parameter changes"
+    params = dict(_quantized_pair()[0].named_parameters())
+    with pytest.raises(RuntimeError, match="requires grad"):
+        get_model_hash(params, hex=True)
+    assert get_model_hash({k: v.detach() for k, v in params.items()}, hex=True)

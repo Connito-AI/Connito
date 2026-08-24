@@ -476,22 +476,6 @@ def _release_global_model_grads(model: nn.Module) -> None:
         p.grad = None
 
 
-def _param_hash(model: nn.Module) -> str:
-    """Short model digest, for log lines only.
-
-    Parameters rather than `state_dict()`: the latter emits every fp8 weight
-    dequantized to fp32, and `serialize_torch_model_path` then materializes the
-    whole thing as bytes twice over — ~43 GB transient on the production model,
-    three times per Merge, to print six hex characters. Those buffers are
-    constant at runtime, so they carry no signal the outer optimizer could
-    change. Not interchangeable with the consensus hashes in `checkpoints.py`,
-    which must keep hashing the full state_dict.
-    """
-    # `.detach()` because `named_parameters()` hands back live Parameters and
-    # the serializer calls `.numpy()`, which rejects requires_grad tensors.
-    return get_model_hash({k: v.detach() for k, v in model.named_parameters()}, hex=True)
-
-
 async def aggregate_miner_gradient_change(
     config: ValidatorConfig,
     global_model: nn.Module,
@@ -1711,7 +1695,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 merged_uids=merged_uids,
                 grad_sum=round(grad_sum_after_aggregation, 6) if math.isfinite(grad_sum_after_aggregation) else str(grad_sum_after_aggregation),
                 grad_is_valid=grad_is_valid,
-                model_hash=_param_hash(global_model)[:6],
+                # Parameters, not `state_dict()`: the latter emits every fp8 weight
+                # dequantized to fp32 and the serializer then buffers it twice more,
+                # ~43 GB transient for six hex characters. `.detach()` because the
+                # serializer calls `.numpy()`, which rejects requires_grad tensors.
+                model_hash=get_model_hash({k: v.detach() for k, v in global_model.named_parameters()}, hex=True)[:6],
             )
 
             if not grad_is_valid:
@@ -1795,8 +1783,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         # === global optimizer ===
                         logger.info("Running global model optimization step")
 
-                        org_model_hash = _param_hash(global_model)
-
                         run_global_optimization(
                             global_model=global_model,
                             device=device,
@@ -1805,11 +1791,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                             miner_jobs=miner_jobs,
                         )
 
-                        logger.info(
-                            "Optimization step complete",
-                            org_model_hash=org_model_hash,
-                            new_model_hash=_param_hash(global_model)[:6],
-                        )
+                        logger.info("Optimization step complete")
                         _participated_in_merge = True
                     else:
                         # Sync was orphaned or skipped: don't run the outer

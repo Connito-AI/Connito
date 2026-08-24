@@ -285,15 +285,13 @@ class Round:
         ])
 
         # CPU-resident clone of the model parameters. Detach + clone + move to
-        # CPU so subsequent in-place mutations of global_model cannot leak into
-        # the snapshot.
+        # CPU so in-place mutations of global_model cannot leak into it.
         #
         # Parameters, not `state_dict()`: the rest is fp8 buffers, which no
-        # runtime path mutates and which every boot rebuilds identically, and
-        # which `state_dict()` emits dequantized to fp32 — 14.5 GB held for the
-        # whole round against 3.9 GB here. The sole consumer
-        # (`background_eval_worker`) loads with `strict=False` into a model
-        # built the same way, so the absent buffer keys are a no-op.
+        # runtime path mutates and every boot rebuilds identically, and which
+        # `state_dict()` emits dequantized to fp32 — 14.5 GB held all round
+        # against 3.9 GB here. The one consumer (`background_eval_worker`)
+        # loads with `strict=False`, so the absent keys are a no-op.
         snapshot = {
             k: v.detach().clone().cpu() for k, v in global_model.named_parameters()
         }
