@@ -163,3 +163,28 @@ def test_load_model_from_path_loads_weights(monkeypatch):
 
     assert set(loaded.state_dict()) == set(ref)
     torch.testing.assert_close(loaded.state_dict()["lm_head.weight"], ref["lm_head.weight"])
+
+
+def test_parameters_only_snapshot_restores_params_and_leaves_fp8_intact():
+    """`Round.freeze` snapshots `named_parameters()`, not `state_dict()` — the
+    latter dequantizes every fp8 weight to fp32 and the round holds it for its
+    whole life. The eval worker loads that snapshot with `strict=False` into a
+    model built the same way, so the absent buffer keys must be a no-op."""
+    base, donor = _quantized_pair()
+    snapshot = {k: v.detach().clone() for k, v in donor.named_parameters()}
+    assert not any("weight_fp8" in k for k in snapshot)
+    fp8_before = {
+        n: m.weight_fp8.clone().view(torch.int8)
+        for n, m in base.named_modules()
+        if isinstance(m, FP8Linear)
+    }
+    assert fp8_before, "fixture must contain fp8 modules for this to mean anything"
+
+    incompatible = base.load_state_dict(snapshot, strict=False)
+
+    assert not incompatible.unexpected_keys
+    for name, param in base.named_parameters():
+        torch.testing.assert_close(param, snapshot[name])
+    for name, module in base.named_modules():
+        if isinstance(module, FP8Linear):
+            assert torch.equal(module.weight_fp8.view(torch.int8), fp8_before[name])
