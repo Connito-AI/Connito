@@ -677,30 +677,24 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
 
     model = copy.deepcopy(base_model)
 
-    # Keys in each state_dict (before loading)
-    base_sd = base_model.state_dict()
-    base_keys = set(base_sd.keys())
-    ckpt_keys = set(sd.keys())
+    # Load weights (strict=False so missing/unexpected are allowed)
+    incompatible = model.load_state_dict(sd, strict=False)
 
-    # 1) Params that are the same across both dicts (intersection).
-    #    (Optional: filter to ones with matching shapes too.)
-    common_keys = base_keys & ckpt_keys
-    common_same_shape = {k for k in common_keys if base_sd[k].shape == sd[k].shape}
+    # Key diagnostics come from `load_state_dict`'s own report. Deriving them
+    # beforehand needed `base_model.state_dict()`, which dequantizes every fp8
+    # weight to fp32 — ~14.5 GB materialized per miner, for these log lines
+    # alone. Mismatched shapes raise from `load_state_dict` itself, so they no
+    # longer need a branch here.
+    expert_not_in_base = [k for k in incompatible.unexpected_keys if "expert" in k]
+    expert_in_base_not_common = [k for k in incompatible.missing_keys if "expert" in k]
+    matched_keys = len(sd) - len(incompatible.unexpected_keys)
 
-    # 2) Keys containing 'expert' that exist in the checkpoint but NOT in the base model
-    expert_not_in_base = {k for k in ckpt_keys - base_keys if "expert" in k}
-
-    # 3) "expert" keys in base_model but NOT in checkpoint/common_keys
-    expert_in_base_not_common = {k for k in (base_keys - common_keys) if "expert" in k}
-
-    if len(common_same_shape) == 0:
+    if matched_keys == 0:
         logger.warning(
             "No compatible keys between checkpoint and base model — "
             "checkpoint is likely from a different architecture or naming convention",
-            ckpt_key_count=len(ckpt_keys),
-            base_key_count=len(base_keys),
-            sample_ckpt_keys=sorted(k for k in ckpt_keys if "expert" in k)[:5],
-            sample_base_keys=sorted(k for k in base_keys if "expert" in k)[:5],
+            ckpt_key_count=len(sd),
+            sample_ckpt_keys=sorted(k for k in sd if "expert" in k)[:5],
         )
     elif expert_not_in_base:
         logger.warning(
@@ -708,24 +702,12 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
             expert_not_in_base=len(expert_not_in_base),
             sample_keys=sorted(expert_not_in_base)[:5],
         )
-    elif common_same_shape != common_keys:
-        logger.warning(
-            "Some common keys have mismatched shapes",
-            common_keys=len(common_keys),
-            common_same_shape=len(common_same_shape),
-            shape_mismatch=len(common_keys - common_same_shape),
-            sample_mismatched=sorted(common_keys - common_same_shape)[:5],
-        )
     else:
         logger.debug(
             "Key summary",
-            common_keys=len(common_keys),
-            common_same_shape=len(common_same_shape),
+            matched_keys=matched_keys,
             expert_in_base_not_common=len(expert_in_base_not_common),
         )
-
-    # Load weights (strict=False so missing/unexpected are allowed)
-    incompatible = model.load_state_dict(sd, strict=False)
 
     # # Extra helpful debug (optional)
     # if incompatible.missing_keys:

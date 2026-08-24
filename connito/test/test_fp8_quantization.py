@@ -125,3 +125,41 @@ def test_round_trip_error_is_within_budget():
 def test_unknown_scope_is_rejected():
     with pytest.raises(ValueError, match="quantization scope"):
         quantize_(_model(), "int8", ASSIGNMENT[GROUP])
+
+
+def _quantized_pair():
+    base, donor = _model(), _model()
+    quantize_(base, "all", ASSIGNMENT[GROUP])
+    quantize_(donor, "all", ASSIGNMENT[GROUP])
+    return base, donor
+
+
+def test_load_model_from_path_does_not_call_base_state_dict(monkeypatch):
+    """`state_dict()` dequantizes every fp8 weight to fp32 — ~14.5 GB on the
+    production model — and this runs once per miner evaluated."""
+    from connito.validator import evaluator
+
+    base, donor = _quantized_pair()
+    monkeypatch.setattr(
+        evaluator, "load_state_dict_from_path", lambda _p: dict(donor.state_dict())
+    )
+    calls = []
+    base.state_dict = lambda *a, **kw: calls.append(1)  # noqa: ARG005
+
+    evaluator.load_model_from_path("ignored", base, torch.device("cpu"))
+
+    assert calls == [], "load_model_from_path must not materialize base state_dict"
+
+
+def test_load_model_from_path_loads_weights(monkeypatch):
+    """The diagnostics moved after the load; the load itself must be unchanged."""
+    from connito.validator import evaluator
+
+    base, donor = _quantized_pair()
+    ref = donor.state_dict()
+    monkeypatch.setattr(evaluator, "load_state_dict_from_path", lambda _p: dict(ref))
+
+    loaded = evaluator.load_model_from_path("ignored", base, torch.device("cpu"))
+
+    assert set(loaded.state_dict()) == set(ref)
+    torch.testing.assert_close(loaded.state_dict()["lm_head.weight"], ref["lm_head.weight"])
