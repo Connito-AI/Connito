@@ -475,11 +475,11 @@ class ChainCheckpoints(BaseModel):
             if not filtered:
                 return ChainCheckpoints(checkpoints=[])
 
-        if for_role == "miner":
-            return ChainCheckpoints(checkpoints=filtered)
-
-
         # select majority model_hash (stake-weighted)
+        # Miners run this too: each validator publishes its own baseline, so
+        # their hashes differ and the max below resolves to the highest-stake
+        # validator. Without it, miners take whichever entry happens to be
+        # first and the subnet forks into incompatible models.
         hash_stake: dict[str, float] = {}
         for ckpt in filtered:
             if ckpt.model_hash:
