@@ -173,8 +173,9 @@ def test_staging_dir_is_removed_after_a_successful_upload(tmp_path, uploads):
 def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
     """The guarantee the selection rule depends on. `cleanup_non_top_submissions`
     runs after every eval and drops anyone outside this round's top-3; the
-    top-average miner can easily place 4th. Unioning `top_avg_uids` into the
-    keep set is what stops the winner's file being deleted before finalize.
+    top-average miner can easily place 4th. Unioning `baseline_winner_uid`
+    into the keep set is what stops the winner's file being deleted before
+    finalize.
 
     Uses the real `Round` and the real cleanup — a stub would prove nothing
     about the interaction between the two ranking sets.
@@ -206,3 +207,71 @@ def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
     # Top-3 by round score still retained — merge takes its top-1 from there.
     assert {"hk1", "hk2", "hk3"} <= survivors
     assert "hk4" in {parse_dynamic_filename(n)["hotkey"] for n in deleted}
+
+
+def test_cleanup_keeps_the_winner_when_a_better_average_went_unevaluated(tmp_path):
+    """Retention and selection must rank over the same population.
+
+    Regression: retention once ranked the whole roster while publish ranked
+    only the miners actually evaluated. When the roster's best average never
+    gets evaluated — routine, since a round rarely scores everyone — the keep
+    set protected a miner that could never be selected, and the miner that
+    *would* be selected was pruned as an also-ran. Observed on 2026-08-25,
+    round 8923578: publish picked uid 24 and found no file.
+    """
+    from connito.validator.evaluator import cleanup_non_top_submissions
+    from connito.validator.round import Round
+
+    sub = tmp_path / "miner_submission"
+    uid_to_hotkey = {n: f"hk{n}" for n in range(1, 7)}
+    for hk in uid_to_hotkey.values():
+        _submission(sub, hk, 550)
+
+    round_obj = Round(
+        round_id=9000, seed="s", validator_miner_assignment={},
+        foreground_uids=tuple(uid_to_hotkey), background_uids=(),
+        uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
+        # uid 6 has the best average but is never evaluated; uid 5 is the best
+        # average *among those evaluated*, so it is the one publish will pick.
+        prior_avg_scores={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 2.0, 6: 3.0},
+    )
+    for uid, score in {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6, 5: 0.1}.items():
+        round_obj.mark_scored(uid, score=score, val_loss=1.0)
+
+    cleanup_non_top_submissions(round_obj=round_obj, submission_dir=sub, top_k=3)
+
+    survivors = {parse_dynamic_filename(p.name)["hotkey"] for p in sub.glob("*.safetensors")}
+    assert "hk5" in survivors, f"publish winner was pruned; kept {sorted(survivors)}"
+
+
+def test_cleanup_keeps_the_winner_when_averages_tie(tmp_path):
+    """Tied averages must not split retention from selection.
+
+    Rank scores are 2.25/1.5/1.0/0.0, so averages over the window collide
+    often. Retention once broke ties on UID alone while selection broke them
+    on val_loss first — so a tie handed the keep slot to one miner and the
+    publish to another.
+    """
+    from connito.validator.evaluator import cleanup_non_top_submissions
+    from connito.validator.round import Round
+
+    sub = tmp_path / "miner_submission"
+    uid_to_hotkey = {n: f"hk{n}" for n in range(1, 6)}
+    for hk in uid_to_hotkey.values():
+        _submission(sub, hk, 550)
+
+    round_obj = Round(
+        round_id=9000, seed="s", validator_miner_assignment={},
+        foreground_uids=tuple(uid_to_hotkey), background_uids=(),
+        uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
+        # uids 4 and 5 tie on average; 5 has the better val_loss, so publish
+        # picks 5, while a uid-only tie-break would keep 4.
+        prior_avg_scores={1: 0.5, 2: 0.5, 3: 0.5, 4: 1.5, 5: 1.5},
+    )
+    for uid, score in {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.2, 5: 0.1}.items():
+        round_obj.mark_scored(uid, score=score, val_loss=(2.0 if uid == 4 else 1.0))
+
+    cleanup_non_top_submissions(round_obj=round_obj, submission_dir=sub, top_k=3)
+
+    survivors = {parse_dynamic_filename(p.name)["hotkey"] for p in sub.glob("*.safetensors")}
+    assert "hk5" in survivors, f"publish winner was pruned; kept {sorted(survivors)}"

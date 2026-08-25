@@ -29,6 +29,33 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def select_baseline_uid(
+    val_losses: dict[int, float],
+    prior_avg_scores: dict[int, float],
+) -> int | None:
+    """The UID the round's baseline is published from, or None if nothing was
+    scored: best freeze-time average among the miners *scored this round*,
+    with this round's val_loss then UID breaking ties.
+
+    Ranks the miner's track record rather than one round's result so a single
+    lucky round cannot become everyone's baseline. Averaged rank scores collide
+    often, hence the val_loss tie-break; UID last so two validators never
+    disagree.
+
+    Module-level because `cleanup_non_top_submissions` and
+    `publish_round_baseline` must rank identically — the file has to survive
+    until finalize, and only the scored miners are candidates.
+    """
+    if not val_losses:
+        return None
+    uid, _ = min(
+        val_losses.items(),
+        key=lambda kv: (-prior_avg_scores.get(kv[0], 0.0), kv[1], kv[0]),
+    )
+    return uid
+
+
+
 class RosterEntry(NamedTuple):
     """Lightweight (uid, hotkey) pair yielded by Round iteration helpers."""
     uid: int
@@ -755,21 +782,16 @@ class Round:
             )
             return {uid for uid, _ in ranked[:top_k]}
 
-    def top_avg_uids(self, top_k: int) -> set[int]:
-        """Top-`top_k` UIDs by the freeze-time average score, restricted to
-        UIDs in this round's roster. Sibling of `top_scored_uids_this_round`;
-        cleanup unions the two so the miner the baseline will be published
-        from is never pruned, while the merge's top-1-by-round-score is still
-        retained.
+    def baseline_winner_uid(self) -> int | None:
+        """The UID `publish_round_baseline` would pick if the round finalized
+        now, so cleanup can retain its file. Delegates to
+        `select_baseline_uid` — the same call publish makes — because two
+        parallel rankings drift: ranking the whole roster here while publish
+        ranked only the scored miners retained a miner that was never
+        evaluated and pruned the one publish selected.
         """
-        if top_k <= 0 or not self.prior_avg_scores:
-            return set()
-        ranked = sorted(
-            ((uid, avg) for uid, avg in self.prior_avg_scores.items()
-             if uid in self.uid_to_hotkey and avg > 0.0),
-            key=lambda kv: (-kv[1], kv[0]),
-        )
-        return {uid for uid, _ in ranked[:top_k]}
+        with self._lock:
+            return select_baseline_uid(self.val_losses, self.prior_avg_scores)
 
     def mark_failed(self, uid: int) -> None:
         """Mark a UID as failed for operational reasons (download timeout,

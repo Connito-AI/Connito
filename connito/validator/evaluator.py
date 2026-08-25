@@ -80,9 +80,9 @@ def cleanup_non_top_submissions(
 
       - `top_scored_uids_this_round` — top-`top_k` by *this round's*
         score. Merge takes its top-1 from here, so it must survive.
-      - `top_avg_uids` — top-1 by the freeze-time average, the miner
-        `publish_round_baseline` will pick. Snapshotted at freeze, so
-        unlike a live average it does not move as evals complete.
+      - `baseline_winner_uid` — the miner `publish_round_baseline`
+        would pick if the round finalized now. Same call publish makes,
+        so the keep set and the selection can never disagree.
 
     A file is deleted iff its hotkey resolves to a UID that:
       - is in `round.failed_uids` (validation/timeout/exception, score=0
@@ -106,7 +106,10 @@ def cleanup_non_top_submissions(
     if not processed:
         return []
 
-    top_uids = round_obj.top_scored_uids_this_round(top_k) | round_obj.top_avg_uids(1)
+    top_uids = round_obj.top_scored_uids_this_round(top_k)
+    baseline_uid = round_obj.baseline_winner_uid()
+    if baseline_uid is not None:
+        top_uids = top_uids | {baseline_uid}
     delete_uids = failed | (scored - top_uids)
     if not delete_uids:
         return []
@@ -451,29 +454,25 @@ def finalize_round_scores(
 
 
 def publish_round_baseline(*, round_obj, config) -> None:
-    """Upload the round's lowest-`val_loss` submission to HF as the next baseline.
+    """Upload the round's best-averaged submission to HF as the next baseline.
 
     Additive — nothing reads the revision back yet. Safe against the live
     checkpoint repo because miners pin the revision committed on chain and
     never track `main`. Never raises: a failed publish must not touch scoring.
     """
+    from connito.validator.round import select_baseline_uid
+
     rid = getattr(round_obj, "round_id", None)
     try:
         val_losses = dict(getattr(round_obj, "val_losses", None) or {})
-        if not val_losses:
+        avg = dict(getattr(round_obj, "prior_avg_scores", None) or {})
+        # Same call cleanup retains against, so the winner's file is still on
+        # disk by construction.
+        uid = select_baseline_uid(val_losses, avg)
+        if uid is None:
             logger.info("publish_baseline: no scored miners", round_id=rid)
             return
-        # Rank by the miner's track record, not one round's result: a single
-        # lucky round should not become everyone's baseline. `prior_avg_scores`
-        # is the freeze-time snapshot cleanup also retained against, so the
-        # winner's file is still on disk by construction. Averaged rank scores
-        # collide often, so this round's val_loss breaks ties, then uid so two
-        # validators never disagree.
-        avg = round_obj.prior_avg_scores
-        uid, val_loss = min(
-            val_losses.items(),
-            key=lambda kv: (-avg.get(kv[0], 0.0), kv[1], kv[0]),
-        )
+        val_loss = val_losses[uid]
         hotkey = round_obj.uid_to_hotkey.get(uid)
         submission_dir = Path(config.ckpt.miner_submission_path)
         src = find_submission_for_hotkey(
