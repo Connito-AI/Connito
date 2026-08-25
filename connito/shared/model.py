@@ -35,8 +35,8 @@ from connito.shared.expert_manager import (
     get_layer_expert_id,
     ExpertAssignments
 )
-from connito.shared.helper import get_model_hash, get_nested_attr
 from connito.shared.memory import cleanup
+from connito.shared.helper import expert_group_shard_name, get_model_hash, get_nested_attr
 from connito.shared.modeling.mycelia import get_base_model
 from connito.shared.schema import verify_message
 
@@ -47,7 +47,7 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
     targets: list[tuple[int | str, str]] = []
     for expert_group_id in expert_group_ids:
         if isinstance(expert_group_id, int):
-            targets.append((expert_group_id, f"model_expgroup_{expert_group_id}.pt"))
+            targets.append((expert_group_id, expert_group_shard_name(expert_group_id)))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state
             # is reconstructed from `config.model.model_path` at instantiation.
