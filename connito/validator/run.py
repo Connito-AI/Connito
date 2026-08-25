@@ -595,15 +595,16 @@ def setup_training(
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
     # global_model: partial model (only assigned experts) — used for optimization and evaluation.
-    # `load_global_checkpoint=False`: the validator boots from the pretrained
-    # backbone + experts (`get_base_model`) without overlaying any on-disk
-    # expert state. Peer-resync via `reload_model_inplace` still pulls the
-    # current pool state in the round loop; the optimizer/scaler/dataloader
-    # resume below is also independent of this flag.
+    # `load_global_checkpoint=True`: overlay the newest on-disk `globalver_*`
+    # expert state. This was False, on the assumption that `reload_model_inplace`
+    # would re-pull the pool state in the round loop — but that call is gated on
+    # `not _participated_in_merge`, which never holds after a restart, so every
+    # restart silently reverted the model to the pretrained weights and threw
+    # away the merge. Measured 6/6 against production restarts on 2026-08-24.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
-        load_global_checkpoint=False,
+        load_global_checkpoint=True,
     )
     apply_from_config(global_model, config, expert_manager, role="validator")
 
