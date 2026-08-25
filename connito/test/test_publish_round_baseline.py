@@ -122,13 +122,15 @@ def test_uid_breaks_a_total_tie(tmp_path, uploads):
     assert uploads[0]["commit_message"].endswith("uid=2")
 
 
-@pytest.mark.parametrize("scenario", ["no_scores", "file_missing", "out_of_window", "deprecated_pt"])
+@pytest.mark.parametrize("scenario", ["no_scores", "file_missing", "stale_previous_round", "deprecated_pt"])
 def test_nothing_is_published_when_the_winner_shard_is_unusable(tmp_path, uploads, scenario):
     sub = tmp_path / "miner_submission"
     sub.mkdir(parents=True)
     val_losses = {} if scenario == "no_scores" else {2: 3.1}
-    if scenario == "out_of_window":
-        _submission(sub, "hkB", BLOCK_RANGE[1] + 1)
+    if scenario == "stale_previous_round":
+        # Stamped before this round froze, so it is a leftover from the
+        # previous cycle — the one case the block check must still reject.
+        _submission(sub, "hkB", BLOCK_RANGE[0] - 1)
     elif scenario == "deprecated_pt":
         # A `.pt` republished under a `.safetensors` name downloads fine and
         # then fails to load — the one failure mode with no miner-side signal.
@@ -275,3 +277,26 @@ def test_cleanup_keeps_the_winner_when_averages_tie(tmp_path):
 
     survivors = {parse_dynamic_filename(p.name)["hotkey"] for p in sub.glob("*.safetensors")}
     assert "hk5" in survivors, f"publish winner was pruned; kept {sorted(survivors)}"
+
+
+def test_a_late_download_is_still_this_round_s_submission(tmp_path, uploads):
+    """Regression: the winner is normally downloaded long after the ~60-block
+    submission phase closes.
+
+    `BackgroundDownloadWorker` stamps the filename with the chain block at
+    *download* time, not the miner's submission block, and downloads run for
+    the whole round. An upper-bound check therefore rejected almost every
+    file — `publish_round_baseline` never once found its winner in
+    production. Observed 2026-08-25 round 8924102: uid 228 scored best, its
+    shard sat on disk stamped block 8924288 against a window ending 8924161,
+    and publish reported `path=None`.
+    """
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkB", BLOCK_RANGE[1] + 200)
+
+    evaluator.publish_round_baseline(
+        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
+    )
+
+    assert len(uploads) == 1, "late download rejected — the production failure"
+    assert uploads[0]["staged"] == [PUBLISHED_NAME]

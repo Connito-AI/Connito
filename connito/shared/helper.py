@@ -150,10 +150,22 @@ def find_submission_for_hotkey(
     hotkey: str,
     submission_block_range: tuple[int, int] | None,
 ) -> Path | None:
-    """Return the on-disk submission for `hotkey` whose embedded block
-    falls inside `submission_block_range`. If the range is None
-    (legacy path / round without a window) fall back to hotkey-only
-    match — but new code always passes a range so this stays safe.
+    """Return the on-disk submission for `hotkey` that belongs to this round.
+
+    Only the *start* of `submission_block_range` is meaningful. The block in
+    the filename is stamped by `BackgroundDownloadWorker` at download time,
+    not by the miner at submission time, and downloads run for the whole
+    round — so anything fetched after the ~60-block submission phase closes
+    fails an upper-bound test. That is every file but the first few minutes'
+    worth, and it silently broke both callers: bg-download re-fetched shards
+    it already had, and `publish_round_baseline` never once found its winner.
+
+    `block >= start` is the correct predicate and needs no cycle length (the
+    configured one disagrees with the chain's). Nothing can carry a future
+    block, and the next freeze prunes anything below the new round id.
+
+    If the range is None (legacy path / round without a window) fall back to
+    hotkey-only match.
     """
     candidates = [
         p for suffix in MINER_CHECKPOINT_SUFFIXES
@@ -169,8 +181,7 @@ def find_submission_for_hotkey(
             block = meta.get("block")
             if not isinstance(block, int):
                 continue
-            start, end = submission_block_range
-            if not (start <= block <= end):
+            if block < submission_block_range[0]:
                 continue
         return path
     return None
