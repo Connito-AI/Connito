@@ -25,12 +25,12 @@ from connito.shared.hf_distribute import (
 logger = structlog.get_logger(__name__)
 
 
-def publish_round_baseline(*, round_obj, config) -> None:
+def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> None:
     """Upload the round's best-averaged submission to HF as the next baseline.
 
-    Additive — nothing reads the revision back yet. Safe against the live
-    checkpoint repo because miners pin the revision committed on chain and
-    never track `main`. Never raises: a failed publish must not touch scoring.
+    On success `out` receives the coordinates the next ValidatorCommit
+    advertises. Never raises: a failed publish must not touch scoring, and the
+    caller runs this on a daemon thread where an exception would be invisible.
     """
     from connito.validator.round import select_baseline_uid
 
@@ -75,10 +75,17 @@ def publish_round_baseline(*, round_obj, config) -> None:
             )
         finally:
             shutil.rmtree(stage, ignore_errors=True)
+        # The winner's own committed hash: we republish its bytes unchanged, so
+        # it still describes the file. Miners verify the download against it,
+        # so it has to travel with the revision or they reject the fetch.
+        model_hash = getattr(round_obj.uid_to_chain_checkpoint.get(uid), "model_hash", None)
+        if out is not None and model_hash:
+            out.update(revision=revision, model_hash=model_hash, round_id=rid, uid=uid)
         logger.info(
             "publish_baseline: published", round_id=rid, uid=uid, val_loss=val_loss,
             avg_score=round(avg.get(uid, 0.0), 4),
             repo_id=repo_id, revision=revision, size_bytes=size_bytes,
+            model_hash=model_hash[:6] if model_hash else None,
             elapsed_s=round(time.monotonic() - started, 1),
         )
     except Exception as e:

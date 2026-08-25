@@ -96,9 +96,7 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.hf_distribute import (
-    get_hf_upload_readiness,
     resolve_hf_repo_ids,
-    upload_checkpoint_to_hf_subprocess,
 )
 from connito.shared.cycle import (
     BITTENSOR_BLOCK_TIME_SECONDS,
@@ -1024,6 +1022,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # If False at the start of the next cycle, pull the updated model from a
     # peer validator before continuing.
     _participated_in_merge = True
+    # Coordinates of the baseline published at finalize, read by the next
+    # ValidatorCommit. Empty means "nothing to advertise this cycle".
+    baseline_ref: dict[str, object] = {}
 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
@@ -1395,7 +1396,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 threading.Thread(
                     target=publish_round_baseline,
-                    kwargs={"round_obj": pending_round, "config": config},
+                    kwargs={"round_obj": pending_round, "config": config, "out": baseline_ref},
                     name="publish-baseline", daemon=True,
                 ).start()
                 # Drop history older than 8 cycle lengths so the aggregator
@@ -2104,84 +2105,53 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     VALIDATOR_GLOBAL_OPT_STEP.set(float(model_ckpt.global_ver))
                 except Exception:
                     pass
+                # Advertise the baseline published at finalize, not the merged
+                # model. `publish_round_baseline` uploaded it ~142 blocks ago,
+                # so it is normally done by now; if it is not (still uploading,
+                # or lost to a restart) commit no HF coordinates and miners keep
+                # what they have — `fetch_model_from_chain_validator` skips a
+                # checkpoint with no repo/revision.
+                _, hf_chain_repo_id = resolve_hf_repo_ids(
+                    config.hf,
+                    max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+                )
+                baseline = dict(baseline_ref)
+                baseline_ref.clear()
+                hf_revision = baseline.get("revision")
+                if hf_revision and baseline.get("model_hash"):
+                    # The hash MUST travel with the revision: miners verify the
+                    # downloaded bytes against `model_hash`, so advertising the
+                    # baseline's revision beside the merged model's hash would
+                    # make every miner reject it.
+                    commit_ckpt = ModelCheckpoint(model_hash=baseline["model_hash"])
+                    if not observer_mode_enabled():
+                        commit_ckpt.sign_hash(wallet=wallet)
+                    logger.info(
+                        "Advertising round baseline",
+                        repo_id=hf_chain_repo_id,
+                        revision=hf_revision[:HF_CHAIN_REVISION_LENGTH],
+                        round_id=baseline.get("round_id"),
+                        uid=baseline.get("uid"),
+                    )
+                else:
+                    commit_ckpt = model_ckpt
+                    logger.warning(
+                        "No baseline to advertise this cycle; committing without HF coordinates",
+                        has_revision=bool(hf_revision),
+                    )
+
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
                 logger.info("Commit new signed_model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(SignedModelHashChainCommit(
-                    signed_model_hash=model_ckpt.signed_model_hash,
+                    signed_model_hash=commit_ckpt.signed_model_hash,
                 ))
 
                 check_phase_expired(lite_subtensor, phase_response)
 
-                # Upload checkpoint to HuggingFace so miners can pull it during
-                # the Distribute phase. The returned revision SHA pins the exact
-                # bytes miners will download, even if :main advances afterward.
-                hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(
-                    config.hf,
-                    max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
-                )
-                hf_revision: str | None = None
-                if hf_upload_repo_id and hf_chain_repo_id and hf_upload_repo_id != hf_chain_repo_id:
-                    logger.info(
-                        "HF upload repo differs from chain-advertised repo",
-                        upload_checkpoint_repo=hf_upload_repo_id,
-                        advertised_checkpoint_repo=hf_chain_repo_id,
-                    )
-                hf_ready, hf_reason = get_hf_upload_readiness(
-                    repo_id=hf_upload_repo_id,
-                    token_env_var=config.hf.token_env_var,
-                )
-                if model_ckpt.path is None:
-                    logger.warning(
-                        "No checkpoint path available for HF upload",
-                        upload_checkpoint_repo=hf_upload_repo_id,
-                        advertised_checkpoint_repo=hf_chain_repo_id,
-                    )
-                elif hf_ready:
-                    # Pause the background workers while we hold the HF
-                    # bandwidth — the download worker also pulls from HF and
-                    # would contend on the same network/disk.
-                    merge_phase_active.set()
-                    try:
-                        # Subprocess isolation: huggingface_hub's chunked
-                        # upload + TLS holds the GIL long enough to starve
-                        # the bittensor websocket keepalive thread in this
-                        # process, which then dumps a ConnectionClosedError
-                        # mid-upload and forces a substrate reconnect/retry
-                        # on the next extrinsic. A spawned child has its
-                        # own interpreter, so the parent's keepalive keeps
-                        # ticking.
-                        hf_revision = upload_checkpoint_to_hf_subprocess(
-                            ckpt_dir=model_ckpt.path,
-                            repo_id=hf_upload_repo_id,
-                            token_env_var=config.hf.token_env_var,
-                            commit_message=(
-                                f"global_ver={model_ckpt.global_ver} "
-                                f"expert_group={config.task.exp.group_id}"
-                            ),
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "HF checkpoint upload failed; miners cannot pull this checkpoint",
-                            upload_checkpoint_repo=hf_upload_repo_id,
-                            advertised_checkpoint_repo=hf_chain_repo_id,
-                            error=str(e),
-                            exc_info=True,
-                        )
-                    finally:
-                        merge_phase_active.clear()
-                else:
-                    logger.error(
-                        "HF checkpoint upload unavailable; miners cannot pull this checkpoint",
-                        upload_checkpoint_repo=hf_upload_repo_id,
-                        advertised_checkpoint_repo=hf_chain_repo_id,
-                        reason=hf_reason,
-                        has_ckpt_path=model_ckpt.path is not None,
-                    )
-
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
                 logger.info("Commit model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(ValidatorChainCommit(
-                    model_hash=model_ckpt.model_hash,
+                    model_hash=commit_ckpt.model_hash,
                     global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
                     expert_group=config.task.exp.group_id,
                     hf_repo_id=hf_chain_repo_id if hf_revision else None,
