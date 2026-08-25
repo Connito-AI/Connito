@@ -130,6 +130,7 @@ from connito.validator.evaluator import (
     evaluate_foreground_round,
     finalize_round_scores,
     load_model_from_path,
+    publish_round_baseline,
 )
 from connito.validator.round import Round, RoundRef
 HF_CHAIN_REVISION_LENGTH = 7
@@ -1389,6 +1390,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     score_aggregator=score_aggregator,
                     score_path=score_path,
                 )
+                # Off the main loop: a ~3 GB upload must not sit between here
+                # and MinerCommit1. Daemon so it can never hold up shutdown.
+                threading.Thread(
+                    target=publish_round_baseline,
+                    kwargs={"round_obj": pending_round, "config": config},
+                    name="publish-baseline", daemon=True,
+                ).start()
                 # Drop history older than 8 cycle lengths so the aggregator
                 # only carries the recent window the cohort election + weight
                 # avg actually look at.
@@ -1720,7 +1728,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # block falls outside this round's window. The end-of-cycle
             # prune is normally enough, but a validator restart that
             # crashed mid-cycle (or any path that skips that prune) leaves
-            # stale .pt files behind — bg-download's _existing_submission
+            # stale .pt files behind — bg-download's find_submission_for_hotkey
             # would then short-circuit the fresh fetch and publish the
             # stale path, which gather_validation_job silently rejects.
             try:
