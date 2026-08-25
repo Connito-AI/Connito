@@ -67,6 +67,12 @@ class Round:
     # path can run `validate(expert_group_assignment=...)` (signature, hash,
     # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
     uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = field(default_factory=dict)
+    # Per-uid average score over the aggregator's rolling window, snapshotted
+    # at freeze. Already fetched to order the eval queue; kept because it is
+    # the only stable ranking available all round — the live aggregator holds
+    # this round's *raw deltas* until finalize replaces them with rank scores,
+    # so a mid-round average mixes incompatible units.
+    prior_avg_scores: dict[int, float] = field(default_factory=dict)
 
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
@@ -552,6 +558,7 @@ class Round:
             model_snapshot_cpu=snapshot,
             submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
+            prior_avg_scores=dict(prior_scores),
             freeze_zero_uids=freeze_zero_uids,
             freeze_zero_hotkeys=freeze_zero_hotkeys,
             weight_group_1=new_weight_group_1,
@@ -747,6 +754,22 @@ class Round:
                 reverse=True,
             )
             return {uid for uid, _ in ranked[:top_k]}
+
+    def top_avg_uids(self, top_k: int) -> set[int]:
+        """Top-`top_k` UIDs by the freeze-time average score, restricted to
+        UIDs in this round's roster. Sibling of `top_scored_uids_this_round`;
+        cleanup unions the two so the miner the baseline will be published
+        from is never pruned, while the merge's top-1-by-round-score is still
+        retained.
+        """
+        if top_k <= 0 or not self.prior_avg_scores:
+            return set()
+        ranked = sorted(
+            ((uid, avg) for uid, avg in self.prior_avg_scores.items()
+             if uid in self.uid_to_hotkey and avg > 0.0),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        return {uid for uid, _ in ranked[:top_k]}
 
     def mark_failed(self, uid: int) -> None:
         """Mark a UID as failed for operational reasons (download timeout,

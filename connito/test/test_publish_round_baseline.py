@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from connito.shared.helper import parse_dynamic_filename
 from connito.validator import evaluator
 
 GROUP_ID = 4
@@ -32,10 +33,14 @@ def _config(submission_dir: Path) -> SimpleNamespace:
     )
 
 
-def _round(val_losses: dict[int, float], uid_to_hotkey: dict[int, str]) -> SimpleNamespace:
+def _round(val_losses: dict[int, float], uid_to_hotkey: dict[int, str],
+           prior_avg_scores: dict[int, float] | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         round_id=9000, val_losses=val_losses, uid_to_hotkey=uid_to_hotkey,
         submission_block_range=BLOCK_RANGE,
+        # Freeze-time snapshot. Flat by default so tests that are not about
+        # selection fall through to the val_loss tie-break.
+        prior_avg_scores=prior_avg_scores or {uid: 0.0 for uid in val_losses},
     )
 
 
@@ -65,16 +70,17 @@ def uploads(monkeypatch) -> list[dict]:
     return calls
 
 
-def test_lowest_val_loss_wins_and_is_staged_under_the_miner_facing_name(tmp_path, uploads):
-    """Winner is `argmin(val_loss)`. That coincides with the top rank score
-    today — every miner in a round shares one baseline — but the rule this
-    function commits to is the loss, so pin it independently."""
+def test_best_average_wins_even_when_another_miner_beat_it_this_round(tmp_path, uploads):
+    """The rule ranks the miner, not the round. uid 1 has the better val_loss
+    here, but uid 2 has the stronger track record and is what gets published —
+    one lucky round must not become everyone's baseline."""
     sub = tmp_path / "miner_submission"
     _submission(sub, "hkA", 550)
     winner = _submission(sub, "hkB", 550)
 
     evaluator.publish_round_baseline(
-        round_obj=_round({1: 3.9, 2: 3.1}, {1: "hkA", 2: "hkB"}),
+        round_obj=_round({1: 3.1, 2: 3.9}, {1: "hkA", 2: "hkB"},
+                         prior_avg_scores={1: 0.25, 2: 1.75}),
         config=_config(sub),
     )
 
@@ -86,13 +92,31 @@ def test_lowest_val_loss_wins_and_is_staged_under_the_miner_facing_name(tmp_path
     assert winner.exists()
 
 
-def test_exact_tie_resolves_on_uid(tmp_path, uploads):
+def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
+    """Averaged rank scores collide constantly — every miner never in a top-3
+    sits at exactly 0.0 — so the round's own result has to settle it."""
     sub = tmp_path / "miner_submission"
     _submission(sub, "hkA", 550)
     _submission(sub, "hkB", 550)
 
     evaluator.publish_round_baseline(
-        round_obj=_round({7: 3.5, 2: 3.5}, {7: "hkA", 2: "hkB"}),
+        round_obj=_round({7: 3.9, 2: 3.1}, {7: "hkA", 2: "hkB"},
+                         prior_avg_scores={7: 1.5, 2: 1.5}),
+        config=_config(sub),
+    )
+    assert uploads[0]["commit_message"].endswith("uid=2")
+
+
+def test_uid_breaks_a_total_tie(tmp_path, uploads):
+    """Same average and same val_loss: fall to uid so two validators seeing
+    identical numbers never publish different baselines."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+    _submission(sub, "hkB", 550)
+
+    evaluator.publish_round_baseline(
+        round_obj=_round({7: 3.5, 2: 3.5}, {7: "hkA", 2: "hkB"},
+                         prior_avg_scores={7: 1.5, 2: 1.5}),
         config=_config(sub),
     )
     assert uploads[0]["commit_message"].endswith("uid=2")
@@ -144,3 +168,41 @@ def test_staging_dir_is_removed_after_a_successful_upload(tmp_path, uploads):
     assert uploads
     assert sorted(p.name for p in sub.iterdir()) == [src.name]
     assert os.stat(src).st_nlink == 1
+
+
+def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
+    """The guarantee the selection rule depends on. `cleanup_non_top_submissions`
+    runs after every eval and drops anyone outside this round's top-3; the
+    top-average miner can easily place 4th. Unioning `top_avg_uids` into the
+    keep set is what stops the winner's file being deleted before finalize.
+
+    Uses the real `Round` and the real cleanup — a stub would prove nothing
+    about the interaction between the two ranking sets.
+    """
+    from connito.validator.evaluator import cleanup_non_top_submissions
+    from connito.validator.round import Round
+
+    sub = tmp_path / "miner_submission"
+    uid_to_hotkey = {n: f"hk{n}" for n in range(1, 6)}
+    for hk in uid_to_hotkey.values():
+        _submission(sub, hk, 550)
+
+    round_obj = Round(
+        round_id=9000, seed="s", validator_miner_assignment={},
+        foreground_uids=tuple(uid_to_hotkey), background_uids=(),
+        uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
+        # uid 5 is the proven miner but has the worst round score.
+        prior_avg_scores={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 2.0},
+    )
+    for uid, score in {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6, 5: 0.1}.items():
+        round_obj.mark_scored(uid, score=score, val_loss=1.0)
+
+    deleted = cleanup_non_top_submissions(
+        round_obj=round_obj, submission_dir=sub, top_k=3,
+    )
+
+    survivors = {parse_dynamic_filename(p.name)["hotkey"] for p in sub.glob("*.safetensors")}
+    assert "hk5" in survivors, f"publish winner was pruned; kept {sorted(survivors)}"
+    # Top-3 by round score still retained — merge takes its top-1 from there.
+    assert {"hk1", "hk2", "hk3"} <= survivors
+    assert "hk4" in {parse_dynamic_filename(n)["hotkey"] for n in deleted}

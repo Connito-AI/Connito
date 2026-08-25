@@ -74,12 +74,15 @@ def cleanup_non_top_submissions(
     """Delete miner submission files for UIDs that have been *processed*
     this round but are not in the top-`top_k` by *this round's* score.
 
-    Ranking uses `Round.top_scored_uids_this_round`, which reads only
-    `round.scores` (populated by `mark_scored`) — the global
-    `MinerScoreAggregator` is intentionally not consulted here, so a
-    miner's history from prior rounds cannot pull them into the keep
-    set this round and the cleanup decision is fully owned by the round
-    object.
+    Ranking unions two sets, both owned by the round object so this hot
+    path (it runs after every eval) never reads the global
+    `MinerScoreAggregator` under a foreign lock:
+
+      - `top_scored_uids_this_round` — top-`top_k` by *this round's*
+        score. Merge takes its top-1 from here, so it must survive.
+      - `top_avg_uids` — top-1 by the freeze-time average, the miner
+        `publish_round_baseline` will pick. Snapshotted at freeze, so
+        unlike a live average it does not move as evals complete.
 
     A file is deleted iff its hotkey resolves to a UID that:
       - is in `round.failed_uids` (validation/timeout/exception, score=0
@@ -103,7 +106,7 @@ def cleanup_non_top_submissions(
     if not processed:
         return []
 
-    top_uids = round_obj.top_scored_uids_this_round(top_k)
+    top_uids = round_obj.top_scored_uids_this_round(top_k) | round_obj.top_avg_uids(1)
     delete_uids = failed | (scored - top_uids)
     if not delete_uids:
         return []
@@ -460,8 +463,17 @@ def publish_round_baseline(*, round_obj, config) -> None:
         if not val_losses:
             logger.info("publish_baseline: no scored miners", round_id=rid)
             return
-        # Tie-break on uid so an exact tie resolves identically everywhere.
-        uid, val_loss = min(val_losses.items(), key=lambda kv: (kv[1], kv[0]))
+        # Rank by the miner's track record, not one round's result: a single
+        # lucky round should not become everyone's baseline. `prior_avg_scores`
+        # is the freeze-time snapshot cleanup also retained against, so the
+        # winner's file is still on disk by construction. Averaged rank scores
+        # collide often, so this round's val_loss breaks ties, then uid so two
+        # validators never disagree.
+        avg = round_obj.prior_avg_scores
+        uid, val_loss = min(
+            val_losses.items(),
+            key=lambda kv: (-avg.get(kv[0], 0.0), kv[1], kv[0]),
+        )
         hotkey = round_obj.uid_to_hotkey.get(uid)
         submission_dir = Path(config.ckpt.miner_submission_path)
         src = find_submission_for_hotkey(
@@ -494,6 +506,7 @@ def publish_round_baseline(*, round_obj, config) -> None:
             shutil.rmtree(stage, ignore_errors=True)
         logger.info(
             "publish_baseline: published", round_id=rid, uid=uid, val_loss=val_loss,
+            avg_score=round(avg.get(uid, 0.0), 4),
             repo_id=repo_id, revision=revision, size_bytes=size_bytes,
             elapsed_s=round(time.monotonic() - started, 1),
         )
