@@ -58,7 +58,7 @@ class Round:
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
     # On-chain Submission phase block range for this round. bg-download uses
-    # it to gate `_existing_submission` reuse — without this filter, a stale
+    # it to gate `find_submission_for_hotkey` reuse — without this filter, a stale
     # .pt left over from a previous cycle would short-circuit the fresh
     # fetch and get published into downloaded_pool, but `gather_validation_job`
     # would silently reject it because its block falls outside the window.

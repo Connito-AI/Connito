@@ -921,7 +921,7 @@ def prune_submissions_outside_window(
     `[start, end]`. Distinct from `prune_miner_submission_files`, which is
     age-based — this one is window-based and is meant to run at round
     freeze so a stale .pt from a previous cycle can't masquerade as the
-    current round's submission and short-circuit `_existing_submission`.
+    current round's submission and short-circuit `find_submission_for_hotkey`.
 
     No-op (returns []) if `submission_block_range` is None or the folder
     does not exist.

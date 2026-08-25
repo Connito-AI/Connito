@@ -145,6 +145,37 @@ def parse_dynamic_filename(filename: str) -> dict:
     return meta
 
 
+def find_submission_for_hotkey(
+    submission_dir: Path,
+    hotkey: str,
+    submission_block_range: tuple[int, int] | None,
+) -> Path | None:
+    """Return the on-disk submission for `hotkey` whose embedded block
+    falls inside `submission_block_range`. If the range is None
+    (legacy path / round without a window) fall back to hotkey-only
+    match — but new code always passes a range so this stays safe.
+    """
+    candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in submission_dir.glob(f"*{suffix}")
+    ]
+    for path in candidates:
+        if path.name.startswith(".tmp"):
+            continue
+        meta = parse_dynamic_filename(path.name)
+        if not meta or meta.get("hotkey") != hotkey:
+            continue
+        if submission_block_range is not None:
+            block = meta.get("block")
+            if not isinstance(block, int):
+                continue
+            start, end = submission_block_range
+            if not (start <= block <= end):
+                continue
+        return path
+    return None
+
+
 def h256_int(*parts: Any) -> int:
     """Deterministic 256-bit hash -> int."""
     m = hashlib.sha256()
