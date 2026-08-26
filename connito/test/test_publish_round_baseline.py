@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from connito.shared.helper import parse_dynamic_filename
-from connito.validator import evaluator
+from connito.validator import distribute
 
 GROUP_ID = 4
 BLOCK_RANGE = (500, 600)
@@ -65,8 +65,8 @@ def uploads(monkeypatch) -> list[dict]:
         })
         return "abc123def456"
 
-    monkeypatch.setattr(evaluator, "upload_checkpoint_to_hf_subprocess", _fake_upload)
-    monkeypatch.setattr(evaluator, "resolve_hf_repo_ids", lambda cfg: ("owner/co", "owner/co"))
+    monkeypatch.setattr(distribute, "upload_checkpoint_to_hf_subprocess", _fake_upload)
+    monkeypatch.setattr(distribute, "resolve_hf_repo_ids", lambda cfg: ("owner/co", "owner/co"))
     return calls
 
 
@@ -78,7 +78,7 @@ def test_best_average_wins_even_when_another_miner_beat_it_this_round(tmp_path, 
     _submission(sub, "hkA", 550)
     winner = _submission(sub, "hkB", 550)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round({1: 3.1, 2: 3.9}, {1: "hkA", 2: "hkB"},
                          prior_avg_scores={1: 0.25, 2: 1.75}),
         config=_config(sub),
@@ -99,7 +99,7 @@ def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
     _submission(sub, "hkA", 550)
     _submission(sub, "hkB", 550)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round({7: 3.9, 2: 3.1}, {7: "hkA", 2: "hkB"},
                          prior_avg_scores={7: 1.5, 2: 1.5}),
         config=_config(sub),
@@ -114,7 +114,7 @@ def test_uid_breaks_a_total_tie(tmp_path, uploads):
     _submission(sub, "hkA", 550)
     _submission(sub, "hkB", 550)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round({7: 3.5, 2: 3.5}, {7: "hkA", 2: "hkB"},
                          prior_avg_scores={7: 1.5, 2: 1.5}),
         config=_config(sub),
@@ -136,7 +136,7 @@ def test_nothing_is_published_when_the_winner_shard_is_unusable(tmp_path, upload
         # then fails to load — the one failure mode with no miner-side signal.
         _submission(sub, "hkB", 550, suffix=".pt")
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round(val_losses, {2: "hkB"}), config=_config(sub),
     )
     assert uploads == []
@@ -150,8 +150,8 @@ def test_upload_failure_neither_raises_nor_leaks_the_staging_dir(tmp_path, monke
     def _boom(**_):
         raise RuntimeError("HF token missing")
 
-    monkeypatch.setattr(evaluator, "upload_checkpoint_to_hf_subprocess", _boom)
-    evaluator.publish_round_baseline(
+    monkeypatch.setattr(distribute, "upload_checkpoint_to_hf_subprocess", _boom)
+    distribute.publish_round_baseline(
         round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
     )
 
@@ -163,7 +163,7 @@ def test_staging_dir_is_removed_after_a_successful_upload(tmp_path, uploads):
     sub = tmp_path / "miner_submission"
     src = _submission(sub, "hkB", 550)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
     )
 
@@ -294,7 +294,7 @@ def test_a_late_download_is_still_this_round_s_submission(tmp_path, uploads):
     sub = tmp_path / "miner_submission"
     _submission(sub, "hkB", BLOCK_RANGE[1] + 200)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
     )
 
@@ -314,7 +314,7 @@ def test_round_best_wins_when_no_proven_miner_submitted(tmp_path, uploads):
     _submission(sub, "hkStale", 550)
     _submission(sub, "hkBest", 550)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round(
             {7: 2.0, 8: 1.0},                       # uid 8 is this round's best
             {7: "hkStale", 8: "hkBest"},
@@ -335,7 +335,7 @@ def test_proven_miner_still_wins_when_it_submits(tmp_path, uploads):
     _submission(sub, "hkProven", 550)
     _submission(sub, "hkBest", 550)
 
-    evaluator.publish_round_baseline(
+    distribute.publish_round_baseline(
         round_obj=_round(
             {7: 2.0, 8: 1.0},                       # uid 8 still has the better val_loss
             {7: "hkProven", 8: "hkBest"},

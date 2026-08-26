@@ -4,10 +4,6 @@ import asyncio
 import copy
 import gc
 import math
-import os
-import shutil
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,13 +16,8 @@ from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
-    find_submission_for_hotkey,
     load_state_dict_from_path,
     parse_dynamic_filename,
-)
-from connito.shared.hf_distribute import (
-    resolve_hf_repo_ids,
-    upload_checkpoint_to_hf_subprocess,
 )
 from connito.shared.telemetry import (
     EvalFailureReason,
@@ -451,66 +442,6 @@ def finalize_round_scores(
         freeze_zero_count=len(freeze_zero - scored - validation_failed),
     )
     return written
-
-
-def publish_round_baseline(*, round_obj, config) -> None:
-    """Upload the round's best-averaged submission to HF as the next baseline.
-
-    Additive — nothing reads the revision back yet. Safe against the live
-    checkpoint repo because miners pin the revision committed on chain and
-    never track `main`. Never raises: a failed publish must not touch scoring.
-    """
-    from connito.validator.round import select_baseline_uid
-
-    rid = getattr(round_obj, "round_id", None)
-    try:
-        val_losses = dict(getattr(round_obj, "val_losses", None) or {})
-        avg = dict(getattr(round_obj, "prior_avg_scores", None) or {})
-        # Same call cleanup retains against, so the winner's file is still on
-        # disk by construction.
-        uid = select_baseline_uid(val_losses, avg)
-        if uid is None:
-            logger.info("publish_baseline: no scored miners", round_id=rid)
-            return
-        val_loss = val_losses[uid]
-        hotkey = round_obj.uid_to_hotkey.get(uid)
-        submission_dir = Path(config.ckpt.miner_submission_path)
-        src = find_submission_for_hotkey(
-            submission_dir, hotkey, round_obj.submission_block_range,
-        ) if hotkey else None
-        # A `.pt` submission republished under a `.safetensors` name would
-        # download fine and then fail to load.
-        if src is None or src.suffix != ".safetensors":
-            logger.warning(
-                "publish_baseline: winner submission unavailable",
-                round_id=rid, uid=uid, path=str(src),
-            )
-            return
-
-        repo_id, _ = resolve_hf_repo_ids(config.hf)
-        # Hardlink, not copy: same filesystem, so staging a ~3 GB shard costs
-        # an inode — and the link keeps the bytes alive if the round's prune
-        # deletes the source out from under an in-flight upload.
-        stage = Path(tempfile.mkdtemp(dir=submission_dir, prefix=".tmp_baseline_"))
-        size_bytes, started = src.stat().st_size, time.monotonic()
-        try:
-            # The name miners already fetch.
-            os.link(src, stage / f"model_expgroup_{config.task.exp.group_id}.safetensors")
-            revision = upload_checkpoint_to_hf_subprocess(
-                ckpt_dir=stage, repo_id=repo_id,
-                token_env_var=config.hf.token_env_var,
-                commit_message=f"baseline round_id={rid} uid={uid}",
-            )
-        finally:
-            shutil.rmtree(stage, ignore_errors=True)
-        logger.info(
-            "publish_baseline: published", round_id=rid, uid=uid, val_loss=val_loss,
-            avg_score=round(avg.get(uid, 0.0), 4),
-            repo_id=repo_id, revision=revision, size_bytes=size_bytes,
-            elapsed_s=round(time.monotonic() - started, 1),
-        )
-    except Exception as e:
-        logger.warning("publish_baseline: failed", round_id=rid, error=str(e), exc_info=True)
 
 
 @dataclass(frozen=True)

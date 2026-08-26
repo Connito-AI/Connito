@@ -130,7 +130,6 @@ from connito.validator.evaluator import (
     evaluate_foreground_round,
     finalize_round_scores,
     load_model_from_path,
-    publish_round_baseline,
 )
 from connito.validator.round import Round, RoundRef
 HF_CHAIN_REVISION_LENGTH = 7
@@ -1392,6 +1391,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
                 # Off the main loop: a ~3 GB upload must not sit between here
                 # and MinerCommit1. Daemon so it can never hold up shutdown.
+                from connito.validator.distribute import publish_round_baseline
+
                 threading.Thread(
                     target=publish_round_baseline,
                     kwargs={"round_obj": pending_round, "config": config},
