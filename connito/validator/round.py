@@ -32,15 +32,22 @@ logger = structlog.get_logger(__name__)
 def select_baseline_uid(
     val_losses: dict[int, float],
     prior_avg_scores: dict[int, float],
+    top_n: int = 3,
 ) -> int | None:
     """The UID the round's baseline is published from, or None if nothing was
-    scored: best freeze-time average among the miners *scored this round*,
-    with this round's val_loss then UID breaking ties.
+    scored: the best-ranked *proven* miner that submitted, else the best
+    submission of this round.
 
-    Ranks the miner's track record rather than one round's result so a single
-    lucky round cannot become everyone's baseline. Averaged rank scores collide
-    often, hence the val_loss tie-break; UID last so two validators never
-    disagree.
+    Only the top-`top_n` miners by track record count as proven — the same
+    count that scores points each round (`_RANK_TO_SCORE`). Everyone else is
+    ranked as 0.0, so when no proven miner submits the val_loss tie-break
+    decides and the round's own best wins. That keeps the baseline fresh
+    instead of falling back on a miner whose single top-3 placing has long
+    since aged out, and it ignores the raw in-flight deltas the aggregator
+    carries mid-round, which are orders of magnitude below a real rank
+    average and so can never reach `top_n`.
+
+    UID breaks a total tie so two validators never disagree.
 
     Module-level because `cleanup_non_top_submissions` and
     `publish_round_baseline` must rank identically — the file has to survive
@@ -48,9 +55,11 @@ def select_baseline_uid(
     """
     if not val_losses:
         return None
+    proven = sorted(prior_avg_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+    proven_avg = {uid: avg for uid, avg in proven if avg > 0.0}
     uid, _ = min(
         val_losses.items(),
-        key=lambda kv: (-prior_avg_scores.get(kv[0], 0.0), kv[1], kv[0]),
+        key=lambda kv: (-proven_avg.get(kv[0], 0.0), kv[1], kv[0]),
     )
     return uid
 

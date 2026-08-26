@@ -300,3 +300,48 @@ def test_a_late_download_is_still_this_round_s_submission(tmp_path, uploads):
 
     assert len(uploads) == 1, "late download rejected — the production failure"
     assert uploads[0]["staged"] == [PUBLISHED_NAME]
+
+
+def test_round_best_wins_when_no_proven_miner_submitted(tmp_path, uploads):
+    """The reviewer's case: none of the top-3 by track record submitted.
+
+    A miner whose single top-3 placing has nearly aged out (uid 7, avg 0.3)
+    should not outrank this round's actual best on the strength of stale
+    reputation. Only the top-3 averages count as proven, so uid 7 ranks 0.0
+    like everyone else and the val_loss tie-break picks uid 8.
+    """
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkStale", 550)
+    _submission(sub, "hkBest", 550)
+
+    evaluator.publish_round_baseline(
+        round_obj=_round(
+            {7: 2.0, 8: 1.0},                       # uid 8 is this round's best
+            {7: "hkStale", 8: "hkBest"},
+            # uids 10/11/12 hold the top-3 averages and did not submit.
+            prior_avg_scores={10: 2.0, 11: 1.5, 12: 1.0, 7: 0.3, 8: 0.0},
+        ),
+        config=_config(sub),
+    )
+
+    assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
+
+
+def test_proven_miner_still_wins_when_it_submits(tmp_path, uploads):
+    """Guard against over-correcting: a top-3-by-average miner that submits
+    must still beat this round's best, which is the whole point of ranking by
+    track record."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkProven", 550)
+    _submission(sub, "hkBest", 550)
+
+    evaluator.publish_round_baseline(
+        round_obj=_round(
+            {7: 2.0, 8: 1.0},                       # uid 8 still has the better val_loss
+            {7: "hkProven", 8: "hkBest"},
+            prior_avg_scores={7: 1.5, 10: 2.0, 11: 1.0, 8: 0.0},
+        ),
+        config=_config(sub),
+    )
+
+    assert uploads[0]["commit_message"].endswith("uid=7"), uploads[0]["commit_message"]
