@@ -35,17 +35,16 @@ def select_baseline_uid(
     top_n: int = 3,
 ) -> int | None:
     """The UID the round's baseline is published from, or None if nothing was
-    scored: the best-ranked *proven* miner that submitted, else the best
-    submission of this round.
+    scored.
 
-    Only the top-`top_n` miners by track record count as proven — the same
-    count that scores points each round (`_RANK_TO_SCORE`). Everyone else is
-    ranked as 0.0, so when no proven miner submits the val_loss tie-break
-    decides and the round's own best wins. That keeps the baseline fresh
-    instead of falling back on a miner whose single top-3 placing has long
-    since aged out, and it ignores the raw in-flight deltas the aggregator
-    carries mid-round, which are orders of magnitude below a real rank
-    average and so can never reach `top_n`.
+    Preferred: the best-ranked *proven* miner that submitted this round.
+    Proven means the top-`top_n` by track record, matching the count that
+    scores points each round (`_RANK_TO_SCORE`).
+
+    Fallback: if none of them submitted, this round's best submission by
+    val_loss. A miner whose single top-3 placing has nearly aged out should
+    not outrank a fresh measurement on the validator's own held-out data —
+    the baseline is a starting model, not a reward.
 
     UID breaks a total tie so two validators never disagree.
 
@@ -55,13 +54,14 @@ def select_baseline_uid(
     """
     if not val_losses:
         return None
-    proven = sorted(prior_avg_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
-    proven_avg = {uid: avg for uid, avg in proven if avg > 0.0}
-    uid, _ = min(
-        val_losses.items(),
-        key=lambda kv: (-proven_avg.get(kv[0], 0.0), kv[1], kv[0]),
-    )
-    return uid
+    proven = {
+        uid for uid, _ in
+        sorted(prior_avg_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+    }
+    submitted = {uid: loss for uid, loss in val_losses.items() if uid in proven}
+    if submitted:
+        return min(submitted, key=lambda uid: (-prior_avg_scores[uid], val_losses[uid], uid))
+    return min(val_losses, key=lambda uid: (val_losses[uid], uid))
 
 
 
