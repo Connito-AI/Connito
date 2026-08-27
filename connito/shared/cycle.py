@@ -51,7 +51,6 @@ from connito.shared.helper import (
     parse_dynamic_filename,
 )
 from connito.shared.hf_distribute import download_checkpoint_from_hf
-from connito.validator.evaluator import MinerEvalJob
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -1011,99 +1010,3 @@ def hydrate_miner_submissions_from_hf(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return hydrated
-
-
-def gather_validation_job(
-    config: ValidatorConfig,
-    subtensor: bittensor.Subtensor,
-    step: int,
-    validator_miner_assignment: dict[str, list[str]],
-) -> list[MinerEvalJob]:
-    miner_assignment = validator_miner_assignment.get(config.chain.hotkey_ss58, [])
-
-    if not miner_assignment:
-        logger.warning("No miners assigned to this validator", hotkey=config.chain.hotkey_ss58)
-    else:
-        logger.debug("assigned_miners", miner_assignment=miner_assignment)
-
-    miner_submission_files = load_submission_files(str(config.ckpt.miner_submission_path))
-    _prev_phase_api = get_blocks_from_previous_phase_from_api(config)
-    if _prev_phase_api is None:
-        logger.warning("gather_validation_job: could not fetch previous phase info from API — skipping evaluation this cycle")
-        return []
-    previous_phase_range = _prev_phase_api.get(PhaseNames.submission)
-
-    hotkeys = subtensor.metagraph(netuid=config.chain.netuid).hotkeys
-    miner_jobs = []
-    qualifying_hotkeys: set[str] = set()
-    outdated_submissions = []
-    unexpected_submissions = []
-    for file_name, submission_meta in miner_submission_files.items():
-        # Guard against filenames that don't match the uid_*_hotkey_*_block_*.pt
-        # template (partial uploads, stale files from older miner versions,
-        # manually placed debug checkpoints). Without this, a single bad file
-        # raises KeyError and aborts the whole scan, losing valid submissions.
-        if "hotkey" not in submission_meta or "block" not in submission_meta:
-            logger.warning(
-                "Skipping submission file: missing required filename fields",
-                file_name=file_name,
-                parsed_keys=sorted(submission_meta.keys()),
-            )
-            continue
-        is_assigned = submission_meta["hotkey"] in miner_assignment
-        in_previous_phase = previous_phase_range is not None and (previous_phase_range[0] <= submission_meta["block"] <= previous_phase_range[1])
-        if is_assigned and in_previous_phase:
-            logger.debug("Found qualifying submission file", file_name=file_name, submission_meta=submission_meta)
-            qualifying_hotkeys.add(submission_meta["hotkey"])
-            miner_jobs.append(
-                MinerEvalJob(
-                    uid=hotkeys.index(submission_meta["hotkey"]),
-                    hotkey=submission_meta["hotkey"],
-                    model_path=config.ckpt.miner_submission_path / file_name,
-                    step=step,
-                )
-            )
-        else:
-            if not in_previous_phase:
-                outdated_submissions.append(
-                    {
-                        "file_name": file_name,
-                        "hotkey": submission_meta["hotkey"],
-                        "block": submission_meta["block"],
-                        # "reason": reason,
-                    }
-                )
-
-            elif not is_assigned:
-                unexpected_submissions.append(
-                    {
-                        "file_name": file_name,
-                        "hotkey": submission_meta["hotkey"],
-                        "block": submission_meta["block"],
-                        # "reason": reason,
-                    }
-                )
-
-
-            else:
-                reason = "unknown"
-
-    missing_hotkeys = [hotkey for hotkey in miner_assignment if hotkey not in qualifying_hotkeys]
-
-
-    if missing_hotkeys:
-        logger.debug(
-            "Missing miner submissions",
-            missing_hotkeys=missing_hotkeys,
-            assigned_count=len(miner_assignment),
-            received_count=len(qualifying_hotkeys),
-        )
-    
-    if unexpected_submissions:
-        logger.debug(
-            "Rejected submission: In phase but unassigned miner",
-            unexpected_count=len(unexpected_submissions),
-            unexpected_submissions=unexpected_submissions,
-        )
-
-    return miner_jobs

@@ -2,8 +2,8 @@
 `_specs/background-submission-validation.md`.
 
 A `Round` is constructed once, at the start of each Submission phase
-(step 0), and is immutable thereafter. The foreground pass and the two
-background workers (download + eval) all anchor on the same `Round`.
+(step 0), and is immutable thereafter. Both background workers (download +
+eval) anchor on the same `Round`.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class Round:
     weights_submitted) are guarded by an internal lock and are updated by
     the workers.
 
-    `foreground_uids` is this validator's assignment slice; `background_uids`
+    `background_uids` is the whole roster in evaluation order: A -> B -> C,
     is every other miner with a chain checkpoint this cycle. `uid_to_hotkey`
     covers the union, so workers don't need to hold a metagraph reference
     to translate a UID back to a hotkey.
@@ -89,7 +89,6 @@ class Round:
     round_id: int
     seed: str
     validator_miner_assignment: dict[str, list[str]]
-    foreground_uids: tuple[int, ...]
     background_uids: tuple[int, ...]
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
@@ -144,8 +143,7 @@ class Round:
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
     # Last live lifecycle step this round reached (set by run.py alongside
-    # the VALIDATOR_ROUND_LIFECYCLE_STEP gauge: 0 freeze / 2 post-foreground
-    # / 3 eval-window). Persisted to the journal so startup recovery can
+    # the VALIDATOR_ROUND_LIFECYCLE_STEP gauge: 0 freeze / 3 eval-window). Persisted to the journal so startup recovery can
     # restore the round-level gauges that only the live loop writes.
     lifecycle_step: int = 0
 
@@ -233,10 +231,10 @@ class Round:
 
         hotkey_to_uid = {hk: uid for uid, hk in enumerate(metagraph.hotkeys)}
 
-        # `miners_with_checkpoint` is already incentive-ranked. Walk it once
-        # and split into foreground (this validator's assignment) and
-        # background (everyone else with a checkpoint).
-        foreground: list[int] = []
+        # `miners_with_checkpoint` is already incentive-ranked. Walk it once,
+        # separating this validator's assignment slice (which leads the roster)
+        # from everyone else with a checkpoint.
+        assigned: list[int] = []
         background: list[int] = []
         uid_to_hotkey: dict[int, str] = {}
         uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = {}
@@ -256,7 +254,7 @@ class Round:
             if ckpt is not None and ckpt.hf_repo_id and ckpt.hf_revision:
                 assigned_with_valid_ckpt.add(hk)
 
-            (foreground if hk in my_assignment_set else background).append(uid)
+            (assigned if hk in my_assignment_set else background).append(uid)
 
         rid = int(round_id) if round_id is not None else int(subtensor.block)
 
@@ -285,8 +283,6 @@ class Round:
                 uids=sorted(freeze_zero_uids),
             )
 
-        foreground_uids = tuple(foreground)
-
         # Legacy fallback ordering (used only when
         # `config.evaluation.enable_round_group_construction = False`):
         # background = top-N by prior avg score, then staleness tail.
@@ -298,7 +294,7 @@ class Round:
         prior_scores = prior_avg_scores or {}
 
         bg_set = set(background)
-        placed: set[int] = set(foreground)
+        placed: set[int] = set(assigned)
 
         # (b) Top-N by prior-round avg score. Random tiebreak.
         scored_candidates = sorted(
@@ -322,7 +318,10 @@ class Round:
             key=lambda uid: (last_eval_map.get(uid, EPOCH), random.random()),
         )
 
+        # The assignment slice leads the roster — there is no separate
+        # foreground pass holding it back any more.
         background_uids = tuple([
+            *assigned,
             *score_prepend_uids,
             *stale_tail,
         ])
@@ -356,16 +355,9 @@ class Round:
             "Round.freeze: roster locked",
             round_id=rid,
             roster_size=len(uid_to_hotkey),
-            foreground_size=len(foreground_uids),
             background_size=len(background_uids),
             base_param_bytes=_nbytes(base_params),
             base_full_bytes=_nbytes(snapshot),
-        )
-        logger.info(
-            "Round.freeze: foreground",
-            round_id=rid,
-            count=len(foreground_uids),
-            uids=list(foreground_uids),
         )
         logger.info(
             "Round.freeze: bg score prepend",
@@ -384,7 +376,7 @@ class Round:
         # _specs/round-group-construction-scheme.md). When enabled, the
         # cohort advances at every 8th cycle, and the validation roster
         # for this round is replaced by Group A + B + C in that order.
-        # The legacy foreground/background just-computed above is the
+        # The legacy ordering just computed above is the
         # fallback path used by every test fixture and validator that has
         # not opted into the new scheme yet.
         new_cohort_state: "CohortState | None" = None
@@ -409,7 +401,7 @@ class Round:
             if effective_cycle_index is None or not effective_cycle_length:
                 logger.warning(
                     "Round.freeze: round-group flag on but cycle_index/cycle_length missing; "
-                    "falling back to legacy foreground/background construction",
+                    "falling back to legacy roster construction",
                     round_id=rid,
                 )
             else:
@@ -454,15 +446,10 @@ class Round:
                 new_validation_c = new_cohort_state.validation_group_c
                 new_cohort_epoch = new_cohort_state.cohort_epoch
 
-                # Override legacy foreground/background with the cohort
-                # validation roster:
-                #   foreground = `cohort_state.foreground_uids` — this
-                #     validator's per-validator seeded partition of A∪B,
-                #     computed at the cohort boundary.
-                #   background = (A ∪ B ∪ C) \\ foreground, preserving
-                #     A → B → C order. Catches A/B miners outside our
-                #     foreground slice plus all of Group C.
-                foreground_uids, background_uids = round_groups.split_foreground_background(
+                # Override the legacy ordering with the cohort validation
+                # roster: A -> B -> C, so the workers reach the consensus tier
+                # first. Every miner runs through the same background path.
+                background_uids = round_groups.full_validation_roster(
                     new_cohort_state
                 )
 
@@ -479,7 +466,7 @@ class Round:
                     | set(new_validation_b)
                     | set(new_validation_c)
                 )
-                cohort_set = abc_set | set(foreground_uids)
+                cohort_set = abc_set
 
                 # Carry-over: re-evaluate last round's Group A and B in
                 # this round's background. Within a cohort epoch A/B
@@ -504,7 +491,7 @@ class Round:
 
                 tail_pool: list[int] = []
                 _seen_tail: set[int] = set()
-                for uid in (*foreground, *background):
+                for uid in (*assigned, *background):
                     if (
                         uid in cohort_set
                         or uid in prev_ab_set
@@ -526,37 +513,12 @@ class Round:
                 # Make sure every UID in the new roster has a hotkey
                 # entry — Group A and B may include UIDs outside this
                 # validator's assignment slice that the earlier loop
-                # didn't see. Cover both foreground and background.
-                for uid in (*foreground_uids, *background_uids):
+                # didn't see.
+                for uid in background_uids:
                     if uid in uid_to_hotkey:
                         continue
                     if 0 <= uid < len(metagraph.hotkeys):
                         uid_to_hotkey[uid] = metagraph.hotkeys[uid]
-
-                # Splice overlay foreground hotkeys into our entry of the
-                # assignment dict. `gather_validation_job` (called by
-                # `evaluate_foreground_round`) reads
-                # `validator_miner_assignment[my_hotkey]` to decide
-                # `is_assigned` for each submission file on disk. Without
-                # this splice every overlay-foreground UID that fell
-                # outside the legacy full-pool slice is bucketed into
-                # `unexpected_submissions` and silently dropped, wasting
-                # the entire foreground eval window for that round. Copy-
-                # on-write so the dict returned by the chain helper is
-                # not mutated under callers that retained a reference.
-                my_hk = config.chain.hotkey_ss58
-                spliced_assignment: dict[str, list[str]] = {
-                    k: list(v) for k, v in assignment.items()
-                }
-                my_list = spliced_assignment.setdefault(my_hk, [])
-                _seen_my_assigned: set[str] = set(my_list)
-                for uid in foreground_uids:
-                    hk = uid_to_hotkey.get(uid)
-                    if hk is None or hk in _seen_my_assigned:
-                        continue
-                    my_list.append(hk)
-                    _seen_my_assigned.add(hk)
-                assignment = spliced_assignment
 
                 logger.info(
                     "Round.freeze: round-group overlay applied",
@@ -566,7 +528,6 @@ class Round:
                     validation_group_a=list(new_validation_a),
                     validation_group_b=list(new_validation_b),
                     validation_group_c=list(new_validation_c),
-                    foreground_uids=list(foreground_uids),
                     background_uids=list(background_uids),
                     prev_ab_carryover=list(prev_ab_pool),
                     tail_uids=list(tail_pool),
@@ -588,7 +549,6 @@ class Round:
             round_id=rid,
             seed=seed,
             validator_miner_assignment=assignment,
-            foreground_uids=foreground_uids,
             background_uids=background_uids,
             uid_to_hotkey=uid_to_hotkey,
             model_snapshot_cpu=snapshot,
@@ -637,17 +597,6 @@ class Round:
         return new_round
 
     # ---------------- Claim / score helpers ----------------
-    def claim_for_foreground(self, uid: int) -> bool:
-        with self._lock:
-            if (
-                uid in self.claimed_uids
-                or uid in self.scored_uids
-                or uid in self.failed_uids
-            ):
-                return False
-            self.claimed_uids.add(uid)
-            return True
-
     def claim_for_eval(self, uid: int) -> bool:
         with self._lock:
             if (
@@ -684,7 +633,7 @@ class Round:
             "freeze_zero_hotkeys": dict(self.freeze_zero_hotkeys),
             "uid_to_commit": commit_map_from_checkpoints(self.uid_to_chain_checkpoint),
             "uid_to_val_loss": dict(self.val_losses),
-            "roster_size": len(self.foreground_uids) + len(self.background_uids),
+            "roster_size": len(self.background_uids),
             "lifecycle_step": int(self.lifecycle_step),
             "seed": str(self.seed),
             "finalized": False,
@@ -865,35 +814,18 @@ class Round:
 
     # ---------------- Iteration helpers ----------------
     @property
-    def assigned_uids(self) -> tuple[int, ...]:
-        """Alias for `foreground_uids` — the validator's assignment slice.
-        Kept under a separate name so callers can express *intent* without
-        coupling to the fact that today every assigned miner is also
-        evaluated in foreground.
-        """
-        return self.foreground_uids
-
-    @property
     def roster(self) -> tuple[RosterEntry, ...]:
-        """Foreground first, then background, both already incentive-ordered."""
+        """The round's miners in evaluation order."""
         return tuple(
             RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
-            for uid in (*self.foreground_uids, *self.background_uids)
+            for uid in self.background_uids
         )
 
     def next_for_download(self) -> Iterable[RosterEntry]:
-        """Yield roster UIDs (foreground first, then background) in priority
-        order that are not yet downloaded, scored, or claimed. Re-checks state
-        each iteration so pause/resume stays correct.
-
-        Foreground UIDs are yielded first because they are this validator's
-        assignment slice — `gather_validation_job` (called by
-        `evaluate_foreground_round`) scans `miner_submission_path`, so until
-        bg-download writes a foreground miner's shard to disk, foreground eval
-        polls forever and finds nothing. Walking foreground first puts the
-        priority work where it's needed.
-        """
-        for uid in (*self.foreground_uids, *self.background_uids):
+        """Yield roster UIDs in priority order (A -> B -> C, then carry-over,
+        then staleness tail) that are not yet downloaded, scored, or claimed.
+        Re-checks state each iteration so pause/resume stays correct."""
+        for uid in self.background_uids:
             with self._lock:
                 if (
                     uid in self.scored_uids
@@ -906,7 +838,7 @@ class Round:
 
     def next_for_eval(self) -> Iterable[RosterEntry]:
         """Yield (uid, hotkey) for every miner whose checkpoint is downloaded
-        and not yet scored/claimed/failed, in foreground-then-background order."""
+        and not yet scored/claimed/failed, in roster order."""
         with self._lock:
             candidates = {
                 u for u in self.downloaded_pool
@@ -914,26 +846,12 @@ class Round:
                 and u not in self.claimed_uids
                 and u not in self.failed_uids
             }
-        for uid in (*self.foreground_uids, *self.background_uids):
+        for uid in self.background_uids:
             if uid in candidates:
                 yield RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
 
-    def unscored_roster_uids(self) -> list[RosterEntry]:
-        """Assigned miners this validator did not score this round. Scoped
-        to `foreground_uids` so it never returns miners that belong to
-        other validators' assignments. No longer used for penalties (we
-        only score=0 for invalid checkpoints, recorded inline at the
-        validation site); kept for diagnostics and future use."""
-        with self._lock:
-            return [
-                RosterEntry(uid=uid, hotkey=self.uid_to_hotkey[uid])
-                for uid in self.foreground_uids
-                if uid not in self.scored_uids
-            ]
-
-    # ---------------- Stats ----------------
     def stats(self) -> dict[str, int]:
-        roster_size = len(self.foreground_uids) + len(self.background_uids)
+        roster_size = len(self.background_uids)
         with self._lock:
             return {
                 "roster": roster_size,
@@ -948,10 +866,9 @@ class Round:
         """Publish this round's progress counters (scored / failed / pending)
         to Prometheus.
 
-        Called from every path that advances the round — once at freeze, after
-        each foreground evaluation, and after each background evaluation — so
-        the counters move as soon as evaluation starts rather than only once
-        the background eval window opens at Merge.
+        Called from every path that advances the round — once at freeze and
+        after each evaluation — so the counters move as soon as evaluation
+        starts.
 
         `stats()` takes `self._lock`, so callers must NOT hold it. Every call
         site is outside the lock (the `mark_*` helpers release it before

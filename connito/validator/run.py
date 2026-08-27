@@ -1,4 +1,3 @@
-import asyncio
 import copy
 import gc
 import math
@@ -93,7 +92,6 @@ from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
 from connito.shared.cycle import (
-    BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
     get_blocks_from_previous_phase_from_api,
     get_phase_from_api,
@@ -116,9 +114,7 @@ from connito.validator.background_download_worker import BackgroundDownloadWorke
 from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter, observer_mode_enabled
 from connito.validator.evaluator import (
-    MinerEvalJob,
     build_submission_uid_weights,
-    evaluate_foreground_round,
     finalize_round_scores,
     load_model_from_path,
 )
@@ -655,8 +651,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # === set up chain worker ===
     # subtensor: archive connection — required by callers that issue
-    # historical block queries (Round.freeze, setup_training/load_model,
-    # reload_model_inplace, evaluate_foreground_round).
+    # historical block queries (Round.freeze, setup_training/load_model).
     # lite_subtensor: sync Subtensor for head-only reads (metagraph,
     # current block, peer connect, phase checks).
     # chain_submitter: owns an AsyncSubtensor + AsyncRunner; handles every
@@ -900,7 +895,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
     #   Pauses bg-download (HF bandwidth contention with the validator's own
     #   HF upload) and bg-eval (GPU contention with allreduce / optimizer step).
-    # eval_window_active: set after Merge(K) completes so the eval worker may
+    # eval_window_active: set when the round freezes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
     # download_window_closed: set when the main loop begins waiting for
@@ -909,11 +904,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     #   from MinerCommit1(K+1) → Submission(K+1).
     # gpu_eval_lock: held by the eval worker only across its load_state_dict
     #   and evaluate_one_miner calls (yielded everywhere else; see plan).
-    #
-    # Note: bg-download intentionally does NOT pause on the foreground eval
-    # pass. Foreground reads from `miner_submission_path`, which bg-download
-    # is responsible for filling, so they MUST run concurrently or foreground
-    # never finds anything to evaluate.
     merge_phase_active = threading.Event()
     eval_window_active = threading.Event()
     download_window_closed = threading.Event()
@@ -930,8 +920,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
-        # bg-eval idles until the main loop hands it a copy of
-        # global_model after foreground eval completes (see below).
+        # bg-eval idles until the main loop hands it a copy of global_model,
+        # which now happens as soon as the round freezes.
         eval_worker = BackgroundEvalWorker(
             config=config,
             round_ref=round_ref,
@@ -1210,11 +1200,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(lite_subtensor, phase_response)
 
-            # === Wait till Submission phase; freeze the round and start
-            # foreground evaluation of the top-N (step 2). The round is the
-            # unit of work for the rest of the lifecycle: download worker
-            # picks up its background_uids, eval worker waits for
-            # eval_window_active to open after Merge.
+            # === Wait till Submission phase and freeze the round. The round is
+            # the unit of work for the rest of the lifecycle: the download
+            # worker picks up its roster, the eval worker scores it.
             phase_response = wait_till(config, PhaseNames.submission)
 
             logger.info(
@@ -1260,10 +1248,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # chain-weight and staleness signals available.
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
 
-            # (0) Lock and prioritize: build the round roster (stalest miners
-            # first within both foreground and background — see Round.freeze),
-            # restricted to this validator's assignment, capture the seed, and
-            # snapshot global_model.state_dict() to CPU before Merge can mutate it.
+            # (0) Lock and prioritize: build the round roster in A -> B -> C
+            # order, then the previous round's A/B carry-over, then a
+            # staleness tail (see Round.freeze). Capture the seed and snapshot
+            # global_model to CPU.
             new_round = Round.freeze(
                 config=config,
                 subtensor=subtensor,
@@ -1311,27 +1299,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 for _uid in new_round.validation_group_c:
                     _group_code_by_uid[int(_uid)] = 3
 
-                _foreground_set = {int(u) for u in new_round.foreground_uids}
-                _background_set = {int(u) for u in new_round.background_uids}
+                _roster_set = {int(u) for u in new_round.background_uids}
 
-                # Tail = miners on this validator's roster (foreground or
-                # background) but outside the formal A/B/C tiers. Distinct
-                # from code 0 ("none"), which means the validator has no
-                # roster status for this miner at all. The dashboard uses
-                # this to render "evaluated opportunistically" instead of
-                # leaving these miners visually indistinguishable from
-                # unrostered ones.
-                for _uid in (_foreground_set | _background_set) - _group_code_by_uid.keys():
+                # Tail = miners on this validator's roster but outside the
+                # formal A/B/C tiers. Distinct from code 0 ("none"), which
+                # means no roster status at all. The dashboard uses this to
+                # render "evaluated opportunistically" instead of leaving
+                # these miners indistinguishable from unrostered ones.
+                for _uid in _roster_set - _group_code_by_uid.keys():
                     _group_code_by_uid[_uid] = 4
 
                 for _uid in range(len(metagraph.hotkeys)):
                     set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
-                    if _uid in _foreground_set:
-                        set_miner_assignment_role(_uid, 1)
-                    elif _uid in _background_set:
-                        set_miner_assignment_role(_uid, 2)
-                    else:
-                        set_miner_assignment_role(_uid, 0)
+                    # Role 1 (foreground) is retired; every rostered miner is 2.
+                    set_miner_assignment_role(_uid, 2 if _uid in _roster_set else 0)
 
                 # Last block at which we confirmed a miner's valid chain commit.
                 for _uid, _ckpt in new_round.uid_to_chain_checkpoint.items():
@@ -1383,6 +1364,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
+            # bg-eval needs an architecture template and an open window; per-round
+            # state comes from `round.model_snapshot_cpu`, taken at freeze. Mirrors
+            # the resume path. Opening here rather than after Merge gives the
+            # worker the whole round now that nothing else competes for the GPU.
+            if eval_worker is not None and not eval_worker.has_eval_base_model():
+                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+            eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 0
@@ -1396,80 +1384,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception:
                 pass
 
-            # (2) Foreground evaluation: top-N miners only, by incentive,
-            # bounded by per_miner_eval_timeout_sec; spillover lands in (3).
-            # bg-download runs concurrently here, filling
-            # `miner_submission_path` with foreground UIDs first so this loop
-            # has work to discover.
-            #
-            # Hard wall-clock backstop on top of the cooperative deadline
-            # checks inside evaluate_foreground_round: derive a budget
-            # from the validate phase's end_block. If the inner path
-            # overshoots, asyncio.wait_for cancels the in-flight eval
-            # and the rest of this round's pipeline runs without it.
-            foreground_timeout_sec = max(
-                0.0,
-                (phase_response.phase_end_block - lite_subtensor.block)
-                * BITTENSOR_BLOCK_TIME_SECONDS,
-            )
-
-            # Pre-allocated accumulator so partial scoring survives
-            # asyncio.wait_for cancellation. evaluate_foreground_round
-            # appends each MinerEvalJob to this list as it completes —
-            # if the wall-clock cap fires mid-round, anything already
-            # scored is still here for the merge step.
-            miner_jobs: list[MinerEvalJob] = []
-
-            async def _bounded_foreground_eval():
-                return await asyncio.wait_for(
-                    evaluate_foreground_round(
-                        config=config,
-                        round_obj=new_round,
-                        subtensor=subtensor,
-                        step=global_opt_step,
-                        device=device,
-                        base_model=global_model,
-                        tokenizer=tokenizer,
-                        end_block=phase_response.phase_end_block,
-                        expert_group_assignment=expert_manager.expert_group_assignment,
-                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                        completed_out=miner_jobs,
-                    ),
-                    timeout=foreground_timeout_sec,
-                )
-
-            # Use a private event loop instead of asyncio.run so a timed-out
-            # evaluate_one_miner cannot stall this thread on cleanup:
-            # asyncio.to_thread cancellation only detaches the awaiter; the
-            # underlying default-executor thread keeps running. asyncio.run
-            # would then block in shutdown_default_executor(wait=True) waiting
-            # on that orphan, freezing the main loop indefinitely (we hit
-            # exactly this — round 8081470 sat ~27 min after
-            # "foreground eval: complete"). loop.close() calls
-            # executor.shutdown(wait=False), so the orphan thread is left to
-            # die with the process and we proceed to the validate phase.
-            foreground_loop = asyncio.new_event_loop()
-            try:
-                foreground_loop.run_until_complete(_bounded_foreground_eval())
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Foreground evaluation exceeded validate phase deadline; "
-                    "cancelling and continuing with partial scores",
-                    round_id=new_round.round_id,
-                    timeout_sec=round(foreground_timeout_sec, 2),
-                    end_block=phase_response.phase_end_block,
-                    completed_count=len(miner_jobs),
-                )
-            finally:
-                foreground_loop.close()
-
-            # Hand bg-eval a copy of global_model the first time foreground
-            # eval finishes — Merge hasn't run yet, so global_model still
-            # matches new_round.model_snapshot_cpu. The worker uses this
-            # only as an architecture template; per-round state comes from
-            # round.model_snapshot_cpu.
-            if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 2
@@ -1479,23 +1393,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             phase_response = wait_till(config, PhaseNames.validate)
 
-            logger.info("(2) Foreground evaluation complete", evaluated=len(miner_jobs))
-            if len(miner_jobs) == 0:
-                logger.warning("No foreground miners evaluated", round_id=new_round.round_id)
-
             cleanup(global_model)
-
-            # Logging — show scores for foreground miners only; the (3)
-            # background scores accumulate after Merge.
-            submitted_uids = {job.uid for job in miner_jobs}
-            all_latest = score_aggregator.uid_score_pairs(how="latest")
-            round_scores = {uid: round(s, 4) for uid, s in all_latest.items() if uid in submitted_uids}
-            logger.info(
-                "Foreground evaluation results",
-                miners_evaluated=len(submitted_uids),
-                round_id=new_round.round_id,
-                scores=round_scores,
-            )
 
             # Persist aggregator state atomically.
             try:
@@ -1581,10 +1479,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             finally:
                 merge_phase_active.clear()
 
-            # (3) Open the eval window for the round we just merged. The eval
-            # worker uses round.model_snapshot_cpu (taken at freeze time) so
-            # the post-Merge mutation of global_model does not affect it.
-            eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 3
