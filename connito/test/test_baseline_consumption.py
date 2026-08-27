@@ -16,9 +16,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
-from connito.shared.helper import expert_group_shard_name
+from connito.shared.helper import (
+    expert_group_shard_name,
+    get_model_hash,
+    load_state_dict_from_path,
+)
 from connito.shared.model import _build_download_targets
 from connito.validator import distribute
 
@@ -153,19 +159,49 @@ def test_failed_publish_leaves_nothing_to_advertise(tmp_path, monkeypatch):
     assert out == {}
 
 
-def test_winner_without_a_chain_commit_is_not_advertised(tmp_path, stub_upload):
-    """No committed hash means nothing to verify against, so the upload may
-    still happen but must not be advertised."""
+def test_winner_without_a_chain_commit_is_advertised_with_a_recomputed_hash(tmp_path, stub_upload):
+    """A miner can be scored this round and still carry no valid chain commit —
+    observed live, with every uid flagged `invalid chain checkpoints` at freeze.
+    Relying on the miner's committed hash stranded the baseline permanently: we
+    paid for the upload and then advertised nothing.
+
+    We republish the bytes unchanged, so hashing what we uploaded is not just a
+    fallback, it is the more authoritative answer.
+    """
     sub = tmp_path / "miner_submission"
     sub.mkdir()
-    (sub / "uid_1_hotkey_hkB_block_550.safetensors").write_bytes(b"shard")
+    shard = sub / "uid_1_hotkey_hkB_block_550.safetensors"
+    save_file({"w": torch.zeros(4)}, str(shard))
 
     round_obj = _round_with_winner()
     round_obj.uid_to_chain_checkpoint = {}
 
     out: dict = {}
     distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out=out)
-    assert out == {}
+
+    assert out["revision"] == "abc123def456"
+    # Must match what a verifier computes, or every miner rejects the download.
+    assert out["model_hash"] == get_model_hash(load_state_dict_from_path(shard), hex=True)
+
+
+def test_publish_records_the_path_even_when_the_hash_is_unusable(tmp_path, stub_upload,
+                                                                 monkeypatch):
+    """`path` drives this validator's own model forward in the Merge window, so
+    it must not be coupled to advertisability. Losing the hash costs the
+    advertisement; it must not also freeze the local model."""
+    sub = tmp_path / "miner_submission"
+    sub.mkdir()
+    (sub / "uid_1_hotkey_hkB_block_550.safetensors").write_bytes(b"not-a-safetensors")
+
+    round_obj = _round_with_winner()
+    round_obj.uid_to_chain_checkpoint = {}   # forces the recompute, which will raise
+
+    out: dict = {}
+    distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out=out)
+
+    assert out["uid"] == 2
+    assert out["path"].endswith("uid_1_hotkey_hkB_block_550.safetensors")
+    assert "model_hash" not in out
 
 
 # --- a restart must not throw the merge away ---------------------------------

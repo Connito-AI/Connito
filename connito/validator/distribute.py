@@ -16,7 +16,11 @@ import time
 from pathlib import Path
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import find_submission_for_hotkey
+from connito.shared.helper import (
+    find_submission_for_hotkey,
+    get_model_hash,
+    load_state_dict_from_path,
+)
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
     upload_checkpoint_to_hf_subprocess,
@@ -28,9 +32,13 @@ logger = structlog.get_logger(__name__)
 def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> None:
     """Upload the round's best-averaged submission to HF as the next baseline.
 
-    On success `out` receives the coordinates the next ValidatorCommit
-    advertises. Never raises: a failed publish must not touch scoring, and the
-    caller runs this on a daemon thread where an exception would be invisible.
+    On success `out` receives `path` — the file the Merge window loads to
+    advance this validator's own model — plus the coordinates the next
+    ValidatorCommit advertises. `path` is written first and separately: the
+    local model must still advance in the rounds where we cannot advertise.
+
+    Never raises: a failed publish must not touch scoring, and the caller runs
+    this on a daemon thread where an exception would be invisible.
     """
     from connito.validator.round import select_baseline_uid
 
@@ -75,17 +83,28 @@ def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> Non
             )
         finally:
             shutil.rmtree(stage, ignore_errors=True)
-        # The winner's own committed hash: we republish its bytes unchanged, so
-        # it still describes the file. Miners verify the download against it,
-        # so it has to travel with the revision or they reject the fetch.
+        # Recorded before the hash so a hashing failure still leaves the local
+        # model able to advance — only the advertisement is lost.
+        if out is not None:
+            out.update(path=str(src), round_id=rid, uid=uid)
+        # Miners verify the download against `model_hash`, so it has to travel
+        # with the revision or they reject the fetch. Prefer the winner's own
+        # committed hash — we republish its bytes unchanged via hardlink, so it
+        # still describes the file and nothing is re-hashed. Fall back to
+        # hashing what we uploaded: a miner can be scored this round and still
+        # have no valid chain commit, which strands the baseline permanently.
         model_hash = getattr(round_obj.uid_to_chain_checkpoint.get(uid), "model_hash", None)
-        if out is not None and model_hash:
-            out.update(revision=revision, model_hash=model_hash, round_id=rid, uid=uid)
+        hash_source = "chain"
+        if not model_hash:
+            model_hash = get_model_hash(load_state_dict_from_path(src), hex=True)
+            hash_source = "recomputed"
+        if out is not None:
+            out.update(revision=revision, model_hash=model_hash)
         logger.info(
             "publish_baseline: published", round_id=rid, uid=uid, val_loss=val_loss,
             avg_score=round(avg.get(uid, 0.0), 4),
             repo_id=repo_id, revision=revision, size_bytes=size_bytes,
-            model_hash=model_hash[:6] if model_hash else None,
+            model_hash=model_hash[:6] if model_hash else None, hash_source=hash_source,
             elapsed_s=round(time.monotonic() - started, 1),
         )
     except Exception as e:
