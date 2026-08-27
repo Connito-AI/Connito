@@ -160,10 +160,13 @@ def test_failed_publish_leaves_nothing_to_advertise(tmp_path, monkeypatch):
 
 
 def test_winner_without_a_chain_commit_is_advertised_with_a_recomputed_hash(tmp_path, stub_upload):
-    """A miner can be scored this round and still carry no valid chain commit —
-    observed live, with every uid flagged `invalid chain checkpoints` at freeze.
-    Relying on the miner's committed hash stranded the baseline permanently: we
-    paid for the upload and then advertised nothing.
+    """The winner comes from `val_losses` (miners we evaluated) while the hash
+    comes from `uid_to_chain_checkpoint` (miners with a chain checkpoint at
+    freeze). Nothing reconciles those two sets, and a restart pulls them apart:
+    the round resumes from its journal with miners already scored, while the
+    checkpoint map is rebuilt from current chain state.
+
+    Observed live — uid 238 won its round, published, and advertised nothing.
 
     We republish the bytes unchanged, so hashing what we uploaded is not just a
     fallback, it is the more authoritative answer.
