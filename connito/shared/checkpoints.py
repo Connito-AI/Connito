@@ -480,6 +480,12 @@ class ChainCheckpoints(BaseModel):
         # their hashes differ and the max below resolves to the highest-stake
         # validator. Without it, miners take whichever entry happens to be
         # first and the subnet forks into incompatible models.
+        #
+        # Load-bearing, not an optimisation: this is the *only* thing keeping
+        # participants on one model now that the merge is gone. Validators used
+        # to converge by all-reducing with each other; they no longer talk at
+        # all, so agreement comes solely from everyone following the same
+        # highest-stake pick.
         hash_stake: dict[str, float] = {}
         for ckpt in filtered:
             if ckpt.model_hash:
