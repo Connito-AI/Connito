@@ -580,10 +580,8 @@ def setup_training(
     expert_manager = ExpertManager(config)
     # global_model: partial model (only assigned experts) — used for optimization and evaluation.
     # `load_global_checkpoint=True`: overlay the newest on-disk `globalver_*`
-    # expert state, which since the merge was removed holds the round
-    # baseline. That directory is now the *only* local copy of the model,
-    # so skipping it does not merely restart from a stale merge — it
-    # silently restarts the subnet's model from the pretrained backbone.
+    # expert state, which now holds the round baseline. That directory is the
+    # only local copy of the model, so skipping it restarts from pretrained.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
@@ -1506,15 +1504,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 logger.warning(f"Failed to persist score_aggregator: {e}")
 
             # === wait till merge phase ===
-            # Nothing is merged any more. The round's baseline — published at
-            # MinerCommit1, roughly four phases back — is this validator's next
-            # model, so the work here is a load rather than an all-reduce.
-            #
-            # The phase stays in the schedule regardless: it comes from the
-            # central phase API that miners read too, so its boundaries are not
-            # ours to move. Doing no work in it frees the window for the
-            # background eval and download workers, which were previously gated
-            # off for its full duration.
+            # Nothing is merged any more; the baseline published at
+            # MinerCommit1 is this validator's next model. The phase itself
+            # stays because the central phase API owns its boundaries and
+            # miners read the same schedule — we just do no work in it, which
+            # frees the window for the background workers.
             check_phase_expired(lite_subtensor, phase_response)
             phase_response = wait_till(config, PhaseNames.merge)
 
@@ -1522,9 +1516,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # `baseline_ref`, and it runs after this point.
             baseline_path = baseline_ref.get("path")
 
-            # Held across the load and the save only, not the whole phase —
-            # both mutate `global_model` and the checkpoint directory that the
-            # background workers read.
+            # Held across the load and save only, not the whole phase: both
+            # mutate state the background workers read.
             merge_phase_active.set()
             try:
                 if baseline_path:
@@ -1543,8 +1536,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     matched_keys = len(sd) - len(incompatible.unexpected_keys)
                     del sd
                     if matched_keys == 0:
-                        # `strict=False` means nothing was written, so the model
-                        # is intact — it simply did not advance this cycle.
                         logger.error(
                             "Round baseline shares no keys with the model; "
                             "model unchanged this cycle",

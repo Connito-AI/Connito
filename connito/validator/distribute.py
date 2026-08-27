@@ -87,12 +87,10 @@ def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> Non
         # model able to advance — only the advertisement is lost.
         if out is not None:
             out.update(path=str(src), round_id=rid, uid=uid)
-        # Miners verify the download against `model_hash`, so it has to travel
-        # with the revision or they reject the fetch. Prefer the winner's own
-        # committed hash — we republish its bytes unchanged via hardlink, so it
-        # still describes the file and nothing is re-hashed. Fall back to
-        # hashing what we uploaded: a miner can be scored this round and still
-        # have no valid chain commit, which strands the baseline permanently.
+        # Prefer the winner's committed hash — we republish its bytes unchanged
+        # via hardlink, so nothing needs re-hashing. Fall back to hashing what
+        # we uploaded: a miner can be scored and still have no chain commit,
+        # and without a hash miners reject the download.
         model_hash = getattr(round_obj.uid_to_chain_checkpoint.get(uid), "model_hash", None)
         hash_source = "chain"
         if not model_hash:
