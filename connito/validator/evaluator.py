@@ -4,7 +4,6 @@ import asyncio
 import copy
 import gc
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,12 +65,15 @@ def cleanup_non_top_submissions(
     """Delete miner submission files for UIDs that have been *processed*
     this round but are not in the top-`top_k` by *this round's* score.
 
-    Ranking uses `Round.top_scored_uids_this_round`, which reads only
-    `round.scores` (populated by `mark_scored`) — the global
-    `MinerScoreAggregator` is intentionally not consulted here, so a
-    miner's history from prior rounds cannot pull them into the keep
-    set this round and the cleanup decision is fully owned by the round
-    object.
+    Ranking unions two sets, both owned by the round object so this hot
+    path (it runs after every eval) never reads the global
+    `MinerScoreAggregator` under a foreign lock:
+
+      - `top_scored_uids_this_round` — top-`top_k` by *this round's*
+        score. Merge takes its top-1 from here, so it must survive.
+      - `baseline_winner_uid` — the miner `publish_round_baseline`
+        would pick if the round finalized now. Same call publish makes,
+        so the keep set and the selection can never disagree.
 
     A file is deleted iff its hotkey resolves to a UID that:
       - is in `round.failed_uids` (validation/timeout/exception, score=0
@@ -96,6 +98,9 @@ def cleanup_non_top_submissions(
         return []
 
     top_uids = round_obj.top_scored_uids_this_round(top_k)
+    baseline_uid = round_obj.baseline_winner_uid()
+    if baseline_uid is not None:
+        top_uids = top_uids | {baseline_uid}
     delete_uids = failed | (scored - top_uids)
     if not delete_uids:
         return []

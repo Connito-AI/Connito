@@ -29,6 +29,42 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def select_baseline_uid(
+    val_losses: dict[int, float],
+    prior_avg_scores: dict[int, float],
+    top_n: int = 3,
+) -> int | None:
+    """The UID the round's baseline is published from, or None if nothing was
+    scored.
+
+    Preferred: the best-ranked *proven* miner that submitted this round.
+    Proven means the top-`top_n` by track record, matching the count that
+    scores points each round (`_RANK_TO_SCORE`).
+
+    Fallback: if none of them submitted, this round's best submission by
+    val_loss. A miner whose single top-3 placing has nearly aged out should
+    not outrank a fresh measurement on the validator's own held-out data —
+    the baseline is a starting model, not a reward.
+
+    UID breaks a total tie so two validators never disagree.
+
+    Module-level because `cleanup_non_top_submissions` and
+    `publish_round_baseline` must rank identically — the file has to survive
+    until finalize, and only the scored miners are candidates.
+    """
+    if not val_losses:
+        return None
+    proven = {
+        uid for uid, _ in
+        sorted(prior_avg_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
+    }
+    submitted = {uid: loss for uid, loss in val_losses.items() if uid in proven}
+    if submitted:
+        return min(submitted, key=lambda uid: (-prior_avg_scores[uid], val_losses[uid], uid))
+    return min(val_losses, key=lambda uid: (val_losses[uid], uid))
+
+
+
 class RosterEntry(NamedTuple):
     """Lightweight (uid, hotkey) pair yielded by Round iteration helpers."""
     uid: int
@@ -58,7 +94,7 @@ class Round:
     uid_to_hotkey: dict[int, str]
     model_snapshot_cpu: dict[str, torch.Tensor]
     # On-chain Submission phase block range for this round. bg-download uses
-    # it to gate `_existing_submission` reuse — without this filter, a stale
+    # it to gate `find_submission_for_hotkey` reuse — without this filter, a stale
     # .pt left over from a previous cycle would short-circuit the fresh
     # fetch and get published into downloaded_pool, but `gather_validation_job`
     # would silently reject it because its block falls outside the window.
@@ -67,6 +103,12 @@ class Round:
     # path can run `validate(expert_group_assignment=...)` (signature, hash,
     # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
     uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = field(default_factory=dict)
+    # Per-uid average score over the aggregator's rolling window, snapshotted
+    # at freeze. Already fetched to order the eval queue; kept because it is
+    # the only stable ranking available all round — the live aggregator holds
+    # this round's *raw deltas* until finalize replaces them with rank scores,
+    # so a mid-round average mixes incompatible units.
+    prior_avg_scores: dict[int, float] = field(default_factory=dict)
 
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
@@ -552,6 +594,7 @@ class Round:
             model_snapshot_cpu=snapshot,
             submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
+            prior_avg_scores=dict(prior_scores),
             freeze_zero_uids=freeze_zero_uids,
             freeze_zero_hotkeys=freeze_zero_hotkeys,
             weight_group_1=new_weight_group_1,
@@ -747,6 +790,17 @@ class Round:
                 reverse=True,
             )
             return {uid for uid, _ in ranked[:top_k]}
+
+    def baseline_winner_uid(self) -> int | None:
+        """The UID `publish_round_baseline` would pick if the round finalized
+        now, so cleanup can retain its file. Delegates to
+        `select_baseline_uid` — the same call publish makes — because two
+        parallel rankings drift: ranking the whole roster here while publish
+        ranked only the scored miners retained a miner that was never
+        evaluated and pruned the one publish selected.
+        """
+        with self._lock:
+            return select_baseline_uid(self.val_losses, self.prior_avg_scores)
 
     def mark_failed(self, uid: int) -> None:
         """Mark a UID as failed for operational reasons (download timeout,
