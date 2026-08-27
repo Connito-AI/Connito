@@ -96,8 +96,8 @@ class BackgroundEvalWorker(threading.Thread):
         self.poll_interval_sec = poll_interval_sec
         self.stuck_lock_recycle_threshold = stuck_lock_recycle_threshold
         # Model is handed in by the main loop (see set_eval_base_model)
-        # right after foreground eval completes, instead of being
-        # re-fetched from chain at startup.
+        # at round freeze, instead of being re-fetched from chain at
+        # startup.
         self._eval_base_model: nn.Module | None = None
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
@@ -112,8 +112,8 @@ class BackgroundEvalWorker(threading.Thread):
         # `gpu_eval_lock` held at the top-of-loop assertion, reset to 0
         # on any successful (or even attempted) eval iteration. When the
         # streak crosses `stuck_lock_recycle_threshold`, we drop our
-        # `_eval_base_model` reference and re-park; the next foreground
-        # eval re-seeds us via `set_eval_base_model`.
+        # `_eval_base_model` reference and re-park; the next round
+        # freeze re-seeds us via `set_eval_base_model`.
         self._stuck_lock_streak: int = 0
 
     # ---------------- Public lifecycle ----------------
@@ -123,9 +123,8 @@ class BackgroundEvalWorker(threading.Thread):
     def set_eval_base_model(self, model: nn.Module) -> None:
         """Hand the worker a model to use as its eval base.
 
-        Called by the main loop after foreground eval completes, so the
-        worker doesn't need to re-fetch and re-construct the model from
-        chain. The state_dict is reloaded per round from
+        Called by the main loop at round freeze, so the worker doesn't need
+        to re-fetch and re-construct the model from chain. The state_dict is reloaded per round from
         `round.model_snapshot_cpu`, so what matters here is the model
         architecture, not its current weights.
         """
@@ -148,8 +147,8 @@ class BackgroundEvalWorker(threading.Thread):
     # ---------------- Internal ----------------
     async def _loop(self) -> None:
         # The eval_base_model is handed to us by the main loop via
-        # set_eval_base_model() after foreground eval completes. Until
-        # then we just gate-loop. This avoids duplicating chain fetches
+        # set_eval_base_model() at round freeze. Until then we just
+        # gate-loop. This avoids duplicating chain fetches
         # + MoE construction on a separate thread at startup.
         logger.info(
             "BackgroundEvalWorker: started",
@@ -167,7 +166,7 @@ class BackgroundEvalWorker(threading.Thread):
                 # lock is held at the iteration boundary by an orphan,
                 # increment the streak; if it persists past the
                 # threshold, drop our `_eval_base_model` and re-park —
-                # the next foreground eval will re-seed us via
+                # the next round freeze will re-seed us via
                 # `set_eval_base_model`. Without this, a single timeout
                 # whose GPU thread never returns wedges the worker for
                 # the rest of the process's life.
@@ -407,8 +406,7 @@ class BackgroundEvalWorker(threading.Thread):
 
         # Verify the on-disk submission against the chain commit (signed
         # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
-        # GPU eval. Off-spec submissions are dropped — same outcome as
-        # the foreground path.
+        # GPU eval. Off-spec submissions are dropped.
         from connito.shared.telemetry import inc_error
         from connito.validator.evaluator import validate_miner_submission
 
@@ -539,9 +537,8 @@ class BackgroundEvalWorker(threading.Thread):
         in-thread deadline hadn't yet fired. Increment the streak; once
         it crosses `stuck_lock_recycle_threshold` consecutive iterations
         we drop `_eval_base_model` and bump the recycle counter. The
-        main loop re-seeds us via `set_eval_base_model` after the next
-        foreground eval finishes, so we recover without a process
-        restart.
+        main loop re-seeds us via `set_eval_base_model` at the next round
+        freeze, so we recover without a process restart.
 
         Returns True iff we recycled — the caller should re-enter the
         outer gate loop instead of trying to claim work this tick.

@@ -892,9 +892,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
     # === Round-lifecycle scaffolding ===
-    # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
-    #   Pauses bg-download (HF bandwidth contention with the validator's own
-    #   HF upload) and bg-eval (GPU contention with allreduce / optimizer step).
+    # merge_phase_active: held across the baseline load and the checkpoint
+    #   save, not the whole Merge phase. Pauses both workers because those
+    #   two steps mutate state they read.
     # eval_window_active: set when the round freezes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.

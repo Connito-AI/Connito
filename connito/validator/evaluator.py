@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import gc
 import math
@@ -350,15 +349,12 @@ def finalize_round_scores(
                         getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
                     ),
                     # v3 round-level gauge inputs. A live Round exposes
-                    # foreground/background uids; the recovery stub carries
+                    # `background_uids`; the recovery stub carries
                     # `roster_size` forward from the journal it was hydrated
                     # from — so a re-finalize preserves them.
                     roster_size=int(
                         getattr(round_obj, "roster_size", 0)
-                        or (
-                            len(getattr(round_obj, "foreground_uids", ()))
-                            + len(getattr(round_obj, "background_uids", ()))
-                        )
+                        or len(getattr(round_obj, "background_uids", ()))
                     ),
                     lifecycle_step=int(getattr(round_obj, "lifecycle_step", 0)),
                     uid_to_val_loss=dict(getattr(round_obj, "val_losses", None) or {}),
@@ -557,33 +553,6 @@ def build_submission_uid_weights(
     )
 
 
-def _prune_non_top_after_eval(
-    *,
-    config,
-    round_obj,
-) -> None:
-    """Wrapper around `cleanup_non_top_submissions` that swallows errors
-    so a cleanup failure can never abort eval flow.
-    """
-    try:
-        deleted = cleanup_non_top_submissions(
-            round_obj=round_obj,
-            submission_dir=Path(config.ckpt.miner_submission_path),
-            top_k=int(config.evaluation.top_k_miners_to_reward),
-        )
-    except Exception as e:
-        logger.warning("foreground eval: post-eval cleanup failed", error=str(e))
-        return
-    if deleted:
-        logger.info(
-            "foreground eval: pruned non-top miner submissions",
-            round_id=round_obj.round_id,
-            deleted=len(deleted),
-            files=deleted,
-        )
-
-
-# -----------------------------------------------------------------------------
 def validate_miner_submission(
     *,
     round_obj,  # connito.validator.round.Round
@@ -752,8 +721,8 @@ def _evaluate_on_fresh_loader_sync(
     skips `get_dataloader` entirely. This keeps HF streaming off the
     per-miner critical path — the trigger for the bg-eval lock-leak
     wedge observed in production logs. Falls back to a fresh streaming
-    dataloader when the cache is absent (foreground eval, first miner
-    of a fresh worker, etc.).
+    dataloader when the cache is absent (first miner of a fresh worker,
+    etc.).
     """
     if cached_batches is not None:
         dataloader = cached_batches
@@ -919,61 +888,3 @@ def evaluate_one_miner_sync(
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
         _record_eval_failure(int(uid), "unknown")
         return None
-
-
-async def evaluate_one_miner(
-    *,
-    config,
-    model_path: str | Path,
-    uid: int,
-    hotkey: str,
-    base_model: nn.Module,
-    tokenizer,
-    combined_seed: str,
-    device: torch.device,
-    baseline_loss: float,
-    step: int,
-    round_id: int | None = None,
-    max_eval_batches: int = EVAL_MAX_BATCHES,
-    rank: int | None = None,
-) -> "MinerEvalJob | None":
-    """Evaluate a single miner and return the per-round delta-based score.
-
-    Shared between foreground (`evaluate_foreground_round`) and the
-    `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
-    is responsible for not mutating it across calls so successive miners
-    see an identical baseline.
-
-    The returned `MinerEvalJob.score` is the raw `(baseline_loss - val_loss)
-    ** 1.2` signal; the caller stores it in `round.scores` via
-    `mark_scored`. The actual reward score sent to the chain is rank-based
-    and written by `finalize_round_scores` at end of round — this function
-    does not touch the global `MinerScoreAggregator`.
-
-    Returns a `MinerEvalJob` on success (so the caller can later use
-    `model_path` for gradient aggregation), or None on failure.
-
-    Implementation: thin wrapper that runs `evaluate_one_miner_sync`
-    inside a single `asyncio.to_thread` task. See that function's
-    docstring for why the whole eval is funnelled through one thread.
-    Foreground eval uses this wrapper; bg-eval calls the sync version
-    directly so it can acquire `gpu_eval_lock` *inside* the threadpool
-    task.
-    """
-    return await asyncio.to_thread(
-        evaluate_one_miner_sync,
-        config=config,
-        model_path=model_path,
-        uid=uid,
-        hotkey=hotkey,
-        base_model=base_model,
-        tokenizer=tokenizer,
-        combined_seed=combined_seed,
-        device=device,
-        baseline_loss=baseline_loss,
-        step=step,
-        round_id=round_id,
-        max_eval_batches=max_eval_batches,
-        rank=rank,
-    )
-

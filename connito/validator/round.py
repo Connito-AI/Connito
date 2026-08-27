@@ -318,8 +318,7 @@ class Round:
             key=lambda uid: (last_eval_map.get(uid, EPOCH), random.random()),
         )
 
-        # The assignment slice leads the roster — there is no separate
-        # foreground pass holding it back any more.
+        # The assignment slice leads the roster; nothing holds it back.
         background_uids = tuple([
             *assigned,
             *score_prepend_uids,
@@ -421,7 +420,7 @@ class Round:
                 else:
                     # Validator seeds for the seeded
                     # `assign_miners_to_validators` partitions used to
-                    # construct Group C and Foreground.
+                    # construct Group C.
                     validator_seeds = get_validator_seed_from_commit(config, commits)
                     new_cohort_state = round_groups.maybe_advance_cohort(
                         cycle_index=int(effective_cycle_index),

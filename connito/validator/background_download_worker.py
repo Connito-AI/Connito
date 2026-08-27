@@ -2,18 +2,17 @@
 background, in incentive order, into the round's `downloaded_pool`.
 
 This worker is network-only — disk writes + HF reads — so it does not
-contend with foreground evaluation (which only reads from disk and runs
-on GPU). It is paused while:
-  - the main loop is in the Merge phase (`merge_phase_active` set), so
-    HF upload + allreduce can hold the available bandwidth, or
+contend with the eval worker, which reads from disk and runs on GPU. It
+is paused while:
+  - the main loop holds `merge_phase_active`, across the baseline load
+    and the checkpoint save, or
   - the download window has closed (`download_window_closed` set), which
     the main loop sets when it begins waiting for MinerCommit1 of the
     next round and clears at the next freeze.
 
-It does not gate on the foreground pass: foreground reads from
-`miner_submission_path`, which this worker is responsible for filling,
-so the two MUST run concurrently or foreground would never discover any
-miner to evaluate.
+It must run concurrently with the eval worker, which reads from
+`miner_submission_path` — the directory this worker is responsible for
+filling.
 """
 
 from __future__ import annotations
@@ -210,10 +209,9 @@ class BackgroundDownloadWorker(threading.Thread):
 
     async def _download_one(self, round_obj, *, uid: int, hotkey: str) -> None:
         timeout = float(self.config.evaluation.per_miner_download_timeout_sec)
-        # We walk foreground_uids first then background_uids; the single
-        # download thread plus next_for_download's claimed/scored/failed
-        # filters keep us from racing with foreground eval. publish_download
-        # is a no-op if the UID has already been scored.
+        # The single download thread plus next_for_download's
+        # claimed/scored/failed filters keep us from racing the eval
+        # worker. publish_download is a no-op if the UID is already scored.
         try:
             ckpt = round_obj.uid_to_chain_checkpoint.get(uid)
             if ckpt is None or not (ckpt.hf_repo_id and ckpt.hf_revision):

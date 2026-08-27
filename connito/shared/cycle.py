@@ -15,8 +15,8 @@ class ValidatorMinerAssignment(NamedTuple):
     Attributes:
         assignment: validator_hotkey -> assigned miner hotkeys, post
             incentive truncation and seeded distribution. This is the
-            "official" assignment used for foreground evaluation and the
-            penalty pass.
+            "official" assignment used for the penalty pass and for
+            ordering the head of the evaluation roster.
         miners_with_checkpoint: every miner that has a chain checkpoint
             this cycle (in the configured expert group), *before* the
             `foreground_top_n * num_validators` incentive truncation.
@@ -187,8 +187,8 @@ def _synth_phase_response_for_test(
     current_block = last_phase_response.block if last_phase_response is not None else 0
     period_attr = _PHASE_PERIOD_ATTR.get(phase_name, "commit_period")
     period = int(getattr(config.cycle, period_attr, 0))
-    # In test mode, give Submission a fixed 30-block window so foreground
-    # evaluation has room to land miners regardless of the prod cycle config.
+    # In test mode, give Submission a fixed window so evaluation has room
+    # to land miners regardless of the prod cycle config.
     if phase_name == PhaseNames.submission:
         period = 60
     return PhaseResponse(
@@ -665,7 +665,7 @@ def get_validator_miner_assignment(
 
     # Snapshot the full incentive-ordered checkpoint set before truncation —
     # callers that want subnet-wide coverage (e.g. bg-download/eval) need
-    # this; foreground assignment still uses the truncated slice.
+    # this; the assignment slice still uses the truncated list.
     all_miners_with_checkpoint = list(miners)
 
     cap = config.evaluation.foreground_top_n * max(len(validator_seeds), 1)
