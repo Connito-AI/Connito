@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import gc
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import bittensor
 import torch
 import torch.nn as nn
 
@@ -23,9 +20,7 @@ from connito.shared.helper import (
 from connito.shared.telemetry import (
     EvalFailureReason,
     VALIDATOR_MINER_VAL_LOSS,
-    inc_error,
     inc_eval_failure,
-    set_baseline_loss,
     set_miner_eval_status,
     track_eval_latency,
     track_model_load_latency,
@@ -66,12 +61,15 @@ def cleanup_non_top_submissions(
     """Delete miner submission files for UIDs that have been *processed*
     this round but are not in the top-`top_k` by *this round's* score.
 
-    Ranking uses `Round.top_scored_uids_this_round`, which reads only
-    `round.scores` (populated by `mark_scored`) — the global
-    `MinerScoreAggregator` is intentionally not consulted here, so a
-    miner's history from prior rounds cannot pull them into the keep
-    set this round and the cleanup decision is fully owned by the round
-    object.
+    Ranking unions two sets, both owned by the round object so this hot
+    path (it runs after every eval) never reads the global
+    `MinerScoreAggregator` under a foreign lock:
+
+      - `top_scored_uids_this_round` — top-`top_k` by *this round's*
+        score. Merge takes its top-1 from here, so it must survive.
+      - `baseline_winner_uid` — the miner `publish_round_baseline`
+        would pick if the round finalized now. Same call publish makes,
+        so the keep set and the selection can never disagree.
 
     A file is deleted iff its hotkey resolves to a UID that:
       - is in `round.failed_uids` (validation/timeout/exception, score=0
@@ -96,6 +94,9 @@ def cleanup_non_top_submissions(
         return []
 
     top_uids = round_obj.top_scored_uids_this_round(top_k)
+    baseline_uid = round_obj.baseline_winner_uid()
+    if baseline_uid is not None:
+        top_uids = top_uids | {baseline_uid}
     delete_uids = failed | (scored - top_uids)
     if not delete_uids:
         return []
@@ -348,15 +349,12 @@ def finalize_round_scores(
                         getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
                     ),
                     # v3 round-level gauge inputs. A live Round exposes
-                    # foreground/background uids; the recovery stub carries
+                    # `background_uids`; the recovery stub carries
                     # `roster_size` forward from the journal it was hydrated
                     # from — so a re-finalize preserves them.
                     roster_size=int(
                         getattr(round_obj, "roster_size", 0)
-                        or (
-                            len(getattr(round_obj, "foreground_uids", ()))
-                            + len(getattr(round_obj, "background_uids", ()))
-                        )
+                        or len(getattr(round_obj, "background_uids", ()))
                     ),
                     lifecycle_step=int(getattr(round_obj, "lifecycle_step", 0)),
                     uid_to_val_loss=dict(getattr(round_obj, "val_losses", None) or {}),
@@ -555,33 +553,6 @@ def build_submission_uid_weights(
     )
 
 
-def _prune_non_top_after_eval(
-    *,
-    config,
-    round_obj,
-) -> None:
-    """Wrapper around `cleanup_non_top_submissions` that swallows errors
-    so a cleanup failure can never abort eval flow.
-    """
-    try:
-        deleted = cleanup_non_top_submissions(
-            round_obj=round_obj,
-            submission_dir=Path(config.ckpt.miner_submission_path),
-            top_k=int(config.evaluation.top_k_miners_to_reward),
-        )
-    except Exception as e:
-        logger.warning("foreground eval: post-eval cleanup failed", error=str(e))
-        return
-    if deleted:
-        logger.info(
-            "foreground eval: pruned non-top miner submissions",
-            round_id=round_obj.round_id,
-            deleted=len(deleted),
-            files=deleted,
-        )
-
-
-# -----------------------------------------------------------------------------
 def validate_miner_submission(
     *,
     round_obj,  # connito.validator.round.Round
@@ -750,8 +721,8 @@ def _evaluate_on_fresh_loader_sync(
     skips `get_dataloader` entirely. This keeps HF streaming off the
     per-miner critical path — the trigger for the bg-eval lock-leak
     wedge observed in production logs. Falls back to a fresh streaming
-    dataloader when the cache is absent (foreground eval, first miner
-    of a fresh worker, etc.).
+    dataloader when the cache is absent (first miner of a fresh worker,
+    etc.).
     """
     if cached_batches is not None:
         dataloader = cached_batches
@@ -917,324 +888,3 @@ def evaluate_one_miner_sync(
         logger.exception("evaluate_one_miner: failed", uid=int(uid), error=str(e))
         _record_eval_failure(int(uid), "unknown")
         return None
-
-
-async def evaluate_one_miner(
-    *,
-    config,
-    model_path: str | Path,
-    uid: int,
-    hotkey: str,
-    base_model: nn.Module,
-    tokenizer,
-    combined_seed: str,
-    device: torch.device,
-    baseline_loss: float,
-    step: int,
-    round_id: int | None = None,
-    max_eval_batches: int = EVAL_MAX_BATCHES,
-    rank: int | None = None,
-) -> "MinerEvalJob | None":
-    """Evaluate a single miner and return the per-round delta-based score.
-
-    Shared between foreground (`evaluate_foreground_round`) and the
-    `BackgroundEvalWorker`. `base_model` is treated as read-only — caller
-    is responsible for not mutating it across calls so successive miners
-    see an identical baseline.
-
-    The returned `MinerEvalJob.score` is the raw `(baseline_loss - val_loss)
-    ** 1.2` signal; the caller stores it in `round.scores` via
-    `mark_scored`. The actual reward score sent to the chain is rank-based
-    and written by `finalize_round_scores` at end of round — this function
-    does not touch the global `MinerScoreAggregator`.
-
-    Returns a `MinerEvalJob` on success (so the caller can later use
-    `model_path` for gradient aggregation), or None on failure.
-
-    Implementation: thin wrapper that runs `evaluate_one_miner_sync`
-    inside a single `asyncio.to_thread` task. See that function's
-    docstring for why the whole eval is funnelled through one thread.
-    Foreground eval uses this wrapper; bg-eval calls the sync version
-    directly so it can acquire `gpu_eval_lock` *inside* the threadpool
-    task.
-    """
-    return await asyncio.to_thread(
-        evaluate_one_miner_sync,
-        config=config,
-        model_path=model_path,
-        uid=uid,
-        hotkey=hotkey,
-        base_model=base_model,
-        tokenizer=tokenizer,
-        combined_seed=combined_seed,
-        device=device,
-        baseline_loss=baseline_loss,
-        step=step,
-        round_id=round_id,
-        max_eval_batches=max_eval_batches,
-        rank=rank,
-    )
-
-
-async def evaluate_foreground_round(
-    *,
-    config,
-    round_obj,  # connito.validator.round.Round
-    subtensor: bittensor.Subtensor,
-    step: int,
-    device: torch.device,
-    base_model: nn.Module,
-    tokenizer,
-    end_block: int,
-    expert_group_assignment,
-    poll_interval_sec: float = 6.0,
-    per_miner_eval_timeout_sec: float | None = None,
-    completed_out: list[MinerEvalJob] | None = None,
-) -> list[MinerEvalJob]:
-    """Foreground (step 2): evaluate the round's top-N miners during
-    Submission + Validate.
-
-    Walks `round_obj.foreground_uids` only and calls `evaluate_one_miner`
-    for each. Miner checkpoints are made available locally by the
-    `BackgroundDownloadWorker` (HF); this function does not pull from HF
-    itself. UIDs that exceed the per-miner budget or fail to land by
-    `end_block` are left unclaimed so the `BackgroundEvalWorker` can pick
-    them up in step 3.
-
-    If `completed_out` is provided, finished `MinerEvalJob`s are appended
-    to that list as they complete (in addition to being returned at the
-    end). Callers wrap this coroutine with `asyncio.wait_for` to enforce
-    a wall-clock cap; on cancellation the local return value is lost,
-    but `completed_out` retains every miner that finished scoring before
-    the deadline. `list.append` is atomic, so there is no partial-append
-    race during cancellation.
-    """
-    # Lazy imports — connito.shared.cycle imports this module, so a top-
-    # level import would create a cycle.
-    from connito.shared.cycle import BITTENSOR_BLOCK_TIME_SECONDS, gather_validation_job
-
-    # Baseline once against the round's input model (= live `base_model`,
-    # which equals round.model_snapshot_cpu since the foreground runs
-    # before Merge(K)). `_evaluate_on_fresh_loader_sync` is sync (per
-    # e692cc7, which moved the GPU work off the event loop); wrap it in
-    # `asyncio.to_thread` so this `async def evaluate_foreground_round`
-    # doesn't block the event loop during the baseline pass.
-    baseline_metrics = await asyncio.to_thread(
-        _evaluate_on_fresh_loader_sync,
-        config=config,
-        tokenizer=tokenizer,
-        combinded_seed=round_obj.seed,
-        step=step,
-        model=base_model,
-        device=device,
-        max_eval_batches=EVAL_MAX_BATCHES,
-    )
-    baseline_loss = float(baseline_metrics.get("val_loss", 100))
-    del baseline_metrics
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Publish to Prometheus so external aggregators can derive
-    # `delta_loss = max(0, baseline - val_loss)` per miner. Best-effort
-    # — Prometheus exposition is purely an observability side-effect
-    # and must never block scoring.
-    # Publishes both the unlabeled gauge (backward compat) and the per-round
-    # labeled family so the gateway can attribute this baseline to the exact
-    # round; the labeled series is evicted on the same cutoff as the other
-    # per-round families. Best-effort — never blocks scoring.
-    set_baseline_loss(round_obj.round_id, baseline_loss)
-
-    foreground_set = set(round_obj.foreground_uids)
-    completed: list[MinerEvalJob] = completed_out if completed_out is not None else []
-
-    logger.info(
-        "foreground eval: starting",
-        round_id=round_obj.round_id,
-        foreground_uids=list(round_obj.foreground_uids),
-        end_block=end_block,
-        current_block=subtensor.block,
-        baseline_loss=round(baseline_loss, 4),
-        per_miner_eval_timeout_sec=per_miner_eval_timeout_sec,
-    )
-
-    poll_idx = 0
-    while subtensor.block <= end_block:
-        try:
-            discovered = gather_validation_job(
-                config,
-                subtensor,
-                step=step,
-                validator_miner_assignment=round_obj.validator_miner_assignment,
-            )
-        except Exception as e:
-            logger.warning("foreground eval: gather_validation_job failed", error=str(e))
-            discovered = []
-
-        # Walk foreground UIDs in incentive order; pick up any whose
-        # checkpoint has landed and is not yet claimed/scored.
-        by_uid: dict[int, MinerEvalJob] = {j.uid: j for j in discovered if j.uid in foreground_set}
-        scored_count = sum(1 for u in foreground_set if u in round_obj.scored_uids)
-        current_block = subtensor.block
-        logger.info(
-            "foreground eval: poll",
-            round_id=round_obj.round_id,
-            poll_idx=poll_idx,
-            current_block=current_block,
-            blocks_remaining=max(0, end_block - current_block),
-            discovered_total=len(discovered),
-            discovered_in_foreground=len(by_uid),
-            ready_uids=sorted(by_uid.keys()),
-            scored=scored_count,
-            foreground_total=len(foreground_set),
-        )
-        poll_idx += 1
-        progressed = False
-        phase_deadline_crossed = False
-        for uid in round_obj.foreground_uids:
-            if uid not in by_uid:
-                continue
-            # Hard-stop before claiming if Validate has ended. Without
-            # this, the inner for-loop walks every foreground UID before
-            # the outer `subtensor.block > end_block` check fires, so a
-            # 5-miner round can spill ~5 × per_miner_eval_timeout_sec
-            # past end_block.
-            block_now = subtensor.block
-            if block_now > end_block:
-                phase_deadline_crossed = True
-                break
-            if not round_obj.claim_for_foreground(uid):
-                continue
-            job = by_uid[uid]
-            hotkey = round_obj.uid_to_hotkey[uid]
-            progressed = True
-
-            # Verify the on-disk submission against the chain commit (signed
-            # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
-            # GPU eval. A failure here means the submission is off-spec —
-            # mark the miner failed so the missed-submission penalty pass
-            # zeroes their score for the round.
-            fail_reason = await asyncio.to_thread(
-                validate_miner_submission,
-                round_obj=round_obj,
-                uid=uid,
-                model_path=job.model_path,
-                expert_group_assignment=expert_group_assignment,
-            )
-            if fail_reason is not None:
-                # Invalid checkpoint (no chain commit / signature / hash /
-                # expert_group / NaN-Inf): mark validation-failed so
-                # `finalize_round_scores` records score=0 at end of round.
-                # Operational failures below (timeout / OOM / unexpected
-                # exception) use plain `mark_failed`, which leaves the
-                # miner's prior EMA untouched — those failures are not
-                # the miner's fault.
-                logger.warning(
-                    "foreground eval: submission failed validation — will record score=0 at finalize",
-                    uid=uid, hotkey=hotkey[:6],
-                    round_id=round_obj.round_id,
-                    reason=fail_reason,
-                )
-                inc_error(component="foreground_eval", kind="validation")
-                _record_eval_failure(int(uid), _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
-                round_obj.mark_validation_failed(uid)
-                round_obj.publish_progress()
-                _prune_non_top_after_eval(
-                    config=config,
-                    round_obj=round_obj,
-                )
-                continue
-
-            # Cap the per-miner eval at min(configured_timeout, time_to_end_block)
-            # so a long-running eval can't itself overrun the phase boundary.
-            sec_to_end_block = max(0.0, (end_block - block_now) * BITTENSOR_BLOCK_TIME_SECONDS)
-            effective_timeout: float | None = sec_to_end_block
-            if per_miner_eval_timeout_sec is not None:
-                effective_timeout = min(per_miner_eval_timeout_sec, sec_to_end_block)
-            if effective_timeout <= 0:
-                round_obj.release_claim(uid)
-                phase_deadline_crossed = True
-                break
-
-            eval_coro = evaluate_one_miner(
-                config=config,
-                model_path=job.model_path,
-                uid=uid,
-                hotkey=hotkey,
-                base_model=base_model,
-                tokenizer=tokenizer,
-                combined_seed=round_obj.seed,
-                device=device,
-                baseline_loss=baseline_loss,
-                step=step,
-                round_id=round_obj.round_id,
-            )
-            try:
-                evaluated = await asyncio.wait_for(eval_coro, timeout=effective_timeout)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "foreground eval: per-miner timeout — marking failed",
-                    uid=uid, hotkey=hotkey[:6],
-                    timeout_sec=round(effective_timeout, 2),
-                )
-                _record_eval_failure(int(uid), "timeout")
-                round_obj.mark_failed(uid)
-                round_obj.publish_progress()
-                _prune_non_top_after_eval(
-                    config=config,
-                    round_obj=round_obj,
-                )
-                continue
-            except Exception as e:
-                logger.exception("foreground eval: unexpected failure", uid=uid, error=str(e))
-                _record_eval_failure(int(uid), "unknown")
-                round_obj.mark_failed(uid)
-                round_obj.publish_progress()
-                _prune_non_top_after_eval(
-                    config=config,
-                    round_obj=round_obj,
-                )
-                continue
-
-            if evaluated is None:
-                round_obj.mark_failed(uid)
-                round_obj.publish_progress()
-                _prune_non_top_after_eval(
-                    config=config,
-                    round_obj=round_obj,
-                )
-                continue
-            round_obj.mark_scored(uid, evaluated.score, val_loss=evaluated.val_loss)
-            round_obj.publish_progress()
-            completed.append(evaluated)
-            _prune_non_top_after_eval(
-                config=config,
-                round_obj=round_obj,
-            )
-
-        # Stop once every top-N UID is scored or the phase boundary hits.
-        scored_top_n = sum(1 for u in foreground_set if u in round_obj.scored_uids)
-        if scored_top_n >= len(foreground_set):
-            break
-
-        if phase_deadline_crossed or subtensor.block > end_block:
-            logger.info(
-                "foreground eval: validate phase ended — stopping",
-                round_id=round_obj.round_id,
-                end_block=end_block,
-                current_block=subtensor.block,
-                scored=scored_top_n,
-                foreground_total=len(foreground_set),
-            )
-            break
-        if not progressed:
-            await asyncio.sleep(poll_interval_sec)
-
-    logger.info(
-        "foreground eval: complete",
-        round_id=round_obj.round_id,
-        top_n=len(foreground_set),
-        scored=len(completed),
-        spilled=len(foreground_set) - len(completed),
-    )
-    return completed

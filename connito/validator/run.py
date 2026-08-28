@@ -1,4 +1,3 @@
-import asyncio
 import copy
 import gc
 import math
@@ -7,11 +6,6 @@ import secrets
 import signal
 import threading
 import time
-from concurrent.futures import (
-    Future,
-    ThreadPoolExecutor,
-    TimeoutError as FuturesTimeoutError,
-)
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -67,7 +61,6 @@ def _get_build_version() -> tuple[str, str]:
 import bittensor
 import torch
 import torch.nn as nn
-from hivemind.averaging import DecentralizedAverager
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
@@ -96,12 +89,9 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.hf_distribute import (
-    get_hf_upload_readiness,
     resolve_hf_repo_ids,
-    upload_checkpoint_to_hf_subprocess,
 )
 from connito.shared.cycle import (
-    BITTENSOR_BLOCK_TIME_SECONDS,
     check_phase_expired,
     get_blocks_from_previous_phase_from_api,
     get_phase_from_api,
@@ -111,11 +101,10 @@ from connito.shared.dataloader import get_dataloader
 from connito.shared.expert_manager import (
     ExpertManager,
     get_weight_sum,
-    populate_global_grads_from_local,
 )
-from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
+from connito.shared.helper import get_nested_attr, load_state_dict_from_path
 from connito.shared.metrics import MetricLogger
-from connito.shared.model import load_model, reload_model_inplace
+from connito.shared.model import load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.shared.modeling.quantization import apply_from_config
 from connito.sn_owner.cycle import PhaseNames, PhaseManager
@@ -125,9 +114,7 @@ from connito.validator.background_download_worker import BackgroundDownloadWorke
 from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter, observer_mode_enabled
 from connito.validator.evaluator import (
-    MinerEvalJob,
     build_submission_uid_weights,
-    evaluate_foreground_round,
     finalize_round_scores,
     load_model_from_path,
 )
@@ -170,13 +157,6 @@ def validate_hf_distribution_config(config: ValidatorConfig) -> tuple[str | None
     return hf_upload_repo_id, hf_chain_repo_id
 
 
-from connito.validator.inter_validator_connection import (
-    build_averagers_from_buff,
-    build_grad_buff_from_model,
-    connect_with_peers,
-    pack_grads,
-    unpack_to_grads,
-)
 from connito.shared.telemetry import (
     TelemetryManager,
     VALIDATOR_AVG_STEP_STATUS,
@@ -579,8 +559,6 @@ def setup_training(
     current_model_meta: ModelCheckpoint | None,
 ) -> tuple[
     torch.nn.Module,  # global_model
-    torch.optim.Optimizer,  # outer_optimizer
-    torch.amp.GradScaler,  # outer_scaler
     int,  # start_step
     "ExpertManager",  # em
     StatefulDataLoader,
@@ -597,32 +575,16 @@ def setup_training(
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
     # global_model: partial model (only assigned experts) — used for optimization and evaluation.
-    # `load_global_checkpoint=False`: the validator boots from the pretrained
-    # backbone + experts (`get_base_model`) without overlaying any on-disk
-    # expert state. Peer-resync via `reload_model_inplace` still pulls the
-    # current pool state in the round loop; the optimizer/scaler/dataloader
-    # resume below is also independent of this flag.
+    # `load_global_checkpoint=True`: overlay the newest on-disk `globalver_*`
+    # expert state, which now holds the round baseline. That directory is the
+    # only local copy of the model, so skipping it restarts from pretrained.
     global_model, model_meta = load_model(
         rank, config, expert_manager, subtensor, wallet, current_model_meta,
         partial=True, checkpoint_device=device,
-        load_global_checkpoint=False,
+        load_global_checkpoint=True,
     )
     apply_from_config(global_model, config, expert_manager, role="validator")
 
-    # === optimizers ===
-    logger.debug("setup training - load optimizer")
-    outer_optimizer = torch.optim.SGD(
-        [p for p in global_model.parameters() if p.requires_grad],
-        lr=config.opt.outer_lr,
-        momentum=config.opt.outer_momentum,
-        nesterov=True,
-    )
-
-    # === scaler ===
-    logger.debug("setup training - load scaler")
-    outer_scaler = torch.amp.GradScaler(
-        "cuda", enabled=(get_nested_attr(config, "model.precision", "") == "fp16-mixed")
-    )
 
     # === dataloader ===
     logger.debug("setup training - load dataloader")
@@ -633,13 +595,11 @@ def setup_training(
     # === load checkpoint (if any) ===
     logger.debug(
         "setup training - load past checkpoint"
-    )  # outer_optimizer is static, so dont really need to load checkpoint
+    )
     if get_nested_attr(config, "resume_from_ckpt", False) and resume and latest_checkpoint_path:
         _ = load_checkpoint(
             config=config,
             checkpoint_path=latest_checkpoint_path,
-            outer_optimizer=outer_optimizer,
-            outer_scaler=outer_scaler,
             rank=rank,
             device=device,
             data_loader=train_dataloader,
@@ -648,298 +608,14 @@ def setup_training(
     logger.info(
         "Training setup complete",
         resumed=resume,
-        outer_lr=config.opt.outer_lr,
         device=str(device),
     )
     return (
         global_model,
-        outer_optimizer,
-        outer_scaler,
         model_meta.global_ver if model_meta else 0,
         expert_manager,
         train_dataloader,
     )
-
-
-def _release_global_model_grads(model: nn.Module) -> None:
-    # populate_global_grads_from_local writes .grad on every param it iterates,
-    # not just those in outer_optimizer.param_groups, so optimizer.zero_grad()
-    # alone leaks the .grad storage for params with requires_grad=False. That
-    # residue is what was driving the VRAM baseline from 18 GB to 36 GB across
-    # rounds on the 48 GB validator.
-    for p in model.parameters():
-        p.grad = None
-
-
-async def aggregate_miner_gradient_change(
-    config: ValidatorConfig,
-    global_model: nn.Module,
-    device: torch.device,
-    rank: int,
-    outer_optimizer: torch.optim.Optimizer,
-    miner_jobs: list[MinerEvalJob],
-) -> list[str]:
-    # global_model is expected to already live on `device` (GPU).
-    # `MinerEvalJob.score` is the per-round delta-based signal
-    # (`(baseline_loss - val_loss) ** 1.2`) returned by `evaluate_one_miner`.
-    # The aggregator is no longer fed during eval — `finalize_round_scores`
-    # writes rank-based scores to it at end of round — so merge ranking
-    # reads `job.score` directly. Drop zero-score miners first (a single
-    # bad eval excludes them regardless of history), then keep the top
-    # `top_k_miners_to_merge` by this-round score.
-    scored_jobs = [job for job in miner_jobs if job.score > 0]
-    skipped_zero_uids = [job.uid for job in miner_jobs if job not in scored_jobs]
-    if skipped_zero_uids:
-        logger.info("Excluding zero-score miners from merge", uids=skipped_zero_uids)
-
-    scored_jobs.sort(key=lambda j: (-j.score, j.uid))
-    top_jobs = scored_jobs[: int(config.evaluation.top_k_miners_to_merge)]
-    weight = 1 / max(1, len(top_jobs))
-    merged_uids: list[str] = []
-
-    # Stream one miner at a time: load → aggregate into global_model → release.
-    # Keeping all top-k miner models resident on CPU simultaneously was the
-    # single largest transient RAM spike in the cycle.
-    for job in top_jobs:
-        # The file at job.model_path can disappear between foreground eval
-        # and merge — bg-eval / foreground's post-eval cleanup keeps only
-        # the top miners' submissions on disk. Treat a load failure as
-        # "skip this miner" instead of letting it kill the whole merge.
-        try:
-            miner_model = await asyncio.to_thread(
-                load_model_from_path, job.model_path, global_model, device
-            )
-        except (FileNotFoundError, OSError, ValueError) as e:
-            logger.warning(
-                "Skipping miner in merge — checkpoint file unavailable",
-                uid=job.uid,
-                model_path=str(job.model_path),
-                error=str(e),
-            )
-            continue
-        try:
-            pre_grad_sum = sum_model_gradients(global_model)
-            populate_global_grads_from_local(global_model, miner_model, weight=weight)
-            post_grad_sum = sum_model_gradients(global_model)
-            # Check element-wise for inf/nan rather than testing the sum,
-            # because abs().sum() in bf16 can overflow to inf even when
-            # individual gradient elements are merely large but finite.
-            grad_has_nonfinite = any(
-                torch.any(torch.isinf(p.grad) | torch.isnan(p.grad)).item()
-                for p in global_model.parameters()
-                if p.grad is not None
-            )
-            if grad_has_nonfinite:
-                logger.warning(
-                    "Non-finite gradient elements after merging miner — zeroing all gradients and skipping miner",
-                    uid=job.uid,
-                    pre_grad_sum=pre_grad_sum,
-                    post_grad_sum=post_grad_sum,
-                )
-                # Zero out all accumulated .grad tensors so the poisoned
-                # gradient does not propagate to the allreduce or optimizer.
-                for p in global_model.parameters():
-                    if p.grad is not None:
-                        p.grad.zero_()
-            else:
-                logger.info(
-                    "Miner gradient aggregated",
-                    uid=job.uid,
-                    pre_grad_sum=round(pre_grad_sum, 6),
-                    post_grad_sum=round(post_grad_sum, 6),
-                    grad_delta=round(post_grad_sum - pre_grad_sum, 6),
-                )
-                merged_uids.append(str(job.uid))
-        except torch.cuda.OutOfMemoryError:
-            # populate_global_grads_from_local can OOM mid-iteration through
-            # parameters, leaving a partially-applied gradient. Drop the
-            # whole grad state so the caller's grad_is_valid check fails
-            # cleanly and the round is skipped without killing the process.
-            logger.error(
-                "aggregate_miner_gradient_change: CUDA OOM during populate — "
-                "discarding partial gradient and skipping merge this round",
-                uid=job.uid,
-            )
-            _release_global_model_grads(global_model)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            # finally still runs and releases miner_model.
-            oom_abort = True
-        else:
-            oom_abort = False
-        finally:
-            del miner_model
-            gc.collect()
-            release_cpu_ram()
-
-        if oom_abort:
-            return []
-
-    return merged_uids
-
-def sync_grad_across_validators(
-    config: ValidatorConfig,
-    group_averagers: dict[str | int, DecentralizedAverager],
-    group_grad_buff_meta: dict[str | int, Any],
-    model,
-    deadline_monotonic: float | None = None,
-):
-    for group_id, avg in group_averagers.items():
-        # avg.total_size is the number of tensor *elements* in the grad buffer,
-        # not the peer count. Skip only if the buffer is empty (should never happen).
-        if avg.total_size <= 0:
-            logger.debug("Skipping averager — grad buffer is empty", group=group_id, mode=avg.mode)
-            continue
-
-        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-            logger.warning(
-                "Skipping averager — merge phase deadline exhausted",
-                group=group_id,
-                mode=avg.mode,
-            )
-            continue
-
-        pack_grads(group_grad_buff_meta[group_id], model)
-
-        grad_sum = sum_model_gradients(model)
-
-        group_bits = avg.get_group_bits()
-
-        logger.info(
-            "Starting gradient sync across validators",
-            group=group_id,
-            mode=avg.mode,
-            matchmaking_key=f"{avg.prefix}/{group_bits}",
-            grad_buffer_elements=avg.total_size,
-        )
-        logger.debug(
-            "Averager details",
-            group=group_id,
-            target_group_size=getattr(avg, "target_group_size", None),
-            min_group_size=getattr(avg, "min_group_size", None),
-            client_mode=getattr(avg, "client_mode", None),
-        )
-
-        avg_step = None
-        for attempt in range(1, config.run.averager_step_max_retries + 1):
-            step_timeout = config.run.averager_step_timeout_sec
-            if deadline_monotonic is not None:
-                remaining = deadline_monotonic - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        "Aborting averager retries — merge phase deadline exhausted",
-                        group=group_id,
-                        attempt=attempt,
-                    )
-                    break
-                # Reserve ~2s of slack: hivemind's `timeout=` governs
-                # matchmaking and is a soft hint — the allreduce that
-                # follows can run a bit past it before unwinding. Floor
-                # at 0.5s so a near-exhausted deadline still produces a
-                # syntactically valid call rather than zero.
-                step_timeout = min(step_timeout, max(remaining - 2.0, 0.5))
-            try:
-                # allow_retries=False so hivemind's internal retry doesn't
-                # stack extra wall time inside one .step() call — our outer
-                # retry loop is the single source of retry budget, which
-                # makes the total time bounded and observable.
-                avg_step = avg.step(
-                    gather={"grad_sum": grad_sum, "hotkey": config.chain.hotkey_ss58},
-                    timeout=step_timeout,
-                    allow_retries=False,
-                    wait=True,
-                    # scheduled_time=scheduled_time.timestamp()
-                )
-                gathered = {}
-                if hasattr(avg_step, "items"):
-                    gathered = {
-                        str(peer): {
-                            "hotkey": vals.get("hotkey") if isinstance(vals, dict) else None,
-                            "grad_sum": vals.get("grad_sum") if isinstance(vals, dict) else vals,
-                        }
-                        for peer, vals in avg_step.items()
-                    }
-                logger.info(
-                    "Averager step succeeded",
-                    group=group_id,
-                    our_hotkey=config.chain.hotkey_ss58[-6:],
-                    our_grad_sum=round(grad_sum, 6),
-                    peers=gathered,
-                    group_size=len(gathered),
-                )
-                VALIDATOR_AVG_STEP_STATUS.labels(status="success").inc()
-                break
-            except TimeoutError as e:
-                logger.warning(f"Averager - Timeout during avg.step (attempt {attempt}/{config.run.averager_step_max_retries}): {e}")
-                VALIDATOR_AVG_STEP_STATUS.labels(status="timeout").inc()
-            except Exception as e:
-                logger.warning(f"Averager - Unexpected error during avg.step (attempt {attempt}/{config.run.averager_step_max_retries}): {e}")
-                VALIDATOR_AVG_STEP_STATUS.labels(status="error").inc()
-                break
-
-            # Defensive: if avg.step ran past its (soft) timeout, the
-            # next attempt's top-of-loop check would catch the exhausted
-            # deadline — but make it explicit here so the retry path
-            # can't accidentally stack another full-budget step on top.
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                logger.warning(
-                    "Aborting averager retries — deadline crossed during step",
-                    group=group_id,
-                    attempt=attempt,
-                )
-                break
-
-        unpack_to_grads(group_grad_buff_meta[group_id], model)
-
-        after_sum = sum_model_gradients(model)
-        logger.info(
-            "Gradient sync complete" if avg_step else "Gradient sync failed — no group found",
-            group=group_id,
-            mode=avg.mode,
-            before_grad_sum=round(grad_sum, 6),
-            after_grad_sum=round(after_sum, 6),
-        )
-
-    return
-
-
-def run_global_optimization(
-    global_model: nn.Module,
-    device: torch.device,
-    rank: int,
-    outer_optimizer: torch.optim.Optimizer,
-    miner_jobs: list[MinerEvalJob],
-):
-    # global_model and outer_optimizer state are expected to already live on `device` (GPU).
-    old_shared_name, old_shared_sum = get_weight_sum(global_model, shared=True)
-    old_expert_name, old_expert_sum = get_weight_sum(global_model, shared=False)
-
-    logger.debug("start syncing shared weights")
-
-    outer_optimizer.step()
-    outer_optimizer.zero_grad(set_to_none=True)
-    # Also release .grad on params not registered with the outer optimizer
-    # (requires_grad=False expert params get .grad populated by
-    # populate_global_grads_from_local). Without this, the storage pins
-    # ~model-size of VRAM across rounds.
-    _release_global_model_grads(global_model)
-
-    new_shared_name, new_shared_sum = get_weight_sum(global_model, shared=True)
-    new_expert_name, new_expert_sum = get_weight_sum(global_model, shared=False)
-
-    shared_delta = round(float(new_shared_sum - old_shared_sum), 6)
-    expert_delta = round(float(new_expert_sum - old_expert_sum), 6)
-    
-    logger.info(
-        "Outer optimizer step complete",
-        shared_param=old_shared_name,
-        shared_delta=shared_delta,
-        expert_param=old_expert_name,
-        expert_delta=expert_delta,
-    )
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = "") -> None:
@@ -975,8 +651,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # === set up chain worker ===
     # subtensor: archive connection — required by callers that issue
-    # historical block queries (Round.freeze, setup_training/load_model,
-    # reload_model_inplace, evaluate_foreground_round).
+    # historical block queries (Round.freeze, setup_training/load_model).
     # lite_subtensor: sync Subtensor for head-only reads (metagraph,
     # current block, peer connect, phase checks).
     # chain_submitter: owns an AsyncSubtensor + AsyncRunner; handles every
@@ -1012,18 +687,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # === set up training ===
     (
         global_model,
-        outer_optimizer,
-        outer_scaler,
         start_step,
         expert_manager,
         train_dataloader,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
     global_opt_step = start_step
-    # Tracks whether this validator participated in the last allreduce.
-    # If False at the start of the next cycle, pull the updated model from a
-    # peer validator before continuing.
-    _participated_in_merge = True
+    # Coordinates of the baseline published at finalize, read by the next
+    # ValidatorCommit. Empty means "nothing to advertise this cycle".
+    baseline_ref: dict[str, object] = {}
 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
@@ -1159,36 +831,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             "Startup recovery: scan failed", error=str(e),
         )
 
-    # === set up averager ===
-    group_grad_buff_meta = build_grad_buff_from_model(
-        model=global_model, expert_group_assignment=expert_manager.expert_group_assignment
-    )
-    # Only keep this validator's expert group and shared; drop other groups
-    active_group_id = config.task.exp.group_id
-    excluded = [gid for gid in group_grad_buff_meta if gid != active_group_id and gid != "shared"]
-    for gid in excluded:
-        logger.info("Disabling averager for non-active expert group", excluded_group_id=gid, active_group_id=active_group_id)
-        del group_grad_buff_meta[gid]
-
-    if observer_mode_enabled():
-        # Staying out of the DHT entirely is the point: `HotkeyAuthorizer`
-        # admits any hotkey on the whitelist, so an observer sharing a live
-        # validator's hotkey would be accepted into the same
-        # `expert_averaging-group{id}` prefix and its gradients would be
-        # averaged into the fleet's global model. Handing hivemind a throwaway
-        # wallet does not work either — peers reject the unwhitelisted signer,
-        # DHT bootstrap exhausts its retries and raises, and this call sits
-        # outside the run loop's `try`, so the process dies at startup.
-        #
-        # `sync_grad_across_validators` iterates `group_averagers`, so an empty
-        # dict makes the merge phase a clean no-op.
-        logger.warning("OBSERVER MODE — not joining the DHT; no all-reduce")
-        group_averagers = {}
-    else:
-        dht = connect_with_peers(config, wallet, lite_subtensor)
-
-        group_averagers = build_averagers_from_buff(group_buff_metas=group_grad_buff_meta, dht=dht)
-
     # Resolve this validator's UID so the poller can emit vtrust / consensus
     # for our own slot. Failing this lookup keeps the metagraph block of the
     # poller inert (validator_uid=None) rather than crashing startup.
@@ -1224,7 +866,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     poller = SystemStatePoller(
         subtensor=lite_subtensor,
         phase_manager=PhaseManager(config, lite_subtensor),
-        group_averagers=group_averagers,
         netuid=config.chain.netuid,
         validator_uid=validator_uid,
         interval_sec=12.0,
@@ -1245,18 +886,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     training_time = 0
     total_training_time = 0
 
-    outer_optimizer.zero_grad()
-
     current_model_hash = None
 
     if config.ckpt.cleanup_stale_temporary_checkpoints:
         cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
 
     # === Round-lifecycle scaffolding ===
-    # merge_phase_active: set for the entire Merge phase plus briefly around HF upload.
-    #   Pauses bg-download (HF bandwidth contention with the validator's own
-    #   HF upload) and bg-eval (GPU contention with allreduce / optimizer step).
-    # eval_window_active: set after Merge(K) completes so the eval worker may
+    # merge_phase_active: held across the baseline load and the checkpoint
+    #   save, not the whole Merge phase. Pauses both workers because those
+    #   two steps mutate state they read.
+    # eval_window_active: set when the round freezes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
     # download_window_closed: set when the main loop begins waiting for
@@ -1265,11 +904,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     #   from MinerCommit1(K+1) → Submission(K+1).
     # gpu_eval_lock: held by the eval worker only across its load_state_dict
     #   and evaluate_one_miner calls (yielded everywhere else; see plan).
-    #
-    # Note: bg-download intentionally does NOT pause on the foreground eval
-    # pass. Foreground reads from `miner_submission_path`, which bg-download
-    # is responsible for filling, so they MUST run concurrently or foreground
-    # never finds anything to evaluate.
     merge_phase_active = threading.Event()
     eval_window_active = threading.Event()
     download_window_closed = threading.Event()
@@ -1286,8 +920,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
-        # bg-eval idles until the main loop hands it a copy of
-        # global_model after foreground eval completes (see below).
+        # bg-eval idles until the main loop hands it a copy of global_model,
+        # which now happens as soon as the round freezes.
         eval_worker = BackgroundEvalWorker(
             config=config,
             round_ref=round_ref,
@@ -1337,18 +971,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     logger.info("ChainSubmitter ready")
 
-    # Hard wall-clock cap for sync_grad_across_validators. Python threads
-    # can't be cancelled, so on timeout we abandon the worker and skip the
-    # rest of this round's merge — the orphan keeps running until avg.step
-    # unwinds (cooperative deadline checks inside the function should make
-    # that quick). The next merge cycle refuses to start a fresh sync
-    # while a previous orphan is still alive, so the orphan can't race
-    # outer_optimizer.step or the next round's pack_grads for model.grad.
-    sync_grad_executor = ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="connito-sync-grad",
-    )
-    last_sync_grad_future: Future | None = None
-    last_sync_grad_started_at: float | None = None
 
     try:
         while True:
@@ -1389,6 +1011,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     score_aggregator=score_aggregator,
                     score_path=score_path,
                 )
+                # Off the main loop: a ~3 GB upload must not sit between here
+                # and MinerCommit1. Daemon so it can never hold up shutdown.
+                from connito.validator.distribute import publish_round_baseline
+
+                threading.Thread(
+                    target=publish_round_baseline,
+                    kwargs={"round_obj": pending_round, "config": config, "out": baseline_ref},
+                    name="publish-baseline", daemon=True,
+                ).start()
                 # Drop history older than 8 cycle lengths so the aggregator
                 # only carries the recent window the cohort election + weight
                 # avg actually look at.
@@ -1569,11 +1200,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(lite_subtensor, phase_response)
 
-            # === Wait till Submission phase; freeze the round and start
-            # foreground evaluation of the top-N (step 2). The round is the
-            # unit of work for the rest of the lifecycle: download worker
-            # picks up its background_uids, eval worker waits for
-            # eval_window_active to open after Merge.
+            # === Wait till Submission phase and freeze the round. The round is
+            # the unit of work for the rest of the lifecycle: the download
+            # worker picks up its roster, the eval worker scores it.
             phase_response = wait_till(config, PhaseNames.submission)
 
             logger.info(
@@ -1619,10 +1248,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # chain-weight and staleness signals available.
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
 
-            # (0) Lock and prioritize: build the round roster (stalest miners
-            # first within both foreground and background — see Round.freeze),
-            # restricted to this validator's assignment, capture the seed, and
-            # snapshot global_model.state_dict() to CPU before Merge can mutate it.
+            # (0) Lock and prioritize: build the round roster in A -> B -> C
+            # order, then the previous round's A/B carry-over, then a
+            # staleness tail (see Round.freeze). Capture the seed and snapshot
+            # global_model to CPU.
             new_round = Round.freeze(
                 config=config,
                 subtensor=subtensor,
@@ -1670,27 +1299,20 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 for _uid in new_round.validation_group_c:
                     _group_code_by_uid[int(_uid)] = 3
 
-                _foreground_set = {int(u) for u in new_round.foreground_uids}
-                _background_set = {int(u) for u in new_round.background_uids}
+                _roster_set = {int(u) for u in new_round.background_uids}
 
-                # Tail = miners on this validator's roster (foreground or
-                # background) but outside the formal A/B/C tiers. Distinct
-                # from code 0 ("none"), which means the validator has no
-                # roster status for this miner at all. The dashboard uses
-                # this to render "evaluated opportunistically" instead of
-                # leaving these miners visually indistinguishable from
-                # unrostered ones.
-                for _uid in (_foreground_set | _background_set) - _group_code_by_uid.keys():
+                # Tail = miners on this validator's roster but outside the
+                # formal A/B/C tiers. Distinct from code 0 ("none"), which
+                # means no roster status at all. The dashboard uses this to
+                # render "evaluated opportunistically" instead of leaving
+                # these miners indistinguishable from unrostered ones.
+                for _uid in _roster_set - _group_code_by_uid.keys():
                     _group_code_by_uid[_uid] = 4
 
                 for _uid in range(len(metagraph.hotkeys)):
                     set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
-                    if _uid in _foreground_set:
-                        set_miner_assignment_role(_uid, 1)
-                    elif _uid in _background_set:
-                        set_miner_assignment_role(_uid, 2)
-                    else:
-                        set_miner_assignment_role(_uid, 0)
+                    # Role 1 (foreground) is retired; every rostered miner is 2.
+                    set_miner_assignment_role(_uid, 2 if _uid in _roster_set else 0)
 
                 # Last block at which we confirmed a miner's valid chain commit.
                 for _uid, _ckpt in new_round.uid_to_chain_checkpoint.items():
@@ -1720,7 +1342,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # block falls outside this round's window. The end-of-cycle
             # prune is normally enough, but a validator restart that
             # crashed mid-cycle (or any path that skips that prune) leaves
-            # stale .pt files behind — bg-download's _existing_submission
+            # stale .pt files behind — bg-download's find_submission_for_hotkey
             # would then short-circuit the fresh fetch and publish the
             # stale path, which gather_validation_job silently rejects.
             try:
@@ -1742,6 +1364,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
+            # bg-eval needs an architecture template and an open window; per-round
+            # state comes from `round.model_snapshot_cpu`, taken at freeze. Mirrors
+            # the resume path. Opening here rather than after Merge gives the
+            # worker the whole round now that nothing else competes for the GPU.
+            if eval_worker is not None and not eval_worker.has_eval_base_model():
+                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+            eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 0
@@ -1755,80 +1384,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception:
                 pass
 
-            # (2) Foreground evaluation: top-N miners only, by incentive,
-            # bounded by per_miner_eval_timeout_sec; spillover lands in (3).
-            # bg-download runs concurrently here, filling
-            # `miner_submission_path` with foreground UIDs first so this loop
-            # has work to discover.
-            #
-            # Hard wall-clock backstop on top of the cooperative deadline
-            # checks inside evaluate_foreground_round: derive a budget
-            # from the validate phase's end_block. If the inner path
-            # overshoots, asyncio.wait_for cancels the in-flight eval
-            # and the rest of this round's pipeline runs without it.
-            foreground_timeout_sec = max(
-                0.0,
-                (phase_response.phase_end_block - lite_subtensor.block)
-                * BITTENSOR_BLOCK_TIME_SECONDS,
-            )
-
-            # Pre-allocated accumulator so partial scoring survives
-            # asyncio.wait_for cancellation. evaluate_foreground_round
-            # appends each MinerEvalJob to this list as it completes —
-            # if the wall-clock cap fires mid-round, anything already
-            # scored is still here for the merge step.
-            miner_jobs: list[MinerEvalJob] = []
-
-            async def _bounded_foreground_eval():
-                return await asyncio.wait_for(
-                    evaluate_foreground_round(
-                        config=config,
-                        round_obj=new_round,
-                        subtensor=subtensor,
-                        step=global_opt_step,
-                        device=device,
-                        base_model=global_model,
-                        tokenizer=tokenizer,
-                        end_block=phase_response.phase_end_block,
-                        expert_group_assignment=expert_manager.expert_group_assignment,
-                        per_miner_eval_timeout_sec=float(config.evaluation.per_miner_eval_timeout_sec),
-                        completed_out=miner_jobs,
-                    ),
-                    timeout=foreground_timeout_sec,
-                )
-
-            # Use a private event loop instead of asyncio.run so a timed-out
-            # evaluate_one_miner cannot stall this thread on cleanup:
-            # asyncio.to_thread cancellation only detaches the awaiter; the
-            # underlying default-executor thread keeps running. asyncio.run
-            # would then block in shutdown_default_executor(wait=True) waiting
-            # on that orphan, freezing the main loop indefinitely (we hit
-            # exactly this — round 8081470 sat ~27 min after
-            # "foreground eval: complete"). loop.close() calls
-            # executor.shutdown(wait=False), so the orphan thread is left to
-            # die with the process and we proceed to the validate phase.
-            foreground_loop = asyncio.new_event_loop()
-            try:
-                foreground_loop.run_until_complete(_bounded_foreground_eval())
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Foreground evaluation exceeded validate phase deadline; "
-                    "cancelling and continuing with partial scores",
-                    round_id=new_round.round_id,
-                    timeout_sec=round(foreground_timeout_sec, 2),
-                    end_block=phase_response.phase_end_block,
-                    completed_count=len(miner_jobs),
-                )
-            finally:
-                foreground_loop.close()
-
-            # Hand bg-eval a copy of global_model the first time foreground
-            # eval finishes — Merge hasn't run yet, so global_model still
-            # matches new_round.model_snapshot_cpu. The worker uses this
-            # only as an architecture template; per-round state comes from
-            # round.model_snapshot_cpu.
-            if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 2
@@ -1838,23 +1393,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             phase_response = wait_till(config, PhaseNames.validate)
 
-            logger.info("(2) Foreground evaluation complete", evaluated=len(miner_jobs))
-            if len(miner_jobs) == 0:
-                logger.warning("No foreground miners evaluated", round_id=new_round.round_id)
-
             cleanup(global_model)
-
-            # Logging — show scores for foreground miners only; the (3)
-            # background scores accumulate after Merge.
-            submitted_uids = {job.uid for job in miner_jobs}
-            all_latest = score_aggregator.uid_score_pairs(how="latest")
-            round_scores = {uid: round(s, 4) for uid, s in all_latest.items() if uid in submitted_uids}
-            logger.info(
-                "Foreground evaluation results",
-                miners_evaluated=len(submitted_uids),
-                round_id=new_round.round_id,
-                scores=round_scores,
-            )
 
             # Persist aggregator state atomically.
             try:
@@ -1862,164 +1401,60 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             except Exception as e:
                 logger.warning(f"Failed to persist score_aggregator: {e}")
 
-            # === aggragate miner gradient change locally ===
-            # Use global_model (partial) as template for loading miner checkpoints (also partial)
-            logger.info("Aggregating miner gradient change locally")
-            try:
-                merged_uids = asyncio.run(
-                    aggregate_miner_gradient_change(
-                        config=config,
-                        global_model=global_model,
-                        device=device,  # gradient aggregation runs on GPU
-                        rank=rank,
-                        outer_optimizer=outer_optimizer,
-                        miner_jobs=miner_jobs,
-                    )
-                )
-            except torch.cuda.OutOfMemoryError:
-                # Inner per-miner OOM is already handled by
-                # aggregate_miner_gradient_change. This outer guard catches
-                # OOM in surrounding bookkeeping (model load, sum reduction)
-                # so a single bad round can't kill the validator process.
-                logger.error(
-                    "aggregate_miner_gradient_change: CUDA OOM at call site — "
-                    "skipping merge/optimizer this round"
-                )
-                _release_global_model_grads(global_model)
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                merged_uids = []
-
-            grad_sum_after_aggregation = sum_model_gradients(global_model)
-            # Use element-wise check: the sum can overflow bf16 to inf even
-            # when no individual element is actually non-finite.
-            grad_has_nonfinite_elements = any(
-                torch.any(torch.isinf(p.grad) | torch.isnan(p.grad)).item()
-                for p in global_model.parameters()
-                if p.grad is not None
-            )
-            grad_is_valid = bool(merged_uids) and not grad_has_nonfinite_elements
-
-            logger.info(
-                "Aggregated miner gradients locally",
-                merged_uids=merged_uids,
-                grad_sum=round(grad_sum_after_aggregation, 6) if math.isfinite(grad_sum_after_aggregation) else str(grad_sum_after_aggregation),
-                grad_is_valid=grad_is_valid,
-                # Parameters, not `state_dict()`: the latter emits every fp8 weight
-                # dequantized to fp32 and the serializer then buffers it twice more,
-                # ~43 GB transient for six hex characters. `.detach()` because the
-                # serializer calls `.numpy()`, which rejects requires_grad tensors.
-                model_hash=get_model_hash({k: v.detach() for k, v in global_model.named_parameters()}, hex=True)[:6],
-            )
-
-            if not grad_is_valid:
-                logger.warning(
-                    "Invalid gradient state after local aggregation — "
-                    "skipping allreduce and optimizer this cycle; "
-                    "will pull updated model from peer at start of next cycle",
-                    merged_uids=merged_uids,
-                    grad_sum=grad_sum_after_aggregation,
-                )
-                outer_optimizer.zero_grad(set_to_none=True)
-                _release_global_model_grads(global_model)
-
-            cleanup(global_model)
-
+            # === wait till merge phase ===
+            # Nothing is merged any more; the baseline published at
+            # MinerCommit1 is this validator's next model. The phase itself
+            # stays because the central phase API owns its boundaries and
+            # miners read the same schedule — we just do no work in it, which
+            # frees the window for the background workers.
             check_phase_expired(lite_subtensor, phase_response)
-
-            # === wait till merging phase and aggregate miner gradient change ===
             phase_response = wait_till(config, PhaseNames.merge)
 
-            # Bound the merge work to the on-chain Merge window: convert the
-            # remaining blocks to a wall-clock deadline so sync_grad can clamp
-            # its timeouts and bail rather than spilling into ValidatorCommit1.
-            merge_deadline_monotonic = time.monotonic() + max(
-                0, phase_response.blocks_remaining_in_phase
-            ) * BITTENSOR_BLOCK_TIME_SECONDS
+            # Still populated: the ValidatorCommit block below is what clears
+            # `baseline_ref`, and it runs after this point.
+            baseline_path = baseline_ref.get("path")
 
-            # Suspend both background workers for the entire Merge window —
-            # they share GPU and DHT resources with sync_grad_across_validators
-            # and run_global_optimization.
+            # Held across the load and save only, not the whole phase: both
+            # mutate state the background workers read.
             merge_phase_active.set()
             try:
-                if grad_is_valid:
-                    logger.info("Syncing gradient across validators")
-
-                    # Refuse to start a fresh sync while a previous one is
-                    # still alive — its thread may still be inside
-                    # unpack_to_grads writing model.grad. Letting a new
-                    # pack_grads run alongside would corrupt both.
-                    if (
-                        last_sync_grad_future is not None
-                        and not last_sync_grad_future.done()
-                    ):
-                        orphan_age = (
-                            round(time.monotonic() - last_sync_grad_started_at, 2)
-                            if last_sync_grad_started_at is not None
-                            else None
-                        )
-                        logger.warning(
-                            "Previous sync_grad_across_validators thread is still alive; "
-                            "skipping this round's gradient sync to avoid concurrent "
-                            "mutation of model.grad",
-                            previous_age_sec=orphan_age,
-                        )
-                        sync_grad_completed = False
-                    else:
-                        last_sync_grad_future = None
-                        last_sync_grad_started_at = time.monotonic()
-                        remaining = max(0.0, merge_deadline_monotonic - time.monotonic())
-                        future = sync_grad_executor.submit(
-                            sync_grad_across_validators,
-                            config=config,
-                            group_averagers=group_averagers,
-                            group_grad_buff_meta=group_grad_buff_meta,
-                            model=global_model,
-                            deadline_monotonic=merge_deadline_monotonic,
-                        )
-                        try:
-                            future.result(timeout=remaining)
-                            sync_grad_completed = True
-                        except FuturesTimeoutError:
-                            logger.warning(
-                                "sync_grad_across_validators exceeded merge deadline; "
-                                "abandoning thread and skipping outer optimizer step",
-                                timeout_sec=round(remaining, 2),
-                            )
-                            last_sync_grad_future = future
-                            sync_grad_completed = False
-
-                    if sync_grad_completed:
-                        # === global optimizer ===
-                        logger.info("Running global model optimization step")
-
-                        run_global_optimization(
-                            global_model=global_model,
-                            device=device,
-                            rank=rank,
-                            outer_optimizer=outer_optimizer,
-                            miner_jobs=miner_jobs,
-                        )
-
-                        logger.info("Optimization step complete")
-                        _participated_in_merge = True
-                    else:
-                        # Sync was orphaned or skipped: don't run the outer
-                        # optimizer (model.grad may be in an indeterminate
-                        # state) and trigger the peer-resync path next
-                        # cycle via _participated_in_merge=False. Release
-                        # the aggregated-but-unused grads so they don't
-                        # accumulate into the next round's populate, and
-                        # so the storage isn't pinned through to next cycle.
-                        _release_global_model_grads(global_model)
-                        _participated_in_merge = False
-                else:
+                if baseline_path:
                     logger.info(
-                        "Skipping gradient sync and optimizer — "
-                        "no valid gradient contribution this cycle"
+                        "Adopting round baseline as the new model",
+                        round_id=baseline_ref.get("round_id"),
+                        uid=baseline_ref.get("uid"),
                     )
-                    _participated_in_merge = False
+                    # Same primitives as `evaluator.load_model_from_path`, but
+                    # applied in place — a deepcopy here would double model
+                    # VRAM for nothing. `strict=False` because the file carries
+                    # only the active expert group; backbone and helper-group
+                    # keys are legitimately absent and keep their values.
+                    try:
+                        sd = load_state_dict_from_path(baseline_path)
+                        incompatible = global_model.load_state_dict(sd, strict=False)
+                        matched_keys = len(sd) - len(incompatible.unexpected_keys)
+                        del sd
+                        if matched_keys == 0:
+                            logger.error(
+                                "Round baseline shares no keys with the model; "
+                                "model unchanged this cycle",
+                                path=baseline_path,
+                            )
+                        else:
+                            logger.info("Round baseline adopted", matched_keys=matched_keys)
+                    except Exception as e:
+                        # On the main loop, so an unhandled error here exits the
+                        # process mid-cycle. Losing one cycle's advance is
+                        # strictly better; the publish side is guarded the same
+                        # way for the same reason.
+                        logger.error(
+                            "Failed to load round baseline; keeping the current model",
+                            path=baseline_path, error=str(e), exc_info=True,
+                        )
+                else:
+                    logger.warning(
+                        "No baseline published this round; keeping the current model"
+                    )
 
                 cleanup(global_model)
 
@@ -2042,9 +1477,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 save_checkpoint(
                     checkpoint_path=ckpt_path,
                     model=global_model,
-                    outer_optimizer=outer_optimizer,
                     loss=loss_batch.item(),
-                    outer_scaler=outer_scaler,
                     data_loader=train_dataloader,
                     save_global_state=rank == 0,
                     rank=rank,
@@ -2056,10 +1489,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             finally:
                 merge_phase_active.clear()
 
-            # (3) Open the eval window for the round we just merged. The eval
-            # worker uses round.model_snapshot_cpu (taken at freeze time) so
-            # the post-Merge mutation of global_model does not affect it.
-            eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
                 new_round.lifecycle_step = 3
@@ -2095,85 +1524,54 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     VALIDATOR_GLOBAL_OPT_STEP.set(float(model_ckpt.global_ver))
                 except Exception:
                     pass
+                # Advertise the baseline published at finalize, not the merged
+                # model. `publish_round_baseline` uploaded it ~142 blocks ago,
+                # so it is normally done by now; if it is not (still uploading,
+                # or lost to a restart) commit no HF coordinates and miners keep
+                # what they have — `fetch_model_from_chain_validator` skips a
+                # checkpoint with no repo/revision.
+                _, hf_chain_repo_id = resolve_hf_repo_ids(
+                    config.hf,
+                    max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+                )
+                baseline = dict(baseline_ref)
+                baseline_ref.clear()
+                hf_revision = baseline.get("revision")
+                if hf_revision and baseline.get("model_hash"):
+                    # The hash MUST travel with the revision: miners verify the
+                    # downloaded bytes against `model_hash`, so advertising the
+                    # baseline's revision beside the merged model's hash would
+                    # make every miner reject it.
+                    commit_ckpt = ModelCheckpoint(model_hash=baseline["model_hash"])
+                    if not observer_mode_enabled():
+                        commit_ckpt.sign_hash(wallet=wallet)
+                    logger.info(
+                        "Advertising round baseline",
+                        repo_id=hf_chain_repo_id,
+                        revision=hf_revision[:HF_CHAIN_REVISION_LENGTH],
+                        round_id=baseline.get("round_id"),
+                        uid=baseline.get("uid"),
+                    )
+                else:
+                    commit_ckpt = model_ckpt
+                    logger.warning(
+                        "No baseline to advertise this cycle; committing without HF coordinates",
+                        has_revision=bool(hf_revision),
+                    )
+
                 phase_response = wait_till(config, PhaseNames.validator_commit_1)
                 logger.info("Commit new signed_model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(SignedModelHashChainCommit(
-                    signed_model_hash=model_ckpt.signed_model_hash,
+                    signed_model_hash=commit_ckpt.signed_model_hash,
                 ))
 
                 check_phase_expired(lite_subtensor, phase_response)
 
-                # Upload checkpoint to HuggingFace so miners can pull it during
-                # the Distribute phase. The returned revision SHA pins the exact
-                # bytes miners will download, even if :main advances afterward.
-                hf_upload_repo_id, hf_chain_repo_id = resolve_hf_repo_ids(
-                    config.hf,
-                    max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
-                )
-                hf_revision: str | None = None
-                if hf_upload_repo_id and hf_chain_repo_id and hf_upload_repo_id != hf_chain_repo_id:
-                    logger.info(
-                        "HF upload repo differs from chain-advertised repo",
-                        upload_checkpoint_repo=hf_upload_repo_id,
-                        advertised_checkpoint_repo=hf_chain_repo_id,
-                    )
-                hf_ready, hf_reason = get_hf_upload_readiness(
-                    repo_id=hf_upload_repo_id,
-                    token_env_var=config.hf.token_env_var,
-                )
-                if model_ckpt.path is None:
-                    logger.warning(
-                        "No checkpoint path available for HF upload",
-                        upload_checkpoint_repo=hf_upload_repo_id,
-                        advertised_checkpoint_repo=hf_chain_repo_id,
-                    )
-                elif hf_ready:
-                    # Pause the background workers while we hold the HF
-                    # bandwidth — the download worker also pulls from HF and
-                    # would contend on the same network/disk.
-                    merge_phase_active.set()
-                    try:
-                        # Subprocess isolation: huggingface_hub's chunked
-                        # upload + TLS holds the GIL long enough to starve
-                        # the bittensor websocket keepalive thread in this
-                        # process, which then dumps a ConnectionClosedError
-                        # mid-upload and forces a substrate reconnect/retry
-                        # on the next extrinsic. A spawned child has its
-                        # own interpreter, so the parent's keepalive keeps
-                        # ticking.
-                        hf_revision = upload_checkpoint_to_hf_subprocess(
-                            ckpt_dir=model_ckpt.path,
-                            repo_id=hf_upload_repo_id,
-                            token_env_var=config.hf.token_env_var,
-                            commit_message=(
-                                f"global_ver={model_ckpt.global_ver} "
-                                f"expert_group={config.task.exp.group_id}"
-                            ),
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "HF checkpoint upload failed; miners cannot pull this checkpoint",
-                            upload_checkpoint_repo=hf_upload_repo_id,
-                            advertised_checkpoint_repo=hf_chain_repo_id,
-                            error=str(e),
-                            exc_info=True,
-                        )
-                    finally:
-                        merge_phase_active.clear()
-                else:
-                    logger.error(
-                        "HF checkpoint upload unavailable; miners cannot pull this checkpoint",
-                        upload_checkpoint_repo=hf_upload_repo_id,
-                        advertised_checkpoint_repo=hf_chain_repo_id,
-                        reason=hf_reason,
-                        has_ckpt_path=model_ckpt.path is not None,
-                    )
-
                 phase_response = wait_till(config, PhaseNames.validator_commit_2)
                 logger.info("Commit model_hash for next validation (non-blocking)")
                 chain_submitter.async_commit(ValidatorChainCommit(
-                    model_hash=model_ckpt.model_hash,
-                    global_ver=model_ckpt.global_ver if _participated_in_merge else 0,  # only update global_ver if we participated in the merge
+                    model_hash=commit_ckpt.model_hash,
+                    global_ver=global_opt_step,
                     expert_group=config.task.exp.group_id,
                     hf_repo_id=hf_chain_repo_id if hf_revision else None,
                     hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
@@ -2198,31 +1596,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # without racing the cleanup.
             wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             download_window_closed.set()
-
-            # === Re-sync from peer if we were excluded last cycle ===
-            # Done in the same quiet pre-MinerCommit1 window as the
-            # download-window close above so the sync settles before the
-            # new cycle begins.
-            if not _participated_in_merge:
-                logger.info(
-                    "Re-syncing model from peer validator (was excluded from allreduce last cycle)"
-                )
-                success = reload_model_inplace(
-                    config=config,
-                    global_model=global_model,
-                    expert_manager=expert_manager,
-                    device=device,
-                    subtensor=subtensor,
-                    wallet=wallet,
-                )
-                if success:
-                    logger.info("Peer sync successful — model updated")
-                else:
-                    logger.warning(
-                        "Peer sync failed — continuing with current model; "
-                        "weight quality may be reduced next cycle"
-                    )
-                _participated_in_merge = True  # reset regardless; try allreduce next cycle
 
             # === validation and log metric ===
             metrics = get_status(
@@ -2250,12 +1623,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
-        # Don't wait on a stuck sync_grad worker — it may be blocked inside
-        # avg.step. cancel_futures only affects pending submissions, not
-        # the in-flight one, which keeps running until avg.step unwinds.
-        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
-        for _, a in group_averagers.items():
-            a.shutdown()
         raise
     except Exception:
         logger.error("Quit training", exc_info=True)
@@ -2264,9 +1631,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup(global_model)
         metric_logger.close()
-        sync_grad_executor.shutdown(wait=False, cancel_futures=True)
-        for _, a in group_averagers.items():
-            a.shutdown()
 
         if rank == 0:
             torch.save(global_model.state_dict(), "mycelia_final.pt")

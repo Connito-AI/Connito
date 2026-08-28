@@ -64,7 +64,6 @@ class WeightGroups:
 class CohortGroups:
     validation: ValidationGroups
     weight: WeightGroups
-    foreground_uids: tuple[int, ...] = ()
 
 
 def is_cohort_boundary(cycle_index: int, window: int = 8) -> bool:
@@ -230,8 +229,8 @@ def _partition_pool(
     `miner_hotkeys` and return this validator's slice as UIDs.
 
     Wrapper over `connito.shared.cycle.assign_miners_to_validators` so
-    the round-group scheme can re-partition arbitrary miner pools (A∪B
-    for foreground, all-minus-A∪B for Group C) without re-issuing chain
+    the round-group scheme can re-partition arbitrary miner pools
+    (all-minus-A∪B for Group C) without re-issuing chain
     RPCs. `validator_seeds` and `miner_hotkeys` together fully determine
     the partition; every validator with the same inputs gets the same
     answer.
@@ -281,36 +280,6 @@ def compute_group_c(
     return _partition_pool(
         validator_seeds=validator_seeds,
         miner_hotkeys=non_ab_hotkeys,
-        my_hotkey=my_hotkey,
-        hotkey_to_uid=hotkey_to_uid,
-        max_per_validator=max_size,
-    )
-
-
-def compute_foreground_partition(
-    *,
-    validator_seeds: dict[str, int],
-    all_miner_hotkeys: list[str],
-    ab_uids: set[int],
-    my_hotkey: str,
-    hotkey_to_uid: dict[str, int],
-    max_size: int | None = None,
-) -> tuple[int, ...]:
-    """Foreground — per-validator partition of A∪B miners.
-
-    Uses the same seeded `assign_miners_to_validators` distribution as
-    `validator_miner_assignment`, but restricted to the chain-consensus
-    pool (A∪B). Each validator gets a deterministic, balanced slice of
-    A∪B regardless of whether those miners landed in its full-pool
-    assignment.
-    """
-    ab_hotkeys = [
-        hk for hk in all_miner_hotkeys
-        if hotkey_to_uid.get(hk) in ab_uids
-    ]
-    return _partition_pool(
-        validator_seeds=validator_seeds,
-        miner_hotkeys=ab_hotkeys,
         my_hotkey=my_hotkey,
         hotkey_to_uid=hotkey_to_uid,
         max_per_validator=max_size,
@@ -409,8 +378,8 @@ def build_cohort_groups(
     election_ballots: ElectionBallots,
     cfg,
 ) -> CohortGroups:
-    """Compose validation Groups A/B/C, weight Groups 1/2, and foreground
-    UIDs for a new cohort. Called only at a cohort boundary.
+    """Compose validation Groups A/B/C and weight Groups 1/2 for a new
+    cohort. Called only at a cohort boundary.
 
     * **Group A / Group B** — derived from the chain-set tally of every
       qualified validator's previous-cohort weight Group 1 / Group 2
@@ -422,9 +391,6 @@ def build_cohort_groups(
       now" separately and records score=0 at finalize.
     * **Group C** — `assign_miners_to_validators` over `(all miners \\ A∪B)`,
       this validator's slice, capped at `cfg.validation_group_c_size`.
-    * **Foreground** — `assign_miners_to_validators` over `A∪B`, this
-      validator's slice. Per-validator distinct partition of the
-      consensus tier. Background falls out as `(A∪B∪C) \\ foreground`.
     * **Weight Groups 1/2** — straight from this validator's local
       `election_ballots`.
     """
@@ -462,17 +428,6 @@ def build_cohort_groups(
         hotkey_to_uid=hotkey_to_uid,
         max_size=cfg.validation_group_c_size,
     )
-    foreground_uids = compute_foreground_partition(
-        validator_seeds=validator_seeds,
-        all_miner_hotkeys=all_miner_hotkeys,
-        ab_uids=ab_uids,
-        my_hotkey=my_hotkey,
-        hotkey_to_uid=hotkey_to_uid,
-        # No cap — A∪B is at most 13 miners; let assignment distribute
-        # them evenly across qualified validators (~1-2 each on a
-        # typical 7-13 validator subnet).
-        max_size=None,
-    )
 
     validation = ValidationGroups(group_a=group_a, group_b=group_b, group_c=group_c)
     weight = WeightGroups(
@@ -485,7 +440,6 @@ def build_cohort_groups(
         group_a=list(group_a),
         group_b=list(group_b),
         group_c=list(group_c),
-        foreground_uids=list(foreground_uids),
         weight_group_1=list(weight.group_1),
         weight_group_2=list(weight.group_2),
     )
@@ -493,7 +447,6 @@ def build_cohort_groups(
     return CohortGroups(
         validation=validation,
         weight=weight,
-        foreground_uids=foreground_uids,
     )
 
 
@@ -589,7 +542,6 @@ def maybe_advance_cohort(
         validation_group_a=new_groups.validation.group_a,
         validation_group_b=new_groups.validation.group_b,
         validation_group_c=new_groups.validation.group_c,
-        foreground_uids=new_groups.foreground_uids,
         last_election_round_id=round_id,
         highest_seen_cycle_index=highest_seen,
     )
@@ -601,48 +553,32 @@ def maybe_advance_cohort(
         validation_group_a=list(new_state.validation_group_a),
         validation_group_b=list(new_state.validation_group_b),
         validation_group_c=list(new_state.validation_group_c),
-        foreground_uids=list(new_state.foreground_uids),
         weight_group_1=list(new_state.weight_group_1),
         weight_group_2=list(new_state.weight_group_2),
     )
     return new_state
 
 
-def split_foreground_background(
-    state: "CohortState",
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Return `(foreground_uids, background_uids)` for the round.
+def full_validation_roster(state: "CohortState") -> tuple[int, ...]:
+    """The round's evaluation roster: A -> B -> C, in that order.
 
-    Foreground is the per-validator A∪B partition stored on
-    `CohortState.foreground_uids` (computed at the cohort boundary by
-    `compute_foreground_partition`). Background is `(A ∪ B ∪ C) \\ foreground`,
-    preserving A → B → C order so the workers process the consensus
-    tier first within background as well.
+    Every miner is reached by the same background path, so this ordering is
+    what gives the consensus tier its priority. De-duplicated defensively —
+    Group C is built disjoint from A∪B, but a UID appearing twice would be
+    downloaded and claimed twice.
     """
-    foreground = tuple(state.foreground_uids)
-    fg_set = set(foreground)
-    full_roster = (
+    seen: set[int] = set()
+    roster: list[int] = []
+    for uid in (
         *state.validation_group_a,
         *state.validation_group_b,
         *state.validation_group_c,
-    )
-    seen: set[int] = set()
-    background_list: list[int] = []
-    for uid in full_roster:
-        if uid in fg_set or uid in seen:
+    ):
+        if uid in seen:
             continue
         seen.add(uid)
-        background_list.append(uid)
-    return foreground, tuple(background_list)
-
-
-def split_validation_uids_into_foreground(
-    state: "CohortState",
-) -> tuple[int, ...]:
-    """Deprecated: returns the flat A→B→C concatenation used in earlier
-    drafts. New callers should use `split_foreground_background`.
-    """
-    return tuple([*state.validation_group_a, *state.validation_group_b, *state.validation_group_c])
+        roster.append(uid)
+    return tuple(roster)
 
 
 def compute_uid_weights(

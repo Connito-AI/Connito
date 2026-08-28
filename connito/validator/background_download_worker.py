@@ -2,18 +2,17 @@
 background, in incentive order, into the round's `downloaded_pool`.
 
 This worker is network-only — disk writes + HF reads — so it does not
-contend with foreground evaluation (which only reads from disk and runs
-on GPU). It is paused while:
-  - the main loop is in the Merge phase (`merge_phase_active` set), so
-    HF upload + allreduce can hold the available bandwidth, or
+contend with the eval worker, which reads from disk and runs on GPU. It
+is paused while:
+  - the main loop holds `merge_phase_active`, across the baseline load
+    and the checkpoint save, or
   - the download window has closed (`download_window_closed` set), which
     the main loop sets when it begins waiting for MinerCommit1 of the
     next round and clears at the next freeze.
 
-It does not gate on the foreground pass: foreground reads from
-`miner_submission_path`, which this worker is responsible for filling,
-so the two MUST run concurrently or foreground would never discover any
-miner to evaluate.
+It must run concurrently with the eval worker, which reads from
+`miner_submission_path` — the directory this worker is responsible for
+filling.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ from pathlib import Path
 import bittensor
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, parse_dynamic_filename
+from connito.shared.helper import find_submission_for_hotkey
 from connito.shared.hf_distribute import (
     HFFileMissingError,
     HFRepoUnavailableError,
@@ -210,10 +209,9 @@ class BackgroundDownloadWorker(threading.Thread):
 
     async def _download_one(self, round_obj, *, uid: int, hotkey: str) -> None:
         timeout = float(self.config.evaluation.per_miner_download_timeout_sec)
-        # We walk foreground_uids first then background_uids; the single
-        # download thread plus next_for_download's claimed/scored/failed
-        # filters keep us from racing with foreground eval. publish_download
-        # is a no-op if the UID has already been scored.
+        # The single download thread plus next_for_download's
+        # claimed/scored/failed filters keep us from racing the eval
+        # worker. publish_download is a no-op if the UID is already scored.
         try:
             ckpt = round_obj.uid_to_chain_checkpoint.get(uid)
             if ckpt is None or not (ckpt.hf_repo_id and ckpt.hf_revision):
@@ -240,7 +238,7 @@ class BackgroundDownloadWorker(threading.Thread):
             # cycle would short-circuit the fresh fetch and get published,
             # but `gather_validation_job` would silently reject it for
             # being out-of-window.
-            existing = self._existing_submission(
+            existing = find_submission_for_hotkey(
                 submission_dir, hotkey, round_obj.submission_block_range,
             )
             if existing is not None:
@@ -452,37 +450,6 @@ class BackgroundDownloadWorker(threading.Thread):
             )
         except Exception as e:
             logger.exception("bg-download: unexpected failure", uid=uid, error=str(e))
-
-    def _existing_submission(
-        self,
-        submission_dir: Path,
-        hotkey: str,
-        submission_block_range: tuple[int, int] | None,
-    ) -> Path | None:
-        """Return the on-disk submission for `hotkey` whose embedded block
-        falls inside `submission_block_range`. If the range is None
-        (legacy path / round without a window) fall back to hotkey-only
-        match — but new code always passes a range so this stays safe.
-        """
-        candidates = [
-            p for suffix in MINER_CHECKPOINT_SUFFIXES
-            for p in submission_dir.glob(f"*{suffix}")
-        ]
-        for path in candidates:
-            if path.name.startswith(".tmp"):
-                continue
-            meta = parse_dynamic_filename(path.name)
-            if not meta or meta.get("hotkey") != hotkey:
-                continue
-            if submission_block_range is not None:
-                block = meta.get("block")
-                if not isinstance(block, int):
-                    continue
-                start, end = submission_block_range
-                if not (start <= block <= end):
-                    continue
-            return path
-        return None
 
     @staticmethod
     def _update_pending_metric(round_obj) -> None:

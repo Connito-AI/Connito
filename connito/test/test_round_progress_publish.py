@@ -45,8 +45,7 @@ def _make_round(round_id: int, *, foreground=(1, 2), background=(3, 4, 5)) -> Ro
         round_id=round_id,
         seed="0" * 64,
         validator_miner_assignment={},
-        foreground_uids=tuple(foreground),
-        background_uids=tuple(background),
+        background_uids=tuple([*foreground, *background]),
         uid_to_hotkey={u: f"hk{u}" for u in (*foreground, *background)},
         model_snapshot_cpu={},
     )

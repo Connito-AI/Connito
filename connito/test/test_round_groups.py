@@ -19,7 +19,6 @@ from connito.validator.round_groups import (
     build_cohort_groups,
     cohort_epoch_for,
     compute_election_ballots,
-    compute_foreground_partition,
     compute_group_a,
     compute_group_b,
     compute_group_c,
@@ -28,7 +27,7 @@ from connito.validator.round_groups import (
     maybe_advance_cohort,
     read_chain_set_top_k,
     select_top_n_by_local_score,
-    split_foreground_background,
+    full_validation_roster,
 )
 
 
@@ -342,56 +341,6 @@ def test_compute_group_c_caps_at_max_size():
     assert len(g_c) <= 17
 
 
-def test_compute_foreground_partition_is_subset_of_ab():
-    """Foreground only contains UIDs from A∪B."""
-    validator_seeds = {"v1": 1, "v2": 2}
-    all_miner_hotkeys = [f"m{i}" for i in range(1, 11)]
-    hotkey_to_uid = {f"m{i}": i for i in range(1, 11)}
-    fg = compute_foreground_partition(
-        validator_seeds=validator_seeds,
-        all_miner_hotkeys=all_miner_hotkeys,
-        ab_uids={3, 4, 5},   # Group A∪B
-        my_hotkey="v1",
-        hotkey_to_uid=hotkey_to_uid,
-    )
-    assert set(fg) <= {3, 4, 5}
-
-
-def test_compute_foreground_partition_distinct_across_validators_covers_ab():
-    """Every A∪B miner ends up in exactly one validator's foreground."""
-    validator_seeds = {"v1": 1, "v2": 2, "v3": 3}
-    all_miner_hotkeys = [f"m{i}" for i in range(1, 14)]
-    hotkey_to_uid = {f"m{i}": i for i in range(1, 14)}
-    ab_uids = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}   # 13 miners
-    fg1 = compute_foreground_partition(
-        validator_seeds=validator_seeds, all_miner_hotkeys=all_miner_hotkeys,
-        ab_uids=ab_uids, my_hotkey="v1", hotkey_to_uid=hotkey_to_uid,
-    )
-    fg2 = compute_foreground_partition(
-        validator_seeds=validator_seeds, all_miner_hotkeys=all_miner_hotkeys,
-        ab_uids=ab_uids, my_hotkey="v2", hotkey_to_uid=hotkey_to_uid,
-    )
-    fg3 = compute_foreground_partition(
-        validator_seeds=validator_seeds, all_miner_hotkeys=all_miner_hotkeys,
-        ab_uids=ab_uids, my_hotkey="v3", hotkey_to_uid=hotkey_to_uid,
-    )
-    assert set(fg1).isdisjoint(set(fg2))
-    assert set(fg1).isdisjoint(set(fg3))
-    assert set(fg2).isdisjoint(set(fg3))
-    assert set(fg1) | set(fg2) | set(fg3) == ab_uids
-
-
-def test_compute_foreground_partition_empty_when_no_ab():
-    fg = compute_foreground_partition(
-        validator_seeds={"v1": 1},
-        all_miner_hotkeys=[f"m{i}" for i in range(5)],
-        ab_uids=set(),
-        my_hotkey="v1",
-        hotkey_to_uid={f"m{i}": i for i in range(5)},
-    )
-    assert fg == ()
-
-
 # ---------------------------------------------------------------------------
 # Election ballots — top-3 of A∪B, top-2 of B∪C \ G1
 # ---------------------------------------------------------------------------
@@ -522,8 +471,6 @@ def test_build_cohort_groups_invariants():
     # Group C drawn from non-A∪B pool.
     ab_set = set(groups.validation.group_a) | set(groups.validation.group_b)
     assert set(groups.validation.group_c).isdisjoint(ab_set)
-    # Foreground is a subset of A∪B (per-validator partition).
-    assert set(groups.foreground_uids) <= ab_set
 
 
 def test_build_cohort_groups_consensus_failure_grows_b():
@@ -779,65 +726,42 @@ def test_select_top_n_by_local_score_empty_pool():
 
 
 # ---------------------------------------------------------------------------
-# split_foreground_background — per-cohort fg/bg partition
+# full_validation_roster — the whole round roster, A -> B -> C
 # ---------------------------------------------------------------------------
 
 
-def _state_with_groups(
-    group_a, group_b, group_c, foreground=()
-) -> CohortState:
+def _state_with_groups(group_a, group_b, group_c) -> CohortState:
     return CohortState(
         cohort_epoch=0,
         expert_group="g1",
         validation_group_a=tuple(group_a),
         validation_group_b=tuple(group_b),
         validation_group_c=tuple(group_c),
-        foreground_uids=tuple(foreground),
     )
 
 
-def test_split_foreground_background_uses_persisted_foreground():
+def test_roster_holds_back_nothing():
+    """The review's caveat: with foreground removed, every A/B miner must
+    still reach the workers. Nothing is partitioned away."""
     state = _state_with_groups(
         group_a=(1, 2, 3),
         group_b=(4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
         group_c=(20, 21, 22),
-        foreground=(2, 5),    # this validator's slice of A∪B
     )
-    fg, bg = split_foreground_background(state)
-    assert fg == (2, 5)
-    # Background = (A ∪ B ∪ C) \ foreground, A→B→C order
-    assert bg == (1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 20, 21, 22)
-    assert len(fg) + len(bg) == 16   # full roster preserved
+    roster = full_validation_roster(state)
+    assert roster == (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 20, 21, 22)
+    assert len(roster) == 16
 
 
-def test_split_foreground_background_empty_foreground_keeps_full_roster_in_bg():
-    state = _state_with_groups(
-        group_a=(1, 2, 3), group_b=(4, 5), group_c=(20, 21),
-        foreground=(),
-    )
-    fg, bg = split_foreground_background(state)
-    assert fg == ()
-    assert bg == (1, 2, 3, 4, 5, 20, 21)
+def test_roster_preserves_a_then_b_then_c_order():
+    """Ordering is the only thing giving the consensus tier priority now,
+    so A must precede B must precede C."""
+    state = _state_with_groups(group_a=(10, 11, 12), group_b=(20, 21), group_c=(30, 31))
+    assert full_validation_roster(state) == (10, 11, 12, 20, 21, 30, 31)
 
 
-def test_split_foreground_background_preserves_a_then_b_then_c_order_in_bg():
-    state = _state_with_groups(
-        group_a=(10, 11, 12), group_b=(20, 21), group_c=(30, 31),
-        foreground=(11,),
-    )
-    fg, bg = split_foreground_background(state)
-    assert fg == (11,)
-    assert bg == (10, 12, 20, 21, 30, 31)
-
-
-def test_split_foreground_background_dedupes_overlap():
-    """Defensive: if Group C accidentally contains an A∪B UID
-    (shouldn't happen by construction), the fg/bg partition still
-    de-duplicates.
-    """
-    state = _state_with_groups(
-        group_a=(1,), group_b=(2,), group_c=(2, 3),   # 2 erroneously dup
-        foreground=(),
-    )
-    _fg, bg = split_foreground_background(state)
-    assert bg == (1, 2, 3)   # 2 not duplicated
+def test_roster_dedupes_overlap():
+    """Defensive: Group C is built disjoint from A∪B, but a duplicate would
+    otherwise be downloaded and claimed twice."""
+    state = _state_with_groups(group_a=(1,), group_b=(2,), group_c=(2, 3))
+    assert full_validation_roster(state) == (1, 2, 3)

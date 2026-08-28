@@ -17,6 +17,16 @@ import torch.nn.functional as F
 MINER_CHECKPOINT_SUFFIXES: tuple[str, ...] = (".safetensors", ".pt")
 
 
+def expert_group_shard_name(group_id: int | str, suffix: str = ".safetensors") -> str:
+    """The filename every participant reads and writes for one expert group.
+
+    Centralised because the writer moved to `.safetensors` while two readers
+    kept asking for `.pt`, which silently broke miner distribution and
+    validator peer-sync — `download_checkpoint_from_hf` has no fallback.
+    """
+    return f"model_expgroup_{group_id}{suffix}"
+
+
 def load_state_dict_from_path(path: str | os.PathLike) -> dict[str, torch.Tensor]:
     """Load a miner-checkpoint state_dict from `.safetensors` or `.pt`.
 
@@ -143,6 +153,48 @@ def parse_dynamic_filename(filename: str) -> dict:
     meta["filename"] = Path(filename)
 
     return meta
+
+
+def find_submission_for_hotkey(
+    submission_dir: Path,
+    hotkey: str,
+    submission_block_range: tuple[int, int] | None,
+) -> Path | None:
+    """Return the on-disk submission for `hotkey` that belongs to this round.
+
+    Only the *start* of `submission_block_range` is meaningful. The block in
+    the filename is stamped by `BackgroundDownloadWorker` at download time,
+    not by the miner at submission time, and downloads run for the whole
+    round — so anything fetched after the ~60-block submission phase closes
+    fails an upper-bound test. That is every file but the first few minutes'
+    worth, and it silently broke both callers: bg-download re-fetched shards
+    it already had, and `publish_round_baseline` never once found its winner.
+
+    `block >= start` is the correct predicate and needs no cycle length (the
+    configured one disagrees with the chain's). Nothing can carry a future
+    block, and the next freeze prunes anything below the new round id.
+
+    If the range is None (legacy path / round without a window) fall back to
+    hotkey-only match.
+    """
+    candidates = [
+        p for suffix in MINER_CHECKPOINT_SUFFIXES
+        for p in submission_dir.glob(f"*{suffix}")
+    ]
+    for path in candidates:
+        if path.name.startswith(".tmp"):
+            continue
+        meta = parse_dynamic_filename(path.name)
+        if not meta or meta.get("hotkey") != hotkey:
+            continue
+        if submission_block_range is not None:
+            block = meta.get("block")
+            if not isinstance(block, int):
+                continue
+            if block < submission_block_range[0]:
+                continue
+        return path
+    return None
 
 
 def h256_int(*parts: Any) -> int:

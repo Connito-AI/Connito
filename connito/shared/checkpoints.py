@@ -475,9 +475,12 @@ class ChainCheckpoints(BaseModel):
             if not filtered:
                 return ChainCheckpoints(checkpoints=[])
 
+        # Miner commits stop here. `for_role` is *whose* commits these are,
+        # not who is reading: every miner trains its own model, so their
+        # hashes are all distinct and the stake-weighted vote below would
+        # discard the whole field bar one arbitrary group.
         if for_role == "miner":
             return ChainCheckpoints(checkpoints=filtered)
-
 
         # select majority model_hash (stake-weighted)
         hash_stake: dict[str, float] = {}
@@ -917,11 +920,16 @@ def prune_submissions_outside_window(
     folder_path: Path,
     submission_block_range: tuple[int, int] | None,
 ) -> list[str]:
-    """Delete miner submission files whose embedded `block_N` falls outside
-    `[start, end]`. Distinct from `prune_miner_submission_files`, which is
-    age-based — this one is window-based and is meant to run at round
-    freeze so a stale .pt from a previous cycle can't masquerade as the
-    current round's submission and short-circuit `_existing_submission`.
+    """Delete miner submission files left over from an earlier round —
+    those whose embedded `block_N` predates `submission_block_range[0]`.
+    Distinct from `prune_miner_submission_files`, which is age-based.
+    Runs at round freeze so a stale shard from a previous cycle can't
+    masquerade as this round's and short-circuit
+    `find_submission_for_hotkey`.
+
+    Only the start bound is used, and it must match the predicate in
+    `find_submission_for_hotkey`: the block is stamped at *download* time,
+    so an upper bound would delete this round's own late downloads.
 
     No-op (returns []) if `submission_block_range` is None or the folder
     does not exist.
@@ -931,7 +939,7 @@ def prune_submissions_outside_window(
     if not folder_path.exists():
         return []
 
-    start, end = submission_block_range
+    start = submission_block_range[0]
     deleted_files: list[str] = []
     candidates = [
         p for suffix in MINER_CHECKPOINT_SUFFIXES
@@ -944,7 +952,7 @@ def prune_submissions_outside_window(
         block = meta.get("block")
         if not isinstance(block, int):
             continue
-        if start <= block <= end:
+        if block >= start:
             continue
         try:
             os.remove(file_path)
