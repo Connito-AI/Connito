@@ -1031,8 +1031,8 @@ class EvalCfg(BaseConfig):
     # the roster into validation Groups A (3) / B (10) / C (17) with
     # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1
     # (98%) / Group 2 (2%). Default ON; set False to opt back into the
-    # legacy foreground/background construction (kept as a rollback path
-    # until the new scheme is validated on mainnet for several cohorts).
+    # legacy assignment-driven roster (kept as a rollback path until the
+    # new scheme is validated on mainnet for several cohorts).
     # Spec: _specs/round-group-construction-scheme.md.
     enable_round_group_construction: bool = True
     cohort_state_filename: str = "cohort_state.json"

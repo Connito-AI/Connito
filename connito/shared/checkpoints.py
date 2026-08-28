@@ -475,9 +475,12 @@ class ChainCheckpoints(BaseModel):
             if not filtered:
                 return ChainCheckpoints(checkpoints=[])
 
+        # Miner commits stop here. `for_role` is *whose* commits these are,
+        # not who is reading: every miner trains its own model, so their
+        # hashes are all distinct and the stake-weighted vote below would
+        # discard the whole field bar one arbitrary group.
         if for_role == "miner":
             return ChainCheckpoints(checkpoints=filtered)
-
 
         # select majority model_hash (stake-weighted)
         hash_stake: dict[str, float] = {}

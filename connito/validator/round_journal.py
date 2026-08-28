@@ -2,8 +2,8 @@
 
 Records every score / failure / freeze-zero event that lands on the live
 ``Round`` to disk, so a kill before ``finalize_round_scores`` runs (SIGKILL,
-OOM, segfault, eval-window timeout) does not lose the bg-eval / foreground
-work for that round. On the next clean startup, ``finalize_round_scores``
+OOM, segfault, eval-window timeout) does not lose the bg-eval work for
+that round. On the next clean startup, ``finalize_round_scores``
 can be replayed against any unfinalized journal so the aggregator on disk
 ends up identical to what it would have been without the kill.
 
@@ -68,10 +68,10 @@ class RoundJournal:
     # v2: uid -> (hf_repo_id, hf_revision) evaluated for the round. Only
     # uids whose chain checkpoint carried BOTH values are recorded.
     uid_to_commit: dict[int, tuple[str, str]] = field(default_factory=dict)
-    # v3: round-level gauge inputs. `roster_size` = len(foreground_uids) +
-    # len(background_uids) at freeze; `lifecycle_step` = the last live
-    # lifecycle step the round reached (0 freeze / 2 post-foreground /
-    # 3 eval-window). Both let startup recovery restore the round-level
+    # v3: round-level gauge inputs. `roster_size` = len(background_uids)
+    # at freeze; `lifecycle_step` = the last live lifecycle step the round
+    # reached (0 freeze / 2 roster published / 3 baseline adopted). Both
+    # let startup recovery restore the round-level
     # gauges. Default 0 for v1/v2 journals (recovery then leaves pending at
     # 0 rather than inventing a roster).
     roster_size: int = 0

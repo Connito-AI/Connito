@@ -17,6 +17,16 @@ import torch.nn.functional as F
 MINER_CHECKPOINT_SUFFIXES: tuple[str, ...] = (".safetensors", ".pt")
 
 
+def expert_group_shard_name(group_id: int | str, suffix: str = ".safetensors") -> str:
+    """The filename every participant reads and writes for one expert group.
+
+    Centralised because the writer moved to `.safetensors` while two readers
+    kept asking for `.pt`, which silently broke miner distribution and
+    validator peer-sync — `download_checkpoint_from_hf` has no fallback.
+    """
+    return f"model_expgroup_{group_id}{suffix}"
+
+
 def load_state_dict_from_path(path: str | os.PathLike) -> dict[str, torch.Tensor]:
     """Load a miner-checkpoint state_dict from `.safetensors` or `.pt`.
 

@@ -196,20 +196,17 @@ class TestRoundFreeze:
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         assert [e.hotkey for e in rnd.roster] == ["hk_b", "hk_c", "hk_d", "hk_a"]
-        assert rnd.foreground_uids == (1, 2, 3, 0)  # all four, incentive desc
-        assert rnd.background_uids == ()
-        assert rnd.assigned_uids == rnd.foreground_uids
+        assert rnd.background_uids == (1, 2, 3, 0)  # all four, incentive desc
 
-    def test_foreground_and_background_disjoint_and_cover_roster(self) -> None:
+    def test_roster_covers_every_miner_without_duplicates(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
         assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
 
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        all_uids = set(rnd.foreground_uids) | set(rnd.background_uids)
-        assert set(rnd.foreground_uids).isdisjoint(rnd.background_uids)
-        assert all_uids == {e.uid for e in rnd.roster}
+        assert set(rnd.background_uids) == {e.uid for e in rnd.roster}
+        assert len(rnd.background_uids) == len(set(rnd.background_uids))
 
     def test_late_registrant_excluded(self) -> None:
         config = _fake_validator_config()
@@ -236,9 +233,8 @@ class TestRoundFreeze:
         assert {e.hotkey for e in rnd.roster} == {"hk_a", "hk_b"}
         uid_a = next(e.uid for e in rnd.roster if e.hotkey == "hk_a")
         uid_b = next(e.uid for e in rnd.roster if e.hotkey == "hk_b")
-        assert rnd.foreground_uids == (uid_a,)
-        assert rnd.background_uids == (uid_b,)
-        assert rnd.assigned_uids == (uid_a,)
+        # Both are on the roster; ours leads it.
+        assert rnd.background_uids == (uid_a, uid_b)
 
 
 # ---------------------------------------------------------------------------
@@ -319,21 +315,20 @@ class TestBackgroundPriorScorePrepend:
         # Pure staleness order: uid 1 (oldest), then 2, 3, 0.
         assert rnd.background_uids == (1, 2, 3, 0)
 
-    def test_foreground_unaffected_by_prepend(self) -> None:
-        # Foreground stays in incentive order. Prior avg scores must not
-        # leak into the foreground ordering.
+    def test_assignment_slice_unaffected_by_prepend(self) -> None:
+        # The assignment slice leads the roster in incentive order. Prior avg
+        # scores must not leak into that ordering.
         config = _fake_validator_config(my_hotkey="vhk")
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
         assignment = {"vhk": ["hk_a", "hk_b", "hk_c"]}
-        # Make hk_a the highest-scored historically — it must still
-        # come *after* hk_b in foreground because foreground uses
-        # incentive order.
+        # Make hk_a the highest-scored historically — it must still come
+        # *after* hk_b because the slice keeps incentive order.
         rnd = _freeze_round(
             config=config, metagraph=metagraph, assignment=assignment,
             prior_avg_scores={0: 99.0, 1: 0.0, 2: 0.0},
         )
         # Incentive desc: hk_b (uid 1), hk_c (uid 2), hk_a (uid 0).
-        assert rnd.foreground_uids == (1, 2, 0)
+        assert rnd.background_uids == (1, 2, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +362,7 @@ class TestSnapshotIsolation:
 # ---------------------------------------------------------------------------
 
 class TestBackgroundQueue:
-    def test_next_for_download_yields_foreground_first_then_background(self) -> None:
+    def test_next_for_download_yields_the_assignment_slice_first(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5, "hk_d": 0.3})
         # Only hk_b is mine; the rest belong to other validators (background).
@@ -375,24 +370,24 @@ class TestBackgroundQueue:
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
         order = [e.hotkey for e in rnd.next_for_download()]
-        # Foreground (hk_b) first, then background in per-(validator, round)
-        # shuffled order (PR #55).
-        assert order[: len(rnd.foreground_uids)] == ["hk_b"]
-        assert set(order[len(rnd.foreground_uids):]) == {"hk_a", "hk_c", "hk_d"}
+        # The assignment slice (hk_b) leads, then the rest in per-(validator,
+        # round) shuffled order (PR #55).
+        assert order[0] == "hk_b"
+        assert set(order[1:]) == {"hk_a", "hk_c", "hk_d"}
 
-    def test_foreground_claim_removes_uid_from_download_queue(self) -> None:
+    def test_eval_claim_removes_uid_from_download_queue(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.1, "hk_b": 0.9, "hk_c": 0.5})
         # hk_b is mine; hk_a and hk_c are someone else's so they go background.
         assignment = {"vhk": ["hk_b"], "other_validator": ["hk_a", "hk_c"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
 
-        # Roster covers foreground (hk_b) + background (hk_a, hk_c).
+        # Roster covers the assignment slice (hk_b) plus the rest.
         assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b", "hk_c"}
 
-        # Claiming a UID via foreground removes it from the download queue.
+        # Claiming a UID for eval removes it from the download queue.
         uid_c = next(e.uid for e in rnd.roster if e.hotkey == "hk_c")
-        assert rnd.claim_for_foreground(uid_c) is True
+        assert rnd.claim_for_eval(uid_c) is True
         assert {e.hotkey for e in rnd.next_for_download()} == {"hk_a", "hk_b"}
 
     def test_publish_download_then_pop_round_trip(self, tmp_path: Path) -> None:
@@ -415,6 +410,23 @@ class TestBackgroundQueue:
         # After pop, no longer in pool.
         assert rnd.pop_downloaded(bg_uid) is None
 
+    def test_next_for_eval_follows_roster_priority(self, tmp_path: Path) -> None:
+        """With foreground removed, roster order is the only thing giving the
+        consensus tier priority — so eval must walk it in order, not in
+        whatever order downloads happened to land."""
+        config = _fake_validator_config()
+        metagraph = _make_metagraph({"hk_a": 0.9, "hk_b": 0.5, "hk_c": 0.1})
+        assignment = {"other_validator": ["hk_a", "hk_b", "hk_c"]}
+        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
+
+        # Publish downloads in reverse roster order.
+        fake = tmp_path / "ckpt.pt"
+        fake.write_bytes(b"x")
+        for uid in reversed(rnd.background_uids):
+            assert rnd.publish_download(uid, fake) is True
+
+        assert [e.uid for e in rnd.next_for_eval()] == list(rnd.background_uids)
+
 
 # ---------------------------------------------------------------------------
 # Round claim semantics — round-level dedup across pause/resume
@@ -426,38 +438,15 @@ class TestRoundClaims:
         metagraph = _make_metagraph({"hk_a": 0.5})
         assignment = {"vhk": ["hk_a"]}
         rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
-        uid = rnd.foreground_uids[0]
+        uid = rnd.background_uids[0]
 
-        assert rnd.claim_for_foreground(uid) is True
+        assert rnd.claim_for_eval(uid) is True
         # Re-claim must fail until released or scored.
-        assert rnd.claim_for_foreground(uid) is False
+        assert rnd.claim_for_eval(uid) is False
         rnd.mark_scored(uid)
         assert uid in rnd.scored_uids
         # Even after re-attempting a claim post-scoring, claim returns False.
-        assert rnd.claim_for_foreground(uid) is False
-
-    def test_unscored_roster_uids(self) -> None:
-        config = _fake_validator_config()
-        metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4})
-        assignment = {"vhk": ["hk_a", "hk_b"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
-
-        # Score one; the other remains unscored.
-        rnd.mark_scored(rnd.roster[0].uid)
-        unscored = rnd.unscored_roster_uids()
-        assert {e.uid for e in unscored} == {rnd.roster[1].uid}
-
-    def test_unscored_roster_uids_scoped_to_assigned(self) -> None:
-        # Other validators' miners are in the roster (so bg-download can
-        # reach them) but must not appear in the missed-submission penalty
-        # pass — that's only for miners *this* validator is responsible for.
-        config = _fake_validator_config(my_hotkey="vhk")
-        metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4})
-        assignment = {"vhk": ["hk_a"], "other_validator": ["hk_b"]}
-        rnd = _freeze_round(config=config, metagraph=metagraph, assignment=assignment)
-
-        unscored = rnd.unscored_roster_uids()
-        assert {e.hotkey for e in unscored} == {"hk_a"}
+        assert rnd.claim_for_eval(uid) is False
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +858,7 @@ class TestDelayedSubmission:
 
         # Drive the penalty pass: every unscored roster UID gets 0.0
         # under round.round_id.
-        for entry in rnd.unscored_roster_uids():
+        for entry in [e for e in rnd.roster if e.uid not in rnd.scored_uids]:
             agg.add_score(uid=entry.uid, hotkey=entry.hotkey, score=0.0, round_id=rnd.round_id)
 
         # Both unscored miners should now have a 0.0 entry under round 999.

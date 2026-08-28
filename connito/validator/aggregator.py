@@ -143,7 +143,7 @@ class MinerSeries:
           - if this miner has one or more points tagged with a `round_id`
             that maps to that cycle, the cycle's score is the mean of those
             points (a miner can be evaluated more than once per cycle —
-            foreground + background, or multiple validators in tests);
+            e.g. multiple validators in tests);
           - if the miner has no points in that cycle, the cycle's score is
             0.0 (sentinel "did not qualify" per spec item 18).
         Returns `(mean, min)` across the cycles. Tie-breaking in the

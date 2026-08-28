@@ -18,6 +18,7 @@ from connito.shared.expert_manager import (
 )
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
+    expert_group_shard_name,
     get_model_hash,
     load_state_dict_from_path,
 )
@@ -331,7 +332,7 @@ def save_state_dict_by_expert_group(
     from safetensors.torch import save_file
     paths = {}
     for gid, sd in grouped_state.items():
-        fname = f"model_expgroup_{gid}.safetensors"
+        fname = expert_group_shard_name(gid)
         path = os.path.join(save_dir, fname)
 
         estimated_bytes = int(group_bytes[gid] * 1.05) + (64 * 1024 * 1024)

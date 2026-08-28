@@ -16,7 +16,11 @@ import time
 from pathlib import Path
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import find_submission_for_hotkey
+from connito.shared.helper import (
+    find_submission_for_hotkey,
+    get_model_hash,
+    load_state_dict_from_path,
+)
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
     upload_checkpoint_to_hf_subprocess,
@@ -25,12 +29,32 @@ from connito.shared.hf_distribute import (
 logger = structlog.get_logger(__name__)
 
 
-def publish_round_baseline(*, round_obj, config) -> None:
+def _retain_baseline(src: Path, baseline_dir: Path, round_id) -> Path:
+    """Hardlink `src` into `baseline_dir` and drop any earlier baseline.
+
+    A sibling of the submission dir, so the same filesystem and the link costs
+    an inode rather than a ~3 GB copy — but it does pin one shard the cycle
+    prune used to free, which is why the previous one goes first.
+    """
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    for stale in baseline_dir.iterdir():
+        if stale.is_file():
+            stale.unlink()
+    dest = baseline_dir / f"round_{round_id}{src.suffix}"
+    os.link(src, dest)
+    return dest
+
+
+def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> None:
     """Upload the round's best-averaged submission to HF as the next baseline.
 
-    Additive — nothing reads the revision back yet. Safe against the live
-    checkpoint repo because miners pin the revision committed on chain and
-    never track `main`. Never raises: a failed publish must not touch scoring.
+    On success `out` receives `path` — the file the Merge window loads to
+    advance this validator's own model — plus the coordinates the next
+    ValidatorCommit advertises. `path` is written first and separately: the
+    local model must still advance in the rounds where we cannot advertise.
+
+    Never raises: a failed publish must not touch scoring, and the caller runs
+    this on a daemon thread where an exception would be invisible.
     """
     from connito.validator.round import select_baseline_uid
 
@@ -75,10 +99,32 @@ def publish_round_baseline(*, round_obj, config) -> None:
             )
         finally:
             shutil.rmtree(stage, ignore_errors=True)
+        # `src` sits in the submission dir, which the end-of-cycle prune empties
+        # at MinerCommit1 — seconds after this runs, and four phases before Merge
+        # loads it. Keep a second name for the same bytes outside that dir so
+        # unlinking the original frees nothing; that also covers the archive
+        # step, which `shutil.move`s the top-k out from under us.
+        retained = _retain_baseline(src, submission_dir.parent / "baseline", rid)
+        # Recorded before the hash so a hashing failure still leaves the local
+        # model able to advance — only the advertisement is lost.
+        if out is not None:
+            out.update(path=str(retained), round_id=rid, uid=uid)
+        # Prefer the winner's committed hash — we republish its bytes unchanged
+        # via hardlink, so nothing needs re-hashing. Fall back to hashing what
+        # we uploaded: a miner can be scored and still have no chain commit,
+        # and without a hash miners reject the download.
+        model_hash = getattr(round_obj.uid_to_chain_checkpoint.get(uid), "model_hash", None)
+        hash_source = "chain"
+        if not model_hash:
+            model_hash = get_model_hash(load_state_dict_from_path(src), hex=True)
+            hash_source = "recomputed"
+        if out is not None:
+            out.update(revision=revision, model_hash=model_hash)
         logger.info(
             "publish_baseline: published", round_id=rid, uid=uid, val_loss=val_loss,
             avg_score=round(avg.get(uid, 0.0), 4),
             repo_id=repo_id, revision=revision, size_bytes=size_bytes,
+            model_hash=model_hash[:6] if model_hash else None, hash_source=hash_source,
             elapsed_s=round(time.monotonic() - started, 1),
         )
     except Exception as e:

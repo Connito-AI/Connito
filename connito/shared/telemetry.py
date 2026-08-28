@@ -110,26 +110,24 @@ VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
     "Rolling EMA voted on chain for a miner",
     ["miner_uid"],
 )
-# Per-miner validation loss measured against this validator's foreground
-# eval set. High-cardinality (one series per miner UID) but bounded by
+# Per-miner validation loss measured against this validator's eval set. High-cardinality (one series per miner UID) but bounded by
 # subnet size (~100s); same shape as `validator_miner_score`. Set inside
 # `evaluate_one_miner` immediately after the val_loss is computed.
 # Aggregators compute `delta_loss = max(0, validator_baseline_loss -
 # validator_miner_val_loss)` as needed.
 VALIDATOR_MINER_VAL_LOSS = Gauge(
     "validator_miner_val_loss",
-    "Per-miner validation loss measured against this validator's foreground eval set",
+    "Per-miner validation loss measured against this validator's eval set",
     ["miner_uid"],
 )
 # Round-level baseline loss: this validator's eval loss against the
-# pre-merge global model, computed once per round at the start of the
-# foreground pass (see `evaluate_foreground_round`). Single value (no
-# labels) — the latest write wins. Distinct from
+# round's global model, computed once per round at freeze. Single value
+# (no labels) — the latest write wins. Distinct from
 # `validator_eval_loss{expert_group=...}` which tracks training-side
 # eval loss reported via MetricLogger.
 VALIDATOR_BASELINE_LOSS = Gauge(
     "validator_baseline_loss",
-    "Round baseline loss against this validator's foreground eval set",
+    "Round baseline loss against this validator's eval set",
 )
 # Per-round baseline loss, labeled by the round it belongs to. The unlabeled
 # gauge above is overwritten every round, so a scraper can only sample it and
@@ -141,7 +139,7 @@ VALIDATOR_BASELINE_LOSS = Gauge(
 # backward compat during rollout.
 VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
     "validator_baseline_loss_by_round",
-    "Round baseline loss (this validator's foreground eval set), labeled by the "
+    "Round baseline loss (this validator's eval set), labeled by the "
     "round it belongs to. Stable per round; the unlabeled validator_baseline_loss "
     "is retained for backward compat.",
     ["round_id"],
@@ -562,15 +560,11 @@ def set_round_progress(
 ) -> None:
     """Publish a round's evaluation-progress counters.
 
-    Shared by every path that advances a round: the freeze-time initial
-    publish, foreground eval (during Submission), and the background eval
-    worker (after Merge). This previously lived as a private static method
-    on `BackgroundEvalWorker`, so the counters only started moving once the
-    background eval window opened at Merge — foreground evals accumulated
-    in `scored_uids` with nothing publishing them, and the dashboard's
-    "Evaluated N of M" panel sat on the *previous* round's final value for
-    the first ~14 minutes of every round, then jumped straight to the
-    foreground total.
+    Shared by the freeze-time initial publish and the background eval
+    worker. This previously lived as a private static method on
+    `BackgroundEvalWorker`, so the counters only started moving once the
+    eval window opened — the dashboard's "Evaluated N of M" panel sat on
+    the *previous* round's final value until then.
 
     Registers the round_id via `note_round_series` so these labelsets are
     evicted on the normal cutoff.
@@ -588,7 +582,7 @@ def set_round_progress(
 
 
 def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
-    """Publish a round's foreground-eval baseline loss to BOTH the unlabeled
+    """Publish a round's eval baseline loss to BOTH the unlabeled
     gauge (backward compat) and the per-round labeled family.
 
     Registers the round_id for eviction so the labeled series is pruned on
@@ -678,10 +672,12 @@ def set_miner_score_snapshot(
 # CONTRACT: COHORT_GROUP_CODES and ASSIGNMENT_ROLE_CODES are mirrored by the
 # telemetry gateway (same pattern as EVAL_STATUS_CODES). Changing a code
 # retroactively reinterprets old Prometheus samples — extend, do not renumber.
-# Code 4 ("tail") = miners on this validator's foreground/background roster but
+# Code 4 ("tail") = miners on this validator's roster but
 # outside the formal A/B/C tiers (the staleness pool). Distinct from 0 ("none"),
 # which means the validator has no roster status for this miner this round.
 COHORT_GROUP_CODES: dict[int, str] = {0: "none", 1: "A", 2: "B", 3: "C", 4: "tail"}
+# Role 1 ("foreground") is retired — every rostered miner is 2. Kept so old
+# samples still decode; per the contract above, do not renumber.
 ASSIGNMENT_ROLE_CODES: dict[int, str] = {0: "unassigned", 1: "foreground", 2: "background"}
 
 

@@ -169,7 +169,10 @@ def test_staging_dir_is_removed_after_a_successful_upload(tmp_path, uploads):
 
     assert uploads
     assert sorted(p.name for p in sub.iterdir()) == [src.name]
-    assert os.stat(src).st_nlink == 1
+    # Two names for the same bytes: the submission, and the retained baseline
+    # that has to outlive the end-of-cycle prune. The staging link is gone.
+    assert os.stat(src).st_nlink == 2
+    assert (sub.parent / "baseline" / "round_9000.safetensors").exists()
 
 
 def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
@@ -192,7 +195,7 @@ def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
 
     round_obj = Round(
         round_id=9000, seed="s", validator_miner_assignment={},
-        foreground_uids=tuple(uid_to_hotkey), background_uids=(),
+        background_uids=tuple(uid_to_hotkey),
         uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
         # uid 5 is the proven miner but has the worst round score.
         prior_avg_scores={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 2.0},
@@ -231,7 +234,7 @@ def test_cleanup_keeps_the_winner_when_a_better_average_went_unevaluated(tmp_pat
 
     round_obj = Round(
         round_id=9000, seed="s", validator_miner_assignment={},
-        foreground_uids=tuple(uid_to_hotkey), background_uids=(),
+        background_uids=tuple(uid_to_hotkey),
         uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
         # uid 6 has the best average but is never evaluated; uid 5 is the best
         # average *among those evaluated*, so it is the one publish will pick.
@@ -264,7 +267,7 @@ def test_cleanup_keeps_the_winner_when_averages_tie(tmp_path):
 
     round_obj = Round(
         round_id=9000, seed="s", validator_miner_assignment={},
-        foreground_uids=tuple(uid_to_hotkey), background_uids=(),
+        background_uids=tuple(uid_to_hotkey),
         uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
         # uids 4 and 5 tie on average; 5 has the better val_loss, so publish
         # picks 5, while a uid-only tie-break would keep 4.
