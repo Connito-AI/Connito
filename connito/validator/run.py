@@ -1429,18 +1429,28 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     # VRAM for nothing. `strict=False` because the file carries
                     # only the active expert group; backbone and helper-group
                     # keys are legitimately absent and keep their values.
-                    sd = load_state_dict_from_path(baseline_path)
-                    incompatible = global_model.load_state_dict(sd, strict=False)
-                    matched_keys = len(sd) - len(incompatible.unexpected_keys)
-                    del sd
-                    if matched_keys == 0:
+                    try:
+                        sd = load_state_dict_from_path(baseline_path)
+                        incompatible = global_model.load_state_dict(sd, strict=False)
+                        matched_keys = len(sd) - len(incompatible.unexpected_keys)
+                        del sd
+                        if matched_keys == 0:
+                            logger.error(
+                                "Round baseline shares no keys with the model; "
+                                "model unchanged this cycle",
+                                path=baseline_path,
+                            )
+                        else:
+                            logger.info("Round baseline adopted", matched_keys=matched_keys)
+                    except Exception as e:
+                        # On the main loop, so an unhandled error here exits the
+                        # process mid-cycle. Losing one cycle's advance is
+                        # strictly better; the publish side is guarded the same
+                        # way for the same reason.
                         logger.error(
-                            "Round baseline shares no keys with the model; "
-                            "model unchanged this cycle",
-                            path=baseline_path,
+                            "Failed to load round baseline; keeping the current model",
+                            path=baseline_path, error=str(e), exc_info=True,
                         )
-                    else:
-                        logger.info("Round baseline adopted", matched_keys=matched_keys)
                 else:
                     logger.warning(
                         "No baseline published this round; keeping the current model"

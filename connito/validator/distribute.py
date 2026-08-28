@@ -29,6 +29,22 @@ from connito.shared.hf_distribute import (
 logger = structlog.get_logger(__name__)
 
 
+def _retain_baseline(src: Path, baseline_dir: Path, round_id) -> Path:
+    """Hardlink `src` into `baseline_dir` and drop any earlier baseline.
+
+    A sibling of the submission dir, so the same filesystem and the link costs
+    an inode rather than a ~3 GB copy — but it does pin one shard the cycle
+    prune used to free, which is why the previous one goes first.
+    """
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    for stale in baseline_dir.iterdir():
+        if stale.is_file():
+            stale.unlink()
+    dest = baseline_dir / f"round_{round_id}{src.suffix}"
+    os.link(src, dest)
+    return dest
+
+
 def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> None:
     """Upload the round's best-averaged submission to HF as the next baseline.
 
@@ -83,10 +99,16 @@ def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> Non
             )
         finally:
             shutil.rmtree(stage, ignore_errors=True)
+        # `src` sits in the submission dir, which the end-of-cycle prune empties
+        # at MinerCommit1 — seconds after this runs, and four phases before Merge
+        # loads it. Keep a second name for the same bytes outside that dir so
+        # unlinking the original frees nothing; that also covers the archive
+        # step, which `shutil.move`s the top-k out from under us.
+        retained = _retain_baseline(src, submission_dir.parent / "baseline", rid)
         # Recorded before the hash so a hashing failure still leaves the local
         # model able to advance — only the advertisement is lost.
         if out is not None:
-            out.update(path=str(src), round_id=rid, uid=uid)
+            out.update(path=str(retained), round_id=rid, uid=uid)
         # Prefer the winner's committed hash — we republish its bytes unchanged
         # via hardlink, so nothing needs re-hashing. Fall back to hashing what
         # we uploaded: a miner can be scored and still have no chain commit,

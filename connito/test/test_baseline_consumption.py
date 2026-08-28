@@ -13,13 +13,18 @@ Run with `python -m pytest connito/test/test_baseline_consumption.py`.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
-from connito.shared.checkpoints import ChainCheckpoint, ChainCheckpoints
+from connito.shared.checkpoints import (
+    ChainCheckpoint,
+    ChainCheckpoints,
+    prune_miner_submission_files,
+)
 from connito.shared.helper import (
     expert_group_shard_name,
     get_model_hash,
@@ -203,8 +208,56 @@ def test_publish_records_the_path_even_when_the_hash_is_unusable(tmp_path, stub_
     distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out=out)
 
     assert out["uid"] == 2
-    assert out["path"].endswith("uid_1_hotkey_hkB_block_550.safetensors")
+    # The retained link, not the submission-dir name — that one is deleted by
+    # the end-of-cycle prune before Merge reads it.
+    assert out["path"].endswith("baseline/round_9000.safetensors")
     assert "model_hash" not in out
+
+
+# --- the baseline file must outlive the cycle that produced it ---------------
+
+def test_baseline_survives_the_end_of_cycle_prune(tmp_path, stub_upload):
+    """The crash this prevents, in the order production runs it.
+
+    `publish_round_baseline` records the winner at MinerCommit1; the
+    end-of-cycle prune empties the submission dir seconds later; Merge loads
+    the recorded path four phases after that. Observed live on 2026-08-28:
+    round 8939822 published at 01:30:48, the prune deleted the winner's shard
+    at 01:31:37, and Merge died with FileNotFoundError at 01:49:50.
+
+    Recording a path into a directory that gets emptied is the bug, so this
+    asserts the original name really is gone — otherwise the test would pass
+    for the wrong reason.
+    """
+    sub = tmp_path / "miner_submission"
+    sub.mkdir()
+    shard = sub / "uid_1_hotkey_hkB_block_550.safetensors"
+    save_file({"w": torch.zeros(4)}, str(shard))
+
+    out: dict = {}
+    distribute.publish_round_baseline(round_obj=_round_with_winner(), config=_config(sub), out=out)
+
+    prune_miner_submission_files(sub, current_block=600, cycle_length=448, max_age_cycles=0)
+    assert not shard.exists()
+
+    assert set(load_state_dict_from_path(Path(out["path"]))) == {"w"}
+
+
+def test_only_the_newest_baseline_is_pinned(tmp_path, stub_upload):
+    """Each retained baseline holds a ~3 GB shard that the prune would
+    otherwise free, so publishing must drop the previous round's link or disk
+    grows by one shard every round."""
+    sub = tmp_path / "miner_submission"
+    sub.mkdir()
+    for block, rid in ((550, 9000), (560, 9001)):
+        shard = sub / f"uid_1_hotkey_hkB_block_{block}.safetensors"
+        save_file({"w": torch.zeros(4)}, str(shard))
+        round_obj = _round_with_winner()
+        round_obj.round_id = rid
+        distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out={})
+
+    retained = sorted(p.name for p in (sub.parent / "baseline").iterdir())
+    assert retained == ["round_9001.safetensors"]
 
 
 # --- a restart must not throw the merge away ---------------------------------

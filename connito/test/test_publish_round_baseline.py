@@ -169,7 +169,10 @@ def test_staging_dir_is_removed_after_a_successful_upload(tmp_path, uploads):
 
     assert uploads
     assert sorted(p.name for p in sub.iterdir()) == [src.name]
-    assert os.stat(src).st_nlink == 1
+    # Two names for the same bytes: the submission, and the retained baseline
+    # that has to outlive the end-of-cycle prune. The staging link is gone.
+    assert os.stat(src).st_nlink == 2
+    assert (sub.parent / "baseline" / "round_9000.safetensors").exists()
 
 
 def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
