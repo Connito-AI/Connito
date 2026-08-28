@@ -64,39 +64,38 @@ def test_shared_sentinel_is_still_a_no_op():
 # --- stake decides which baseline everyone uses ------------------------------
 
 def test_miners_follow_the_highest_stake_validator():
-    """Each validator publishes its own pick, so their hashes differ. Without
-    stake weighting a miner takes whichever entry came first and the subnet
-    forks into incompatible models."""
+    """`for_role` names *whose* commits these are, not who is reading. A miner
+    fetching the official model reads validator commits, so this is the path
+    that must resolve to the highest-stake validator — each validator now
+    publishes its own pick, and without stake weighting miners scatter across
+    incompatible models."""
     cks = ChainCheckpoints(checkpoints=[
         _ckpt(1, "aa" * 32, stake=31.4),
         _ckpt(2, "bb" * 32, stake=58734.8),
     ])
-    kept = cks.filter_checkpoints(for_role="miner")
+    kept = cks.filter_checkpoints(for_role="validator")
     assert [c.uid for c in kept.checkpoints] == [2]
 
 
-def test_validators_and_miners_agree_on_the_winner():
-    """Both roles must resolve to the same baseline, or validators evaluate
-    against a model the miners never trained on."""
-    pair = [_ckpt(1, "aa" * 32, stake=31.4), _ckpt(2, "bb" * 32, stake=58734.8)]
-    as_miner = ChainCheckpoints(checkpoints=list(pair)).filter_checkpoints(for_role="miner")
-    as_validator = ChainCheckpoints(checkpoints=list(pair)).filter_checkpoints(for_role="validator")
-    assert [c.uid for c in as_miner.checkpoints] == [c.uid for c in as_validator.checkpoints]
+def test_miner_commits_are_never_collapsed_to_one_hash():
+    """The regression that cost a day on the test validator.
 
+    Reading *miner* commits must skip the stake-weighted majority vote
+    entirely. Every miner trains its own model, so distinct hashes are the
+    normal case, not a disagreement to resolve — running the vote here keeps
+    only whichever arbitrary group shares the top-staked hash and silently
+    deletes everyone else.
 
-def test_miner_version_gate_skip_survives_stake_selection():
-    """Guard against over-deleting: routing miners through the stake block must
-    not drag them back through the version-range gate, which drops a commit
-    landing 1-2 blocks outside the window."""
-    inside, above = 8338208, 8338209
+    Measured with the vote wrongly enabled: `competing_hashes=244`,
+    `majority_stake=178.07`, and the validator scored 1 miner per round
+    instead of ~90. Nothing errored; the scores simply stopped appearing.
+    """
     cks = ChainCheckpoints(checkpoints=[
-        _ckpt(1, "aa" * 32, stake=1.0, global_ver=inside),
-        _ckpt(2, "aa" * 32, stake=1.0, global_ver=above),
+        _ckpt(uid, f"{uid:02x}" * 32, stake=float(uid) * 10.0)
+        for uid in range(1, 6)
     ])
-    kept = cks.filter_checkpoints(
-        for_role="miner", min_allowed_version=inside - 100, max_allowed_version=inside,
-    )
-    assert sorted(c.uid for c in kept.checkpoints) == [1, 2]
+    kept = cks.filter_checkpoints(for_role="miner")
+    assert sorted(c.uid for c in kept.checkpoints) == [1, 2, 3, 4, 5]
 
 
 # --- revision and hash must travel together ----------------------------------

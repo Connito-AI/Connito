@@ -351,14 +351,6 @@ class Round:
             return sum(t.numel() * t.element_size() for t in d.values())
 
         logger.info(
-            "Round.freeze: roster locked",
-            round_id=rid,
-            roster_size=len(uid_to_hotkey),
-            background_size=len(background_uids),
-            base_param_bytes=_nbytes(base_params),
-            base_full_bytes=_nbytes(snapshot),
-        )
-        logger.info(
             "Round.freeze: bg score prepend",
             round_id=rid,
             count=len(score_prepend_uids),
@@ -533,6 +525,19 @@ class Round:
                     weight_group_1=list(new_weight_group_1),
                     weight_group_2=list(new_weight_group_2),
                 )
+
+        # Emitted here, not at the top: the cohort path below replaces
+        # `background_uids` wholesale and backfills `uid_to_hotkey`, so a log
+        # placed before it reported the pre-cohort roster. That is the number
+        # used to verify evaluation coverage, so it has to be the final one.
+        logger.info(
+            "Round.freeze: roster locked",
+            round_id=rid,
+            roster_size=len(background_uids),
+            hotkey_count=len(uid_to_hotkey),
+            base_param_bytes=_nbytes(base_params),
+            base_full_bytes=_nbytes(snapshot),
+        )
 
         # Resolve the journal location. If `checkpoint_path` is provided
         # we mirror the aggregator's checkpoint dir; otherwise leave

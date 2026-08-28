@@ -475,11 +475,14 @@ class ChainCheckpoints(BaseModel):
             if not filtered:
                 return ChainCheckpoints(checkpoints=[])
 
+        # Miner commits stop here. `for_role` is *whose* commits these are,
+        # not who is reading: every miner trains its own model, so their
+        # hashes are all distinct and the stake-weighted vote below would
+        # discard the whole field bar one arbitrary group.
+        if for_role == "miner":
+            return ChainCheckpoints(checkpoints=filtered)
+
         # select majority model_hash (stake-weighted)
-        # Miners run this too: each validator publishes its own baseline, so
-        # their hashes differ and the max below resolves to the highest-stake
-        # validator. Since validators no longer all-reduce, this is the only
-        # thing keeping participants on one model.
         hash_stake: dict[str, float] = {}
         for ckpt in filtered:
             if ckpt.model_hash:
