@@ -447,12 +447,16 @@ class WeightSubmissionPayload:
     can log them without recomputing the selection.
     `g1_redirected_to_uid_zero` is set when the empty-G1 guard fires —
     the caller logs that case under its own info line.
+    `g1_stale_excluded` lists the A∪B UIDs that cleared the count and
+    recency gates but were dropped by the freshness gate, so the caller
+    can log exactly who lost a seat to staleness.
     """
     uid_weights: dict[int, float]
     weight_group_1: tuple[int, ...] = ()
     weight_group_2: tuple[int, ...] = ()
     cohort_emission: bool = False
     g1_redirected_to_uid_zero: bool = False
+    g1_stale_excluded: tuple[int, ...] = ()
 
 
 def build_submission_uid_weights(
@@ -483,9 +487,11 @@ def build_submission_uid_weights(
         round_ids within the last `5 * cycle_length` blocks — i.e.
         scored in at least 3 of the last 5 cycles. Tightens the prior
         2-of-5 gate so a miner needs sustained participation to anchor
-        the validator's top-N ballot. Empty-G1 guard: if no UID
-        clears, redirect to `uid = 0` (subnet owner) so the validator
-        stays at full emission.
+        the validator's top-N ballot. On top of that, a **freshness
+        gate**: the UID's most recent tagged point must be no older
+        than `cfg.g1_max_stale_rounds` rounds. Empty-G1 guard: if no
+        UID clears, redirect to `uid = 0` (subnet owner) so the
+        validator stays at full emission.
       * Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
         of A∪B∪C \\ G1 by aggregator avg, restricted to UIDs with
         `record_count >= 1` (no recency gate).
@@ -510,13 +516,44 @@ def build_submission_uid_weights(
     cur_rid = int(round_id)
     g1_window_min_rid = cur_rid - 5 * int(cycle_length)
 
+    # Freshness gate. `avg_scores` is a rolling mean over *recorded
+    # points* with no notion of elapsed rounds, so a UID that stops
+    # being evaluated keeps its last average intact and holds its G1
+    # seat until those points age out of the retention window. Observed
+    # on mainnet: uid 158 took 31.5% of emission at round 8692978 on a
+    # 2.25 earned four rounds earlier, and its avg sat unchanged at
+    # 0.40625 across six consecutive rounds. Requiring a recent tagged
+    # point makes "no current evidence about this miner" disqualifying
+    # for a G1 seat, independent of what the stale average says.
+    #
+    # A 0.0 written by `finalize_round_scores` counts as evidence — the
+    # gate is about whether the validator looked at the miner this
+    # round, not about how well it did. `latest_round_id` returns None
+    # for a UID with no tagged points (schema v1 legacy state), which
+    # fails the gate: unattributable history cannot back a G1 seat.
+    max_stale = int(getattr(eval_cfg, "g1_max_stale_rounds", 1))
+    g1_min_fresh_rid = cur_rid - max_stale * int(cycle_length)
+
+    def _has_recent_history(uid: int) -> bool:
+        return (
+            score_aggregator.record_count(uid) >= 3
+            and score_aggregator.count_distinct_round_ids_in_range(
+                uid, g1_window_min_rid, cur_rid,
+            ) >= 3
+        )
+
+    def _is_fresh(uid: int) -> bool:
+        latest_rid = score_aggregator.latest_round_id(uid)
+        return latest_rid is not None and latest_rid >= g1_min_fresh_rid
+
     ab_qualified = [
-        u for u in ab_uids
-        if score_aggregator.record_count(u) >= 3
-        and score_aggregator.count_distinct_round_ids_in_range(
-            u, g1_window_min_rid, cur_rid,
-        ) >= 3
+        u for u in ab_uids if _has_recent_history(u) and _is_fresh(u)
     ]
+    # Recorded purely so the caller can log who lost a seat to staleness;
+    # does not affect selection.
+    g1_stale_excluded = tuple(
+        u for u in ab_uids if _has_recent_history(u) and not _is_fresh(u)
+    )
     g1 = _rg.select_top_n_by_local_score(
         ab_qualified,
         avg_scores,
@@ -550,6 +587,7 @@ def build_submission_uid_weights(
         weight_group_2=g2,
         cohort_emission=True,
         g1_redirected_to_uid_zero=g1_redirected,
+        g1_stale_excluded=g1_stale_excluded,
     )
 
 

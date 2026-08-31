@@ -169,8 +169,8 @@ class CycleCfg(BaseConfig):
     cycle_length: int = 448 # 1.5 hr
     distribute_period: int = 20 # 4 mins
     train_period: int = 300 # 1 hr (will adjust to 500 mins when mature to align with Diloco)
-    commit_period: int = 10 # 2 mins
-    submission_period: int = 80 # 4 mins
+    commit_period: int = 11 # 2 mins
+    submission_period: int = 100 # 4 mins
     validate_period: int = 10 # 10 mins
     merge_period: int = 50 # 10 mins
 
@@ -1046,6 +1046,13 @@ class EvalCfg(BaseConfig):
     validation_group_c_size: int = 17
     group_a_min_consensus: int = 1               # ≥ 1 qualified validator
     group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
+    # Freshness gate on weight Group 1: a UID may only hold a G1 seat if
+    # its most recent aggregator point is no older than this many rounds
+    # (`round_id >= cur_rid - g1_max_stale_rounds * cycle_length`).
+    # 1 → the current round or the one before it. Set to a large value to
+    # restore the legacy behavior of letting a stale rolling average hold
+    # a G1 seat indefinitely.
+    g1_max_stale_rounds: int = 1
     # When a miner's committed HF repo/revision/file is definitively not
     # retrievable (deleted, private, gated, revision rewritten) AND an
     # unauthenticated probe confirms it is not publicly fetchable, treat
