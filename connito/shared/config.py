@@ -465,6 +465,16 @@ class HfCfg(BaseConfig):
     # Read from HF_TOKEN env at runtime — not stored in config YAML.
     # Validators need write access; miners need read access (or public repo).
     token_env_var: str = "HF_TOKEN"
+    # Separate repo the round podium is published to, off unless set. Keep it
+    # distinct from `checkpoint_repo`: podium commits would otherwise advance
+    # `main` on the repo miners fetch from, and the squash below rewrites
+    # history, which must never touch the distribution repo.
+    archive_repo: str | None = None
+    archive_keep_rounds: PositiveInt = 3
+    # Deleting a round folder leaves its LFS bytes in history; squashing is
+    # what reclaims them. Costs every prior revision of the archive repo,
+    # which is why it is confined to a repo nothing pins.
+    archive_squash: bool = True
 
     @staticmethod
     def _normalize_checkpoint_repo_value(value: str | None) -> str | None:
@@ -514,11 +524,8 @@ class LoggingCfg(BaseConfig):
 class ValidatorCheckpointCfg(CheckpointCfg):
     base_checkpoint_path: Path = Path("checkpoints/validator")
     miner_submission_path: Path = Path("miner_submission")
-    miner_submission_archive_path: Path = Path("miner_submission_archive")
-    archive_submissions: bool = False
     cleanup_stale_temporary_checkpoints: bool = True
     miner_submission_max_age_cycles: PositiveFloat = 1.5
-    miner_submission_archive_max_files: PositiveInt = 5
 
 
 class DhtCfg(BaseConfig):
@@ -670,10 +677,6 @@ class WorkerConfig(BaseConfig):
         if hasattr(self.ckpt, "miner_submission_path"):
             self.ckpt.miner_submission_path = (
                 base_ckpt / Path(ckpt_cls.model_fields["miner_submission_path"].default)
-            )
-        if hasattr(self.ckpt, "miner_submission_archive_path"):
-            self.ckpt.miner_submission_archive_path = (
-                base_ckpt / Path(ckpt_cls.model_fields["miner_submission_archive_path"].default)
             )
 
     def _ensure_runtime_dirs(self) -> None:

@@ -724,25 +724,26 @@ class Round:
         if hotkey is not None:
             self._record_in_cycle_score(uid, hotkey, score_f)
 
-    def top_scored_uids_this_round(self, top_k: int) -> set[int]:
-        """Top-`top_k` UIDs by *this round's* score. Returns every scored
-        UID when fewer than `top_k` have been scored. Ties are broken
-        arbitrarily by UID (stable-sort fallback) — the caller only needs
-        a set, not a ranking.
+    def top_scored_ranked_this_round(self, top_k: int) -> list[tuple[int, float]]:
+        """Top-`top_k` `(uid, score)` by *this round's* score, best first.
+
+        Returns every scored UID when fewer than `top_k` have been scored.
+        The submission archive needs the ordering to name its files by rank;
+        the cleanup path only needs membership, so it takes the set below.
         """
         if top_k <= 0:
-            return set()
+            return []
         with self._lock:
-            if not self.scores:
-                return set()
-            if len(self.scores) <= top_k:
-                return set(self.scores.keys())
             ranked = sorted(
                 self.scores.items(),
                 key=lambda kv: (kv[1], -kv[0]),  # score desc, uid asc as tiebreak
                 reverse=True,
             )
-            return {uid for uid, _ in ranked[:top_k]}
+            return ranked[:top_k]
+
+    def top_scored_uids_this_round(self, top_k: int) -> set[int]:
+        """Top-`top_k` UIDs by *this round's* score, unordered."""
+        return {uid for uid, _ in self.top_scored_ranked_this_round(top_k)}
 
     def baseline_winner_uid(self) -> int | None:
         """The UID `publish_round_baseline` would pick if the round finalized
