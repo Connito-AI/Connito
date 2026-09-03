@@ -108,6 +108,10 @@ class Round:
     # this round's *raw deltas* until finalize replaces them with rank scores,
     # so a mid-round average mixes incompatible units.
     prior_avg_scores: dict[int, float] = field(default_factory=dict)
+    # The cycle this round belongs to, as the cycle API numbers them. Carried
+    # so publishing can name artifacts the way the dashboard does; `round_id`
+    # is a block and the two are not interchangeable.
+    cycle_index: int | None = None
 
     # Mutable, lock-guarded
     downloaded_pool: dict[int, Path] = field(default_factory=dict)
@@ -382,13 +386,14 @@ class Round:
             "enable_round_group_construction",
             False,
         ))
+        effective_cycle_length = cycle_length
+        effective_cycle_index = cycle_index
+        if effective_cycle_index is None and effective_cycle_length:
+            effective_cycle_index = rid // int(effective_cycle_length)
+
         if flag_enabled:
             from connito.validator import round_groups
 
-            effective_cycle_length = cycle_length
-            effective_cycle_index = cycle_index
-            if effective_cycle_index is None and effective_cycle_length:
-                effective_cycle_index = rid // int(effective_cycle_length)
             if effective_cycle_index is None or not effective_cycle_length:
                 logger.warning(
                     "Round.freeze: round-group flag on but cycle_index/cycle_length missing; "
@@ -559,6 +564,7 @@ class Round:
             submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
             prior_avg_scores=dict(prior_scores),
+            cycle_index=int(effective_cycle_index) if effective_cycle_index is not None else None,
             freeze_zero_uids=freeze_zero_uids,
             freeze_zero_hotkeys=freeze_zero_hotkeys,
             weight_group_1=new_weight_group_1,

@@ -152,7 +152,7 @@ def _sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
 
 
 def _prune_archive_repo(repo_id: str, keep_rounds: int, token: str | None, squash: bool) -> None:
-    """Drop `round_*` folders beyond the newest `keep_rounds`, then squash.
+    """Drop `cycle_*` folders beyond the newest `keep_rounds`, then squash.
 
     Deleting a folder only rewrites the tree; the LFS bytes stay in history and
     keep counting against the repo. `super_squash_history` is what actually
@@ -165,10 +165,10 @@ def _prune_archive_repo(repo_id: str, keep_rounds: int, token: str | None, squas
     rounds: list[tuple[int, str]] = []
     for entry in api.list_repo_tree(repo_id, recursive=False):
         name = Path(entry.path).name
-        if not name.startswith("round_"):
+        if not name.startswith("cycle_"):
             continue
         try:
-            rounds.append((int(name.removeprefix("round_")), entry.path))
+            rounds.append((int(name.removeprefix("cycle_")), entry.path))
         except ValueError:
             # Leave anything we cannot identify alone rather than deleting blind.
             logger.warning("publish_podium: unrecognized archive folder", path=entry.path)
@@ -201,6 +201,7 @@ def publish_round_podium(*, round_obj, config) -> None:
     and a lost archive must never disturb scoring.
     """
     rid = getattr(round_obj, "round_id", None)
+    cycle = getattr(round_obj, "cycle_index", None)
     repo_id = getattr(config.hf, "archive_repo", None)
     if not repo_id:
         return
@@ -209,6 +210,13 @@ def publish_round_podium(*, round_obj, config) -> None:
         return
     stage: Path | None = None
     try:
+        if cycle is None:
+            # Named by cycle so artifacts line up with the dashboard. Without
+            # it there is no name to give the folder, and inventing one would
+            # put a second scheme in the repo the consumer has to parse.
+            logger.warning("publish_podium: no cycle_index on the round", round_id=rid)
+            return
+
         podium = round_obj.top_scored_ranked_this_round(int(config.evaluation.top_k_miners_to_reward))
         if not podium:
             logger.info("publish_podium: nothing scored this round", round_id=rid)
@@ -241,7 +249,11 @@ def publish_round_podium(*, round_obj, config) -> None:
             logger.warning("publish_podium: no podium file was available", round_id=rid)
             return
 
+        # Both identifiers: the folder is named by cycle, but consumers key
+        # their index on `round_id` — it is what `publish_round_baseline`
+        # stamps its commits with, so it is what correlates the two sources.
         (stage / "manifest.json").write_text(json.dumps({
+            "cycle_index": int(cycle),
             "round_id": int(rid),
             "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "files": entries,
@@ -251,14 +263,15 @@ def publish_round_podium(*, round_obj, config) -> None:
         token_env_var = config.hf.token_env_var
         revision = upload_checkpoint_to_hf_subprocess(
             ckpt_dir=stage, repo_id=repo_id, token_env_var=token_env_var,
-            commit_message=f"podium round_id={rid}",
+            commit_message=f"podium cycle_index={cycle} round_id={rid}",
             # The default patterns match `model_expgroup_*` only, which would
             # upload an empty commit here.
             allow_patterns=["rank*.safetensors", "manifest.json"],
-            path_in_repo=f"round_{rid}",
+            path_in_repo=f"cycle_{cycle}",
         )
         logger.info(
-            "publish_podium: published", round_id=rid, repo_id=repo_id, revision=revision,
+            "publish_podium: published", cycle_index=cycle, round_id=rid,
+            repo_id=repo_id, revision=revision,
             uids=[e["uid"] for e in entries],
             size_bytes=sum(e["size_bytes"] for e in entries),
             elapsed_s=round(time.monotonic() - started, 1),

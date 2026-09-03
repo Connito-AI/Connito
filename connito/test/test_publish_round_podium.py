@@ -24,7 +24,8 @@ from connito.validator import distribute
 from connito.validator.round import Round
 
 BLOCK_RANGE = (500, 600)
-ROUND_ID = 9000
+ROUND_ID = 8988554
+CYCLE = 17153
 REPO = "owner/co-archive"
 
 
@@ -38,7 +39,8 @@ def _config(submission_dir: Path, top_k: int = 3, keep_rounds: int = 3,
     )
 
 
-def _round(scores: dict[int, float], uid_to_hotkey: dict[int, str]) -> SimpleNamespace:
+def _round(scores: dict[int, float], uid_to_hotkey: dict[int, str],
+           cycle_index: int | None = CYCLE) -> SimpleNamespace:
     """A stand-in round carrying the *real* ranking method.
 
     Binding `Round.top_scored_ranked_this_round` rather than reimplementing the
@@ -46,7 +48,8 @@ def _round(scores: dict[int, float], uid_to_hotkey: dict[int, str]) -> SimpleNam
     tests, which a hand-rolled ranking in the fixture would hide.
     """
     obj = SimpleNamespace(
-        round_id=ROUND_ID, scores=scores, uid_to_hotkey=uid_to_hotkey,
+        round_id=ROUND_ID, cycle_index=cycle_index, scores=scores,
+        uid_to_hotkey=uid_to_hotkey,
         submission_block_range=BLOCK_RANGE, _lock=threading.Lock(),
     )
     obj.top_scored_ranked_this_round = Round.top_scored_ranked_this_round.__get__(obj)
@@ -188,22 +191,24 @@ def test_manifest_hashes_match_the_staged_bytes(tmp_path, uploads):
 
     call = uploads[0]
     assert call["manifest"]["round_id"] == ROUND_ID
+    assert call["manifest"]["cycle_index"] == CYCLE
     for entry in call["manifest"]["files"]:
         raw = call["bytes"][entry["filename"]]
         assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
         assert entry["size_bytes"] == len(raw)
 
 
-def test_the_round_folder_is_the_upload_path(tmp_path, uploads):
-    """Retention deletes whole rounds, which only works if each lands in its
-    own folder rather than at the repo root."""
+def test_the_cycle_folder_is_the_upload_path(tmp_path, uploads):
+    """Named by cycle so artifacts line up with the dashboard, which counts
+    cycles; `round_id` is a block and the two are not interchangeable.
+    Retention also needs one folder per round to delete whole rounds."""
     sub = tmp_path / "sub"
     _submission(sub, "aaa")
     rnd = _round({1: 0.9}, {1: "aaa"})
 
     distribute.publish_round_podium(round_obj=rnd, config=_config(sub))
 
-    assert uploads[0]["path_in_repo"] == f"round_{ROUND_ID}"
+    assert uploads[0]["path_in_repo"] == f"cycle_{CYCLE}"
     assert uploads[0]["repo_id"] == REPO
     # The default patterns match `model_expgroup_*` and would commit nothing.
     assert "manifest.json" in uploads[0]["allow_patterns"]
@@ -283,11 +288,11 @@ def test_retention_drops_only_rounds_beyond_keep_rounds(tmp_path, uploads):
     sub = tmp_path / "sub"
     _submission(sub, "aaa")
     rnd = _round({1: 0.9}, {1: "aaa"})
-    _FakeApi.folders = ["round_100", "round_300", "round_200", "round_400"]
+    _FakeApi.folders = ["cycle_100", "cycle_300", "cycle_200", "cycle_400"]
 
     distribute.publish_round_podium(round_obj=rnd, config=_config(sub, keep_rounds=3))
 
-    assert _FakeApi.deleted == ["round_100"]
+    assert _FakeApi.deleted == ["cycle_100"]
     assert _FakeApi.squashed == [REPO]
 
 
@@ -296,11 +301,11 @@ def test_retention_leaves_unrecognized_folders_alone(tmp_path, uploads):
     sub = tmp_path / "sub"
     _submission(sub, "aaa")
     rnd = _round({1: 0.9}, {1: "aaa"})
-    _FakeApi.folders = ["round_old", "round_100", "round_200"]
+    _FakeApi.folders = ["cycle_old", "cycle_100", "cycle_200"]
 
     distribute.publish_round_podium(round_obj=rnd, config=_config(sub, keep_rounds=1))
 
-    assert _FakeApi.deleted == ["round_100"]
+    assert _FakeApi.deleted == ["cycle_100"]
 
 
 def test_no_squash_when_nothing_was_pruned(tmp_path, uploads):
@@ -309,7 +314,7 @@ def test_no_squash_when_nothing_was_pruned(tmp_path, uploads):
     sub = tmp_path / "sub"
     _submission(sub, "aaa")
     rnd = _round({1: 0.9}, {1: "aaa"})
-    _FakeApi.folders = ["round_100"]
+    _FakeApi.folders = ["cycle_100"]
 
     distribute.publish_round_podium(round_obj=rnd, config=_config(sub, keep_rounds=3))
 
@@ -355,3 +360,16 @@ def test_the_lock_is_released_after_a_failure(tmp_path, uploads, monkeypatch):
     monkeypatch.setattr(distribute, "upload_checkpoint_to_hf_subprocess", working)
     distribute.publish_round_podium(round_obj=rnd, config=_config(sub))
     assert len(uploads) == 1
+
+
+def test_a_round_without_a_cycle_number_is_not_published(tmp_path, uploads):
+    """The folder is named from the cycle. Inventing a fallback name would put
+    a second scheme in the repo for the consumer to parse."""
+    sub = tmp_path / "sub"
+    _submission(sub, "aaa")
+    rnd = _round({1: 0.9}, {1: "aaa"}, cycle_index=None)
+
+    distribute.publish_round_podium(round_obj=rnd, config=_config(sub))
+
+    assert uploads == []
+    assert list(sub.glob(".tmp_podium_*")) == []
