@@ -132,6 +132,7 @@ def upload_checkpoint_to_hf(
     token_env_var: str = "HF_TOKEN",
     commit_message: str | None = None,
     allow_patterns: list[str] | None = None,
+    path_in_repo: str | None = None,
 ) -> str:
     """Upload a checkpoint directory to HF and return a short commit revision.
 
@@ -139,6 +140,10 @@ def upload_checkpoint_to_hf(
     use a shorter immutable revision token downstream. `main` is updated to
     point at the new commit as a side effect, but miners should pin to the
     revision from the chain, not the branch name.
+
+    `path_in_repo` places the upload under a subdirectory instead of the repo
+    root — the podium archive keys a folder per round so retention can drop a
+    whole round at once.
     """
     ready, reason = get_hf_upload_readiness(repo_id=repo_id, token=token, token_env_var=token_env_var)
     if not ready:
@@ -170,6 +175,7 @@ def upload_checkpoint_to_hf(
         repo_id=repo_id,
         commit_message=commit_message or f"checkpoint upload from {ckpt_dir.name}",
         allow_patterns=allow_patterns if allow_patterns is not None else default_allow_patterns,
+        path_in_repo=path_in_repo,
     )
     revision = commit_info.oid[:12]
     logger.info(
@@ -248,6 +254,7 @@ def _upload_child(
     token_env_var: str,
     commit_message: str | None,
     allow_patterns: list[str] | None,
+    path_in_repo: str | None,
 ) -> None:
     # Entry point in the spawned child. Pickle boundary keeps args
     # simple types (str/list); reconstruct Path inside the child.
@@ -261,6 +268,7 @@ def _upload_child(
             token_env_var=token_env_var,
             commit_message=commit_message,
             allow_patterns=allow_patterns,
+            path_in_repo=path_in_repo,
         )
         conn.send(("ok", revision))
     except BaseException as e:
@@ -277,6 +285,7 @@ def upload_checkpoint_to_hf_subprocess(
     token_env_var: str = "HF_TOKEN",
     commit_message: str | None = None,
     allow_patterns: list[str] | None = None,
+    path_in_repo: str | None = None,
     timeout_sec: float | None = None,
 ) -> str:
     """Run `upload_checkpoint_to_hf` in a spawned child process.
@@ -315,6 +324,7 @@ def upload_checkpoint_to_hf_subprocess(
             token_env_var,
             commit_message,
             allow_patterns,
+            path_in_repo,
         ),
         name="hf-upload-worker",
     )

@@ -82,7 +82,7 @@ Reveal the model hash and post chain weights:
 These steps are not gated by another `wait_till`; they run immediately after the ValidatorCommit2 commit and finish before the next iteration's MinerCommit1 wait:
 
 - **(9) `submit_weights`** (`run.py:1014-1028`). Pulls `score_aggregator.uid_score_pairs(how="avg")`, normalizes, restricts to top `config.evaluation.top_k_miners_to_reward`, and submits via `submit_weights`. This is the actual TAO emissions signal.
-- **(10) Archive + prune miner submissions** (`run.py:1030-1053`). If `config.ckpt.archive_submissions`, copy the top-k miner submission files into `miner_submission_archive_path` (capped at `miner_submission_archive_max_files`). Then `prune_miner_submission_files(..., max_age_cycles=0)` deletes everything else from this cycle's submission staging dir.
+- **(10) Prune miner submissions** (`run.py:1030-1053`). `prune_miner_submission_files(..., max_age_cycles=0)` sets `min_allowed_block = current_block`, so it deletes *every* submission from this cycle's staging dir regardless of rank. Anything that needs a submission past this point must already hold its own reference: `publish_round_baseline` and `publish_round_podium` both hardlink before uploading, which is why the unlink here frees nothing they still need.
 - **(11) Local evaluation is intentionally disabled** to reduce per-cycle RAM/compute (`run.py:1055-1057`). Only `get_status` + `metric_logger.log` runs to record the cycle's loss/timing metrics.
 - `cleanup(global_model)` and back to the top of the loop.
 

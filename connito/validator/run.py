@@ -80,7 +80,6 @@ from connito.shared.checkpoint_helper import (
 )
 from connito.shared.checkpoints import (
     ModelCheckpoint,
-    archive_top_miner_submissions,
     build_local_checkpoint,
     delete_old_checkpoints,
     prune_miner_submission_files,
@@ -1013,12 +1012,24 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
                 # Off the main loop: a ~3 GB upload must not sit between here
                 # and MinerCommit1. Daemon so it can never hold up shutdown.
-                from connito.validator.distribute import publish_round_baseline
+                from connito.validator.distribute import (
+                    publish_round_baseline,
+                    publish_round_podium,
+                )
 
                 threading.Thread(
                     target=publish_round_baseline,
                     kwargs={"round_obj": pending_round, "config": config, "out": baseline_ref},
                     name="publish-baseline", daemon=True,
+                ).start()
+                # Ranks 2-3 exist nowhere but this dir, and the prune at
+                # MinerCommit1 empties it. Its own thread: nothing waits on the
+                # archive, and it must not delay the baseline the next
+                # ValidatorCommit advertises. No-ops unless `hf.archive_repo`.
+                threading.Thread(
+                    target=publish_round_podium,
+                    kwargs={"round_obj": pending_round, "config": config},
+                    name="publish-podium", daemon=True,
                 ).start()
                 # Drop history older than 8 cycle lengths so the aggregator
                 # only carries the recent window the cohort election + weight
@@ -1173,16 +1184,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 expert_group=config.task.exp.group_id,
                 miner_seed=new_miner_seed,
             ))
-
-            if config.ckpt.archive_submissions:
-                logger.info("Archiving top miner submissions")
-                archive_top_miner_submissions(
-                    submission_dir=config.ckpt.miner_submission_path,
-                    archive_dir=config.ckpt.miner_submission_archive_path,
-                    score_aggregator=score_aggregator,
-                    top_k=config.evaluation.top_k_miners_to_reward,
-                    max_archive=config.ckpt.miner_submission_archive_max_files,
-                )
 
             deleted = prune_miner_submission_files(
                 config.ckpt.miner_submission_path,

@@ -29,6 +29,7 @@ from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
     note_round_series,
+    set_baseline_loss,
 )
 from connito.validator.evaluator import (
     EVAL_MAX_BATCHES,
@@ -363,6 +364,10 @@ class BackgroundEvalWorker(threading.Thread):
 
         try:
             self._loaded_baseline_loss = await asyncio.to_thread(_baseline)
+            # Feeds the dashboard's baseline trend. Only the measured path
+            # publishes: both fallbacks park the value at 100.0, and a
+            # sentinel in the series reads as a real regression.
+            set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss)
         except Exception as e:
             logger.warning("bg-eval: baseline failed; using fallback", error=str(e))
             self._loaded_baseline_loss = 100.0
