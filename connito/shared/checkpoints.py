@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import time
 from collections import Counter
 from functools import total_ordering
@@ -17,7 +16,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from connito.shared.app_logging import structlog
 from connito.shared.checkpoint_helper import compile_full_state_dict_from_path
 from connito.shared.expert_manager import get_layer_expert_id
-from connito.shared.helper import MINER_CHECKPOINT_SUFFIXES, get_model_hash, parse_dynamic_filename
+from connito.shared.helper import (
+    MINER_CHECKPOINT_SUFFIXES,
+    get_model_hash,
+    parse_dynamic_filename,
+)
 from connito.shared.schema import sign_message, verify_message
 
 from connito.shared.cycle import (
@@ -964,111 +967,6 @@ def prune_submissions_outside_window(
                 error=str(exc),
             )
     return deleted_files
-
-
-def archive_top_miner_submissions(
-    submission_dir: Path,
-    archive_dir: Path,
-    score_aggregator,
-    top_k: int | None = None,
-    max_archive: int = 500,
-) -> None:
-    """
-    Archive the top-k and 25th-percentile miner submissions to a permanent folder.
-    Files are renamed with a rank prefix (rank01_best, rank02, ..., p25) so the
-    quality is visible from the filename. Delete all other submissions.
-    Prune archive to max_archive files.
-    """
-    submission_dir = Path(submission_dir)
-    archive_dir = Path(archive_dir)
-    if not submission_dir.exists():
-        return
-
-    archive_dir.mkdir(parents=True, exist_ok=True)
-
-    # Collect all submission files with their hotkey
-    submissions: dict[str, Path] = {}
-    submission_files = [
-        p for suffix in MINER_CHECKPOINT_SUFFIXES
-        for p in submission_dir.glob(f"*{suffix}")
-    ]
-    for file_path in submission_files:
-        meta = parse_dynamic_filename(file_path.name)
-        hotkey = meta.get("hotkey")
-        if hotkey:
-            submissions[hotkey] = file_path
-
-    if not submissions:
-        return
-
-    # Get scores for ranking
-    uid_scores = score_aggregator.uid_score_pairs(how="avg")
-
-    # Map hotkey -> best score (lower val_loss = better)
-    hotkey_scores: dict[str, float] = {}
-    for hotkey in submissions:
-        for uid, score in uid_scores.items():
-            state = score_aggregator._miners.get(uid)
-            if state and state.hotkey == hotkey:
-                hotkey_scores[hotkey] = score
-                break
-
-    # Rank by score (lower val_loss is better)
-    ranked_hotkeys = sorted(
-        hotkey_scores.keys(),
-        key=lambda hk: hotkey_scores.get(hk, float("inf")),
-    )
-
-    # Determine which hotkeys to archive: best + 25th percentile
-    best_hotkey = ranked_hotkeys[0] if ranked_hotkeys else None
-    p25_idx = max(0, len(ranked_hotkeys) - 1) * 3 // 4
-    p25_hotkey = ranked_hotkeys[p25_idx] if ranked_hotkeys else None
-
-    archive_hotkeys: dict[str, str] = {}
-    if best_hotkey:
-        archive_hotkeys[best_hotkey] = "best"
-    if p25_hotkey and p25_hotkey != best_hotkey:
-        archive_hotkeys[p25_hotkey] = "p25"
-
-    archived = []
-    deleted = []
-    for hotkey, file_path in submissions.items():
-        if hotkey in archive_hotkeys:
-            label = archive_hotkeys[hotkey]
-            score_str = f"{hotkey_scores.get(hotkey, 0):.4f}"
-            stem = file_path.stem
-            dest_name = f"{stem}_rank_{label}_loss_{score_str}{file_path.suffix}"
-            dest = archive_dir / dest_name
-            # bg-eval's _prune_non_top can delete this file between the
-            # glob above and now (its per-round top-k disagrees with our
-            # rolling-avg top-k). Treat a vanished source as "already
-            # cleaned" rather than crashing the validator.
-            try:
-                shutil.move(str(file_path), str(dest))
-            except FileNotFoundError:
-                continue
-            archived.append(dest_name)
-        else:
-            file_path.unlink(missing_ok=True)
-            deleted.append(file_path.name)
-
-    if archived:
-        logger.info("Archived miner submissions", count=len(archived), top_k=top_k, files=archived)
-    if deleted:
-        logger.debug("Deleted non-archived miner submissions", count=len(deleted))
-
-    # Prune archive to max_archive files (keep newest by modification time)
-    archive_candidates = [
-        p for suffix in MINER_CHECKPOINT_SUFFIXES
-        for p in archive_dir.glob(f"*{suffix}")
-    ]
-    archive_files = sorted(archive_candidates, key=lambda f: f.stat().st_mtime, reverse=True)
-    if len(archive_files) > max_archive:
-        pruned = []
-        for old_file in archive_files[max_archive:]:
-            old_file.unlink(missing_ok=True)
-            pruned.append(old_file.name)
-        logger.debug("Pruned old archive files", count=len(pruned), max_archive=max_archive)
 
 
 def select_best_checkpoint(

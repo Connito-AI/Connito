@@ -9,9 +9,12 @@ feature, and the transport primitives already live in
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -23,6 +26,7 @@ from connito.shared.helper import (
 )
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
+    resolve_hf_token,
     upload_checkpoint_to_hf_subprocess,
 )
 
@@ -129,3 +133,157 @@ def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> Non
         )
     except Exception as e:
         logger.warning("publish_baseline: failed", round_id=rid, error=str(e), exc_info=True)
+
+
+# One upload at a time. A round's podium is ~9 GB and a cycle is ~105 min, so
+# overlap should not happen — but if an upload stalls, stacking a second one
+# behind it would compete for the same bandwidth and double the staged bytes
+# the cycle prune is being held off from.
+_podium_lock = threading.Lock()
+
+
+def _sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
+    """Streaming sha256 — submissions are ~3 GB, so never read one whole."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(chunk_bytes), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _prune_archive_repo(repo_id: str, keep_rounds: int, token: str | None, squash: bool) -> None:
+    """Drop `cycle_*` folders beyond the newest `keep_rounds`, then squash.
+
+    Deleting a folder only rewrites the tree; the LFS bytes stay in history and
+    keep counting against the repo. `super_squash_history` is what actually
+    reclaims them, at the cost of every prior revision — which is why the
+    archive repo must stay separate from the one miners pin.
+    """
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+    rounds: list[tuple[int, str]] = []
+    for entry in api.list_repo_tree(repo_id, recursive=False):
+        name = Path(entry.path).name
+        if not name.startswith("cycle_"):
+            continue
+        try:
+            rounds.append((int(name.removeprefix("cycle_")), entry.path))
+        except ValueError:
+            # Leave anything we cannot identify alone rather than deleting blind.
+            logger.warning("publish_podium: unrecognized archive folder", path=entry.path)
+    rounds.sort(reverse=True)
+
+    dropped = [path for _, path in rounds[keep_rounds:]]
+    for path in dropped:
+        api.delete_folder(path_in_repo=path, repo_id=repo_id, commit_message=f"prune {path}")
+    if dropped:
+        logger.info("publish_podium: pruned archive rounds", repo_id=repo_id, dropped=dropped)
+    if dropped and squash:
+        api.super_squash_history(repo_id=repo_id, commit_message="reclaim pruned podium bytes")
+
+
+def publish_round_podium(*, round_obj, config) -> None:
+    """Upload this round's top-`top_k` submissions to the archive repo.
+
+    The end-of-cycle prune empties the submission dir at MinerCommit1 regardless
+    of rank. `publish_round_baseline` rescues one file, but it picks the best
+    *proven* miner by track record — so when this cycle's top scorer is not a
+    proven miner, not even rank 1 survives. Miners routinely delete the
+    evaluated revision from their own repo, so this is the only chance.
+
+    Ranked by *this round's* scores rather than rolling averages: a miner with a
+    strong average may not have submitted this cycle, and its file would not be
+    on disk to upload. That also means rank 1 here and the published baseline —
+    which selects on the average — legitimately differ some rounds.
+
+    Never raises: runs on a daemon thread where an exception would be invisible,
+    and a lost archive must never disturb scoring.
+    """
+    rid = getattr(round_obj, "round_id", None)
+    cycle = getattr(round_obj, "cycle_index", None)
+    repo_id = getattr(config.hf, "archive_repo", None)
+    if not repo_id:
+        return
+    if not _podium_lock.acquire(blocking=False):
+        logger.warning("publish_podium: previous upload still running", round_id=rid)
+        return
+    stage: Path | None = None
+    try:
+        if cycle is None:
+            # Named by cycle so artifacts line up with the dashboard. Without
+            # it there is no name to give the folder, and inventing one would
+            # put a second scheme in the repo the consumer has to parse.
+            logger.warning("publish_podium: no cycle_index on the round", round_id=rid)
+            return
+
+        podium = round_obj.top_scored_ranked_this_round(int(config.evaluation.top_k_miners_to_reward))
+        if not podium:
+            logger.info("publish_podium: nothing scored this round", round_id=rid)
+            return
+
+        submission_dir = Path(config.ckpt.miner_submission_path)
+        # Hardlink, not copy: same filesystem, so staging ~9 GB costs three
+        # inodes — and the links keep the bytes alive when the prune unlinks
+        # the originals out from under an upload still in flight.
+        stage = Path(tempfile.mkdtemp(dir=submission_dir, prefix=".tmp_podium_"))
+        entries: list[dict] = []
+        for rank, (uid, score) in enumerate(podium, start=1):
+            hotkey = round_obj.uid_to_hotkey.get(uid)
+            src = find_submission_for_hotkey(
+                submission_dir, hotkey, round_obj.submission_block_range,
+            ) if hotkey else None
+            if src is None or src.suffix != ".safetensors":
+                logger.warning("publish_podium: submission unavailable",
+                               round_id=rid, rank=rank, uid=uid, path=str(src))
+                continue
+            dest = stage / f"rank{rank}_uid{uid}.safetensors"
+            os.link(src, dest)
+            entries.append({
+                "rank": rank, "uid": int(uid), "hotkey": hotkey,
+                "score": round(float(score), 6), "filename": dest.name,
+                "size_bytes": dest.stat().st_size, "sha256": _sha256_file(dest),
+            })
+
+        if not entries:
+            logger.warning("publish_podium: no podium file was available", round_id=rid)
+            return
+
+        # Both identifiers: the folder is named by cycle, but consumers key
+        # their index on `round_id` — it is what `publish_round_baseline`
+        # stamps its commits with, so it is what correlates the two sources.
+        (stage / "manifest.json").write_text(json.dumps({
+            "cycle_index": int(cycle),
+            "round_id": int(rid),
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "files": entries,
+        }, indent=2))
+
+        started = time.monotonic()
+        token_env_var = config.hf.token_env_var
+        revision = upload_checkpoint_to_hf_subprocess(
+            ckpt_dir=stage, repo_id=repo_id, token_env_var=token_env_var,
+            commit_message=f"podium cycle_index={cycle} round_id={rid}",
+            # The default patterns match `model_expgroup_*` only, which would
+            # upload an empty commit here.
+            allow_patterns=["rank*.safetensors", "manifest.json"],
+            path_in_repo=f"cycle_{cycle}",
+        )
+        logger.info(
+            "publish_podium: published", cycle_index=cycle, round_id=rid,
+            repo_id=repo_id, revision=revision,
+            uids=[e["uid"] for e in entries],
+            size_bytes=sum(e["size_bytes"] for e in entries),
+            elapsed_s=round(time.monotonic() - started, 1),
+        )
+        # After the upload, so a retention failure cannot cost us the round.
+        _prune_archive_repo(
+            repo_id, int(config.hf.archive_keep_rounds),
+            resolve_hf_token(token_env_var=token_env_var), bool(config.hf.archive_squash),
+        )
+    except Exception as e:
+        logger.warning("publish_podium: failed", round_id=rid, error=str(e), exc_info=True)
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+        _podium_lock.release()
