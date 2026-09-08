@@ -180,11 +180,10 @@ class PhaseManager:
     """Block-height phase clock, computed locally from `config.cycle.*`.
 
     The subnet owner's cycle-api serves the authoritative phase over HTTP
-    (`get_phase_from_api`); this is the same arithmetic run in-process, used
-    by the validator and miner as the local fallback and by the sn_owner dev
-    harness to back its endpoints. Lives here rather than in `sn_owner`
-    because production client code depends on it — `sn_owner` is a local
-    development harness, not a deployed service.
+    (`get_phase_from_api`); this is the same arithmetic run in-process, and the
+    validator and miner both construct one. cycle-api is deployed from a
+    separate repository and keeps its own copy, so any change to the phase
+    schedule has to land in both.
     """
 
     def __init__(self, config: WorkerConfig, subtensor: bittensor.Subtensor):

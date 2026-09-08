@@ -3,8 +3,8 @@
 `PhaseManager` moved from `connito/sn_owner/cycle.py` to
 `connito/shared/cycle.py` because the validator (`connito/validator/run.py`)
 and the miner (`connito/miner/train.py`) both construct one — it is client
-code, not owner-only code, and `sn_owner/` is a local development harness
-rather than a deployed service.
+code, not owner-only code. The `connito/sn_owner/` package has since been
+removed entirely; the deployed service lives in its own repository.
 
 It had no coverage before the move. These tests pin the arithmetic that the
 whole cycle depends on: phase order, the exact block a phase starts and ends

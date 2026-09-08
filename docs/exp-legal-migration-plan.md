@@ -204,15 +204,15 @@ was pruned exactly this way. Miners must NOT switch before the validator
 majority has; test miners should plan to complete a full commit→score cycle
 within their immunity window.
 
-### 1.5 Subnet owner (`connito/sn_owner/`)
+### 1.5 Subnet owner
 
-**No changes needed.** Owner code (`cycle.py`, `phase_service.py`,
-`dht_init.py`, `validator_whitelist.json`) is dataset-agnostic. The owner runs
-the phase scheduler and DHT bootstrap; doesn't know or care which task miners
-train on.
+**No changes needed.** The owner runs the phase scheduler; it doesn't know or
+care which task miners train on.
 
-`connito/sn_owner/expert_selection.ipynb` mentions `exp_dummy` in a notebook —
-old artifact, not runtime code, skip.
+> Superseded: the `connito/sn_owner/` package described here no longer exists.
+> The phase service is deployed from its own repository, and the DHT bootstrap
+> was removed along with hivemind. `PhaseManager` now lives in
+> `connito/shared/cycle.py`.
 
 ## 2. Validator-consensus shard policy (the longest pole)
 
