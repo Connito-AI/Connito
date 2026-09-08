@@ -28,9 +28,12 @@ If `cycle-api.connito.ai` is unreachable, `get_phase_from_api` returns
 will idle until the API comes back. Both workers will keep retrying with
 backoff (`api_retries = 5`, `api_backoff_sec = 2`).
 
+The `/get_phase` endpoint is served by the subnet owner's cycle-api service,
+which is not part of this repository. `PhaseManager` mirrors the same block
+arithmetic locally, so you can read the phase schedule here.
+
 Code: `connito/shared/cycle.py:PhaseManager`,
-`connito/shared/cycle.py:get_phase_from_api`,
-`connito/sn_owner/phase_service.py:read_phase`.
+`connito/shared/cycle.py:get_phase_from_api`.
 
 ## Phase order and default lengths
 

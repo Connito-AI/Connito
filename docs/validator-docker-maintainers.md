@@ -91,7 +91,7 @@ workflow.
 
 The workflow has a `paths:` filter so it only runs when something that
 actually ends up in the image changes (validator code, shared code,
-sn_owner code, requirements, the Dockerfile itself). Pure
+requirements, the Dockerfile itself). Pure
 miner/docs/notebook edits skip the build entirely. **If you change a
 file that should trigger the build but isn't in the list, add it to
 `paths:` — don't disable the filter.**

@@ -20,7 +20,6 @@ on:
     paths:
       - "connito/validator/**"
       - "connito/shared/**"
-      - "connito/sn_owner/**"
       # Baked into the image by the Dockerfile (COPY expert_groups) — a
       # change here ships to validators, so it must trigger a rebuild.
       - "expert_groups/**"
@@ -45,7 +44,6 @@ on:
     paths:
       - "connito/validator/**"
       - "connito/shared/**"
-      - "connito/sn_owner/**"
       # Baked into the image by the Dockerfile (COPY expert_groups) — a
       # change here ships to validators, so it must trigger a rebuild.
       - "expert_groups/**"
