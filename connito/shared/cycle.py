@@ -995,27 +995,6 @@ def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | N
     return min_version, max_version
 
 
-def get_init_peer_id(config: WorkerConfig) -> str | None:
-    """
-    Determine current phase based on block schedule.
-
-    Returns:
-        str: one of ["training", "submission", "waiting"]
-    """
-    base_url = config.cycle.owner_url
-    url = f"{base_url}/get_init_peer_id"
-
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as e:
-        # JSON decoding failed
-        logger.exception("Invalid JSON from %s: %s", url, e)
-        return None
-
 def load_submission_files(folder: str = "miner_submission"):
     """
     Scans a folder for miner-checkpoint files (.safetensors or .pt) and

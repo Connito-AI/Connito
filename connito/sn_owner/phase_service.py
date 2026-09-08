@@ -19,7 +19,6 @@ from fastapi import FastAPI, HTTPException
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.config import OwnerConfig, parse_args
 from connito.shared.cycle import PhaseManager, PhaseResponse
-from connito.sn_owner.init_peer_store import get_init_peer_ids
 
 app = FastAPI(title="Phase Service")
 
@@ -56,16 +55,6 @@ async def next_phase():
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/get_init_peer_id", response_model=list[str])
-async def get_init_peer_id():
-    """
-    Returns which phase we're in for the given block height.
-    """
-    try:
-        return get_init_peer_ids(init_peer_id_path)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
 @app.get("/get_validator_whitelist", response_model=list[str])
 async def get_validator_whitelist():
     """Returns the list of hotkeys that are force-permitted as validators."""
@@ -95,7 +84,6 @@ if __name__ == "__main__":
 
     global config
     global phase_manager
-    global init_peer_id_path
     global validator_whitelist_path
 
     if args.path:
@@ -105,7 +93,6 @@ if __name__ == "__main__":
 
     config.write()
 
-    init_peer_id_path = Path(config.run.root_path) / "init_peer_ids.json"
     validator_whitelist_path = Path(config.run.root_path) / "connito" / "sn_owner" / "validator_whitelist.json"
 
     subtensor = bittensor.Subtensor(network=config.chain.network)

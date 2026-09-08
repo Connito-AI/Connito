@@ -4,9 +4,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ipaddress import ip_address
-from typing import Iterable, List
-
 import torch
 import torch.nn.functional as F
 
@@ -254,31 +251,3 @@ def hex_to_byte(hex_str: str) -> bytes:
     Convert hex string to raw bytes.
     """
     return bytes.fromhex(hex_str)
-
-def public_multiaddrs(maddrs: Iterable) -> List:
-    """
-    Keep only multiaddrs whose /ip4 or /ip6 component is globally routable.
-    Works with hivemind Multiaddr objects or strings.
-    """
-    out = []
-    for ma in maddrs:
-        s = str(ma)
-
-        # multiaddr tokens look like: /ip4/1.2.3.4/tcp/1234/p2p/...
-        parts = s.strip("/").split("/")
-        ip = None
-        for i in range(len(parts) - 1):
-            if parts[i] in ("ip4", "ip6"):
-                ip = parts[i + 1]
-                break
-
-        if ip is None:
-            continue
-
-        addr = ip_address(ip)
-
-        # "public" => globally routable (not private/loopback/link-local/multicast/etc.)
-        if addr.is_global:
-            out.append(ma)
-
-    return out

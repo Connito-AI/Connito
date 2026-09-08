@@ -50,8 +50,8 @@ is why `.dockerignore` lives at the repo root.
 
 1. Base: `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`. Pin via the
    `CUDA_IMAGE` build arg.
-2. System deps: Python 3.10, build tools, git (needed for the VCS-installed
-   `hivemind` dep), curl (for the healthcheck).
+2. System deps: Python 3.10, build tools, git (kept for source builds; no
+   VCS-pinned requirements remain), curl (for the healthcheck).
 3. `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124`.
    Torch is pinned in `requirements.txt`; the extra index just makes
    sure pip picks up the cu124 binary wheel instead of the CPU one.
@@ -294,7 +294,7 @@ It ships with Buildx and Compose v2. Two caveats matching the landmines
 section below:
 
 - **`network_mode: host` is ignored on macOS.** The validator will start,
-  but the hivemind DHT and chain serve ports won't bind to the host. Fine
+  but the chain serve port won't bind to the host. Fine
   for "does the entrypoint import cleanly" tests, useless for anything
   touching the chain.
 - **No GPU passthrough.** You can't run `--gpus all` on macOS regardless
@@ -467,7 +467,7 @@ These need a heads-up in the operator channel:
   forces every operator to redo their port forwarding.
 - **Removing the `com.centurylinklabs.watchtower.enable` label** —
   Watchtower will stop upgrading the container.
-- **Bumping torch / hivemind / bittensor major versions.** Always do
+- **Bumping torch / bittensor major versions.** Always do
   these on a tagged release, never as a silent `master` push, and post
   in the operators channel.
 

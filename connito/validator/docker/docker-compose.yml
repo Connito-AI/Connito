@@ -28,8 +28,8 @@ services:
     pull_policy: always
 
     # tini as PID 1 (docker --init). Forwards signals to the validator and
-    # reaps zombie children inside the container — hivemind spawns a libp2p
-    # daemon and the DHT loop as separate subprocesses, and bittensor opens
+    # reaps zombie children inside the container — the HF upload runs in a
+    # spawned subprocess, the dataloader spawns workers, and bittensor opens
     # its own websocket threads. Without tini, if the validator dies before
     # cleaning these up the container's PID 1 is left as a zombie that
     # dockerd refuses to remove (seen as Watchtower's "PID … is zombie and
@@ -49,8 +49,8 @@ services:
     labels:
       com.centurylinklabs.watchtower.enable: "true"
 
-    # Host networking keeps the hivemind DHT, chain serve port, and
-    # Prometheus telemetry endpoint reachable on the host's public IP
+    # Host networking keeps the chain serve port and the Prometheus
+    # telemetry endpoint reachable on the host's public IP
     # without per-port NAT — same pattern as observability/docker-compose.yml.
     network_mode: "host"
 
@@ -65,7 +65,7 @@ services:
               device_ids: ["${VALIDATOR_GPU_ID:-0}"]
               capabilities: [gpu]
 
-    # Shared memory for PyTorch DataLoader workers and hivemind averager buffers.
+    # Shared memory for PyTorch DataLoader workers.
     # ipc: host removed — with host IPC, crashed containers leak torch shm files
     # onto the host /dev/shm permanently (owned by root, never cleaned up).
     # Private IPC (the default) gives each container its own tmpfs that Docker

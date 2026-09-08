@@ -51,8 +51,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CONNITO_GIT_VERSION=${GIT_VERSION}
 
 # System packages: python 3.10, build essentials (some wheels still need them),
-# git for the VCS-installed deps in requirements.txt (hivemind, unsloth),
-# and curl for healthchecks.
+# git (kept for source builds; no VCS-pinned requirements remain), and curl for
+# healthchecks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3.10-venv python3-pip \
         build-essential git curl ca-certificates \
@@ -96,12 +96,11 @@ ENV CHECKPOINTS_DIR=/data/checkpoints \
     EXPERT_GROUPS_DIR=/data/expert_groups \
     WANDB_DIR=/data/wandb
 
-# 6000/tcp + 6000/udp: hivemind DHT (config.dht.port)
 # 8000/tcp:            chain serve port (config.chain.port)
 # 8200/tcp:            prometheus telemetry (CONNITO_TELEMETRY_PORT + rank) -> /metrics
 # Documentation only — the compose file uses `network_mode: host`, so these
 # are not published mappings. 8300 (the removed /v1/state.json API) is gone.
-EXPOSE 6000/tcp 6000/udp 8000/tcp 8200/tcp
+EXPOSE 8000/tcp 8200/tcp
 
 # Default command — override `--path` to point at your config in compose.
 ENTRYPOINT ["python", "-m", "connito.validator.run"]

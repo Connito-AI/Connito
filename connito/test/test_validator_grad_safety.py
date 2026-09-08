@@ -211,11 +211,9 @@ def _import_pull_helper():
     import importlib, sys
 
     # Stub heavy dependencies so the import succeeds in a test environment
-    # without bittensor / hivemind installed.
+    # without bittensor installed.
     stubs = [
         "bittensor",
-        "hivemind",
-        "hivemind.averaging",
         "torchdata",
         "torchdata.stateful_dataloader",
         "transformers",
@@ -232,7 +230,6 @@ def _import_pull_helper():
         "connito.shared.modeling.mycelia",
         "connito.validator.aggregator",
         "connito.validator.evaluator",
-        "connito.validator.inter_validator_connection",
         "connito.shared.telemetry",
         "connito.shared.config",
         "connito.shared.app_logging",

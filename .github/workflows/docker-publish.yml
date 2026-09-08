@@ -132,7 +132,7 @@ jobs:
             GIT_SHA=${{ github.sha }}
             GIT_VERSION=${{ steps.meta.outputs.version }}
           # Use the GitHub Actions cache backend so subsequent builds reuse
-          # the heavy pip-install layer (torch + transformers + hivemind).
+          # the heavy pip-install layer (torch + transformers).
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
