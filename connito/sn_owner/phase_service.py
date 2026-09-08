@@ -1,17 +1,25 @@
+"""Local development harness for the subnet-owner phase service.
+
+NOT the deployed service. Production cycle-api is deployed from the private
+Connito-AI/cycle-api repository; this module exists so the phase endpoints can
+be run offline — in tests, and when driving a validator or miner through a full
+cycle without touching the real owner API.
+
+Keep it dependency-light and free of validator/miner imports: it backs onto
+`connito.shared.cycle.PhaseManager`, the same block arithmetic the clients use.
+"""
+
+import json
+from pathlib import Path
+
 import bittensor
-from connito.validator.inter_validator_connection import structlog, AllowedHotkeyService
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
+from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.config import OwnerConfig, parse_args
-from connito.sn_owner.cycle import PhaseManager, PhaseResponse
-from connito.shared.app_logging import configure_logging
-import multiprocessing as mp
-from pathlib import Path
-
-from connito.sn_owner.init_peer_store import add_init_peer_id, get_init_peer_ids
-from connito.sn_owner.dht_init import init_dht_and_peer_id
-import json
+from connito.shared.cycle import PhaseManager, PhaseResponse
+from connito.sn_owner.init_peer_store import get_init_peer_ids
 
 app = FastAPI(title="Phase Service")
 
@@ -57,7 +65,7 @@ async def get_init_peer_id():
         return get_init_peer_ids(init_peer_id_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
+
 @app.get("/get_validator_whitelist", response_model=list[str])
 async def get_validator_whitelist():
     """Returns the list of hotkeys that are force-permitted as validators."""
@@ -101,7 +109,6 @@ if __name__ == "__main__":
     validator_whitelist_path = Path(config.run.root_path) / "connito" / "sn_owner" / "validator_whitelist.json"
 
     subtensor = bittensor.Subtensor(network=config.chain.network)
-    wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
 
     phase_manager = PhaseManager(config, subtensor)
     uvicorn.run(app, host="127.0.0.1", port=8080)

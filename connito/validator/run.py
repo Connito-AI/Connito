@@ -91,6 +91,8 @@ from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
 from connito.shared.cycle import (
+    PhaseManager,
+    PhaseNames,
     check_phase_expired,
     get_blocks_from_previous_phase_from_api,
     get_phase_from_api,
@@ -106,7 +108,6 @@ from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.shared.modeling.quantization import apply_from_config
-from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker

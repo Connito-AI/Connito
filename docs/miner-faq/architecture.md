@@ -26,7 +26,7 @@ global model), **Train** (run local training on its expert group), and
 **MinerCommit1 / MinerCommit2** (commit the trained checkpoint to chain and
 HuggingFace). Everything else belongs to validators.
 
-Code: `connito/sn_owner/cycle.py:PhaseManager`,
+Code: `connito/shared/cycle.py:PhaseManager`,
 `connito/shared/cycle.py:wait_till`, `connito/shared/cycle.py:PhaseNames`.
 
 ## Validator vs. miner responsibilities

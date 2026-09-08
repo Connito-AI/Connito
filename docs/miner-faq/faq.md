@@ -150,7 +150,7 @@ Cycle length is ~500 blocks (≈100 minutes at 12s/block) per the deployed
 `PhaseManager`. The owner phase service at `cycle-api.connito.ai` is the
 single source of truth for the current phase.
 
-Code: `connito/sn_owner/cycle.py:PhaseManager`,
+Code: `connito/shared/cycle.py:PhaseManager`,
 `connito/shared/cycle.py:wait_till`.
 
 ## How is `chain_weight_stake_weighted` computed?

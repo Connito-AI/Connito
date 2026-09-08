@@ -22,7 +22,7 @@ from transformers import (
 from connito.miner.train_helper import free_cuda_models, get_status
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import wait_till, PhaseNames
+from connito.shared.cycle import wait_till, PhaseNames, PhaseManager
 from connito.shared.checkpoint_helper import (
     load_checkpoint,
     save_checkpoint,
@@ -278,7 +278,6 @@ def setup_training(
 
 
 from connito.shared.telemetry import TelemetryManager, SystemStatePoller
-from connito.sn_owner.cycle import PhaseManager
 
 def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     """

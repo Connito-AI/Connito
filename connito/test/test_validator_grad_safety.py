@@ -230,7 +230,6 @@ def _import_pull_helper():
         "connito.shared.metrics",
         "connito.shared.model",
         "connito.shared.modeling.mycelia",
-        "connito.sn_owner.cycle",
         "connito.validator.aggregator",
         "connito.validator.evaluator",
         "connito.validator.inter_validator_connection",
