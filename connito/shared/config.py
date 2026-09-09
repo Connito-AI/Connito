@@ -542,21 +542,18 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
-    # `expert_group_name` is locked so the whole fleet evaluates the same task:
-    # `auto_update_config` resets any non-default value on load and logs a
-    # one-time reset warning. Validators only score miners whose chain commit
-    # carries a matching `expert_group`, so a drifting operator would simply
-    # stop seeing (and stop being seen by) everyone else.
-    #
-    # Currently `exp_nemotron_c4` (group 4): Nemotron-CC-Math + C4. This
-    # replaces the `exp_legal` switch made in #186 — see
-    # docs/exp-legal-migration-plan.md for that history and the flag-day
-    # mechanics, which apply identically in this direction.
+    # `expert_group_name` is unlocked but still not the operator's to pick:
+    # `_apply_owner_task` overwrites it from the owner API on every load. The
+    # lock stopped an operator drifting away from the fleet (validators only
+    # score miners whose chain commit carries a matching `expert_group`); that
+    # guarantee is unchanged, its authority just moved from a code constant to
+    # the API, so a new task no longer needs a release. The value stored here is
+    # the fallback used when the API is unreachable.
     #
     # `helper_group_id` and `routing_mode` stay locked for the natural-routing
     # (2Fnat) consensus contract and are independent of the dataset.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "expert_group_name", "helper_group_id", "routing_mode",
+        "helper_group_id", "routing_mode",
     })
     expert_group_name: str = "exp_nemotron_c4"
     load_all_expert_groups: bool = False
@@ -734,6 +731,54 @@ class WorkerConfig(BaseConfig):
     # Sub-config sections that participate in locked-field checks.
     _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
 
+    def _apply_owner_task(self, config_path: Path | None) -> None:
+        """Take the active task from the owner API; the YAML is the fallback.
+
+        Two cases decline to act, both leaving the current task running: the API
+        is unreachable (the agreed outage behaviour — keep mining, never halt),
+        or it names a task whose directory this node does not have. Fetching an
+        absent task is the next PR's job; until then, adopting a name with no
+        files on disk would fail the load outright in `_update_by_task`.
+        """
+        # Imported here: connito.shared.cycle imports this module, so
+        # task_sync -> cycle -> config is a cycle at module scope.
+        from connito.shared.task_sync import get_active_task
+
+        active = get_active_task(self)
+        if active is None:
+            logger.warning(
+                "Owner API unreachable — keeping the task from config",
+                task=self.task.expert_group_name,
+                owner_url=self.cycle.owner_url,
+            )
+            return
+        if active.name == self.task.expert_group_name:
+            return
+        if not (self.task.base_path / active.name).is_dir():
+            logger.error(
+                "Owner API named a task this node does not have — keeping the current one",
+                served=active.name,
+                running=self.task.expert_group_name,
+                looked_in=str(self.task.base_path),
+            )
+            return
+
+        logger.info(
+            "Owner API changed the active task",
+            old=self.task.expert_group_name,
+            new=active.name,
+            group_id=active.group_id,
+        )
+        # Re-derive in the same load. task.path, task.exp and the group-scoped
+        # checkpoint_path were all derived at construction from the old name;
+        # skipping this is the 2026-07-11 pioneer-validator bug, where the
+        # process persisted the new name but kept RUNNING the old group (wrong
+        # group_id on chain commits) until a second restart.
+        self._update_by_task(expert_group_name=active.name)
+        # Persist so an API outage on the next boot resumes THIS task rather
+        # than whatever the operator's YAML still says.
+        self._persist(config_path, reason="owner API changed the active task")
+
     @classmethod
     def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
         path = Path(path)
@@ -741,25 +786,10 @@ class WorkerConfig(BaseConfig):
             data = yaml.safe_load(f) or {}
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
-        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
-        # Locked-field enforcement may have just reset task.expert_group_name
-        # (the exp_legal activation path: a YAML still saying exp_math gets
-        # reset to the locked default). task.path / task.exp were derived at
-        # construction from the PRE-reset name, so re-derive them — otherwise
-        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
-        # (wrong group_id on chain commits) until a second restart. Observed
-        # live on the pioneer validator, 2026-07-11 11:49 UTC.
-        if instance.task.expert_group_name != pre_lock_group:
-            logger.info(
-                "Locked-field reset changed the active task — re-deriving task config",
-                old_task=pre_lock_group,
-                new_task=instance.task.expert_group_name,
-            )
-            # Pass the name explicitly: the no-arg form of _update_by_task
-            # reloads task.exp from the STALE task.path before refreshing
-            # paths, so the exp config would still be the old group's.
-            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
+        # No locked field feeds a derived path any more, so this is the only
+        # step that can change the active task — it re-derives its own.
+        instance._apply_owner_task(config_path=path)
         return instance
 
     def _prompt_new_fields(
@@ -872,20 +902,27 @@ class WorkerConfig(BaseConfig):
                         setattr(sub_cfg, field_name, default_val)
                         changed = True
 
-        if changed and config_path is not None:
-            data = self.model_dump(exclude={"task": {"exp"}})
-            data = self._strip_root(data, self.run.root_path)
-            data = convert_to_str(data)
-            try:
-                with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(data, f, sort_keys=False)
-                logger.info("Wrote updated config (locked fields reset)", path=str(config_path))
-            except OSError as e:
-                logger.warning(
-                    "Could not persist locked-field reset — config path is read-only; reset applied in memory only",
-                    path=str(config_path),
-                    error=str(e),
-                )
+        if changed:
+            self._persist(config_path, reason="locked fields reset")
+
+    def _persist(self, config_path: Path | None, *, reason: str) -> None:
+        """Write the config back to disk, minus the derived `task.exp` section."""
+        if config_path is None:
+            return
+        data = self.model_dump(exclude={"task": {"exp"}})
+        data = self._strip_root(data, self.run.root_path)
+        data = convert_to_str(data)
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, sort_keys=False)
+            logger.info("Wrote updated config", path=str(config_path), reason=reason)
+        except OSError as e:
+            logger.warning(
+                "Could not persist config change — path is read-only; applied in memory only",
+                path=str(config_path),
+                reason=reason,
+                error=str(e),
+            )
 
     # -----------------------
     # Config equivalence / versioning
