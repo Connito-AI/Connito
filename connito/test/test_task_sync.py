@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from connito.shared import task_sync
+from connito.shared.config import CycleCfg
 from connito.shared.task_sync import (
     ActiveTask,
     resolve_active_task_name,
@@ -35,16 +36,9 @@ def _fixture(name: str) -> dict:
     return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
-def _config() -> SimpleNamespace:
-    """Only the four fields `_fetch` reads, so no chain or wallet is needed."""
-    return SimpleNamespace(
-        cycle=SimpleNamespace(
-            owner_url="https://cycle-api.example",
-            api_timeout_sec=1,
-            api_retries=0,
-            api_backoff_sec=0,
-        )
-    )
+def _cycle() -> CycleCfg:
+    """The real config section, so the tests exercise the real defaults."""
+    return CycleCfg(owner_url="https://cycle-api.example", api_retries=0, api_backoff_sec=0)
 
 
 def _stub_response(monkeypatch, payload) -> None:
@@ -92,14 +86,14 @@ def test_unknown_fields_are_ignored():
 def test_returns_none_when_the_api_is_unreachable(monkeypatch):
     monkeypatch.setattr(task_sync, "get_with_retry", lambda *a, **k: None)
     # An owner-API outage must never stop a node; the caller keeps its task.
-    assert get_active_task(_config()) is None
-    assert get_active_task_bundle(_config()) is None
+    assert get_active_task(_cycle()) is None
+    assert get_active_task_bundle(_cycle()) is None
 
 
 @pytest.mark.parametrize("payload", [{"name": "x"}, {"unrelated": 1}, []])
 def test_malformed_payload_returns_none_without_raising(monkeypatch, payload):
     _stub_response(monkeypatch, payload)
-    assert get_active_task(_config()) is None
+    assert get_active_task(_cycle()) is None
 
 
 def test_bundle_failing_its_own_hash_is_refused(monkeypatch):
@@ -107,12 +101,12 @@ def test_bundle_failing_its_own_hash_is_refused(monkeypatch):
     tampered["expert_assignment"] = {"1": [[0, 999]]}   # hash no longer matches
     _stub_response(monkeypatch, tampered)
     # Refusing beats materializing a payload the two repos disagree about.
-    assert get_active_task_bundle(_config()) is None
+    assert get_active_task_bundle(_cycle()) is None
 
 
 def test_valid_bundle_is_returned(monkeypatch):
     _stub_response(monkeypatch, _fixture("active_task_bundle"))
-    bundle = get_active_task_bundle(_config())
+    bundle = get_active_task_bundle(_cycle())
     assert bundle is not None and bundle.group_id == 4
 
 

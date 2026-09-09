@@ -1654,8 +1654,6 @@ if __name__ == "__main__":
         set_test_mode(True)
 
     if args.path:
-        # Ask the owner API what the task is before building the config, so
-        # everything is derived from the right task the first time.
         active_task = resolve_active_task_name(args.path)
         config = ValidatorConfig.from_path(
             args.path, active_task=active_task, auto_update_config=args.auto_update_config

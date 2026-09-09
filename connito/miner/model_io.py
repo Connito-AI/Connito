@@ -445,8 +445,6 @@ if __name__ == "__main__":
         logger.debug("Verbose debug logging enabled!")
 
     if args.path:
-        # Ask the owner API what the task is before building the config, so
-        # everything is derived from the right task the first time.
         active_task = resolve_active_task_name(args.path)
         config = MinerConfig.from_path(
             args.path, active_task=active_task, auto_update_config=args.auto_update_config

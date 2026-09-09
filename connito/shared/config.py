@@ -759,13 +759,11 @@ class WorkerConfig(BaseConfig):
     ) -> "WorkerConfig":
         """Load a config, with the owner API's answer supplied by the caller.
 
-        `active_task` is keyword-only and has no default so a new entrypoint
-        cannot silently skip resolving it — call
-        `task_sync.resolve_active_task_name` and pass the result, or pass None
+        `active_task` has no default so a new entrypoint cannot silently skip
+        resolving it: pass `task_sync.resolve_active_task_name(path)`, or None
         for tooling that does not run a node. It is applied *before*
-        construction, so `task.path`, `task.exp` and the group-scoped
-        `checkpoint_path` are derived from the right name the first time and
-        there is nothing to re-derive afterwards.
+        construction, so every derived path tracks the right task first time
+        and there is nothing to re-derive afterwards.
         """
         path = Path(path)
         with open(path, encoding="utf-8") as f:

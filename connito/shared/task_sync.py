@@ -29,7 +29,6 @@ import json
 import os
 import shutil
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import yaml
@@ -88,31 +87,18 @@ class TaskBundle(BaseModel):
         return hashlib.sha256(encoded).hexdigest()
 
 
-class _OwnerUrl:
-    """Just enough of a config for `_fetch` when none has been built yet."""
-
-    def __init__(self, owner_url: str | None) -> None:
-        defaults = CycleCfg.model_fields
-        self.cycle = SimpleNamespace(
-            owner_url=owner_url or defaults["owner_url"].default,
-            api_timeout_sec=defaults["api_timeout_sec"].default,
-            api_retries=defaults["api_retries"].default,
-            api_backoff_sec=defaults["api_backoff_sec"].default,
-        )
-
-
-def _fetch(config, path: str, model: type[BaseModel]):
+def _fetch(cycle: CycleCfg, path: str, model: type[BaseModel]):
     """GET `path` from the owner API and parse it, or return None.
 
     Shares `helper.get_with_retry` with `get_phase_from_api`, so timeout,
     retry, backoff and the non-retryable status list stay identical.
     """
-    url = f"{config.cycle.owner_url}/{path}"
+    url = f"{cycle.owner_url}/{path}"
     resp = get_with_retry(
         url,
-        timeout=config.cycle.api_timeout_sec,
-        retries=config.cycle.api_retries,
-        backoff=config.cycle.api_backoff_sec,
+        timeout=cycle.api_timeout_sec,
+        retries=cycle.api_retries,
+        backoff=cycle.api_backoff_sec,
     )
     if resp is None:
         return None
@@ -124,39 +110,38 @@ def _fetch(config, path: str, model: type[BaseModel]):
         return None
 
 
-def get_active_task(config) -> ActiveTask | None:
-    """Which expert group the subnet is training right now."""
-    return _fetch(config, "active_task", ActiveTask)
+def get_active_task(cycle: CycleCfg) -> ActiveTask | None:
+    """Which expert group the subnet is training right now.
+
+    Takes the `cycle` section rather than a whole config so it also serves
+    `resolve_active_task_name`, which runs before any config exists.
+    """
+    return _fetch(cycle, "active_task", ActiveTask)
 
 
 def resolve_active_task_name(config_path: str | Path) -> str | None:
     """The task an entrypoint should start on, or None to use the config's own.
 
-    Entrypoints call this *before* building their config and pass the result to
-    `WorkerConfig.from_path`, so the name is right from the start and nothing is
-    ever derived from a stale one. Config itself never reaches for the network —
-    it only receives an answer.
-
-    Reads `cycle.owner_url` straight from the YAML because there is no config
-    object yet; an absent or unreadable file falls through to the shipped
-    default, which is the same URL every node uses.
+    Called before the config exists, so it builds the `cycle` section straight
+    from the YAML — an unreadable file just falls through to the shipped
+    defaults, which every node shares.
     """
     try:
         raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-        owner_url = (raw.get("cycle") or {}).get("owner_url")
-    except (OSError, yaml.YAMLError):
-        owner_url = None
+        cycle = CycleCfg(**(raw.get("cycle") or {}))
+    except (OSError, yaml.YAMLError, ValueError):
+        cycle = CycleCfg()
 
-    active = get_active_task(_OwnerUrl(owner_url))
+    active = get_active_task(cycle)
     if active is None:
         logger.warning("Owner API unreachable — starting on the task from config")
         return None
     return active.name
 
 
-def get_active_task_bundle(config) -> TaskBundle | None:
+def get_active_task_bundle(cycle: CycleCfg) -> TaskBundle | None:
     """The active task's full payload, refused if it fails its own hash."""
-    bundle = _fetch(config, "active_task_bundle", TaskBundle)
+    bundle = _fetch(cycle, "active_task_bundle", TaskBundle)
     if bundle is None:
         return None
     computed = bundle.canonical_sha256()
