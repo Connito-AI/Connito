@@ -52,6 +52,10 @@ def _stub_response(monkeypatch, payload) -> None:
     )
 
 
+def _explode(*args, **kwargs):
+    raise OSError("disk full")
+
+
 def _bundle(**overrides) -> TaskBundle:
     data = _fixture("active_task_bundle") | overrides
     return TaskBundle(**data)
@@ -157,10 +161,7 @@ def test_a_changed_bundle_replaces_the_directory(tmp_path: Path):
 
 
 def test_a_crash_mid_write_leaves_no_half_written_task(tmp_path: Path, monkeypatch):
-    def boom(*a, **k):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(task_sync.json, "dumps", boom)
+    monkeypatch.setattr(task_sync.json, "dumps", _explode)
     with pytest.raises(OSError):
         materialize_task(_bundle(), tmp_path)
 
@@ -171,14 +172,21 @@ def test_a_crash_mid_write_leaves_no_half_written_task(tmp_path: Path, monkeypat
 
 def test_a_failed_write_leaves_the_existing_task_intact(tmp_path: Path, monkeypatch):
     materialize_task(_bundle(), tmp_path)
-    changed = _bundle(expert_assignment={"1": [[0, 5]]})
+    task_dir = tmp_path / "exp_nemotron_c4"
+
+    # Differ in BOTH files: config.yaml is written before expert_assignment.json,
+    # so a non-atomic write would leave the new config beside the old routing
+    # table — a mixed directory that loads without complaint.
+    changed = _bundle(config={"group_id": 9}, expert_assignment={"1": [[0, 5]]})
     changed.bundle_sha256 = changed.canonical_sha256()
 
-    monkeypatch.setattr(task_sync.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(task_sync.json, "dumps", _explode)
     with pytest.raises(OSError):
         materialize_task(changed, tmp_path)
 
-    # The task that was already there is still intact and still loadable.
+    served = _fixture("active_task_bundle")
+    assert yaml.safe_load((task_dir / "config.yaml").read_text()) == served["config"]
     assert json.loads(
-        (tmp_path / "exp_nemotron_c4" / "expert_assignment.json").read_text()
-    ) == _fixture("active_task_bundle")["expert_assignment"]
+        (task_dir / "expert_assignment.json").read_text()
+    ) == served["expert_assignment"]
+    assert (task_dir / task_sync.STAMP_FILE).read_text() == served["bundle_sha256"]
