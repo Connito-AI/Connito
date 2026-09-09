@@ -24,7 +24,7 @@ from connito.shared.checkpoints import (
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till
+from connito.shared.cycle import PhaseNames, PhaseResponse, check_phase_expired, wait_till
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_hf_repo_ids,
@@ -32,7 +32,6 @@ from connito.shared.hf_distribute import (
 )
 from connito.shared.model import fetch_model_from_chain_validator
 from connito.shared.telemetry import inc_error
-from connito.sn_owner.cycle import PhaseNames
 
 # Short SHA prefix written to the chain. Matches the validator convention so
 # HF short-SHA resolution behaves the same on both sides.

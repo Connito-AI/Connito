@@ -91,6 +91,8 @@ from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
 from connito.shared.cycle import (
+    PhaseManager,
+    PhaseNames,
     check_phase_expired,
     get_blocks_from_previous_phase_from_api,
     get_phase_from_api,
@@ -106,7 +108,6 @@ from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.shared.modeling.quantization import apply_from_config
-from connito.sn_owner.cycle import PhaseNames, PhaseManager
 from connito.validator.aggregator import MinerScoreAggregator
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
@@ -284,18 +285,20 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
 def _install_signal_logging() -> None:
     """Funnel SIGTERM / SIGHUP into the same `KeyboardInterrupt` path SIGINT
     already takes, so docker-initiated stops run the existing shutdown block
-    in `run()` (background workers, chain_submitter, poller, averagers, …).
+    in `run()` (background workers, chain_submitter, poller, metric logger).
 
     The previous implementation restored `SIG_DFL` and re-raised the signal.
     For SIGTERM that meant "terminate immediately" with no Python exception —
     the `except KeyboardInterrupt` / `except Exception` arms in `run()` never
     fired, so nothing was stopped cleanly. Watchtower then timed out after 120s
-    and dockerd was left with a zombie PID 1 (orphaned hivemind libp2p +
-    background-worker threads, no init to reap them) which couldn't be removed.
+    and dockerd was left with a zombie PID 1 (at the time, orphaned hivemind
+    libp2p + background-worker threads, no init to reap them) which couldn't be
+    removed. Hivemind has since been removed; the subprocesses that remain are
+    the spawned HF upload and the dataloader workers.
     Raising `KeyboardInterrupt` reuses the SIGINT shutdown path verbatim.
 
     Caveat: if the main thread is parked inside a C extension when the signal
-    arrives (hivemind averager step, a torch op, etc.), the exception only
+    arrives (a torch op, an HF upload, etc.), the exception only
     propagates once control returns to Python. The shutdown block itself still
     needs per-step time bounds for that, but those are separate work.
     """

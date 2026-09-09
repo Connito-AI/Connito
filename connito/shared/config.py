@@ -528,10 +528,6 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     miner_submission_max_age_cycles: PositiveFloat = 1.5
 
 
-class DhtCfg(BaseConfig):
-    port: int = 6000
-
-
 class OwnerCheckpointCfg(CheckpointCfg):
     base_checkpoint_path: Path = Path("checkpoints/owner")
 
@@ -1062,7 +1058,6 @@ class EvalCfg(BaseConfig):
 class ValidatorConfig(WorkerConfig):
     role: str = "validator"
     ckpt: ValidatorCheckpointCfg = Field(default_factory=ValidatorCheckpointCfg)
-    dht: DhtCfg = Field(default_factory=DhtCfg)
     run: ValidatorRunCfg = Field(default_factory=ValidatorRunCfg)
     evaluation: EvalCfg = Field(default_factory=EvalCfg)
 

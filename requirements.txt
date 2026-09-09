@@ -35,10 +35,8 @@ prefetch_generator==1.0.3
 bitsandbytes==0.50.1
 
 # -----------------------------
-# API / server (validator)
+# HTTP client (validator + miner)
 # -----------------------------
-fastapi==0.110.1
-uvicorn[standard]==0.30.0
 # bittensor 10.5 requires requests>=2.33 (fresh-resolve conflict caught by CI 2026-07-21)
 requests==2.33.0
 aiofiles==25.1.0
@@ -47,7 +45,6 @@ python-multipart==0.0.22
 # -----------------------------
 # Distributed training
 # -----------------------------
-git+https://github.com/learning-at-home/hivemind.git@4bd43b77
 py-cid==0.5.0
 
 # -----------------------------

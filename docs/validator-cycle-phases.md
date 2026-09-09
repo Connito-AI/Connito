@@ -1,6 +1,6 @@
 # Validator cycle phases
 
-What `connito/validator/run.py` does in each phase of one cycle. The phase order is fixed by `connito/sn_owner/cycle.py::PhaseManager` and phase names live in `connito/shared/cycle.py::PhaseNames`. The validator advances by blocking on `wait_till(config, <phase_name>)` and only acts at phase boundaries.
+What `connito/validator/run.py` does in each phase of one cycle. The phase order is fixed by `connito/shared/cycle.py::PhaseManager` and phase names live alongside it in `connito/shared/cycle.py::PhaseNames`. The validator advances by blocking on `wait_till(config, <phase_name>)` and only acts at phase boundaries.
 
 `run.py:NNN` references point at the relevant lines in `connito/validator/run.py`.
 
