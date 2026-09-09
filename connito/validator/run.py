@@ -87,6 +87,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
+from connito.shared.task_sync import resolve_active_task_name
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
@@ -1653,7 +1654,12 @@ if __name__ == "__main__":
         set_test_mode(True)
 
     if args.path:
-        config = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        # Ask the owner API what the task is before building the config, so
+        # everything is derived from the right task the first time.
+        active_task = resolve_active_task_name(args.path)
+        config = ValidatorConfig.from_path(
+            args.path, active_task=active_task, auto_update_config=args.auto_update_config
+        )
     else:
         config = ValidatorConfig()
 

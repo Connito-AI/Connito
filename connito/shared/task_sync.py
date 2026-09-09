@@ -29,13 +29,15 @@ import json
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict
 
 from connito.shared.app_logging import configure_logging, structlog
-from connito.shared.cycle import _get_with_retry
+from connito.shared.config import CycleCfg
+from connito.shared.helper import get_with_retry
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -86,14 +88,27 @@ class TaskBundle(BaseModel):
         return hashlib.sha256(encoded).hexdigest()
 
 
+class _OwnerUrl:
+    """Just enough of a config for `_fetch` when none has been built yet."""
+
+    def __init__(self, owner_url: str | None) -> None:
+        defaults = CycleCfg.model_fields
+        self.cycle = SimpleNamespace(
+            owner_url=owner_url or defaults["owner_url"].default,
+            api_timeout_sec=defaults["api_timeout_sec"].default,
+            api_retries=defaults["api_retries"].default,
+            api_backoff_sec=defaults["api_backoff_sec"].default,
+        )
+
+
 def _fetch(config, path: str, model: type[BaseModel]):
     """GET `path` from the owner API and parse it, or return None.
 
-    Reuses `cycle._get_with_retry` so timeout, retry, backoff and the
-    non-retryable status list stay identical to `get_phase_from_api`.
+    Shares `helper.get_with_retry` with `get_phase_from_api`, so timeout,
+    retry, backoff and the non-retryable status list stay identical.
     """
     url = f"{config.cycle.owner_url}/{path}"
-    resp = _get_with_retry(
+    resp = get_with_retry(
         url,
         timeout=config.cycle.api_timeout_sec,
         retries=config.cycle.api_retries,
@@ -112,6 +127,31 @@ def _fetch(config, path: str, model: type[BaseModel]):
 def get_active_task(config) -> ActiveTask | None:
     """Which expert group the subnet is training right now."""
     return _fetch(config, "active_task", ActiveTask)
+
+
+def resolve_active_task_name(config_path: str | Path) -> str | None:
+    """The task an entrypoint should start on, or None to use the config's own.
+
+    Entrypoints call this *before* building their config and pass the result to
+    `WorkerConfig.from_path`, so the name is right from the start and nothing is
+    ever derived from a stale one. Config itself never reaches for the network —
+    it only receives an answer.
+
+    Reads `cycle.owner_url` straight from the YAML because there is no config
+    object yet; an absent or unreadable file falls through to the shipped
+    default, which is the same URL every node uses.
+    """
+    try:
+        raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+        owner_url = (raw.get("cycle") or {}).get("owner_url")
+    except (OSError, yaml.YAMLError):
+        owner_url = None
+
+    active = get_active_task(_OwnerUrl(owner_url))
+    if active is None:
+        logger.warning("Owner API unreachable — starting on the task from config")
+        return None
+    return active.name
 
 
 def get_active_task_bundle(config) -> TaskBundle | None:

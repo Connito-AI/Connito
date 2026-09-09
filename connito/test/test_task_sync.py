@@ -21,6 +21,7 @@ import yaml
 from connito.shared import task_sync
 from connito.shared.task_sync import (
     ActiveTask,
+    resolve_active_task_name,
     TaskBundle,
     get_active_task,
     get_active_task_bundle,
@@ -48,7 +49,7 @@ def _config() -> SimpleNamespace:
 
 def _stub_response(monkeypatch, payload) -> None:
     monkeypatch.setattr(
-        task_sync, "_get_with_retry", lambda *a, **k: SimpleNamespace(json=lambda: payload)
+        task_sync, "get_with_retry", lambda *a, **k: SimpleNamespace(json=lambda: payload)
     )
 
 
@@ -89,7 +90,7 @@ def test_unknown_fields_are_ignored():
 # ---------------------------------------------------------------------- fetch
 
 def test_returns_none_when_the_api_is_unreachable(monkeypatch):
-    monkeypatch.setattr(task_sync, "_get_with_retry", lambda *a, **k: None)
+    monkeypatch.setattr(task_sync, "get_with_retry", lambda *a, **k: None)
     # An owner-API outage must never stop a node; the caller keeps its task.
     assert get_active_task(_config()) is None
     assert get_active_task_bundle(_config()) is None
@@ -190,3 +191,27 @@ def test_a_failed_write_leaves_the_existing_task_intact(tmp_path: Path, monkeypa
         (task_dir / "expert_assignment.json").read_text()
     ) == served["expert_assignment"]
     assert (task_dir / task_sync.STAMP_FILE).read_text() == served["bundle_sha256"]
+
+
+# ------------------------------------------------------------------ resolver
+
+def test_resolver_returns_the_served_name(tmp_path, monkeypatch):
+    _stub_response(monkeypatch, _fixture("active_task"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("cycle:\n  owner_url: https://cycle-api.example\n")
+    assert resolve_active_task_name(cfg) == "exp_nemotron_c4"
+
+
+def test_resolver_returns_none_when_the_api_is_unreachable(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_sync, "get_with_retry", lambda *a, **k: None)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("cycle: {}\n")
+    # None means "start on whatever the config says" — never halt.
+    assert resolve_active_task_name(cfg) is None
+
+
+def test_resolver_survives_an_unreadable_config(tmp_path, monkeypatch):
+    _stub_response(monkeypatch, _fixture("active_task"))
+    # No config file at all: fall through to the shipped owner_url rather than
+    # raising, since every node uses the same one anyway.
+    assert resolve_active_task_name(tmp_path / "missing.yaml") == "exp_nemotron_c4"

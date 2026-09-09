@@ -1,11 +1,17 @@
 import hashlib
 import importlib
 import os
+import time
 from pathlib import Path
 from typing import Any
 
+import requests
 import torch
 import torch.nn.functional as F
+
+from connito.shared.app_logging import structlog
+
+logger = structlog.get_logger(__name__)
 
 
 # File extensions accepted as miner-checkpoint formats. `.safetensors` is the
@@ -251,3 +257,68 @@ def hex_to_byte(hex_str: str) -> bytes:
     Convert hex string to raw bytes.
     """
     return bytes.fromhex(hex_str)
+
+
+def get_with_retry(
+    url: str,
+    *,
+    timeout: int = 10,
+    retries: int = 3,
+    backoff: int = 2,
+) -> requests.Response | None:
+    """GET `url`, retrying transient failures with exponential backoff.
+
+    Lives here rather than in `shared/cycle.py` so that modules which need an
+    HTTP client do not have to import the cycle module, which imports config —
+    `config -> task_sync -> cycle -> config` was a genuine import cycle.
+    Returns None once retries are exhausted; never raises.
+    """
+    attempt = 0
+    non_retryable = {400, 401, 403, 404, 405, 409, 422}
+
+    while attempt <= retries:
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code >= 400:
+                body_snippet = resp.text[:500] if resp.text else ""
+                if resp.status_code in non_retryable or attempt == retries:
+                    logger.error(
+                        "HTTP error calling %s (status=%s). Body (first 500 chars): %r",
+                        url,
+                        resp.status_code,
+                        body_snippet,
+                    )
+                    return None
+                logger.warning(
+                    "HTTP error, will retry",
+                    url=url,
+                    status_code=resp.status_code,
+                    attempt=attempt + 1,
+                )
+            else:
+                if attempt > 0:
+                    logger.info("Request succeeded after retry", url=url, attempt=attempt + 1)
+                return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+            logger.warning(
+                "Network error calling %s, will retry",
+                url,
+                error=str(net_err),
+                attempt=attempt + 1,
+            )
+        except requests.exceptions.RequestException as req_err:
+            logger.warning(
+                "Request error calling %s, will retry",
+                url,
+                error=str(req_err),
+                attempt=attempt + 1,
+            )
+
+        attempt += 1
+        if attempt <= retries:
+            sleep_s = backoff**attempt
+            logger.info("Retrying after backoff", url=url, sleep_seconds=sleep_s, attempt=attempt + 1)
+            time.sleep(sleep_s)
+
+    logger.error("Request failed after retries", url=url, total_attempts=retries + 1)
+    return None
