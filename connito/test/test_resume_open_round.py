@@ -281,7 +281,16 @@ def _resume(tmp_path, *, phase_name="Train", blocks_remaining=200, model=None):
 
 
 def _seed_journal(tmp_path, **overrides):
-    """Write a partially-progressed journal, as a mid-round restart would leave."""
+    """Write a partially-progressed journal, as a mid-round restart would leave.
+
+    Records an existing base shard by default so each refusal test below
+    exercises its own reason rather than the missing-base one.
+    """
+    if "base_shard" not in overrides:
+        shard = tmp_path / "baseline" / "round_99.safetensors"
+        shard.parent.mkdir(parents=True, exist_ok=True)
+        shard.touch()
+        overrides["base_shard"] = str(shard)
     payload = dict(
         round_id=ROUND_ID,
         uid_to_hotkey={1: "m0", 2: "m1", 3: "m2"},
@@ -340,6 +349,20 @@ def test_resume_refused_when_the_base_shard_is_gone(tmp_path):
     _freeze(checkpoint_path=tmp_path, base_shard=shard)
     _seed_journal(tmp_path, base_shard=str(shard))
     # Retention dropped it, or the task changed underneath us.
+
+    rid, round_ref, eval_window, _ = _resume(tmp_path)
+
+    assert rid is None
+    assert round_ref.current is None
+    assert not eval_window.is_set()
+
+
+def test_resume_refused_on_a_journal_without_a_base(tmp_path):
+    """Written before `base_shard` existed, or by a cold-start round. Guessing
+    the base would score the rest of the roster against a different one than
+    the miners already in `scores`."""
+    _freeze(checkpoint_path=tmp_path)
+    _seed_journal(tmp_path, base_shard="")
 
     rid, round_ref, eval_window, _ = _resume(tmp_path)
 
