@@ -92,7 +92,10 @@ class BackgroundEvalWorker(threading.Thread):
         self.merge_phase_active = merge_phase_active
         self.eval_window_active = eval_window_active
         self.gpu_eval_lock = gpu_eval_lock
-        self.expert_group_assignment = expert_group_assignment
+        # Private so the only way in is `set_expert_group_assignment`. No
+        # lock, unlike `_eval_base_model` below: a bare rebind, and the
+        # window guard keeps the swap out of an in-flight eval.
+        self._expert_group_assignment = expert_group_assignment
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
         self.stuck_lock_recycle_threshold = stuck_lock_recycle_threshold
@@ -137,6 +140,20 @@ class BackgroundEvalWorker(threading.Thread):
     def has_eval_base_model(self) -> bool:
         with self._eval_base_model_lock:
             return self._eval_base_model is not None
+
+    def set_expert_group_assignment(self, assignment) -> None:
+        """Point the worker at a different expert group's assignment.
+
+        Refuses while the eval window is open: `validate_miner_submission`
+        checks expert-group ownership, so a swap mid-round rejects every
+        submission and writes score=0 for the whole roster.
+        """
+        if self.eval_window_active.is_set():
+            raise RuntimeError(
+                "refusing to swap expert_group_assignment while the eval window "
+                "is open; clear eval_window_active and finalize the round first"
+            )
+        self._expert_group_assignment = assignment
 
     # ---------------- Thread body ----------------
     def run(self) -> None:
@@ -420,7 +437,7 @@ class BackgroundEvalWorker(threading.Thread):
             round_obj=round_obj,
             uid=uid,
             model_path=path,
-            expert_group_assignment=self.expert_group_assignment,
+            expert_group_assignment=self._expert_group_assignment,
         )
         if fail_reason is not None:
             logger.warning(
