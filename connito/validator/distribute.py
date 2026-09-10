@@ -29,6 +29,7 @@ from connito.shared.hf_distribute import (
     resolve_hf_token,
     upload_checkpoint_to_hf_subprocess,
 )
+from connito.validator import adopted_baseline as adopted
 
 logger = structlog.get_logger(__name__)
 
@@ -46,13 +47,16 @@ def retained_baselines(baseline_dir: Path) -> list[Path]:
     return sorted((p for p in baseline_dir.iterdir() if p.is_file()), key=_rid, reverse=True)
 
 
-def _retain_baseline(src: Path, baseline_dir: Path, round_id, keep: int = 2) -> Path:
+def _retain_baseline(
+    src: Path, baseline_dir: Path, round_id, keep: int = 2, spare: Path | None = None,
+) -> Path:
     """Hardlink `src` into `baseline_dir`, keeping the newest `keep` shards.
 
     Two, not one: the round in flight is scored against the shard adopted at
     the previous Merge, and this one lands at MinerCommit1 — before that round
     freezes. Keeping only the newest would delete the base the open round is
-    still being scored against.
+    still being scored against. `spare` is the adopted shard, never unlinked
+    even if two publishes land while Merge fails to adopt.
 
     A sibling of the submission dir, so the same filesystem and the link costs
     an inode rather than a ~3 GB copy — but it pins shards the cycle prune
@@ -63,7 +67,8 @@ def _retain_baseline(src: Path, baseline_dir: Path, round_id, keep: int = 2) -> 
     if not dest.exists():
         os.link(src, dest)
     for stale in retained_baselines(baseline_dir)[keep:]:
-        stale.unlink(missing_ok=True)
+        if stale != spare:
+            stale.unlink(missing_ok=True)
     return dest
 
 
@@ -126,7 +131,10 @@ def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> Non
         # loads it. Keep a second name for the same bytes outside that dir so
         # unlinking the original frees nothing; that also covers the archive
         # step, which `shutil.move`s the top-k out from under us.
-        retained = _retain_baseline(src, submission_dir.parent / "baseline", rid)
+        own = adopted.load(config)
+        retained = _retain_baseline(
+            src, submission_dir.parent / "baseline", rid, spare=own.path if own else None,
+        )
         # Recorded before the hash so a hashing failure still leaves the local
         # model able to advance — only the advertisement is lost.
         if out is not None:

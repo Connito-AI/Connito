@@ -115,7 +115,10 @@ def _round_with_winner(uid: int = 2) -> SimpleNamespace:
 
 def _config(submission_dir) -> SimpleNamespace:
     return SimpleNamespace(
-        ckpt=SimpleNamespace(miner_submission_path=submission_dir),
+        ckpt=SimpleNamespace(
+            miner_submission_path=submission_dir,
+            checkpoint_path=Path(submission_dir).parent / "ckpt" / "exp_g4",
+        ),
         hf=SimpleNamespace(token_env_var="HF_TOKEN"),
         task=SimpleNamespace(exp=SimpleNamespace(group_id=GROUP_ID)),
     )
@@ -261,6 +264,25 @@ def test_the_adopted_baseline_survives_the_next_publish(tmp_path, stub_upload):
 
     retained = sorted(p.name for p in (sub.parent / "baseline").iterdir())
     assert retained == ["round_9000.safetensors", "round_9001.safetensors"]
+
+
+def test_retention_never_unlinks_the_adopted_shard(tmp_path, stub_upload):
+    """Two publishes can land while Merge fails to adopt twice; the base the
+    open round is scored against must still be on disk."""
+    from connito.validator import adopted_baseline as adopted
+
+    sub = tmp_path / "miner_submission"
+    sub.mkdir()
+    cfg = _config(sub)
+    _publish_rounds(sub, ((550, 9000),))
+    adopted.persist(cfg, adopted.AdoptedBaseline(
+        path=sub.parent / "baseline" / "round_9000.safetensors",
+        round_id=9000, global_ver=9000, model_hash="ab" * 32,
+    ))
+    _publish_rounds(sub, ((560, 9001), (570, 9002), (580, 9003)))
+
+    retained = sorted(p.name for p in (sub.parent / "baseline").iterdir())
+    assert retained == ["round_9000.safetensors", "round_9002.safetensors", "round_9003.safetensors"]
 
 
 def test_retention_is_bounded_at_two(tmp_path, stub_upload):

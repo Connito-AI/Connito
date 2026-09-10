@@ -75,16 +75,13 @@ from connito.shared.chain import (
 )
 from connito.shared.checkpoint_helper import (
     cleanup_temporary_checkpoint_dirs,
-    load_checkpoint,
-    save_checkpoint,
 )
 from connito.shared.checkpoints import (
     ModelCheckpoint,
-    build_local_checkpoint,
-    delete_old_checkpoints,
+    ModelCheckpoints,
+    build_local_checkpoints,
     prune_miner_submission_files,
     prune_submissions_outside_window,
-    select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.hf_distribute import (
@@ -103,7 +100,11 @@ from connito.shared.expert_manager import (
     ExpertManager,
     get_weight_sum,
 )
-from connito.shared.helper import get_nested_attr, load_state_dict_from_path
+from connito.shared.helper import (
+    expert_group_shard_name,
+    get_model_hash,
+    load_state_dict_from_path,
+)
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
@@ -113,6 +114,7 @@ from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.chain_submitter import ChainSubmitter, observer_mode_enabled
+from connito.validator import adopted_baseline as adopted
 from connito.validator.evaluator import (
     build_submission_uid_weights,
     finalize_round_scores,
@@ -601,6 +603,87 @@ def _switch_task(
     return expert_manager
 
 
+def _overlay_expert_shard(model: nn.Module, shard: Path) -> int:
+    """Load one expert shard into `model` in place; returns matched keys.
+
+    `strict=False`: the file carries only the active expert group, so backbone
+    and helper-group keys are legitimately absent and keep their values. Zero
+    matches is silent corruption waiting to happen, hence the error log.
+    """
+    sd = load_state_dict_from_path(str(shard))
+    incompatible = model.load_state_dict(sd, strict=False)
+    matched = len(sd) - len(incompatible.unexpected_keys)
+    del sd
+    if matched == 0:
+        logger.error("Expert shard shares no keys with the model", path=str(shard))
+    return matched
+
+
+def _shard_file(ckpt: ModelCheckpoint, group_id: int) -> Path:
+    """The adopted pointer names a file; a downloaded checkpoint is a dir."""
+    p = Path(ckpt.path)
+    return p if p.is_file() else p / expert_group_shard_name(group_id)
+
+
+def _apply_boot_overlay(
+    config, model: nn.Module, own: "adopted.AdoptedBaseline | None", *, migrated: bool = False,
+) -> tuple[str, ModelCheckpoint | None]:
+    """Overlay the highest-`global_ver` shard among the validator's own adopted
+    baseline and the downloaded fleet cache — the precedence
+    `select_best_checkpoint` applied when the legacy checkpoint dir was the
+    "own" side. Returns the source, for the one boot log line to check after
+    every upgrade.
+    """
+    if config.ckpt.use_pretrained_only or not config.ckpt.resume_from_ckpt:
+        logger.info("Boot model source", source="pretrained")
+        return "pretrained", None
+    cache = Path(config.ckpt.validator_checkpoint_path)
+    candidates = (
+        list(build_local_checkpoints(cache, role="validator").checkpoints) if cache.is_dir() else []
+    )
+    own_ckpt = own.as_checkpoint() if own else None
+    if own_ckpt is not None:
+        candidates.append(own_ckpt)
+    for ckpt in ModelCheckpoints(checkpoints=candidates).ordered():
+        shard = _shard_file(ckpt, config.task.exp.group_id)
+        if not shard.is_file():
+            logger.error("Boot overlay candidate missing on disk; skipping", path=str(shard))
+            continue
+        source = ("legacy_globalver" if migrated else "pointer") if ckpt is own_ckpt else "downloaded"
+        matched = _overlay_expert_shard(model, shard)
+        logger.info(
+            "Boot model source", source=source, global_ver=ckpt.global_ver,
+            model_hash=(ckpt.model_hash or "")[:8], matched_keys=matched, path=str(shard),
+        )
+        return source, ckpt
+    logger.info("Boot model source", source="pretrained")
+    return "pretrained", None
+
+
+def _adopt_baseline(config, model: nn.Module, baseline_ref: dict, global_ver: int) -> Path | None:
+    """Merge: load the published baseline into `model`, then persist the pointer.
+
+    Returns the adopted path, or None if the shard matched nothing. Persisted
+    only after the load matched, so a failed adopt leaves the previous pointer.
+    """
+    path = Path(str(baseline_ref["path"]))
+    if not _overlay_expert_shard(model, path):
+        return None
+    adopted.persist(config, adopted.AdoptedBaseline(
+        path=path,
+        round_id=int(baseline_ref.get("round_id") or 0),
+        global_ver=int(global_ver),
+        # Recorded by the publish thread once the upload lands; hash the file
+        # ourselves if the switch beat it.
+        model_hash=str(
+            baseline_ref.get("model_hash")
+            or get_model_hash(load_state_dict_from_path(str(path)), hex=True)
+        ),
+        revision=baseline_ref.get("revision"),
+    ))
+    return path
+
+
 def setup_training(
     config,
     rank: int,
@@ -618,25 +701,24 @@ def setup_training(
     """
     Build model(s), experts layout, optimizers, scheduler, scaler, and optionally resume from a checkpoint.
     """
-    # === checkpoint info ===
-    latest_checkpoint = select_best_checkpoint(primary_dir=config.ckpt.checkpoint_path)
-    resume = latest_checkpoint is not None
-    latest_checkpoint_path = latest_checkpoint.path if latest_checkpoint else None
-
     # === model & Experts manager ===
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
-    # `load_global_checkpoint=True`: overlay the newest on-disk `globalver_*`
-    # expert state, which now holds the round baseline. That directory is the
-    # only local copy of the model, so skipping it restarts from pretrained.
-    global_model, model_meta = load_model(
-        rank, config, expert_manager, subtensor, wallet, current_model_meta,
+    # The validator's persisted model state is the adopted-baseline pointer,
+    # not a checkpoint: a frozen backbone plus the shard it names. Build
+    # pretrained here and choose the overlay below. Passing the pointer as
+    # `current_model_meta` keeps the chain fetch's "only download something
+    # newer than mine" filter exactly as it was.
+    own = adopted.load(config)
+    migrated = own is None and (own := adopted.migrate_from_legacy_globalver(config)) is not None
+    global_model, _ = load_model(
+        rank, config, expert_manager, subtensor, wallet,
+        own.as_checkpoint() if own else None,
         partial=True, checkpoint_device=device,
-        load_global_checkpoint=True,
+        load_global_checkpoint=False,
     )
     apply_from_config(global_model, config, expert_manager, role="validator")
-
+    source, overlay = _apply_boot_overlay(config, global_model, own, migrated=migrated)
 
     # === dataloader ===
     logger.debug("setup training - load dataloader")
@@ -644,27 +726,10 @@ def setup_training(
         config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
     )
 
-    # === load checkpoint (if any) ===
-    logger.debug(
-        "setup training - load past checkpoint"
-    )
-    if get_nested_attr(config, "resume_from_ckpt", False) and resume and latest_checkpoint_path:
-        _ = load_checkpoint(
-            config=config,
-            checkpoint_path=latest_checkpoint_path,
-            rank=rank,
-            device=device,
-            data_loader=train_dataloader,
-        )
-
-    logger.info(
-        "Training setup complete",
-        resumed=resume,
-        device=str(device),
-    )
+    logger.info("Training setup complete", model_source=source, device=str(device))
     return (
         global_model,
-        model_meta.global_ver if model_meta else 0,
+        int(overlay.global_ver or 0) if overlay else 0,
         expert_manager,
         train_dataloader,
     )
@@ -748,11 +813,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Coordinates of the baseline published at finalize, read by the next
     # ValidatorCommit. Empty means "nothing to advertise this cycle".
     baseline_ref: dict[str, object] = {}
-    # The shard `global_model` currently consists of, recorded at Merge and
-    # handed to the next `Round.freeze` as the round's base. `None` at boot:
-    # the model came from the newest `globalver_*` checkpoint instead, which
-    # is what the eval worker's first copy already holds.
-    adopted_baseline: Path | None = None
+    # The shard `global_model` currently consists of — handed to the next
+    # `Round.freeze` as the round's base, persisted at Merge as the pointer
+    # boot reads. `None` only on a cold start with nothing adopted yet.
+    _own = adopted.load(config)
+    adopted_baseline: Path | None = _own.path if _own else None
 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
@@ -1473,8 +1538,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # `baseline_ref`, and it runs after this point.
             baseline_path = baseline_ref.get("path")
 
-            # Held across the load and save only, not the whole phase: both
-            # mutate state the background workers read.
+            # Held across the load only, not the whole phase: it mutates state
+            # the background workers read.
             merge_phase_active.set()
             try:
                 if baseline_path:
@@ -1483,25 +1548,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         round_id=baseline_ref.get("round_id"),
                         uid=baseline_ref.get("uid"),
                     )
-                    # Same primitives as `evaluator.load_model_from_path`, but
-                    # applied in place — a deepcopy here would double model
-                    # VRAM for nothing. `strict=False` because the file carries
-                    # only the active expert group; backbone and helper-group
-                    # keys are legitimately absent and keep their values.
                     try:
-                        sd = load_state_dict_from_path(baseline_path)
-                        incompatible = global_model.load_state_dict(sd, strict=False)
-                        matched_keys = len(sd) - len(incompatible.unexpected_keys)
-                        del sd
-                        if matched_keys == 0:
+                        new_path = _adopt_baseline(config, global_model, baseline_ref, global_opt_step)
+                        if new_path is None:
                             logger.error(
                                 "Round baseline shares no keys with the model; "
                                 "model unchanged this cycle",
                                 path=baseline_path,
                             )
                         else:
-                            adopted_baseline = Path(baseline_path)
-                            logger.info("Round baseline adopted", matched_keys=matched_keys)
+                            adopted_baseline = new_path
+                            logger.info("Round baseline adopted", path=str(new_path))
                     except Exception as e:
                         # On the main loop, so an unhandled error here exits the
                         # process mid-cycle. Losing one cycle's advance is
@@ -1517,35 +1574,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
 
                 cleanup(global_model)
-
-                # === save checkpoint ===
-                logger.info("Saving checkpoint")
-                ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
-
-                presave_keep = None
-                if config.ckpt.checkpoint_topk is not None:
-                    presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
-                if presave_keep is not None:
-                    presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
-                    if presave_deleted:
-                        logger.info(
-                            "Pruned older checkpoints before save",
-                            keep=presave_keep,
-                            deleted=presave_deleted,
-                        )
-
-                save_checkpoint(
-                    checkpoint_path=ckpt_path,
-                    model=global_model,
-                    loss=loss_batch.item(),
-                    data_loader=train_dataloader,
-                    save_global_state=rank == 0,
-                    rank=rank,
-                    expert_manager=expert_manager,
-                    save_model_by_expert_group=True,
-                    strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
-                    active_expert_group_id=config.task.exp.group_id,
-                )
             finally:
                 merge_phase_active.clear()
 
@@ -1558,23 +1586,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(lite_subtensor, phase_response)
 
-            # === Comit to chain for new model ===
-            model_ckpt = build_local_checkpoint(ckpt_path)
+            # === Commit to chain for the current model ===
+            # The pointer carries the hash, so nothing on disk is re-hashed.
+            # Observer mode skips the signature: the commit below is its only
+            # consumer, and this is the last thing that needs the hotkey's
+            # private key — so an observer can run on a public-only keyfile.
+            _own = adopted.load(config)
+            model_ckpt = _own.as_checkpoint() if _own else None
             if model_ckpt is not None:
-
                 model_ckpt.expert_group = config.task.exp.group_id
-                if observer_mode_enabled():
-                    # The signature's only consumer is the commit below, which
-                    # observer mode suppresses — and this is the last thing in
-                    # the validator that needs the hotkey's *private* key.
-                    # Skipping it lets an observer run on a public-only
-                    # keyfile, so a live validator's key never has to be copied
-                    # onto the test host at all. Hash anyway: `model_hash` is
-                    # read on the next line and drives eval, and `sign_hash`
-                    # was what triggered it.
-                    if model_ckpt.model_hash is None:
-                        model_ckpt.hash_model()
-                else:
+                if not observer_mode_enabled():
                     model_ckpt.sign_hash(wallet=wallet)
                 current_model_hash = model_ckpt.model_hash
                 # Dashboard telemetry: the model's global optimization version
@@ -1636,11 +1657,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     hf_repo_id=hf_chain_repo_id if hf_revision else None,
                     hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
                 ))
-
-                if config.ckpt.checkpoint_topk is not None:
-                    ckpt_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, config.ckpt.checkpoint_topk)
-                    if ckpt_deleted:
-                        logger.debug(f"Deleted old checkpoints: {ckpt_deleted}")
 
             # === (4) Set weight to chain ===
             # Relocated to the top of the next iteration's MinerCommit1 block
