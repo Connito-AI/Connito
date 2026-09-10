@@ -1,0 +1,44 @@
+services:
+  phase-service:
+    image: ${IMAGE:-ghcr.io/connito-ai/connito-sn-owner:stable}
+    restart: unless-stopped
+    pull_policy: always
+    init: true
+
+    # Local development build
+    build:
+      context: ../../..
+      dockerfile: connito/validator/docker/Dockerfile
+
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+    # Same pattern as the validator: host networking so the DHT port and
+    # the FastAPI service are reachable without per-port NAT. This also
+    # means uvicorn's 127.0.0.1 bind is host-localhost only — bind 0.0.0.0
+    # in the code if other machines need to reach :8080.
+    network_mode: "host"
+
+    # Match the entrypoint style: exec the module, pass through args.
+    entrypoint: ["/bin/sh", "-c", "exec python -m connito.sn_owner.phase_service \"$@\"", "--"]
+
+    # environment:
+    #   WALLET_NAME: ${WALLET_NAME:?set WALLET_NAME in .env}
+    #   HOTKEY_NAME: ${HOTKEY_NAME:?set HOTKEY_NAME in .env}
+
+    volumes:
+      # Wallet — read-only; only the hotkey is needed for signing (if at all)
+      - ${BITTENSOR_WALLET_PATH:-${HOME}/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      # Persistent state: init_peer_ids.json lives under config.run.root_path
+      - ${DATA_DIR:-../../..}:/data
+      # Owner config YAML — editable on the host without rebuilding
+      - ${CONFIG_PATH:?set CONFIG_PATH in .env}:/data/configs/owner.yaml
+
+    command: ["--path", "/data/configs/owner.yaml"]
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "10", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
