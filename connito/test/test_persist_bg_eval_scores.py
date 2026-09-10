@@ -38,7 +38,7 @@ def _make_round(*, round_id: int, score_path: Path, journal_path: Path,
         validator_miner_assignment={},
         background_uids=tuple(uid_to_hotkey.keys()),
         uid_to_hotkey=dict(uid_to_hotkey),
-        model_snapshot_cpu={},
+        base_shard=None,
         freeze_zero_uids=set(freeze_zero_uids or set()),
         freeze_zero_hotkeys=dict(freeze_zero_hotkeys or {}),
         journal_path=journal_path,
@@ -207,7 +207,7 @@ def test_mark_methods_are_no_op_when_round_has_no_journal_path(tmp_path: Path) -
         validator_miner_assignment={},
         background_uids=(1,),
         uid_to_hotkey={1: "hk1"},
-        model_snapshot_cpu={},
+        base_shard=None,
         # journal_path / score_aggregator / score_path all None.
     )
     round_obj.mark_scored(1, score=1.0)

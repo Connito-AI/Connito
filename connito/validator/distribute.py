@@ -33,19 +33,37 @@ from connito.shared.hf_distribute import (
 logger = structlog.get_logger(__name__)
 
 
-def _retain_baseline(src: Path, baseline_dir: Path, round_id) -> Path:
-    """Hardlink `src` into `baseline_dir` and drop any earlier baseline.
+def retained_baselines(baseline_dir: Path) -> list[Path]:
+    """Retained shards, newest round first. Unparseable names sort last."""
+    def _rid(p: Path) -> int:
+        try:
+            return int(p.stem.removeprefix("round_"))
+        except ValueError:
+            return -1
+
+    if not baseline_dir.is_dir():
+        return []
+    return sorted((p for p in baseline_dir.iterdir() if p.is_file()), key=_rid, reverse=True)
+
+
+def _retain_baseline(src: Path, baseline_dir: Path, round_id, keep: int = 2) -> Path:
+    """Hardlink `src` into `baseline_dir`, keeping the newest `keep` shards.
+
+    Two, not one: the round in flight is scored against the shard adopted at
+    the previous Merge, and this one lands at MinerCommit1 — before that round
+    freezes. Keeping only the newest would delete the base the open round is
+    still being scored against.
 
     A sibling of the submission dir, so the same filesystem and the link costs
-    an inode rather than a ~3 GB copy — but it does pin one shard the cycle
-    prune used to free, which is why the previous one goes first.
+    an inode rather than a ~3 GB copy — but it pins shards the cycle prune
+    used to free, hence the bound.
     """
     baseline_dir.mkdir(parents=True, exist_ok=True)
-    for stale in baseline_dir.iterdir():
-        if stale.is_file():
-            stale.unlink()
     dest = baseline_dir / f"round_{round_id}{src.suffix}"
-    os.link(src, dest)
+    if not dest.exists():
+        os.link(src, dest)
+    for stale in retained_baselines(baseline_dir)[keep:]:
+        stale.unlink(missing_ok=True)
     return dest
 
 

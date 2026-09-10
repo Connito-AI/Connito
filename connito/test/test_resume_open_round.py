@@ -78,7 +78,7 @@ def _metagraph(hotkeys: list[str]) -> SimpleNamespace:
     )
 
 
-def _freeze(*, checkpoint_path, model=None, miners=("m0", "m1", "m2"), **kw):
+def _freeze(*, checkpoint_path, base_shard=None, miners=("m0", "m1", "m2"), **kw):
     hotkeys = ["vme", *miners]
     metagraph = _metagraph(hotkeys)
     assignment_result = SimpleNamespace(
@@ -102,7 +102,7 @@ def _freeze(*, checkpoint_path, model=None, miners=("m0", "m1", "m2"), **kw):
             config=_config(),
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=model if model is not None else _ModelWithBuffer(),
+            base_shard=base_shard,
             round_id=ROUND_ID,
             cycle_index=8,
             cycle_length=CYCLE_LENGTH,
@@ -112,27 +112,26 @@ def _freeze(*, checkpoint_path, model=None, miners=("m0", "m1", "m2"), **kw):
 
 
 # ---------------------------------------------------------------------------
-# Piece 1: freeze persists the base parameters
+# Piece 1: freeze records the base shard
 # ---------------------------------------------------------------------------
 
 
-def test_freeze_persists_only_named_parameters(tmp_path):
-    """The buffer must be absent: it is why parameters-only is exact."""
-    _freeze(checkpoint_path=tmp_path)
+def test_freeze_records_the_base_shard_in_the_journal(tmp_path):
+    """A path, not a parameter dump: the backbone is frozen, so the shard
+    plus a pretrained backbone reproduces the base exactly."""
+    shard = tmp_path / "baseline" / "round_99.safetensors"
+    _freeze(checkpoint_path=tmp_path, base_shard=shard)
 
-    base_path = rj.base_snapshot_path_for(tmp_path, ROUND_ID)
-    assert base_path.exists()
-
-    saved = torch.load(base_path, map_location="cpu", weights_only=True)
-    assert set(saved) == {"lin.weight"}
-    assert "scale" not in saved, "buffers must not be persisted"
-    torch.testing.assert_close(saved["lin.weight"], torch.full((2, 4), 0.1))
+    journal = rj.load(rj.journal_path_for(tmp_path, ROUND_ID))
+    assert journal.base_shard == str(shard)
+    # And nothing multi-GB landed beside it.
+    assert list(rj.journal_dir(tmp_path).glob("*.pt")) == []
 
 
 def test_freeze_without_checkpoint_path_writes_nothing(tmp_path):
-    """Legacy rounds (no journaling) must not start writing snapshots."""
+    """Legacy rounds (no journaling) must not start writing journals."""
     _freeze(checkpoint_path=None)
-    assert not rj.base_snapshot_path_for(tmp_path, ROUND_ID).exists()
+    assert not rj.journal_path_for(tmp_path, ROUND_ID).exists()
 
 
 def test_freeze_records_seed_in_journal(tmp_path):
@@ -195,7 +194,7 @@ def test_advance_cohort_false_reuses_state(tmp_path):
             config=cfg,
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=_ModelWithBuffer(),
+            base_shard=None,
             round_id=ROUND_ID,
             cycle_index=8,
             cycle_length=CYCLE_LENGTH,
@@ -304,9 +303,11 @@ def _seed_journal(tmp_path, **overrides):
 
 def test_resume_restores_verdicts_and_base(tmp_path):
     """The happy path: work already done is preserved, base comes from disk."""
-    model = _ModelWithBuffer()
-    _freeze(checkpoint_path=tmp_path, model=model)
-    _seed_journal(tmp_path)
+    shard = tmp_path / "baseline" / "round_99.safetensors"
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    shard.write_bytes(b"")
+    _freeze(checkpoint_path=tmp_path, base_shard=shard)
+    _seed_journal(tmp_path, base_shard=str(shard))
 
     # A different model at resume — as after a restart, where global_model is
     # reloaded from the pretrained backbone rather than the merged state.
@@ -325,21 +326,20 @@ def test_resume_restores_verdicts_and_base(tmp_path):
     assert resumed.val_losses == {1: 1.5}
     assert resumed.validation_failed_uids == {2}
     assert resumed.freeze_zero_uids == {3}
-    # The base is the ORIGINAL freeze's parameters, not a fresh snapshot of
-    # the restarted process's model — this is the whole point.
-    torch.testing.assert_close(
-        resumed.model_snapshot_cpu["lin.weight"], torch.full((2, 4), 0.1)
-    )
+    # The base is the ORIGINAL freeze's shard, not whatever the restarted
+    # process happens to hold — this is the whole point.
+    assert resumed.base_shard == shard
     # Workers are handed the round.
     assert eval_window.is_set()
     assert not dl_closed.is_set()
 
 
-def test_resume_refused_without_base_snapshot(tmp_path):
+def test_resume_refused_when_the_base_shard_is_gone(tmp_path):
     """No base means no provable comparability — refuse rather than degrade."""
-    _freeze(checkpoint_path=tmp_path)
-    _seed_journal(tmp_path)
-    rj.base_snapshot_path_for(tmp_path, ROUND_ID).unlink()
+    shard = tmp_path / "baseline" / "round_99.safetensors"
+    _freeze(checkpoint_path=tmp_path, base_shard=shard)
+    _seed_journal(tmp_path, base_shard=str(shard))
+    # Retention dropped it, or the task changed underneath us.
 
     rid, round_ref, eval_window, _ = _resume(tmp_path)
 
@@ -400,13 +400,12 @@ def test_resume_marks_hotkey_drift_as_failed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_prune_removes_base_snapshot(tmp_path):
+def test_prune_removes_the_journal(tmp_path):
     _freeze(checkpoint_path=tmp_path)
-    assert rj.base_snapshot_path_for(tmp_path, ROUND_ID).exists()
+    assert rj.journal_path_for(tmp_path, ROUND_ID).exists()
 
     rj.prune_before_round(tmp_path, ROUND_ID + 1)
 
-    assert not rj.base_snapshot_path_for(tmp_path, ROUND_ID).exists()
     assert not rj.journal_path_for(tmp_path, ROUND_ID).exists()
 
 

@@ -141,7 +141,7 @@ def _freeze(
             config=config,
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=_make_model(),
+            base_shard=None,
             round_id=round_id,
             cycle_index=cycle_index,
             cycle_length=cycle_length,

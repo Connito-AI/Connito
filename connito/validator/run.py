@@ -426,14 +426,17 @@ def resume_open_round(
     if remaining <= 0:
         return _decline("roster already complete", round_id=sub_start)
 
-    base_path = _rj.base_snapshot_path_for(checkpoint_path, sub_start)
-    if not base_path.exists():
+    # The base is the shard the round froze on. A journal predating this
+    # field reads as "", and resuming on the wrong base would make every
+    # later `delta = max(0, baseline - val_loss)` incomparable with the ones
+    # already in `scores` — so refuse rather than guess.
+    base_shard = Path(journal.base_shard) if journal.base_shard else None
+    if base_shard is not None and not base_shard.exists():
         logger.warning(
-            "resume: no base snapshot — refusing to resume",
-            round_id=sub_start, path=str(base_path),
+            "resume: round base shard is gone — refusing to resume",
+            round_id=sub_start, path=str(base_shard),
         )
         return None
-    base_params = torch.load(base_path, map_location="cpu", weights_only=True)
 
     current_cohort_state = None
     if config.evaluation.enable_round_group_construction:
@@ -449,7 +452,7 @@ def resume_open_round(
         config=config,
         subtensor=subtensor,
         metagraph=lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False),
-        global_model=global_model,
+        base_shard=base_shard,
         round_id=sub_start,
         submission_block_range=(sub_start, sub_end),
         last_evaluated=score_aggregator.last_evaluated_per_uid(),
@@ -471,7 +474,6 @@ def resume_open_round(
         )
         return None
 
-    resumed.model_snapshot_cpu = base_params
     resumed.journal_path = _rj.journal_path_for(checkpoint_path, sub_start)
 
     # A uid that deregistered and re-registered mid-cycle must not inherit the
@@ -746,6 +748,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Coordinates of the baseline published at finalize, read by the next
     # ValidatorCommit. Empty means "nothing to advertise this cycle".
     baseline_ref: dict[str, object] = {}
+    # The shard `global_model` currently consists of, recorded at Merge and
+    # handed to the next `Round.freeze` as the round's base. `None` at boot:
+    # the model came from the newest `globalver_*` checkpoint instead, which
+    # is what the eval worker's first copy already holds.
+    adopted_baseline: Path | None = None
 
     # === set up score aggregator ===
     score_window = config.evaluation.score_window
@@ -1308,7 +1315,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 config=config,
                 subtensor=subtensor,
                 metagraph=metagraph,
-                global_model=global_model,
+                base_shard=adopted_baseline,
                 round_id=phase_response.phase_start_block,
                 submission_block_range=(
                     phase_response.phase_start_block,
@@ -1416,9 +1423,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
-            # bg-eval needs an architecture template and an open window; per-round
-            # state comes from `round.model_snapshot_cpu`, taken at freeze. Mirrors
-            # the resume path. Opening here rather than after Merge gives the
+            # bg-eval needs an architecture template and an open window; the
+            # round's expert weights come from `round.base_shard`. Mirrors the
+            # resume path. Opening here rather than after Merge gives the
             # worker the whole round now that nothing else competes for the GPU.
             if eval_worker is not None and not eval_worker.has_eval_base_model():
                 eval_worker.set_eval_base_model(copy.deepcopy(global_model))
@@ -1493,6 +1500,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                                 path=baseline_path,
                             )
                         else:
+                            adopted_baseline = Path(baseline_path)
                             logger.info("Round baseline adopted", matched_keys=matched_keys)
                     except Exception as e:
                         # On the main loop, so an unhandled error here exits the

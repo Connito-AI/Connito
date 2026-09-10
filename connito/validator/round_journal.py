@@ -83,6 +83,11 @@ class RoundJournal:
     # field with `raw.get`, so an older build ignores this key and a newer
     # one defaults it to "" — the resume path treats "" as "refuse".
     seed: str = ""
+    # The baseline shard the round was scored against. Replaces the
+    # multi-GB `_base.pt` snapshot: the backbone is frozen, so the base is
+    # reproducible from this file alone. Additive — `from_json` uses
+    # `raw.get`, so an older journal reads as "" and the resume path refuses.
+    base_shard: str = ""
     finalized: bool = False
     schema_version: int = SCHEMA_VERSION
 
@@ -139,6 +144,7 @@ class RoundJournal:
                 int(k): float(v) for k, v in raw.get("uid_to_val_loss", {}).items()
             },
             seed=str(raw.get("seed", "")),
+            base_shard=str(raw.get("base_shard", "")),
             finalized=bool(raw.get("finalized", False)),
             schema_version=version,
         )
@@ -292,15 +298,6 @@ def journal_path_for(checkpoint_path: str | os.PathLike, round_id: int) -> Path:
     return journal_dir(checkpoint_path) / f"{JOURNAL_FILENAME_PREFIX}{int(round_id)}{JOURNAL_FILENAME_SUFFIX}"
 
 
-def base_snapshot_path_for(checkpoint_path: str | os.PathLike, round_id: int) -> Path:
-    """Path of the round's base-parameter snapshot.
-
-    Sibling of the journal file. `scan()` only matches `round_<int>.json`,
-    so the `.pt` never shows up as a journal.
-    """
-    return journal_dir(checkpoint_path) / f"{JOURNAL_FILENAME_PREFIX}{int(round_id)}_base.pt"
-
-
 def write_atomic(path: str | os.PathLike, journal: RoundJournal) -> None:
     """Write ``journal.to_json()`` to ``path`` atomically (tmp file +
     ``os.replace``). Same shape as ``cohort_state.persist_atomic`` so a
@@ -435,9 +432,6 @@ def prune_before_round(checkpoint_path: str | os.PathLike, min_round_id: int) ->
         if rid < int(min_round_id):
             try:
                 entry.unlink(missing_ok=True)
-                # Backstop for a round that never reached finalize, which is
-                # where the snapshot is normally unlinked.
-                base_snapshot_path_for(checkpoint_path, rid).unlink(missing_ok=True)
                 deleted += 1
             except Exception:
                 pass

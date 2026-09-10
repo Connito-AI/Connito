@@ -144,7 +144,7 @@ def _make_worker_and_round(tmp_path: Path, *, miner_fault_enabled: bool = True):
         validator_miner_assignment={},
         background_uids=(1,),
         uid_to_hotkey={1: "hk1"},
-        model_snapshot_cpu={},
+        base_shard=None,
         uid_to_chain_checkpoint={
             1: SimpleNamespace(hf_repo_id="acct/repo", hf_revision="abc123"),
         },

@@ -242,21 +242,36 @@ def test_baseline_survives_the_end_of_cycle_prune(tmp_path, stub_upload):
     assert set(load_state_dict_from_path(Path(out["path"]))) == {"w"}
 
 
-def test_only_the_newest_baseline_is_pinned(tmp_path, stub_upload):
-    """Each retained baseline holds a ~3 GB shard that the prune would
-    otherwise free, so publishing must drop the previous round's link or disk
-    grows by one shard every round."""
-    sub = tmp_path / "miner_submission"
-    sub.mkdir()
-    for block, rid in ((550, 9000), (560, 9001)):
+def _publish_rounds(sub, rounds):
+    for block, rid in rounds:
         shard = sub / f"uid_1_hotkey_hkB_block_{block}.safetensors"
         save_file({"w": torch.zeros(4)}, str(shard))
         round_obj = _round_with_winner()
         round_obj.round_id = rid
         distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out={})
 
+
+def test_the_adopted_baseline_survives_the_next_publish(tmp_path, stub_upload):
+    """The round in flight is scored against the shard adopted at the previous
+    Merge, and the next one lands at MinerCommit1 — before that round freezes.
+    Keeping only the newest would delete the base still being scored against."""
+    sub = tmp_path / "miner_submission"
+    sub.mkdir()
+    _publish_rounds(sub, ((550, 9000), (560, 9001)))
+
     retained = sorted(p.name for p in (sub.parent / "baseline").iterdir())
-    assert retained == ["round_9001.safetensors"]
+    assert retained == ["round_9000.safetensors", "round_9001.safetensors"]
+
+
+def test_retention_is_bounded_at_two(tmp_path, stub_upload):
+    """Each retained baseline pins a ~3 GB shard the prune would otherwise
+    free, so the set must not grow with the round count."""
+    sub = tmp_path / "miner_submission"
+    sub.mkdir()
+    _publish_rounds(sub, ((550, 9000), (560, 9001), (570, 9002), (580, 9003)))
+
+    retained = sorted(p.name for p in (sub.parent / "baseline").iterdir())
+    assert retained == ["round_9002.safetensors", "round_9003.safetensors"]
 
 
 # --- a restart must not throw the merge away ---------------------------------
