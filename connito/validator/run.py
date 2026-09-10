@@ -429,11 +429,18 @@ def resume_open_round(
         return _decline("roster already complete", round_id=sub_start)
 
     # The base is the shard the round froze on. A journal predating this
-    # field reads as "", and resuming on the wrong base would make every
-    # later `delta = max(0, baseline - val_loss)` incomparable with the ones
-    # already in `scores` — so refuse rather than guess.
-    base_shard = Path(journal.base_shard) if journal.base_shard else None
-    if base_shard is not None and not base_shard.exists():
+    # field reads as "" — so does a cold-start round — and resuming on a
+    # guessed base would make every later `delta = max(0, baseline -
+    # val_loss)` incomparable with the ones already in `scores`. Refuse; the
+    # caller finalizes what was scored.
+    if not journal.base_shard:
+        logger.warning(
+            "resume: journal records no base shard — refusing to resume",
+            round_id=sub_start,
+        )
+        return None
+    base_shard = Path(journal.base_shard)
+    if not base_shard.exists():
         logger.warning(
             "resume: round base shard is gone — refusing to resume",
             round_id=sub_start, path=str(base_shard),
