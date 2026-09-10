@@ -1309,8 +1309,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # (0) Lock and prioritize: build the round roster in A -> B -> C
             # order, then the previous round's A/B carry-over, then a
-            # staleness tail (see Round.freeze). Capture the seed and snapshot
-            # global_model to CPU.
+            # staleness tail (see Round.freeze). Capture the seed and pin the
+            # shard the round is scored against.
             new_round = Round.freeze(
                 config=config,
                 subtensor=subtensor,
