@@ -516,6 +516,35 @@ def resume_open_round(
     return resumed.round_id
 
 
+def _resolve_score_aggregator_path(config) -> Path:
+    """Where miner score history lives, migrating it there once if needed.
+
+    Miner history, not task history: the roster is unchanged by a switch, and
+    `select_baseline_uid` ranks on this rolling average — empty, it falls back
+    to raw val_loss just as a cold start makes that least trustworthy.
+
+    One level above `checkpoint_path`, which drops the expert-group leaf and
+    nothing else: still per coldkey/hotkey/run_name, so validators sharing a
+    box keep separate histories. Not `validator_checkpoint_path` — that is the
+    downloaded-model cache, read by the miner path too.
+
+    The move would itself wipe a deployed validator's history once, hence the
+    migration. Destination wins, so a repeat run is a no-op.
+    """
+    group_dir = Path(config.ckpt.checkpoint_path)
+    dest = group_dir.parent / "score_aggregator.json"
+    src = group_dir / dest.name
+    if src.is_file() and not dest.exists():
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dest)
+            logger.info("Migrated score aggregator", src=str(src), dest=str(dest))
+        except OSError as e:
+            # Falls back to a fresh aggregator — the pre-migration behaviour.
+            logger.warning("Failed to migrate score aggregator", error=str(e))
+    return dest
+
+
 def _shutdown_background_workers(
     download_worker: "BackgroundDownloadWorker | None",
     eval_worker: "BackgroundEvalWorker | None",
@@ -756,7 +785,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Hard-coded for now; promote to a config field once we settle on a
     # default that won't change cross-validator behavior.
     score_history_window: int = 80
-    score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
+    score_path = _resolve_score_aggregator_path(config)
     if pkg_version == "v0.2.3":
         # One-time wipe: drop any prior aggregator state on disk so the v0.2.3
         # rollout starts every validator with a clean score history. Subsequent
