@@ -558,7 +558,7 @@ def _switch_task(
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
-) -> ExpertManager:
+) -> tuple[ExpertManager, dict[str, object]]:
     """Move a running validator onto a different task, all-or-nothing.
 
     `run` binds everything task-scoped once before the loop, so this is the
@@ -570,6 +570,11 @@ def _switch_task(
 
     Rolls config back if the new assignment will not load — config naming one
     group while `ExpertManager` holds another's table is silent.
+
+    Returns a *fresh* `baseline_ref`, not the old one cleared: the publish
+    thread filling it can still be uploading, and its second `out.update`
+    would repopulate a cleared dict with the previous group's shard. Costs one
+    cycle with no model advance, which `run` already handles.
 
     Not yet called: `global_model` and `train_dataloader` have to move with
     it before a switch is coherent.
@@ -596,7 +601,7 @@ def _switch_task(
         task=new_task,
         group_id=config.task.exp.group_id,
     )
-    return expert_manager
+    return expert_manager, {}
 
 
 def setup_training(
