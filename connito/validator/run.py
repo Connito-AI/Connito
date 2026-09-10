@@ -551,6 +551,54 @@ def _shutdown_background_workers(
             logger.info("Shutdown: background worker joined", thread_name=worker.name)
 
 
+def _switch_task(
+    config: ValidatorConfig,
+    new_task: str,
+    *,
+    eval_worker: BackgroundEvalWorker,
+    eval_window_active: threading.Event,
+    merge_phase_active: threading.Event,
+) -> ExpertManager:
+    """Move a running validator onto a different task, all-or-nothing.
+
+    `run` binds everything task-scoped once before the loop, so this is the
+    single place a switch happens — objects re-pointed in dependency order.
+
+    Both gates checked before anything moves. The eval window opens at
+    `Round.freeze` and closes at MinerCommit1 of the *next* cycle, so
+    switching inside it scores the round in flight against the wrong group.
+
+    Rolls config back if the new assignment will not load — config naming one
+    group while `ExpertManager` holds another's table is silent.
+
+    Not yet called: `global_model` and `train_dataloader` have to move with
+    it before a switch is coherent.
+    """
+    if eval_window_active.is_set() or merge_phase_active.is_set():
+        raise RuntimeError(
+            f"refusing to switch to {new_task!r} mid-round: "
+            f"eval_window_active={eval_window_active.is_set()}, "
+            f"merge_phase_active={merge_phase_active.is_set()}"
+        )
+
+    previous_task = config.task.expert_group_name
+    config.switch_active_task(new_task)
+    try:
+        expert_manager = ExpertManager(config)
+    except Exception:
+        config.switch_active_task(previous_task)
+        raise
+
+    eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
+    logger.info(
+        "Switched active task",
+        previous_task=previous_task,
+        task=new_task,
+        group_id=config.task.exp.group_id,
+    )
+    return expert_manager
+
+
 def setup_training(
     config,
     rank: int,
