@@ -205,3 +205,28 @@ def materialize_task(bundle: TaskBundle, dest_root: Path) -> Path:
         bundle_sha256=bundle.bundle_sha256,
     )
     return task_dir
+
+
+def ensure_active_task(config, active: str | None) -> None:
+    """Fetch and switch onto the owner's task when boot could not.
+
+    `from_path` applies the owner's answer before construction, but a task
+    this node has not got on disk falls back to the shipped default there —
+    it cannot fetch, since config stays off the network. Called right after,
+    this closes the gap: fetch the bundle, write it under `task.base_path`,
+    switch. Any failure leaves the fallback in place, logged, which is what
+    boot already did; the poll in the round loop tries again.
+    """
+    if active is None or config.task.expert_group_name == active:
+        return
+    bundle = get_active_task_bundle(config.cycle)
+    if bundle is None:
+        logger.error("Owner's task is not on disk and its bundle could not be fetched — staying on the fallback",
+                     task=config.task.expert_group_name, active=active)
+        return
+    try:
+        materialize_task(bundle, config.task.base_path)
+        config.switch_active_task(bundle.name)
+    except Exception as e:
+        logger.error("Could not switch onto the owner's task — staying on the fallback",
+                     task=config.task.expert_group_name, active=bundle.name, error=str(e), exc_info=True)

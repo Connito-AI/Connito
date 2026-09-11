@@ -78,6 +78,7 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.config import ValidatorConfig, parse_args
 from connito.shared.task_sync import (
+    ensure_active_task,
     get_active_task,
     get_active_task_bundle,
     materialize_task,
@@ -1696,6 +1697,7 @@ if __name__ == "__main__":
         config = ValidatorConfig.from_path(
             args.path, active_task=active_task, auto_update_config=args.auto_update_config
         )
+        ensure_active_task(config, active_task)
     else:
         config = ValidatorConfig()
 
