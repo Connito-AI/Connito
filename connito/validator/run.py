@@ -109,7 +109,7 @@ from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.shared.modeling.quantization import apply_from_config
-from connito.validator.aggregator import MinerScoreAggregator
+from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
@@ -774,7 +774,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Hard-coded for now; promote to a config field once we settle on a
     # default that won't change cross-validator behavior.
     score_history_window: int = 80
-    score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
+    score_path = resolve_score_path(config.ckpt.checkpoint_path)
     if pkg_version == "v0.2.3":
         # One-time wipe: drop any prior aggregator state on disk so the v0.2.3
         # rollout starts every validator with a clean score history. Subsequent
