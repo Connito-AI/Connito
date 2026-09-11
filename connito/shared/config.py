@@ -619,8 +619,22 @@ class WorkerConfig(BaseConfig):
         # Derive paths
         self._refresh_paths()
 
-        # Load per-task overrides
-        self._update_by_task()
+        # Load per-task overrides. A task this node has not got — the owner
+        # named one it has not fetched yet — falls back to the shipped default
+        # here, at construction, where raising would be a crash loop before
+        # anything can ask the API or fetch the task. A live switch has a task
+        # to stay on, so `switch_active_task` gets no such fallback.
+        try:
+            self._update_by_task()
+        except FileNotFoundError as e:
+            fallback = type(self.task).model_fields["expert_group_name"].default
+            if self.task.expert_group_name == fallback:
+                raise
+            logger.error(
+                "No task definition on disk — falling back to the shipped default",
+                task=self.task.expert_group_name, error=str(e), fallback=fallback,
+            )
+            self._update_by_task(expert_group_name=fallback)
 
         # Create directories
         self._ensure_runtime_dirs()
@@ -688,31 +702,13 @@ class WorkerConfig(BaseConfig):
         ]
         ensure_dirs(dirs)
 
-    def _update_by_task(self, expert_group_name: str | None = None, *, fallback: bool = True) -> None:
+    def _update_by_task(self, expert_group_name: str | None = None) -> None:
         if expert_group_name:
             self.task.expert_group_name = expert_group_name
             self._refresh_paths()
 
         assert self.task.path is not None
-        cfg_path = self.task.path / "config.yaml"
-        if fallback and not cfg_path.is_file():
-            # Reached when the owner API names a task this node has not got.
-            # Falling back keeps the process alive and complaining; raising here
-            # would kill it during construction, before anything can ask the API
-            # or fetch the task, which is an unrecoverable crash loop.
-            fallback = type(self.task).model_fields["expert_group_name"].default
-            logger.error(
-                "No task definition on disk — falling back to the shipped default",
-                task=self.task.expert_group_name,
-                looked_in=str(cfg_path),
-                fallback=fallback,
-            )
-            if self.task.expert_group_name == fallback:
-                raise FileNotFoundError(f"shipped task {fallback!r} is missing at {cfg_path}")
-            self.task.expert_group_name = fallback
-            self._refresh_paths()
-            cfg_path = self.task.path / "config.yaml"
-        self.task.exp = ExpertCfg.from_path(cfg_path)  # type: ignore
+        self.task.exp = ExpertCfg.from_path(self.task.path / "config.yaml")  # type: ignore
         self._refresh_paths()
 
     def switch_active_task(self, expert_group_name: str) -> None:
@@ -722,16 +718,14 @@ class WorkerConfig(BaseConfig):
         reads the new task's `config.yaml`, so a task this node does not have
         on disk would strand the new name against the old `task.exp` — the
         `5e6ab4c` shape, training one dataset while committing another
-        group's id. Roll back and re-raise instead — no fallback to the
-        shipped default here: that is for boot, where the alternative is a
-        crash loop; a live process has a task to stay on.
+        group's id. Roll back and re-raise instead.
 
         `_ensure_runtime_dirs` because both group-scoped paths are new.
         """
         previous_name = self.task.expert_group_name
         previous_exp = self.task.exp
         try:
-            self._update_by_task(expert_group_name=expert_group_name, fallback=False)
+            self._update_by_task(expert_group_name=expert_group_name)
         except Exception:
             self.task.expert_group_name = previous_name
             self.task.exp = previous_exp
