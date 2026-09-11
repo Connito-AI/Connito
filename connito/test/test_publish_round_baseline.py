@@ -92,6 +92,19 @@ def test_best_average_wins_even_when_another_miner_beat_it_this_round(tmp_path, 
     assert winner.exists()
 
 
+def test_the_shard_is_named_by_the_group_it_was_given(tmp_path, uploads):
+    """The publisher runs on a thread after the loop may have switched task;
+    the name must be the round's group, not whatever config says by then."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round({1: 3.1}, {1: "hkA"}), config=_config(sub), group_id=7,
+    )
+
+    assert uploads[0]["staged"] == ["model_expgroup_7.safetensors"]
+
+
 def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
     """Averaged rank scores collide constantly — every miner never in a top-3
     sits at exactly 0.0 — so the round's own result has to settle it."""

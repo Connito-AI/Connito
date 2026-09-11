@@ -223,3 +223,104 @@ def test_a_failed_build_rolls_everything_back(config, eval_worker, gates) -> Non
     assert config.task.exp.group_id == 4
     assert eval_worker._eval_base_model is old
     assert 4 in eval_worker._expert_group_assignment
+
+
+# --- tier 3: the trigger ------------------------------------------------------
+
+def _poll(config, eval_worker, gates, monkeypatch, *, active, bundle=None, build_model=_stub_builder,
+          round_ref=None):
+    """Run `_maybe_switch_task` against a stubbed owner. Returns the state it
+    handed back and the (task, root) pairs it asked to materialize."""
+    from types import SimpleNamespace
+
+    from connito.validator import run
+    from connito.validator.round import RoundRef
+
+    eval_window, merge = gates
+    round_ref = round_ref or RoundRef()
+    materialized: list[tuple[str, Path]] = []
+    monkeypatch.setattr(run, "get_active_task", lambda cycle: active and SimpleNamespace(name=active))
+    monkeypatch.setattr(run, "get_active_task_bundle", lambda cycle: bundle and SimpleNamespace(name=bundle))
+    monkeypatch.setattr(run, "materialize_task", lambda b, root: materialized.append((b.name, Path(root))))
+    monkeypatch.setattr(run, "_build_eval_model", build_model)
+    state = run._maybe_switch_task(
+        config, rank=0, device=torch.device("cpu"), eval_worker=eval_worker,
+        eval_window_active=eval_window, merge_phase_active=merge,
+        round_ref=round_ref, gpu_eval_lock=threading.Lock(),
+    )
+    return state, materialized
+
+
+def _round_in_flight(gates):
+    """A round mid-evaluation: the window is open and the ref holds it."""
+    from types import SimpleNamespace
+
+    from connito.validator.round import RoundRef
+
+    gates[0].set()
+    return RoundRef(current=SimpleNamespace(round_id=9000))
+
+
+def test_the_owner_naming_another_task_switches_to_it(config, eval_worker, gates, monkeypatch) -> None:
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=TARGET)
+
+    assert state is not None and state.eval_model.group_id == 7
+    assert config.task.expert_group_name == TARGET
+    assert materialized == [(TARGET, config.task.base_path)]
+
+
+def test_the_round_in_flight_is_dropped_with_its_task(config, eval_worker, gates, monkeypatch) -> None:
+    """Its task is over: no more claims (window closed) and nothing to
+    finalize (ref cleared), so no weights go out for it."""
+    round_ref = _round_in_flight(gates)
+
+    _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=TARGET, round_ref=round_ref)
+
+    assert round_ref.current is None
+    assert not gates[0].is_set()
+
+
+def test_an_unreachable_owner_keeps_the_current_task(config, eval_worker, gates, monkeypatch) -> None:
+    """No answer is not a change of answer: nothing is fetched, let alone switched."""
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=None, bundle=TARGET)
+
+    assert state is None
+    assert config.task.expert_group_name == SHIPPED
+    assert materialized == []
+
+
+def test_the_owner_naming_our_task_fetches_nothing(config, eval_worker, gates, monkeypatch) -> None:
+    """Had the bundle been fetched, its task would have been materialized."""
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=SHIPPED, bundle=TARGET)
+
+    assert state is None and materialized == []
+    assert config.task.expert_group_name == SHIPPED
+
+
+def test_a_bad_bundle_keeps_the_current_task(config, eval_worker, gates, monkeypatch) -> None:
+    """The bundle fetch refuses a payload that fails its hash by returning None."""
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=None)
+
+    assert state is None
+    assert config.task.expert_group_name == SHIPPED
+    assert materialized == []
+
+
+def test_a_failed_build_keeps_the_current_task_and_model(config, eval_worker, gates, monkeypatch) -> None:
+    old = torch.nn.Linear(2, 2)
+    eval_worker.set_eval_base_model(old)
+
+    def boom(cfg, rank, device, expert_manager):
+        raise RuntimeError("no such model")
+
+    round_ref = _round_in_flight(gates)
+
+    state, _ = _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=TARGET, build_model=boom,
+                     round_ref=round_ref)
+
+    assert state is None
+    assert config.task.expert_group_name == SHIPPED
+    assert eval_worker._eval_base_model is old
+    # The round carries on, on the model it had.
+    assert round_ref.current is not None
+    assert gates[0].is_set()
