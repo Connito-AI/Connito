@@ -84,7 +84,7 @@ def _switch(config, eval_worker, gates, to: str):
 
 
 def test_config_and_routing_table_move_together(config, eval_worker, gates) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET)
+    manager = _switch(config, eval_worker, gates, TARGET).expert_manager
 
     assert config.task.expert_group_name == TARGET
     assert config.task.exp.group_id == 7
@@ -94,7 +94,7 @@ def test_config_and_routing_table_move_together(config, eval_worker, gates) -> N
 
 
 def test_the_eval_worker_is_handed_the_new_table(config, eval_worker, gates) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET)
+    manager = _switch(config, eval_worker, gates, TARGET).expert_manager
 
     assert eval_worker._expert_group_assignment is manager.expert_group_assignment
 
