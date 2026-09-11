@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import gc
 import math
 from dataclasses import dataclass
@@ -40,6 +39,7 @@ _VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
     "signature": "signature_invalid",
     "hash": "hash_mismatch",
     "expert_group_or_nan": "expert_group_or_nan",
+    "incomplete_expert_set": "incomplete_expert_set",
     "unknown": "unknown",
 }
 
@@ -362,12 +362,6 @@ def finalize_round_scores(
                     finalized=True,
                 ),
             )
-            # The round is over, so its base snapshot can never be resumed
-            # from again. `prune_before_round` is the backstop for a round
-            # that never reached finalize.
-            _rj.base_snapshot_path_for(
-                Path(journal_path).parent.parent, round_obj.round_id
-            ).unlink(missing_ok=True)
         except Exception as e:
             logger.warning(
                 "finalize_round_scores: journal flip-to-finalized failed",
@@ -553,15 +547,32 @@ def build_submission_uid_weights(
     )
 
 
+def _submission_keys(path: str | Path) -> set[str]:
+    """Key set without materialising tensors where the format allows."""
+    p = Path(path)
+    if p.suffix == ".safetensors":
+        from safetensors import safe_open
+
+        with safe_open(str(p), framework="pt") as f:
+            return set(f.keys())
+    return set(load_state_dict_from_path(str(p)))
+
+
 def validate_miner_submission(
     *,
     round_obj,  # connito.validator.round.Round
     uid: int,
     model_path: str | Path,
     expert_group_assignment,
+    expected_keys: set[str] | None = None,
 ) -> str | None:
     """Run the existing `ChainCheckpoint.validate(...)` against a miner's
     on-disk submission before it is fed to `evaluate_one_miner`.
+
+    `expected_keys` is the round's base shard key set. A submission that is
+    not exactly that set is `incomplete_expert_set`: miners are loaded into
+    one shared model in place, so a subset would leave the previous miner's
+    experts in it. Skipped (None) only on a cold start with no base shard.
 
     Returns ``None`` on success. On failure returns a short reason string —
     one of ``no_chain_commit | signature | hash | expert_group | nan_inf``,
@@ -595,6 +606,12 @@ def validate_miner_submission(
         return "unknown"
 
     if ok:
+        if expected_keys is not None and _submission_keys(model_path) != expected_keys:
+            logger.warning(
+                "validate_miner_submission: incomplete expert set",
+                uid=int(uid), expected=len(expected_keys),
+            )
+            return "incomplete_expert_set"
         return None
 
     # `validate()` already logged a structured warning per failed sub-check.
@@ -653,9 +670,12 @@ def load_model_from_path(path: str, base_model: nn.Module, device: torch.device)
     if len(sd) == 0:
         raise ValueError(f"Checkpoint at {path} has empty model_state_dict")
 
-    model = copy.deepcopy(base_model)
-
-    # Load weights (strict=False so missing/unexpected are allowed)
+    # In place: the worker owns one model and every miner is loaded into it.
+    # Safe because `gpu_eval_lock` serialises load + forward pass, and every
+    # accepted submission covers the full expert key set (the completeness
+    # check in `validate_miner_submission`), so each load fully overwrites
+    # the previous miner. `strict=False`: backbone keys are absent by design.
+    model = base_model
     incompatible = model.load_state_dict(sd, strict=False)
 
     # Key diagnostics come from `load_state_dict`'s own report. Deriving them
@@ -810,7 +830,6 @@ def evaluate_one_miner_sync(
                 cached_batches=cached_batches,
             )
         finally:
-            del miner_model
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

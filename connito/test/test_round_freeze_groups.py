@@ -8,6 +8,7 @@ its new group fields populated and its roster overridden.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -141,7 +142,7 @@ def _freeze(
             config=config,
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=_make_model(),
+            base_shard=Path("pretrained/model_expgroup_1.safetensors"),
             round_id=round_id,
             cycle_index=cycle_index,
             cycle_length=cycle_length,
