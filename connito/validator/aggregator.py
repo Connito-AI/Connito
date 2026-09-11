@@ -172,7 +172,11 @@ class MinerSeries:
         return float(mean), float(min(per_cycle_means))
 
 
+from connito.shared.app_logging import structlog
 from connito.shared.telemetry import VALIDATOR_MINER_SCORE
+
+logger = structlog.get_logger(__name__)
+
 
 @dataclass
 class MinerState:
@@ -623,3 +627,33 @@ class MinerScoreAggregator:
                 os.fsync(tmp.fileno())
                 tmp_name = tmp.name
             os.replace(tmp_name, path)
+
+
+def resolve_score_path(checkpoint_path: str | os.PathLike) -> Path:
+    """Where miner score history lives, migrating it there once if needed.
+
+    Miner history, not task history: the roster is unchanged by a switch, and
+    `select_baseline_uid` ranks on this rolling average — empty, it falls back
+    to raw val_loss just as a cold start makes that least trustworthy.
+
+    One level above the group-scoped `checkpoint_path`, which drops the
+    expert-group leaf and nothing else: still per coldkey/hotkey/run_name, so
+    validators sharing a box keep separate histories. Not
+    `validator_checkpoint_path` — that is the downloaded-model cache, read by
+    the miner path too.
+
+    The move would itself wipe a deployed validator's history once, hence the
+    migration. Destination wins, so a repeat run is a no-op.
+    """
+    group_dir = Path(checkpoint_path)
+    dest = group_dir.parent / "score_aggregator.json"
+    src = group_dir / dest.name
+    if src.is_file() and not dest.exists():
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dest)
+            logger.info("Migrated score aggregator", src=str(src), dest=str(dest))
+        except OSError as e:
+            # Falls back to a fresh aggregator — the pre-migration behaviour.
+            logger.warning("Failed to migrate score aggregator", error=str(e))
+    return dest
