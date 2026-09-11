@@ -40,7 +40,7 @@ def config(tmp_path: Path) -> MinerConfig:
         # Pre-filled so from_path skips the chain lookup.
         "chain": {"hotkey_ss58": "test-hk", "coldkey_ss58": "test-ck", "uid": 0},
     }))
-    return MinerConfig.from_path(cfg_path, auto_update_config=True)
+    return MinerConfig.from_path(cfg_path, active_task=None, auto_update_config=True)
 
 
 def test_every_task_scoped_value_follows_the_switch(config: MinerConfig) -> None:
