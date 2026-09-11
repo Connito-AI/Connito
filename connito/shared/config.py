@@ -542,21 +542,19 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
-    # `expert_group_name` is locked so the whole fleet evaluates the same task:
-    # `auto_update_config` resets any non-default value on load and logs a
-    # one-time reset warning. Validators only score miners whose chain commit
-    # carries a matching `expert_group`, so a drifting operator would simply
-    # stop seeing (and stop being seen by) everyone else.
-    #
-    # Currently `exp_nemotron_c4` (group 4): Nemotron-CC-Math + C4. This
-    # replaces the `exp_legal` switch made in #186 — see
-    # docs/exp-legal-migration-plan.md for that history and the flag-day
-    # mechanics, which apply identically in this direction.
+    # `expert_group_name` is unlocked but still not the operator's to pick:
+    # entrypoints resolve it from the owner API and pass it to `from_path`,
+    # which applies it before anything is derived from it. The lock stopped an
+    # operator drifting away from the fleet (validators only score miners whose
+    # chain commit carries a matching `expert_group`); that guarantee is
+    # unchanged, its authority just moved from a code constant to the API, so a
+    # new task no longer needs a release. The value here is the fallback used
+    # when the API is unreachable.
     #
     # `helper_group_id` and `routing_mode` stay locked for the natural-routing
     # (2Fnat) consensus contract and are independent of the dataset.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "expert_group_name", "helper_group_id", "routing_mode",
+        "helper_group_id", "routing_mode",
     })
     expert_group_name: str = "exp_nemotron_c4"
     load_all_expert_groups: bool = False
@@ -697,6 +695,23 @@ class WorkerConfig(BaseConfig):
 
         assert self.task.path is not None
         cfg_path = self.task.path / "config.yaml"
+        if not cfg_path.is_file():
+            # Reached when the owner API names a task this node has not got.
+            # Falling back keeps the process alive and complaining; raising here
+            # would kill it during construction, before anything can ask the API
+            # or fetch the task, which is an unrecoverable crash loop.
+            fallback = type(self.task).model_fields["expert_group_name"].default
+            logger.error(
+                "No task definition on disk — falling back to the shipped default",
+                task=self.task.expert_group_name,
+                looked_in=str(cfg_path),
+                fallback=fallback,
+            )
+            if self.task.expert_group_name == fallback:
+                raise FileNotFoundError(f"shipped task {fallback!r} is missing at {cfg_path}")
+            self.task.expert_group_name = fallback
+            self._refresh_paths()
+            cfg_path = self.task.path / "config.yaml"
         self.task.exp = ExpertCfg.from_path(cfg_path)  # type: ignore
         self._refresh_paths()
 
@@ -757,31 +772,29 @@ class WorkerConfig(BaseConfig):
     _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
-    def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        active_task: str | None,
+        auto_update_config: bool = False,
+    ) -> "WorkerConfig":
+        """Load a config, with the owner API's answer supplied by the caller.
+
+        `active_task` has no default so a new entrypoint cannot silently skip
+        resolving it: pass `task_sync.resolve_active_task_name(path)`, or None
+        for tooling that does not run a node. It is applied *before*
+        construction, so every derived path tracks the right task first time
+        and there is nothing to re-derive afterwards.
+        """
         path = Path(path)
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
+        if active_task:
+            data.setdefault("task", {})["expert_group_name"] = active_task
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
-        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
-        # Locked-field enforcement may have just reset task.expert_group_name
-        # (the exp_legal activation path: a YAML still saying exp_math gets
-        # reset to the locked default). task.path / task.exp were derived at
-        # construction from the PRE-reset name, so re-derive them — otherwise
-        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
-        # (wrong group_id on chain commits) until a second restart. Observed
-        # live on the pioneer validator, 2026-07-11 11:49 UTC.
-        if instance.task.expert_group_name != pre_lock_group:
-            logger.info(
-                "Locked-field reset changed the active task — re-deriving task config",
-                old_task=pre_lock_group,
-                new_task=instance.task.expert_group_name,
-            )
-            # Pass the name explicitly: the no-arg form of _update_by_task
-            # reloads task.exp from the STALE task.path before refreshing
-            # paths, so the exp config would still be the old group's.
-            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
         return instance
 
     def _prompt_new_fields(
@@ -1195,6 +1208,9 @@ if __name__ == "__main__":
             MinerConfig(**config_dict).write()
 
     elif args.command == "create_docker_env":
-        cfg = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        # Tooling, not a node: no owner-API call, no task resolution.
+        cfg = ValidatorConfig.from_path(
+            args.path, active_task=None, auto_update_config=args.auto_update_config
+        )
         cfg.write_docker_env()
 
