@@ -74,7 +74,7 @@ def test_validation_uses_the_swapped_assignment(monkeypatch, tmp_path):
 
     seen = {}
 
-    def _capture(*, round_obj, uid, model_path, expert_group_assignment):
+    def _capture(*, round_obj, uid, model_path, expert_group_assignment, expected_keys=None):
         seen["assignment"] = expert_group_assignment
         return "rejected"  # non-None short-circuits before the GPU eval
 

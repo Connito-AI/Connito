@@ -1,4 +1,3 @@
-import copy
 import gc
 import math
 import os
@@ -368,7 +367,7 @@ def resume_open_round(
     config,
     subtensor,
     lite_subtensor,
-    global_model: nn.Module,
+    eval_model: nn.Module,
     base_shard: Path,
     score_aggregator,
     score_path,
@@ -489,7 +488,7 @@ def resume_open_round(
     round_ref.swap(new_current=resumed)
     download_window_closed.clear()
     if eval_worker is not None and not eval_worker.has_eval_base_model():
-        eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+        eval_worker.set_eval_base_model(eval_model)
     eval_window_active.set()
 
     try:
@@ -563,7 +562,7 @@ def _switch_task(
     Rolls config back if the new assignment will not load — config naming one
     group while `ExpertManager` holds another's table is silent.
 
-    Not yet called: `global_model` and the pretrained shard have to be rebuilt
+    Not yet called: the eval model and the pretrained shard have to be rebuilt
     for the new group before a switch is coherent.
     """
     if eval_window_active.is_set() or merge_phase_active.is_set():
@@ -611,7 +610,7 @@ def _write_pretrained_shard(
 
 
 def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, ExpertManager, Path]:
-    """Build the model and record the shard every round is scored against.
+    """Build the process's only model and record the shard every round is scored against.
 
     The validator's model is the pretrained one and never advances. The round
     baseline is published for miners to train from, but every submission is
@@ -621,18 +620,18 @@ def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, 
     """
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    global_model, _ = get_model_from_checkpoint(
+    eval_model, _ = get_model_from_checkpoint(
         rank=rank, config=config, expert_manager=expert_manager,
         partial=True, checkpoint_device=device, load_global_checkpoint=False,
     )
     # Before quantization, so the shard holds the dtype miners submit in.
     base_shard = _write_pretrained_shard(
-        global_model, expert_manager, config.task.exp.group_id,
+        eval_model, expert_manager, config.task.exp.group_id,
         Path(config.ckpt.checkpoint_path) / "pretrained",
     )
-    apply_from_config(global_model, config, expert_manager, role="validator")
+    apply_from_config(eval_model, config, expert_manager, role="validator")
     logger.info("Training setup complete", device=str(device), base_shard=str(base_shard))
-    return global_model, expert_manager, base_shard
+    return eval_model, expert_manager, base_shard
 
 
 def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = "") -> None:
@@ -702,7 +701,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # processes / prefetched batches don't stay resident across the whole cycle.
 
     # === set up training ===
-    global_model, expert_manager, base_shard = setup_training(config, rank, device)
+    eval_model, expert_manager, base_shard = setup_training(config, rank, device)
 
     global_opt_step = 0
     # Coordinates of the baseline published at finalize, read by the next
@@ -929,7 +928,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
-        # bg-eval idles until the main loop hands it a copy of global_model,
+        # bg-eval idles until the main loop hands it the eval model,
         # which now happens as soon as the round freezes.
         eval_worker = BackgroundEvalWorker(
             config=config,
@@ -961,7 +960,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 config=config,
                 subtensor=subtensor,
                 lite_subtensor=lite_subtensor,
-                global_model=global_model,
+                eval_model=eval_model,
                 base_shard=base_shard,
                 score_aggregator=score_aggregator,
                 score_path=score_path,
@@ -1224,7 +1223,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 current_block=lite_subtensor.block,
             )
 
-            cleanup(global_model)
+            cleanup()
 
             # Round-group construction scheme (gated by
             # config.evaluation.enable_round_group_construction). When the
@@ -1381,7 +1380,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # resume path. Opening here rather than after Merge gives the
             # worker the whole round now that nothing else competes for the GPU.
             if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+                eval_worker.set_eval_base_model(eval_model)
             eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
@@ -1405,7 +1404,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             phase_response = wait_till(config, PhaseNames.validate)
 
-            cleanup(global_model)
+            cleanup()
 
             # Persist aggregator state atomically.
             try:
@@ -1512,9 +1511,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             download_window_closed.set()
 
             # === validation and log metric ===
+            # No model: the only one belongs to the eval worker and holds
+            # whatever miner is loaded, so its parameter sum says nothing —
+            # and reading it would wait on a running eval.
             metrics = get_status(
                 config=config,
-                model=global_model,
+                model=None,
                 step=global_opt_step,
                 training_time=training_time,
                 total_training_time=total_training_time,
@@ -1525,7 +1527,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             )
 
             metric_logger.log(metrics)
-            cleanup(global_model)
+            cleanup()
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
@@ -1535,7 +1537,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
-        cleanup(global_model)
+        cleanup()
         metric_logger.close()
         raise
     except Exception:
@@ -1543,7 +1545,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
-        cleanup(global_model)
+        cleanup()
         metric_logger.close()
 
 

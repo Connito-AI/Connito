@@ -118,7 +118,7 @@ def free_cuda_models(
 
 def get_status(
     config: MinerConfig | ValidatorConfig,
-    model: torch.nn.Module,
+    model: torch.nn.Module | None,
     step: int,
     training_time: float,
     total_training_time: float,
@@ -142,12 +142,15 @@ def get_status(
         total_samples = inner_opt_step * total_batch_size
         total_tokens = total_samples * config.task.exp.data.sequence_length
 
-    _, expert_sum = get_weight_sum(model, shared=False)
-    if not torch.isfinite(expert_sum):
-        logger.warning("Non-finite expert parameter sum detected in get_status; substituting 0.0", step=step)
-        expert_sum = torch.tensor(0.0, dtype=torch.float32, device=expert_sum.device)
-
-    expert_sum_value = float(expert_sum.detach().cpu().item())
+    # None when the caller has no model of its own to health-check: the
+    # validator's is the eval worker's, and holds whatever miner is loaded.
+    expert_sum_value: float | None = None
+    if model is not None:
+        _, expert_sum = get_weight_sum(model, shared=False)
+        if not torch.isfinite(expert_sum):
+            logger.warning("Non-finite expert parameter sum detected in get_status; substituting 0.0", step=step)
+            expert_sum = torch.tensor(0.0, dtype=torch.float32, device=expert_sum.device)
+        expert_sum_value = float(expert_sum.detach().cpu().item())
 
     # Extract current learning rate (assume one param group or take first)
 

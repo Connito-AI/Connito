@@ -401,6 +401,7 @@ EvalFailureReason = Literal[
     "signature_invalid",
     "hash_mismatch",
     "expert_group_or_nan",
+    "incomplete_expert_set",
     "non_finite_loss",
     "download_failed",
     "statedict_parse_failed",
@@ -433,6 +434,7 @@ EVAL_STATUS_CODES: dict[int, str] = {
     10: "deadline_exceeded",
     11: "rpc_error",
     12: "repo_unavailable",
+    13: "incomplete_expert_set",
     99: "unknown",
 }
 _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
@@ -448,6 +450,7 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "deadline": 10,
     "rpc": 11,
     "repo_unavailable": 12,
+    "incomplete_expert_set": 13,
     # Legacy aliases — fold into the closest miner-facing code so old
     # call sites continue producing meaningful status values.
     "corrupt": 2,
