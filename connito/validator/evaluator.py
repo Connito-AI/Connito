@@ -362,12 +362,6 @@ def finalize_round_scores(
                     finalized=True,
                 ),
             )
-            # The round is over, so its base snapshot can never be resumed
-            # from again. `prune_before_round` is the backstop for a round
-            # that never reached finalize.
-            _rj.base_snapshot_path_for(
-                Path(journal_path).parent.parent, round_obj.round_id
-            ).unlink(missing_ok=True)
         except Exception as e:
             logger.warning(
                 "finalize_round_scores: journal flip-to-finalized failed",
