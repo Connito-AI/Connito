@@ -276,7 +276,7 @@ def _resume(tmp_path, *, phase_name="Train", blocks_remaining=200, model=None, b
             lite_subtensor=SimpleNamespace(
                 metagraph=lambda netuid=None, lite=None: metagraph
             ),
-            global_model=model if model is not None else _ModelWithBuffer(),
+            eval_model=model if model is not None else _ModelWithBuffer(),
             base_shard=base_shard or _shard(tmp_path),
             score_aggregator=aggregator,
             score_path=tmp_path / "score.json",

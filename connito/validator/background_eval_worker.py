@@ -108,6 +108,10 @@ class BackgroundEvalWorker(threading.Thread):
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
+        # The round's base shard key set — what every submission must equal,
+        # since miners are loaded into the one model in place. None until a
+        # base shard has been loaded (cold start), when the check is skipped.
+        self._expected_expert_keys: set[str] | None = None
         # Round-scoped cache of materialized eval batches. Built once in
         # `_load_round_base` from the streaming dataloader, then
         # iterated by every miner's eval this round. Same combined seed
@@ -251,7 +255,9 @@ class BackgroundEvalWorker(threading.Thread):
                 VALIDATOR_BG_WORKER_PAUSED.labels(worker="eval").set(0)
             except Exception:
                 pass
-            # Free GPU memory the worker held.
+            # Drop our reference and re-park. The main loop holds the same
+            # model and re-seeds it at the next freeze, so this frees nothing;
+            # it resets the worker's state machine.
             try:
                 del self._eval_base_model
                 self._eval_base_model = None
@@ -318,6 +324,7 @@ class BackgroundEvalWorker(threading.Thread):
         def _load() -> None:
             shard = round_obj.base_shard
             sd = load_state_dict_from_path(str(shard))
+            self._expected_expert_keys = set(sd)
             with self.gpu_eval_lock:
                 incompatible = self._eval_base_model.load_state_dict(sd, strict=False)
                 if torch.cuda.is_available():
@@ -455,6 +462,7 @@ class BackgroundEvalWorker(threading.Thread):
             uid=uid,
             model_path=path,
             expert_group_assignment=self._expert_group_assignment,
+            expected_keys=self._expected_expert_keys,
         )
         if fail_reason is not None:
             logger.warning(
