@@ -77,7 +77,12 @@ from connito.shared.checkpoints import (
     prune_submissions_outside_window,
 )
 from connito.shared.config import ValidatorConfig, parse_args
-from connito.shared.task_sync import resolve_active_task_name
+from connito.shared.task_sync import (
+    get_active_task,
+    get_active_task_bundle,
+    materialize_task,
+    resolve_active_task_name,
+)
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
@@ -546,13 +551,11 @@ def _shutdown_background_workers(
 
 @dataclass
 class TaskScopedState:
-    """The values `run` rebinds when the active task changes.
-
-    Named rather than positional because it grows per tier item — the eval
-    model and `train_dataloader` still have to move with a switch.
-    """
+    """The values `run` rebinds when the active task changes."""
 
     expert_manager: ExpertManager
+    eval_model: nn.Module
+    base_shard: Path
     baseline_ref: dict[str, object] = field(default_factory=dict)
 
 
@@ -560,6 +563,8 @@ def _switch_task(
     config: ValidatorConfig,
     new_task: str,
     *,
+    rank: int,
+    device: torch.device,
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
@@ -581,8 +586,15 @@ def _switch_task(
     would repopulate a cleared dict with the previous group's shard. Costs one
     cycle with no model advance, which `run` already handles.
 
-    Not yet called: the eval model and the pretrained shard have to be rebuilt
-    for the new group before a switch is coherent.
+    The model is rebuilt from pretrained for the new group, and its pretrained
+    shard written, exactly as at boot — always, rather than keeping the module
+    tree on a same-topology switch: a switch happens once per task and the
+    rebuild costs seconds. Built *before* the old model is released, so a
+    failed build rolls everything back with the old model still serving;
+    the price is two models resident for the duration of the build. The caller
+    rebinds and then `cleanup()`s, which is what frees the old one.
+
+    Called from `_maybe_switch_task` once per cycle.
     """
     if eval_window_active.is_set() or merge_phase_active.is_set():
         raise RuntimeError(
@@ -595,18 +607,89 @@ def _switch_task(
     config.switch_active_task(new_task)
     try:
         expert_manager = ExpertManager(config)
+        eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
     except Exception:
         config.switch_active_task(previous_task)
         raise
 
     eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
+    eval_worker.set_eval_base_model(eval_model)
     logger.info(
         "Switched active task",
         previous_task=previous_task,
         task=new_task,
         group_id=config.task.exp.group_id,
+        base_shard=str(base_shard),
     )
-    return TaskScopedState(expert_manager=expert_manager)
+    return TaskScopedState(expert_manager=expert_manager, eval_model=eval_model, base_shard=base_shard)
+
+
+def _maybe_switch_task(
+    config: ValidatorConfig,
+    *,
+    rank: int,
+    device: torch.device,
+    eval_worker: BackgroundEvalWorker,
+    eval_window_active: threading.Event,
+    merge_phase_active: threading.Event,
+    round_ref: RoundRef,
+    gpu_eval_lock: threading.Lock,
+) -> TaskScopedState | None:
+    """Ask the owner which task is active and switch if it is not ours.
+
+    Runs at the start of Train, which gives the build the whole phase; the
+    seam after finalize is too short for it, and overrunning MinerCommit1
+    would make the loop wait for the *next* cycle's. The price is the round
+    still being evaluated: it is dropped, unscored, and the next commit and
+    freeze are already on the new task. Miners poll at Distribute, so both
+    sides commit the new group at the same MinerCommit1.
+
+    Never raises. An unreachable owner, a bad bundle or a failed build all
+    leave the node on the task it has — round included — to try again next
+    cycle: the same "keep running" choice the boot-time resolve makes.
+    """
+    active = get_active_task(config.cycle)
+    if active is None:
+        logger.warning("Owner API unreachable — staying on the current task",
+                       task=config.task.expert_group_name)
+        return None
+    if active.name == config.task.expert_group_name:
+        return None
+    try:
+        bundle = get_active_task_bundle(config.cycle)
+        if bundle is None:
+            raise RuntimeError(f"no usable bundle for {active.name!r}")
+        materialize_task(bundle, config.task.base_path)
+        # Close the window so the worker claims no more miners, then wait for
+        # the eval it may be running — it holds the lock for that — so the old
+        # model is idle before a second one is built beside it. Only on
+        # success is the round dropped; a failed build reopens the window and
+        # the round carries on, on the model it had.
+        was_open = eval_window_active.is_set()
+        eval_window_active.clear()
+        with gpu_eval_lock:
+            pass
+        try:
+            state = _switch_task(
+                config, bundle.name,
+                rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+            )
+        except Exception:
+            if was_open:
+                eval_window_active.set()
+            raise
+    except Exception as e:
+        logger.error("Task switch failed — staying on the current task",
+                     task=config.task.expert_group_name, target=active.name,
+                     error=str(e), exc_info=True)
+        return None
+    dropped = round_ref.current
+    round_ref.current = None
+    if dropped is not None:
+        logger.warning("Dropped the round in flight: its task is over",
+                       round_id=dropped.round_id, task=config.task.expert_group_name)
+    return state
 
 
 def _write_pretrained_shard(
@@ -628,6 +711,24 @@ def _write_pretrained_shard(
     return Path(paths[group_id])
 
 
+def _build_eval_model(
+    config, rank: int, device: torch.device, expert_manager: ExpertManager,
+) -> tuple[nn.Module, Path]:
+    """The process's only model for the active group, plus the shard every
+    round is scored against. Shared by boot and the task switch."""
+    eval_model, _ = get_model_from_checkpoint(
+        rank=rank, config=config, expert_manager=expert_manager,
+        partial=True, checkpoint_device=device, load_global_checkpoint=False,
+    )
+    # Before quantization, so the shard holds the dtype miners submit in.
+    base_shard = _write_pretrained_shard(
+        eval_model, expert_manager, config.task.exp.group_id,
+        Path(config.ckpt.checkpoint_path) / "pretrained",
+    )
+    apply_from_config(eval_model, config, expert_manager, role="validator")
+    return eval_model, base_shard
+
+
 def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, ExpertManager, Path]:
     """Build the process's only model and record the shard every round is scored against.
 
@@ -639,16 +740,7 @@ def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, 
     """
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    eval_model, _ = get_model_from_checkpoint(
-        rank=rank, config=config, expert_manager=expert_manager,
-        partial=True, checkpoint_device=device, load_global_checkpoint=False,
-    )
-    # Before quantization, so the shard holds the dtype miners submit in.
-    base_shard = _write_pretrained_shard(
-        eval_model, expert_manager, config.task.exp.group_id,
-        Path(config.ckpt.checkpoint_path) / "pretrained",
-    )
-    apply_from_config(eval_model, config, expert_manager, role="validator")
+    eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
     logger.info("Training setup complete", device=str(device), base_shard=str(base_shard))
     return eval_model, expert_manager, base_shard
 
@@ -1048,7 +1140,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 threading.Thread(
                     target=publish_round_baseline,
-                    kwargs={"round_obj": pending_round, "config": config, "out": baseline_ref},
+                    kwargs={"round_obj": pending_round, "config": config,
+                            "group_id": config.task.exp.group_id, "out": baseline_ref},
                     name="publish-baseline", daemon=True,
                 ).start()
                 # Ranks 2-3 exist nowhere but this dir, and the prune at
@@ -1518,6 +1611,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Relocated to the top of the next iteration's MinerCommit1 block
             # so it can incorporate the (3) background scores collected from
             # end-of-Validate(K) through end-of-Train(K+1).
+
+            # === Task switch, if the owner has moved on ===
+            # At the start of the next cycle's Train. The publish threads
+            # from finalize hold their own group id, so the switch races
+            # nothing; the MinerCommit1 commit later reads the new group.
+            wait_till(config, PhaseNames.train)
+            switched = _maybe_switch_task(
+                config, rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+                round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
+            )
+            if switched is not None:
+                expert_manager, eval_model, base_shard, baseline_ref = (
+                    switched.expert_manager, switched.eval_model,
+                    switched.base_shard, switched.baseline_ref,
+                )
+                # Exactly the state of a fresh boot on the new task: no hash
+                # to commit until ValidatorCommit1, and the previous model's
+                # last reference was just dropped.
+                current_model_hash = None
+                cleanup()
 
             # === Close download window before next-cycle MinerCommit1 ===
             # Wait until 30 blocks before the next MinerCommit1 so bg-download
