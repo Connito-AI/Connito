@@ -116,9 +116,27 @@ def free_cuda_models(
     logger.info("Free cuda models complete")
 
 
+def model_health(model: torch.nn.Module, step: int | None = None) -> dict[str, float]:
+    """The miner's cheap checks that its weights are moving and finite:
+    the expert parameter sum (non-finite reads as 0.0 so the gauge keeps
+    updating through a NaN incident) and the gradient norm when grads exist.
+    Miner-only — the validator's model belongs to its eval worker."""
+    _, expert_sum = get_weight_sum(model, shared=False)
+    if torch.isfinite(expert_sum):
+        health = {"param_sum": float(expert_sum.detach().cpu().item())}
+    else:
+        logger.warning("Non-finite expert parameter sum detected; substituting 0.0", step=step)
+        health = {"param_sum": 0.0}
+    try:
+        total = sum(float(p.grad.detach().norm(2)) ** 2 for p in model.parameters() if p.grad is not None)
+        health["grad_norm"] = total ** 0.5
+    except Exception:
+        pass
+    return health
+
+
 def get_status(
     config: MinerConfig | ValidatorConfig,
-    model: torch.nn.Module | None,
     step: int,
     training_time: float,
     total_training_time: float,
@@ -142,16 +160,6 @@ def get_status(
         total_samples = inner_opt_step * total_batch_size
         total_tokens = total_samples * config.task.exp.data.sequence_length
 
-    # None when the caller has no model of its own to health-check: the
-    # validator's is the eval worker's, and holds whatever miner is loaded.
-    expert_sum_value: float | None = None
-    if model is not None:
-        _, expert_sum = get_weight_sum(model, shared=False)
-        if not torch.isfinite(expert_sum):
-            logger.warning("Non-finite expert parameter sum detected in get_status; substituting 0.0", step=step)
-            expert_sum = torch.tensor(0.0, dtype=torch.float32, device=expert_sum.device)
-        expert_sum_value = float(expert_sum.detach().cpu().item())
-
     # Extract current learning rate (assume one param group or take first)
 
     metrics: dict[str, Any] = {
@@ -161,7 +169,6 @@ def get_status(
         "lr": (
             next(iter(group["lr"] for group in inner_optimizer.param_groups)) if inner_optimizer is not None else None
         ),
-        "param_sum": expert_sum_value,
     }
 
     if inner_opt_step is not None:
@@ -200,17 +207,6 @@ def get_status(
         
     if hasattr(config, "local_par") and hasattr(config.local_par, "gradient_accumulation_steps"):
         metrics["gradient_accumulation_steps"] = config.local_par.gradient_accumulation_steps
-        
-    # Attempt to calculate simple grad norm on the fly safely 
-    try:
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.detach().data.norm(2)
-                total_norm += param_norm.item() ** 2
-        metrics["grad_norm"] = total_norm ** 0.5
-    except Exception as e:
-        pass
         
     return metrics
 

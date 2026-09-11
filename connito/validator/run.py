@@ -1510,13 +1510,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             download_window_closed.set()
 
-            # === validation and log metric ===
-            # No model: the only one belongs to the eval worker and holds
-            # whatever miner is loaded, so its parameter sum says nothing —
-            # and reading it would wait on a running eval.
+            # === log metric ===
             metrics = get_status(
                 config=config,
-                model=None,
                 step=global_opt_step,
                 training_time=training_time,
                 total_training_time=total_training_time,
