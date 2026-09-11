@@ -122,7 +122,7 @@ def _freeze_round(
     miners_with_checkpoint: list[str] | None = None,
     seed: str = "deadbeef",
     round_id: int = 100,
-    global_model: nn.Module | None = None,
+    base_shard: Path | None = None,
     chain_checkpoints_by_hotkey: dict[str, "object"] | None = None,
     last_evaluated: dict[int, datetime] | None = None,
     prior_avg_scores: dict[int, float] | None = None,
@@ -135,8 +135,6 @@ def _freeze_round(
     treated as freeze-zero), which mirrors how the test suite has
     historically run.
     """
-    if global_model is None:
-        global_model = _make_model()
     subtensor = _fake_subtensor(metagraph, block=round_id)
 
     if miners_with_checkpoint is None:
@@ -161,7 +159,7 @@ def _freeze_round(
             config=config,
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=global_model,
+            base_shard=base_shard,
             round_id=round_id,
             last_evaluated=last_evaluated,
             prior_avg_scores=prior_avg_scores,
@@ -332,29 +330,27 @@ class TestBackgroundPriorScorePrepend:
 
 
 # ---------------------------------------------------------------------------
-# (3) Snapshot isolation — mutating global_model after freeze must not
-# leak into round.model_snapshot_cpu
+# (3) Base isolation — the round pins the shard it froze on, and a later
+# Merge adopting a newer one cannot move it
 # ---------------------------------------------------------------------------
 
-class TestSnapshotIsolation:
-    def test_mutating_global_model_after_freeze_does_not_change_snapshot(self) -> None:
+class TestBaseIsolation:
+    def test_freeze_pins_the_shard_and_a_later_adoption_does_not_move_it(self) -> None:
         config = _fake_validator_config()
         metagraph = _make_metagraph({"hk_a": 0.5, "hk_b": 0.4})
         assignment = {"vhk": ["hk_a", "hk_b"]}
 
-        global_model = _make_model(val=0.1)
+        frozen_on = Path("/baseline/round_100.safetensors")
         rnd = _freeze_round(
             config=config, metagraph=metagraph, assignment=assignment,
-            global_model=global_model,
+            base_shard=frozen_on,
         )
 
-        # Mutate the live model.
-        with torch.no_grad():
-            for p in global_model.parameters():
-                p.fill_(99.0)
+        # What `run` does at the Merge inside this round's eval window.
+        adopted_baseline = Path("/baseline/round_200.safetensors")  # noqa: F841
 
-        for k, v in rnd.model_snapshot_cpu.items():
-            assert torch.equal(v, torch.full_like(v, 0.1)), f"snapshot for {k} drifted"
+        assert rnd.base_shard == frozen_on
+
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +636,7 @@ class TestRoundRefSwap:
         assert ref.swap(new_current=r2) is r1
         assert ref.current is r2
 
-        # The multi-GB `model_snapshot_cpu` must go with it.
+        # Nothing reads a finished round back.
         del r1
         gc.collect()
         assert finished() is None

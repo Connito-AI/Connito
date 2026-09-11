@@ -2,9 +2,10 @@
 
 Active only inside the (3) window: from end of Validate(K) to end of
 Train(K+1). Pulls UIDs from `Round.downloaded_pool` and runs
-`evaluate_one_miner` against this worker's own `eval_base_model` (loaded
-once per round from `round.model_snapshot_cpu`, so Merge(K) cannot
-change the round's reference state mid-evaluation).
+`evaluate_one_miner` against `eval_base_model`, whose expert weights are
+reloaded once per round from `round.base_shard`. The backbone is frozen
+(`model.freeze_parameters`), so the shard plus a pretrained backbone is
+the whole base — nothing else has to be carried between rounds.
 
 GPU-lock yielding invariant: `gpu_eval_lock` is acquired only for the
 narrow `load_state_dict` and `evaluate_one_miner` calls. It MUST NOT be
@@ -23,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.helper import load_state_dict_from_path
 from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
@@ -56,7 +58,7 @@ DEFAULT_STUCK_LOCK_RECYCLE_THRESHOLD = 3
 EVAL_DEADLINE_GRACE_SEC = 30.0
 
 # Backoff delays (seconds) between dataloader build/materialize attempts
-# inside `_load_round_snapshot`. Total budget ~40 s — short enough that
+# inside `_load_round_base`. Total budget ~40 s — short enough that
 # the retry loop never bites into the eval window meaningfully (cycle is
 # ~90 min), long enough to absorb transient HF blips of the sort that
 # triggered the lock-leak wedges (single timeout, recovered seconds
@@ -107,7 +109,7 @@ class BackgroundEvalWorker(threading.Thread):
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
         # Round-scoped cache of materialized eval batches. Built once in
-        # `_load_round_snapshot` from the streaming dataloader, then
+        # `_load_round_base` from the streaming dataloader, then
         # iterated by every miner's eval this round. Same combined seed
         # → same batches, so per-miner re-streaming was wasted work AND
         # the trigger for the HF-stall lock-leak.
@@ -128,9 +130,9 @@ class BackgroundEvalWorker(threading.Thread):
         """Hand the worker a model to use as its eval base.
 
         Called by the main loop at round freeze, so the worker doesn't need
-        to re-fetch and re-construct the model from chain. The state_dict is reloaded per round from
-        `round.model_snapshot_cpu`, so what matters here is the model
-        architecture, not its current weights.
+        to re-fetch and re-construct the model from chain. Expert weights are
+        reloaded per round from `round.base_shard`, so what matters here is
+        the architecture, not the current weights.
         """
         model.to(self.device)
         model.eval()
@@ -220,7 +222,7 @@ class BackgroundEvalWorker(threading.Thread):
 
                 # Reload state_dict on round transition.
                 if round_obj.round_id != self._loaded_round_id:
-                    await self._load_round_snapshot(round_obj)
+                    await self._load_round_base(round_obj)
 
                 target = self._next_target(round_obj)
                 if target is None:
@@ -285,9 +287,14 @@ class BackgroundEvalWorker(threading.Thread):
                 return
             await asyncio.sleep(0.5)
 
-    async def _load_round_snapshot(self, round_obj) -> None:
-        """Load the round's CPU snapshot into our GPU eval_base_model,
+    async def _load_round_base(self, round_obj) -> None:
+        """Load the round's baseline shard into our GPU eval_base_model,
         materialize the round's eval batches once, and compute baseline.
+
+        The shard is the active group's pretrained experts, written at boot.
+        Every other parameter is frozen for the life of the subnet, so
+        `strict=False` with the backbone left alone rebuilds the base exactly,
+        whatever the previous round left in the model.
 
         Holds `gpu_eval_lock` only for the duration of `load_state_dict`
         and the baseline forward pass. The dataloader is *materialized*
@@ -309,10 +316,20 @@ class BackgroundEvalWorker(threading.Thread):
         self._cached_batches = None
 
         def _load() -> None:
+            shard = round_obj.base_shard
+            sd = load_state_dict_from_path(str(shard))
             with self.gpu_eval_lock:
-                self._eval_base_model.load_state_dict(round_obj.model_snapshot_cpu, strict=False)
+                incompatible = self._eval_base_model.load_state_dict(sd, strict=False)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+            matched = len(sd) - len(incompatible.unexpected_keys)
+            if matched == 0:
+                # Scoring the round against the wrong base is silent, so say
+                # so loudly rather than letting every delta drift.
+                logger.error(
+                    "bg-eval: round base shard matched no keys",
+                    round_id=round_obj.round_id, path=str(shard),
+                )
 
         await asyncio.to_thread(_load)
 
