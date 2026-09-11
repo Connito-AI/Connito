@@ -84,7 +84,7 @@ def _switch(config, eval_worker, gates, to: str):
 
 
 def test_config_and_routing_table_move_together(config, eval_worker, gates) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET)
+    manager = _switch(config, eval_worker, gates, TARGET).expert_manager
 
     assert config.task.expert_group_name == TARGET
     assert config.task.exp.group_id == 7
@@ -94,7 +94,7 @@ def test_config_and_routing_table_move_together(config, eval_worker, gates) -> N
 
 
 def test_the_eval_worker_is_handed_the_new_table(config, eval_worker, gates) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET)
+    manager = _switch(config, eval_worker, gates, TARGET).expert_manager
 
     assert eval_worker._expert_group_assignment is manager.expert_group_assignment
 
@@ -139,3 +139,15 @@ def test_an_unloadable_task_rolls_config_back(config, eval_worker, gates, tmp_pa
     assert config.task.path.name == SHIPPED
     # And the worker was never handed a half-built table.
     assert 4 in eval_worker._expert_group_assignment
+
+
+def test_the_switch_hands_back_a_fresh_baseline_ref(config, eval_worker, gates) -> None:
+    """`run` must rebind to a different dict than a still-uploading publish
+    holds: `publish_round_baseline` writes `out` a second time once the ~3 GB
+    upload lands, routinely after the switch window, so clearing in place
+    would put the previous group's shard back. Fresh means empty and new."""
+    first = _switch(config, eval_worker, gates, TARGET).baseline_ref
+    second = _switch(config, eval_worker, gates, SHIPPED).baseline_ref
+
+    assert first == {} and second == {}
+    assert first is not second

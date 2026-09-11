@@ -5,6 +5,7 @@ import secrets
 import signal
 import threading
 import time
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -97,7 +98,7 @@ from connito.shared.metrics import MetricLogger
 from connito.shared.model import get_model_from_checkpoint
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.shared.modeling.quantization import apply_from_config
-from connito.validator.aggregator import MinerScoreAggregator
+from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
@@ -543,6 +544,18 @@ def _shutdown_background_workers(
             logger.info("Shutdown: background worker joined", thread_name=worker.name)
 
 
+@dataclass
+class TaskScopedState:
+    """The values `run` rebinds when the active task changes.
+
+    Named rather than positional because it grows per tier item — the eval
+    model and `train_dataloader` still have to move with a switch.
+    """
+
+    expert_manager: ExpertManager
+    baseline_ref: dict[str, object] = field(default_factory=dict)
+
+
 def _switch_task(
     config: ValidatorConfig,
     new_task: str,
@@ -550,7 +563,7 @@ def _switch_task(
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
-) -> ExpertManager:
+) -> TaskScopedState:
     """Move a running validator onto a different task, all-or-nothing.
 
     `run` binds everything task-scoped once before the loop, so this is the
@@ -562,6 +575,11 @@ def _switch_task(
 
     Rolls config back if the new assignment will not load — config naming one
     group while `ExpertManager` holds another's table is silent.
+
+    `baseline_ref` comes back *fresh*, not the old one cleared: the publish
+    thread filling it can still be uploading, and its second `out.update`
+    would repopulate a cleared dict with the previous group's shard. Costs one
+    cycle with no model advance, which `run` already handles.
 
     Not yet called: the eval model and the pretrained shard have to be rebuilt
     for the new group before a switch is coherent.
@@ -588,7 +606,7 @@ def _switch_task(
         task=new_task,
         group_id=config.task.exp.group_id,
     )
-    return expert_manager
+    return TaskScopedState(expert_manager=expert_manager)
 
 
 def _write_pretrained_shard(
@@ -718,7 +736,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Hard-coded for now; promote to a config field once we settle on a
     # default that won't change cross-validator behavior.
     score_history_window: int = 80
-    score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
+    score_path = resolve_score_path(config.ckpt.checkpoint_path)
     if pkg_version == "v0.2.3":
         # One-time wipe: drop any prior aggregator state on disk so the v0.2.3
         # rollout starts every validator with a clean score history. Subsequent
