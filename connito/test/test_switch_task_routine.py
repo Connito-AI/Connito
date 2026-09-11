@@ -163,3 +163,63 @@ def test_the_switch_hands_back_a_fresh_baseline_ref(config, eval_worker, gates) 
 
     assert first == {} and second == {}
     assert first is not second
+
+
+# --- tier 3: the switch rebuilds the model --------------------------------
+
+def test_the_switch_hands_the_worker_the_new_groups_model(config, eval_worker, gates) -> None:
+    old = torch.nn.Linear(2, 2)
+    eval_worker.set_eval_base_model(old)
+
+    state = _switch(config, eval_worker, gates, TARGET)
+
+    assert state.eval_model.group_id == 7
+    assert eval_worker._eval_base_model is state.eval_model
+    assert state.base_shard.name == "model_expgroup_7.safetensors"
+    assert 7 in eval_worker._expert_group_assignment
+
+
+def test_the_model_is_built_from_the_new_groups_table(config, eval_worker, gates) -> None:
+    """Config moves first, then the manager, then the model — a builder that
+    saw the old table would host the old group's experts."""
+    seen: list[set[int]] = []
+
+    def spy(cfg, rank, device, expert_manager):
+        seen.append(set(expert_manager.expert_group_assignment))
+        return _stub_builder(cfg, rank, device, expert_manager)
+
+    _switch(config, eval_worker, gates, TARGET, build_model=spy)
+
+    assert seen == [{7, 2}]  # the new group plus the helper
+
+
+def test_the_old_model_is_still_serving_while_the_new_one_builds(config, eval_worker, gates) -> None:
+    """Built before released: two models resident briefly, so a failed build
+    has something to fall back to."""
+    old = torch.nn.Linear(2, 2)
+    eval_worker.set_eval_base_model(old)
+    during: list[object] = []
+
+    def spy(cfg, rank, device, expert_manager):
+        during.append(eval_worker._eval_base_model)
+        return _stub_builder(cfg, rank, device, expert_manager)
+
+    _switch(config, eval_worker, gates, TARGET, build_model=spy)
+
+    assert during == [old]
+
+
+def test_a_failed_build_rolls_everything_back(config, eval_worker, gates) -> None:
+    old = torch.nn.Linear(2, 2)
+    eval_worker.set_eval_base_model(old)
+
+    def boom(cfg, rank, device, expert_manager):
+        raise RuntimeError("no such model")
+
+    with pytest.raises(RuntimeError, match="no such model"):
+        _switch(config, eval_worker, gates, TARGET, build_model=boom)
+
+    assert config.task.expert_group_name == SHIPPED
+    assert config.task.exp.group_id == 4
+    assert eval_worker._eval_base_model is old
+    assert 4 in eval_worker._expert_group_assignment
