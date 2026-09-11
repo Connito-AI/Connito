@@ -19,7 +19,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from connito.miner.train_helper import free_cuda_models, get_status
+from connito.miner.train_helper import free_cuda_models, get_status, model_health
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
 from connito.shared.cycle import wait_till, PhaseNames, PhaseManager
@@ -582,7 +582,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 logger.info("(2) Logging step", loss_batch=loss_batch, aux_loss_batch=aux_loss_batch)
                 metrics = get_status(
                     config=config,
-                    model=model,
                     step=step,
                     inner_opt_step=inner_opt_step,
                     training_time=training_time,
@@ -590,7 +589,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     inner_optimizer=inner_optimizer,
                     loss_batch=loss_batch,
                     aux_loss_batch=aux_loss_batch,
-                )
+                ) | model_health(model, step)
                 metric_logger.log(metrics, print_log=False)
 
             # === local validation and log metric ===
@@ -647,7 +646,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 metrics = (
                     get_status(
                         config=config,
-                        model=model,
                         step=step,
                         inner_opt_step=inner_opt_step,
                         training_time=training_time,
@@ -656,6 +654,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         loss_batch=loss_batch,
                         aux_loss_batch=aux_loss_batch,
                     )
+                    | model_health(model, step)
                     | val_metric
                 )
 
