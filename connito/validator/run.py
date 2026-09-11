@@ -632,18 +632,21 @@ def _maybe_switch_task(
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
+    round_ref: RoundRef,
+    gpu_eval_lock: threading.Lock,
 ) -> TaskScopedState | None:
     """Ask the owner which task is active and switch if it is not ours.
 
-    Runs after round K is finalized and before MinerCommit1 of K+1: the one
-    span with no round in flight. The commit minutes later then carries the
-    new group and the next freeze uses the new shard. Miners poll at
-    Distribute of the same cycle, so both sides commit the new group at the
-    same MinerCommit1.
+    Runs at the start of Train, which gives the build the whole phase; the
+    seam after finalize is too short for it, and overrunning MinerCommit1
+    would make the loop wait for the *next* cycle's. The price is the round
+    still being evaluated: it is dropped, unscored, and the next commit and
+    freeze are already on the new task. Miners poll at Distribute, so both
+    sides commit the new group at the same MinerCommit1.
 
     Never raises. An unreachable owner, a bad bundle or a failed build all
-    leave the node on the task it has, to try again next cycle — the same
-    "keep running" choice the boot-time resolve makes.
+    leave the node on the task it has — round included — to try again next
+    cycle: the same "keep running" choice the boot-time resolve makes.
     """
     active = get_active_task(config.cycle)
     if active is None:
@@ -657,16 +660,36 @@ def _maybe_switch_task(
         if bundle is None:
             raise RuntimeError(f"no usable bundle for {active.name!r}")
         materialize_task(bundle, config.task.base_path)
-        return _switch_task(
-            config, bundle.name,
-            rank=rank, device=device, eval_worker=eval_worker,
-            eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
-        )
+        # Close the window so the worker claims no more miners, then wait for
+        # the eval it may be running — it holds the lock for that — so the old
+        # model is idle before a second one is built beside it. Only on
+        # success is the round dropped; a failed build reopens the window and
+        # the round carries on, on the model it had.
+        was_open = eval_window_active.is_set()
+        eval_window_active.clear()
+        with gpu_eval_lock:
+            pass
+        try:
+            state = _switch_task(
+                config, bundle.name,
+                rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+            )
+        except Exception:
+            if was_open:
+                eval_window_active.set()
+            raise
     except Exception as e:
         logger.error("Task switch failed — staying on the current task",
                      task=config.task.expert_group_name, target=active.name,
                      error=str(e), exc_info=True)
         return None
+    dropped = round_ref.current
+    round_ref.current = None
+    if dropped is not None:
+        logger.warning("Dropped the round in flight: its task is over",
+                       round_id=dropped.round_id, task=config.task.expert_group_name)
+    return state
 
 
 def _write_pretrained_shard(
@@ -1260,25 +1283,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # commit_status that follows, so order is preserved.
                 chain_submitter.async_submit_fallback_weights()
 
-            # === Task switch, if the owner has moved on ===
-            # Round K is finalized and its publish threads hold their own
-            # group id, so nothing task-scoped is in flight; the MinerCommit1
-            # commit below already reads the new group from config.
-            switched = _maybe_switch_task(
-                config, rank=rank, device=device, eval_worker=eval_worker,
-                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
-            )
-            if switched is not None:
-                expert_manager, eval_model, base_shard, baseline_ref = (
-                    switched.expert_manager, switched.eval_model,
-                    switched.base_shard, switched.baseline_ref,
-                )
-                # Exactly the state of a fresh boot on the new task: no hash
-                # to commit until ValidatorCommit1, and the previous model's
-                # last reference was just dropped.
-                current_model_hash = None
-                cleanup()
-
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
 
@@ -1607,6 +1611,27 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # Relocated to the top of the next iteration's MinerCommit1 block
             # so it can incorporate the (3) background scores collected from
             # end-of-Validate(K) through end-of-Train(K+1).
+
+            # === Task switch, if the owner has moved on ===
+            # At the start of the next cycle's Train. The publish threads
+            # from finalize hold their own group id, so the switch races
+            # nothing; the MinerCommit1 commit later reads the new group.
+            wait_till(config, PhaseNames.train)
+            switched = _maybe_switch_task(
+                config, rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+                round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
+            )
+            if switched is not None:
+                expert_manager, eval_model, base_shard, baseline_ref = (
+                    switched.expert_manager, switched.eval_model,
+                    switched.base_shard, switched.baseline_ref,
+                )
+                # Exactly the state of a fresh boot on the new task: no hash
+                # to commit until ValidatorCommit1, and the previous model's
+                # last reference was just dropped.
+                current_model_hash = None
+                cleanup()
 
             # === Close download window before next-cycle MinerCommit1 ===
             # Wait until 30 blocks before the next MinerCommit1 so bg-download
