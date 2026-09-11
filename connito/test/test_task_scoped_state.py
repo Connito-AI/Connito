@@ -38,7 +38,7 @@ def config(tmp_path: Path) -> ValidatorConfig:
         "run": {"root_path": str(tmp_path)},
         "chain": {"hotkey_ss58": "test-hk", "coldkey_ss58": "test-ck", "uid": 0},
     }))
-    return ValidatorConfig.from_path(cfg_path, auto_update_config=True)
+    return ValidatorConfig.from_path(cfg_path, active_task=None, auto_update_config=True)
 
 
 # --- score history survives ---------------------------------------------------

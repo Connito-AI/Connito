@@ -23,6 +23,7 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
+from connito.shared.task_sync import resolve_active_task_name
 from connito.shared.chain import setup_chain_worker
 from connito.shared.cycle import PhaseNames, PhaseResponse, check_phase_expired, wait_till
 from connito.shared.hf_distribute import (
@@ -444,7 +445,10 @@ if __name__ == "__main__":
         logger.debug("Verbose debug logging enabled!")
 
     if args.path:
-        config = MinerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        active_task = resolve_active_task_name(args.path)
+        config = MinerConfig.from_path(
+            args.path, active_task=active_task, auto_update_config=args.auto_update_config
+        )
     else:
         config = MinerConfig()
 

@@ -46,6 +46,7 @@ from connito.shared.chain import (
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
 from connito.shared.helper import (
+    get_with_retry,
     MINER_CHECKPOINT_SUFFIXES,
     h256_int,
     parse_dynamic_filename,
@@ -75,63 +76,6 @@ def set_test_mode(enabled: bool) -> None:
     if _TEST_MODE:
         logger.warning("cycle: TEST MODE enabled — wait_till() will not block")
 
-
-def _get_with_retry(
-    url: str,
-    *,
-    timeout: int = 10,
-    retries: int = 3,
-    backoff: int = 2,
-) -> requests.Response | None:
-    attempt = 0
-    non_retryable = {400, 401, 403, 404, 405, 409, 422}
-
-    while attempt <= retries:
-        try:
-            resp = requests.get(url, timeout=timeout)
-            if resp.status_code >= 400:
-                body_snippet = resp.text[:500] if resp.text else ""
-                if resp.status_code in non_retryable or attempt == retries:
-                    logger.error(
-                        "HTTP error calling %s (status=%s). Body (first 500 chars): %r",
-                        url,
-                        resp.status_code,
-                        body_snippet,
-                    )
-                    return None
-                logger.warning(
-                    "HTTP error, will retry",
-                    url=url,
-                    status_code=resp.status_code,
-                    attempt=attempt + 1,
-                )
-            else:
-                if attempt > 0:
-                    logger.info("Request succeeded after retry", url=url, attempt=attempt + 1)
-                return resp
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-            logger.warning(
-                "Network error calling %s, will retry",
-                url,
-                error=str(net_err),
-                attempt=attempt + 1,
-            )
-        except requests.exceptions.RequestException as req_err:
-            logger.warning(
-                "Request error calling %s, will retry",
-                url,
-                error=str(req_err),
-                attempt=attempt + 1,
-            )
-
-        attempt += 1
-        if attempt <= retries:
-            sleep_s = backoff**attempt
-            logger.info("Retrying after backoff", url=url, sleep_seconds=sleep_s, attempt=attempt + 1)
-            time.sleep(sleep_s)
-
-    logger.error("Request failed after retries", url=url, total_attempts=retries + 1)
-    return None
 
 class PhaseResponseLite(BaseModel):
     phase_name: str
@@ -872,7 +816,7 @@ def get_phase_from_api(config: WorkerConfig) -> PhaseResponse | None:
     base_url = config.cycle.owner_url
     url = f"{base_url}/get_phase"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    resp = get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
     if resp is None:
         return None
 
@@ -895,7 +839,7 @@ def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tupl
     base_url = config.cycle.owner_url
     url = f"{base_url}/blocks_until_next_phase"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    resp = get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
     if resp is None:
         return None
 
@@ -917,7 +861,7 @@ def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None
     base_url = config.cycle.owner_url
     url = f"{base_url}/previous_phase_blocks"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
+    resp = get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
     if resp is None:
         return None
 
@@ -933,7 +877,7 @@ def get_validator_whitelist_from_api(config) -> set[str]:
     base_url = config.cycle.owner_url
     url = f"{base_url}/get_validator_whitelist"
 
-    resp = _get_with_retry(
+    resp = get_with_retry(
         url,
         timeout=config.cycle.api_timeout_sec,
         retries=config.cycle.api_retries,
