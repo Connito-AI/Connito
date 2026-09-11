@@ -33,6 +33,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, parse_args
+from connito.shared.task_sync import resolve_active_task_name
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
@@ -838,7 +839,10 @@ def run_distributed_training() -> None:
         logger.debug("Verbose debug logging + autograd anomaly detection enabled")
 
     if args.path:
-        config = MinerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        active_task = resolve_active_task_name(args.path)
+        config = MinerConfig.from_path(
+            args.path, active_task=active_task, auto_update_config=args.auto_update_config
+        )
     else:
         config = MinerConfig()
 
