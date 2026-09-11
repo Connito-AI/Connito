@@ -6,6 +6,7 @@ import secrets
 import signal
 import threading
 import time
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -551,6 +552,18 @@ def _shutdown_background_workers(
             logger.info("Shutdown: background worker joined", thread_name=worker.name)
 
 
+@dataclass
+class TaskScopedState:
+    """The values `run` rebinds when the active task changes.
+
+    Named rather than positional because it grows per tier item — the eval
+    model and `train_dataloader` still have to move with a switch.
+    """
+
+    expert_manager: ExpertManager
+    baseline_ref: dict[str, object] = field(default_factory=dict)
+
+
 def _switch_task(
     config: ValidatorConfig,
     new_task: str,
@@ -558,7 +571,7 @@ def _switch_task(
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
-) -> tuple[ExpertManager, dict[str, object]]:
+) -> TaskScopedState:
     """Move a running validator onto a different task, all-or-nothing.
 
     `run` binds everything task-scoped once before the loop, so this is the
@@ -571,7 +584,7 @@ def _switch_task(
     Rolls config back if the new assignment will not load — config naming one
     group while `ExpertManager` holds another's table is silent.
 
-    Returns a *fresh* `baseline_ref`, not the old one cleared: the publish
+    `baseline_ref` comes back *fresh*, not the old one cleared: the publish
     thread filling it can still be uploading, and its second `out.update`
     would repopulate a cleared dict with the previous group's shard. Costs one
     cycle with no model advance, which `run` already handles.
@@ -601,7 +614,7 @@ def _switch_task(
         task=new_task,
         group_id=config.task.exp.group_id,
     )
-    return expert_manager, {}
+    return TaskScopedState(expert_manager=expert_manager)
 
 
 def setup_training(
