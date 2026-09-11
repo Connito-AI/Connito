@@ -77,7 +77,12 @@ from connito.shared.checkpoints import (
     prune_submissions_outside_window,
 )
 from connito.shared.config import ValidatorConfig, parse_args
-from connito.shared.task_sync import resolve_active_task_name
+from connito.shared.task_sync import (
+    get_active_task,
+    get_active_task_bundle,
+    materialize_task,
+    resolve_active_task_name,
+)
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
@@ -589,7 +594,7 @@ def _switch_task(
     the price is two models resident for the duration of the build. The caller
     rebinds and then `cleanup()`s, which is what frees the old one.
 
-    Not yet called: the poll at Distribute decides when.
+    Called from `_maybe_switch_task` once per cycle.
     """
     if eval_window_active.is_set() or merge_phase_active.is_set():
         raise RuntimeError(
@@ -617,6 +622,51 @@ def _switch_task(
         base_shard=str(base_shard),
     )
     return TaskScopedState(expert_manager=expert_manager, eval_model=eval_model, base_shard=base_shard)
+
+
+def _maybe_switch_task(
+    config: ValidatorConfig,
+    *,
+    rank: int,
+    device: torch.device,
+    eval_worker: BackgroundEvalWorker,
+    eval_window_active: threading.Event,
+    merge_phase_active: threading.Event,
+) -> TaskScopedState | None:
+    """Ask the owner which task is active and switch if it is not ours.
+
+    Runs after round K is finalized and before MinerCommit1 of K+1: the one
+    span with no round in flight. The commit minutes later then carries the
+    new group and the next freeze uses the new shard. Miners poll at
+    Distribute of the same cycle, so both sides commit the new group at the
+    same MinerCommit1.
+
+    Never raises. An unreachable owner, a bad bundle or a failed build all
+    leave the node on the task it has, to try again next cycle — the same
+    "keep running" choice the boot-time resolve makes.
+    """
+    active = get_active_task(config.cycle)
+    if active is None:
+        logger.warning("Owner API unreachable — staying on the current task",
+                       task=config.task.expert_group_name)
+        return None
+    if active.name == config.task.expert_group_name:
+        return None
+    try:
+        bundle = get_active_task_bundle(config.cycle)
+        if bundle is None:
+            raise RuntimeError(f"no usable bundle for {active.name!r}")
+        materialize_task(bundle, config.task.base_path)
+        return _switch_task(
+            config, bundle.name,
+            rank=rank, device=device, eval_worker=eval_worker,
+            eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+        )
+    except Exception as e:
+        logger.error("Task switch failed — staying on the current task",
+                     task=config.task.expert_group_name, target=active.name,
+                     error=str(e), exc_info=True)
+        return None
 
 
 def _write_pretrained_shard(
@@ -1067,7 +1117,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 threading.Thread(
                     target=publish_round_baseline,
-                    kwargs={"round_obj": pending_round, "config": config, "out": baseline_ref},
+                    kwargs={"round_obj": pending_round, "config": config,
+                            "group_id": config.task.exp.group_id, "out": baseline_ref},
                     name="publish-baseline", daemon=True,
                 ).start()
                 # Ranks 2-3 exist nowhere but this dir, and the prune at
@@ -1208,6 +1259,25 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 # Non-blocking; ChainSubmitter serializes this with the
                 # commit_status that follows, so order is preserved.
                 chain_submitter.async_submit_fallback_weights()
+
+            # === Task switch, if the owner has moved on ===
+            # Round K is finalized and its publish threads hold their own
+            # group id, so nothing task-scoped is in flight; the MinerCommit1
+            # commit below already reads the new group from config.
+            switched = _maybe_switch_task(
+                config, rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+            )
+            if switched is not None:
+                expert_manager, eval_model, base_shard, baseline_ref = (
+                    switched.expert_manager, switched.eval_model,
+                    switched.base_shard, switched.baseline_ref,
+                )
+                # Exactly the state of a fresh boot on the new task: no hash
+                # to commit until ValidatorCommit1, and the previous model's
+                # last reference was just dropped.
+                current_model_hash = None
+                cleanup()
 
             phase_response = wait_till(config, PhaseNames.miner_commit_1)
             global_opt_step = phase_response.phase_start_block
