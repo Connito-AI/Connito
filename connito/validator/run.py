@@ -545,13 +545,11 @@ def _shutdown_background_workers(
 
 @dataclass
 class TaskScopedState:
-    """The values `run` rebinds when the active task changes.
-
-    Named rather than positional because it grows per tier item — the eval
-    model and `train_dataloader` still have to move with a switch.
-    """
+    """The values `run` rebinds when the active task changes."""
 
     expert_manager: ExpertManager
+    eval_model: nn.Module
+    base_shard: Path
     baseline_ref: dict[str, object] = field(default_factory=dict)
 
 
@@ -559,6 +557,8 @@ def _switch_task(
     config: ValidatorConfig,
     new_task: str,
     *,
+    rank: int,
+    device: torch.device,
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
@@ -580,8 +580,15 @@ def _switch_task(
     would repopulate a cleared dict with the previous group's shard. Costs one
     cycle with no model advance, which `run` already handles.
 
-    Not yet called: the eval model and the pretrained shard have to be rebuilt
-    for the new group before a switch is coherent.
+    The model is rebuilt from pretrained for the new group, and its pretrained
+    shard written, exactly as at boot — always, rather than keeping the module
+    tree on a same-topology switch: a switch happens once per task and the
+    rebuild costs seconds. Built *before* the old model is released, so a
+    failed build rolls everything back with the old model still serving;
+    the price is two models resident for the duration of the build. The caller
+    rebinds and then `cleanup()`s, which is what frees the old one.
+
+    Not yet called: the poll at Distribute decides when.
     """
     if eval_window_active.is_set() or merge_phase_active.is_set():
         raise RuntimeError(
@@ -594,18 +601,21 @@ def _switch_task(
     config.switch_active_task(new_task)
     try:
         expert_manager = ExpertManager(config)
+        eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
     except Exception:
         config.switch_active_task(previous_task)
         raise
 
     eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
+    eval_worker.set_eval_base_model(eval_model)
     logger.info(
         "Switched active task",
         previous_task=previous_task,
         task=new_task,
         group_id=config.task.exp.group_id,
+        base_shard=str(base_shard),
     )
-    return TaskScopedState(expert_manager=expert_manager)
+    return TaskScopedState(expert_manager=expert_manager, eval_model=eval_model, base_shard=base_shard)
 
 
 def _write_pretrained_shard(
@@ -627,6 +637,24 @@ def _write_pretrained_shard(
     return Path(paths[group_id])
 
 
+def _build_eval_model(
+    config, rank: int, device: torch.device, expert_manager: ExpertManager,
+) -> tuple[nn.Module, Path]:
+    """The process's only model for the active group, plus the shard every
+    round is scored against. Shared by boot and the task switch."""
+    eval_model, _ = get_model_from_checkpoint(
+        rank=rank, config=config, expert_manager=expert_manager,
+        partial=True, checkpoint_device=device, load_global_checkpoint=False,
+    )
+    # Before quantization, so the shard holds the dtype miners submit in.
+    base_shard = _write_pretrained_shard(
+        eval_model, expert_manager, config.task.exp.group_id,
+        Path(config.ckpt.checkpoint_path) / "pretrained",
+    )
+    apply_from_config(eval_model, config, expert_manager, role="validator")
+    return eval_model, base_shard
+
+
 def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, ExpertManager, Path]:
     """Build the process's only model and record the shard every round is scored against.
 
@@ -638,16 +666,7 @@ def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, 
     """
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    eval_model, _ = get_model_from_checkpoint(
-        rank=rank, config=config, expert_manager=expert_manager,
-        partial=True, checkpoint_device=device, load_global_checkpoint=False,
-    )
-    # Before quantization, so the shard holds the dtype miners submit in.
-    base_shard = _write_pretrained_shard(
-        eval_model, expert_manager, config.task.exp.group_id,
-        Path(config.ckpt.checkpoint_path) / "pretrained",
-    )
-    apply_from_config(eval_model, config, expert_manager, role="validator")
+    eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
     logger.info("Training setup complete", device=str(device), base_shard=str(base_shard))
     return eval_model, expert_manager, base_shard
 

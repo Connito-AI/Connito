@@ -10,7 +10,7 @@ import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -73,14 +73,26 @@ def eval_worker(gates) -> BackgroundEvalWorker:
     )
 
 
-def _switch(config, eval_worker, gates, to: str):
+def _stub_builder(config, rank, device, expert_manager):
+    """Stands in for `_build_eval_model`: a tiny module and a shard path,
+    without loading DeepSeek. Tagged with the group so tests can tell
+    whose model came back."""
+    model = torch.nn.Linear(2, 2)
+    model.group_id = config.task.exp.group_id
+    shard = Path(config.ckpt.checkpoint_path) / "pretrained" / f"model_expgroup_{model.group_id}.safetensors"
+    return model, shard
+
+
+def _switch(config, eval_worker, gates, to: str, build_model=_stub_builder):
     eval_window, merge = gates
-    return _switch_task(
-        config, to,
-        eval_worker=eval_worker,
-        eval_window_active=eval_window,
-        merge_phase_active=merge,
-    )
+    with patch("connito.validator.run._build_eval_model", build_model):
+        return _switch_task(
+            config, to,
+            rank=0, device=torch.device("cpu"),
+            eval_worker=eval_worker,
+            eval_window_active=eval_window,
+            merge_phase_active=merge,
+        )
 
 
 def test_config_and_routing_table_move_together(config, eval_worker, gates) -> None:
