@@ -10,7 +10,7 @@ import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -85,14 +85,14 @@ def _stub_builder(config, rank, device, expert_manager):
 
 def _switch(config, eval_worker, gates, to: str, build_model=_stub_builder):
     eval_window, merge = gates
-    return _switch_task(
-        config, to,
-        rank=0, device=torch.device("cpu"),
-        eval_worker=eval_worker,
-        eval_window_active=eval_window,
-        merge_phase_active=merge,
-        build_model=build_model,
-    )
+    with patch("connito.validator.run._build_eval_model", build_model):
+        return _switch_task(
+            config, to,
+            rank=0, device=torch.device("cpu"),
+            eval_worker=eval_worker,
+            eval_window_active=eval_window,
+            merge_phase_active=merge,
+        )
 
 
 def test_config_and_routing_table_move_together(config, eval_worker, gates) -> None:

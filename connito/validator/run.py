@@ -562,7 +562,6 @@ def _switch_task(
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
-    build_model=None,
 ) -> TaskScopedState:
     """Move a running validator onto a different task, all-or-nothing.
 
@@ -602,7 +601,7 @@ def _switch_task(
     config.switch_active_task(new_task)
     try:
         expert_manager = ExpertManager(config)
-        eval_model, base_shard = (build_model or _build_eval_model)(config, rank, device, expert_manager)
+        eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
     except Exception:
         config.switch_active_task(previous_task)
         raise
