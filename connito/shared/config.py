@@ -688,14 +688,14 @@ class WorkerConfig(BaseConfig):
         ]
         ensure_dirs(dirs)
 
-    def _update_by_task(self, expert_group_name: str | None = None) -> None:
+    def _update_by_task(self, expert_group_name: str | None = None, *, fallback: bool = True) -> None:
         if expert_group_name:
             self.task.expert_group_name = expert_group_name
             self._refresh_paths()
 
         assert self.task.path is not None
         cfg_path = self.task.path / "config.yaml"
-        if not cfg_path.is_file():
+        if fallback and not cfg_path.is_file():
             # Reached when the owner API names a task this node has not got.
             # Falling back keeps the process alive and complaining; raising here
             # would kill it during construction, before anything can ask the API
@@ -722,14 +722,16 @@ class WorkerConfig(BaseConfig):
         reads the new task's `config.yaml`, so a task this node does not have
         on disk would strand the new name against the old `task.exp` — the
         `5e6ab4c` shape, training one dataset while committing another
-        group's id. Roll back and re-raise instead.
+        group's id. Roll back and re-raise instead — no fallback to the
+        shipped default here: that is for boot, where the alternative is a
+        crash loop; a live process has a task to stay on.
 
         `_ensure_runtime_dirs` because both group-scoped paths are new.
         """
         previous_name = self.task.expert_group_name
         previous_exp = self.task.exp
         try:
-            self._update_by_task(expert_group_name=expert_group_name)
+            self._update_by_task(expert_group_name=expert_group_name, fallback=False)
         except Exception:
             self.task.expert_group_name = previous_name
             self.task.exp = previous_exp
