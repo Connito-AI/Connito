@@ -85,20 +85,15 @@ def persist(config, ab: AdoptedBaseline) -> None:
     os.replace(tmp, p)
 
 
-def migrate_from_legacy_globalver(config) -> AdoptedBaseline | None:
-    """One boot per validator: derive the pointer from the newest `globalver_*`.
+def adopt_file(config, src: Path, global_ver: int, *, model_hash: str | None = None) -> AdoptedBaseline:
+    """Make an arbitrary shard file the adopted baseline.
 
-    Links its shard into `baseline/` under the version as round id, so normal
-    retention applies from then on. The legacy dir is deliberately left in
-    place — a rollback to the previous image must still find it.
+    Links it into `baseline/` under the version as round id, so normal
+    retention applies from then on, and persists the pointer. Used for a
+    shard that did not arrive through Merge: a legacy `globalver_*` dir, or
+    the downloaded fleet checkpoint boot preferred over our own.
     """
-    legacy = select_best_checkpoint(primary_dir=Path(config.ckpt.checkpoint_path))
-    if legacy is None or legacy.path is None or legacy.global_ver is None:
-        return None
-    src = Path(legacy.path) / expert_group_shard_name(config.task.exp.group_id)
-    if not src.is_file():
-        return None
-    dest = baseline_dir(config) / f"round_{int(legacy.global_ver)}{src.suffix}"
+    dest = baseline_dir(config) / f"round_{int(global_ver)}{src.suffix}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
         try:
@@ -106,12 +101,28 @@ def migrate_from_legacy_globalver(config) -> AdoptedBaseline | None:
         except OSError:
             shutil.copy2(src, dest)
     ab = AdoptedBaseline(
-        path=dest, round_id=int(legacy.global_ver), global_ver=int(legacy.global_ver),
-        model_hash=get_model_hash(load_state_dict_from_path(str(dest)), hex=True),
+        path=dest, round_id=int(global_ver), global_ver=int(global_ver),
+        model_hash=model_hash or get_model_hash(load_state_dict_from_path(str(dest)), hex=True),
     )
     persist(config, ab)
+    return ab
+
+
+def migrate_from_legacy_globalver(config) -> AdoptedBaseline | None:
+    """One boot per validator: derive the pointer from the newest `globalver_*`.
+
+    The legacy dir is deliberately left in place — a rollback to the previous
+    image must still find it.
+    """
+    legacy = select_best_checkpoint(primary_dir=Path(config.ckpt.checkpoint_path))
+    if legacy is None or legacy.path is None or legacy.global_ver is None:
+        return None
+    src = Path(legacy.path) / expert_group_shard_name(config.task.exp.group_id)
+    if not src.is_file():
+        return None
+    ab = adopt_file(config, src, int(legacy.global_ver))
     logger.info(
         "adopted_baseline: migrated from legacy checkpoint",
-        legacy=str(legacy.path), path=str(dest), global_ver=ab.global_ver,
+        legacy=str(legacy.path), path=str(ab.path), global_ver=ab.global_ver,
     )
     return ab

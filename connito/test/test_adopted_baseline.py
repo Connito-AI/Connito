@@ -129,9 +129,16 @@ def test_boot_prefers_the_higher_global_ver(tmp_path):
 
     own = _pointer(cfg, 0.5, global_ver=9384)
     model = _Tiny(0.1)
-    source, _ = _apply_boot_overlay(cfg, model, own)
+    source, chosen = _apply_boot_overlay(cfg, model, own)
     assert source == "downloaded"
     torch.testing.assert_close(_weight(model), torch.full((2, 4), 0.9))
+    # The pointer follows: the next freeze must pin what the model holds, not
+    # the older own shard — otherwise the first round is scored against a
+    # base the miners never trained from.
+    after = adopted.load(cfg)
+    assert after.global_ver == 9500 and chosen.global_ver == 9500
+    assert after.path == adopted.baseline_dir(cfg) / "round_9500.safetensors"
+    assert after.path.is_file() and after.model_hash
 
     own = _pointer(cfg, 0.5, global_ver=9600)
     model = _Tiny(0.1)

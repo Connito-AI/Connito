@@ -658,6 +658,13 @@ def _apply_boot_overlay(
             continue
         source = ("legacy_globalver" if migrated else "pointer") if ckpt is own_ckpt else "downloaded"
         matched = _overlay_expert_shard(model, shard)
+        if ckpt is not own_ckpt:
+            # The pointer must describe what the model now holds: the next
+            # freeze pins `adopted_baseline` as the round's base, and
+            # ValidatorCommit reads the hash from it. Leaving it on the older
+            # own shard would score the first round against a base the
+            # miners never trained from.
+            ckpt = adopted.adopt_file(config, shard, int(ckpt.global_ver or 0)).as_checkpoint()
         logger.info(
             "Boot model source", source=source, global_ver=ckpt.global_ver,
             model_hash=(ckpt.model_hash or "")[:8], matched_keys=matched, path=str(shard),
