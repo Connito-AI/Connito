@@ -105,3 +105,28 @@ def test_a_failed_write_keeps_the_fallback_without_raising(config, monkeypatch) 
 
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
+
+
+# --- sync_active_task: the poll the loops call ------------------------------
+
+def test_the_owner_naming_another_task_switches_and_reports_it(config, owner, monkeypatch) -> None:
+    monkeypatch.setattr(task_sync, "get_active_task", lambda cycle: SimpleNamespace(name=TARGET))
+
+    assert task_sync.sync_active_task(config) is True
+    assert config.task.expert_group_name == TARGET
+    assert owner == ["materialize"]
+
+
+def test_an_unreachable_owner_reports_no_switch(config, owner, monkeypatch) -> None:
+    monkeypatch.setattr(task_sync, "get_active_task", lambda cycle: None)
+
+    assert task_sync.sync_active_task(config) is False
+    assert config.task.expert_group_name == SHIPPED
+    assert owner == []
+
+
+def test_the_owner_naming_our_task_reports_no_switch(config, owner, monkeypatch) -> None:
+    monkeypatch.setattr(task_sync, "get_active_task", lambda cycle: SimpleNamespace(name=SHIPPED))
+
+    assert task_sync.sync_active_task(config) is False
+    assert owner == []
