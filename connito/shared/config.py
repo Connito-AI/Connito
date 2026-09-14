@@ -668,8 +668,13 @@ class WorkerConfig(BaseConfig):
             / self.run.run_name
             / self.task.expert_group_name
         )
+        # The miner's cache of downloaded validator baselines. Group in the
+        # leaf for the same reason as above: after a task switch the picker
+        # must not find the previous task's shards first.
         self.ckpt.validator_checkpoint_path = (
-            base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+            base_ckpt
+            / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+            / self.task.expert_group_name
         )
 
         # logging paths
