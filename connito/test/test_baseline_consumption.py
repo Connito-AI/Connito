@@ -132,7 +132,7 @@ def test_publish_reports_revision_and_hash_together(tmp_path, stub_upload):
     (sub / "uid_1_hotkey_hkB_block_550.safetensors").write_bytes(b"shard")
 
     out: dict = {}
-    distribute.publish_round_baseline(round_obj=_round_with_winner(), config=_config(sub), out=out)
+    distribute.publish_round_baseline(round_obj=_round_with_winner(), config=_config(sub), group_id=GROUP_ID, out=out)
 
     assert out["revision"] == "abc123def456"
     assert out["model_hash"] == WINNER_HASH
@@ -154,7 +154,7 @@ def test_failed_publish_leaves_nothing_to_advertise(tmp_path, monkeypatch):
     monkeypatch.setattr(distribute, "upload_checkpoint_to_hf_subprocess", _boom)
 
     out: dict = {}
-    distribute.publish_round_baseline(round_obj=_round_with_winner(), config=_config(sub), out=out)
+    distribute.publish_round_baseline(round_obj=_round_with_winner(), config=_config(sub), group_id=GROUP_ID, out=out)
     assert out == {}
 
 
@@ -179,7 +179,7 @@ def test_winner_without_a_chain_commit_is_advertised_with_a_recomputed_hash(tmp_
     round_obj.uid_to_chain_checkpoint = {}
 
     out: dict = {}
-    distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out=out)
+    distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), group_id=GROUP_ID, out=out)
 
     assert out["revision"] == "abc123def456"
     # Must match what a verifier computes, or every miner rejects the download.
@@ -199,7 +199,7 @@ def test_publish_records_the_winner_even_when_the_hash_is_unusable(tmp_path, stu
     round_obj.uid_to_chain_checkpoint = {}   # forces the recompute, which will raise
 
     out: dict = {}
-    distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), out=out)
+    distribute.publish_round_baseline(round_obj=round_obj, config=_config(sub), group_id=GROUP_ID, out=out)
 
     assert out["uid"] == 2 and out["round_id"] == 9000
     assert "model_hash" not in out

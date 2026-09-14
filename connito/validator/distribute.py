@@ -33,13 +33,17 @@ from connito.shared.hf_distribute import (
 logger = structlog.get_logger(__name__)
 
 
-def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> None:
+def publish_round_baseline(*, round_obj, config, group_id: int, out: dict | None = None) -> None:
     """Upload the round's best-averaged submission to HF as the next baseline.
 
     On success `out` receives `path` — the file the Merge window loads to
     advance this validator's own model — plus the coordinates the next
     ValidatorCommit advertises. `path` is written first and separately: the
     local model must still advance in the rounds where we cannot advertise.
+
+    `group_id` is the round's, passed in rather than read from `config` here:
+    this runs after the main loop may have switched task, and the shard name
+    must be the group these weights belong to.
 
     Never raises: a failed publish must not touch scoring, and the caller runs
     this on a daemon thread where an exception would be invisible.
@@ -79,7 +83,7 @@ def publish_round_baseline(*, round_obj, config, out: dict | None = None) -> Non
         size_bytes, started = src.stat().st_size, time.monotonic()
         try:
             # The name miners already fetch.
-            os.link(src, stage / f"model_expgroup_{config.task.exp.group_id}.safetensors")
+            os.link(src, stage / f"model_expgroup_{group_id}.safetensors")
             revision = upload_checkpoint_to_hf_subprocess(
                 ckpt_dir=stage, repo_id=repo_id,
                 token_env_var=config.hf.token_env_var,
