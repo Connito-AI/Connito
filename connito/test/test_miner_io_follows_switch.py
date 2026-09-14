@@ -78,3 +78,15 @@ def test_the_download_job_fetches_the_group_config_has_now(config, monkeypatch) 
     assert before["expert_group_ids"] == [4] and 4 in before["expert_group_assignment"]
     assert after["expert_group_ids"] == [7] and 7 in after["expert_group_assignment"]
     assert 4 not in after["expert_group_assignment"]
+
+
+def test_the_download_dir_is_the_tasks_own_and_moves_with_it(config) -> None:
+    """Two tasks' baseline caches never share a directory, so the checkpoint
+    picker cannot find the previous task's shards after a switch."""
+    before = config.ckpt.validator_checkpoint_path
+    config.switch_active_task(TARGET)
+    after = config.ckpt.validator_checkpoint_path
+
+    assert before.name == SHIPPED and after.name == TARGET
+    assert before.parent == after.parent
+    assert after.is_dir()
