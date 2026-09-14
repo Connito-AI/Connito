@@ -33,7 +33,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, parse_args
-from connito.shared.task_sync import resolve_active_task_name
+from connito.shared.task_sync import ensure_active_task, resolve_active_task_name, sync_active_task
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
@@ -707,6 +707,25 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 logger.info("reached barrier, waiting for complete checkpoint saving")
                 # dist.barrier(device_ids=[rank])
 
+            # === task switch ===
+            # One light poll per inner step. On a change config has already
+            # moved — task path, expert config, group-scoped checkpoint dir —
+            # so start over the way the recovery paths below do: everything
+            # is rebuilt from config, and the old dataloader's iterator, which
+            # `for` above holds, is never resumed on the new task.
+            if is_inner_optimizer_step and sync_active_task(config):
+                logger.info(
+                    "Task changed — restarting the training loop on the new task",
+                    task=config.task.expert_group_name,
+                    group_id=config.task.exp.group_id,
+                )
+                poller.stop()
+                metric_logger.close()
+                free_cuda_models(models=[model], optimizers=[inner_optimizer], devices=[device])
+                torch.cuda.empty_cache()
+                gc.collect()
+                return train_worker(rank, world_size, config)
+
             # === reload model ===
             # Gated by ckpt.enable_peer_resync (default True). Standalone
             # smoke/train runs — especially under use_pretrained_only=True —
@@ -843,6 +862,7 @@ def run_distributed_training() -> None:
         config = MinerConfig.from_path(
             args.path, active_task=active_task, auto_update_config=args.auto_update_config
         )
+        ensure_active_task(config, active_task)
     else:
         config = MinerConfig()
 
