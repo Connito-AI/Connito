@@ -208,25 +208,42 @@ def materialize_task(bundle: TaskBundle, dest_root: Path) -> Path:
 
 
 def ensure_active_task(config, active: str | None) -> None:
-    """Fetch and switch onto the owner's task when boot could not.
+    """Fetch and switch onto the owner's task if config is not on it.
 
-    `from_path` applies the owner's answer before construction, but a task
-    this node has not got on disk falls back to the shipped default there —
-    it cannot fetch, since config stays off the network. Called right after,
-    this closes the gap: fetch the bundle, write it under `task.base_path`,
-    switch. Any failure leaves the fallback in place, logged, which is what
-    boot already did; the poll in the round loop tries again.
+    At boot: `from_path` applies the owner's answer before construction, but
+    a task this node has not got on disk falls back to the shipped default
+    there — it cannot fetch, since config stays off the network. Called right
+    after, this closes the gap. In the loop: `sync_active_task` calls it with
+    each poll's answer. Either way: fetch the bundle, write it under
+    `task.base_path`, switch. Any failure leaves config where it was, logged;
+    the next poll tries again.
     """
     if active is None or config.task.expert_group_name == active:
         return
     bundle = get_active_task_bundle(config.cycle)
     if bundle is None:
-        logger.error("Owner's task is not on disk and its bundle could not be fetched — staying on the fallback",
+        logger.error("Owner's task is not on disk and its bundle could not be fetched — staying on the current task",
                      task=config.task.expert_group_name, active=active)
         return
     try:
         materialize_task(bundle, config.task.base_path)
         config.switch_active_task(bundle.name)
     except Exception as e:
-        logger.error("Could not switch onto the owner's task — staying on the fallback",
+        logger.error("Could not switch onto the owner's task — staying on the current task",
                      task=config.task.expert_group_name, active=bundle.name, error=str(e), exc_info=True)
+        return
+    logger.info("Switched active task", task=bundle.name, group_id=config.task.exp.group_id)
+
+
+def sync_active_task(config) -> bool:
+    """One poll: ask the owner which task is active, switch config if it is
+    not ours. True when a switch happened, so the caller can rebuild what it
+    holds. An unreachable owner is a no-op — keep running what we have.
+    """
+    active = get_active_task(config.cycle)
+    if active is None:
+        logger.warning("Owner API unreachable — staying on the current task", task=config.task.expert_group_name)
+        return False
+    before = config.task.expert_group_name
+    ensure_active_task(config, active.name)
+    return config.task.expert_group_name != before
