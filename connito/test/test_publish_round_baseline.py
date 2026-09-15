@@ -81,7 +81,7 @@ def test_best_average_wins_even_when_another_miner_beat_it_this_round(tmp_path, 
     distribute.publish_round_baseline(
         round_obj=_round({1: 3.1, 2: 3.9}, {1: "hkA", 2: "hkB"},
                          prior_avg_scores={1: 0.25, 2: 1.75}),
-        config=_config(sub),
+        config=_config(sub), group_id=GROUP_ID,
     )
 
     assert len(uploads) == 1
@@ -90,6 +90,19 @@ def test_best_average_wins_even_when_another_miner_beat_it_this_round(tmp_path, 
     # Hardlinked, not copied: the source still exists and shared an inode.
     assert uploads[0]["nlink"] == 2
     assert winner.exists()
+
+
+def test_the_shard_is_named_by_the_group_it_was_given(tmp_path, uploads):
+    """The publisher runs on a thread after the loop may have switched task;
+    the name must be the round's group, not whatever config says by then."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round({1: 3.1}, {1: "hkA"}), config=_config(sub), group_id=7,
+    )
+
+    assert uploads[0]["staged"] == ["model_expgroup_7.safetensors"]
 
 
 def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
@@ -102,7 +115,7 @@ def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
     distribute.publish_round_baseline(
         round_obj=_round({7: 3.9, 2: 3.1}, {7: "hkA", 2: "hkB"},
                          prior_avg_scores={7: 1.5, 2: 1.5}),
-        config=_config(sub),
+        config=_config(sub), group_id=GROUP_ID,
     )
     assert uploads[0]["commit_message"].endswith("uid=2")
 
@@ -117,7 +130,7 @@ def test_uid_breaks_a_total_tie(tmp_path, uploads):
     distribute.publish_round_baseline(
         round_obj=_round({7: 3.5, 2: 3.5}, {7: "hkA", 2: "hkB"},
                          prior_avg_scores={7: 1.5, 2: 1.5}),
-        config=_config(sub),
+        config=_config(sub), group_id=GROUP_ID,
     )
     assert uploads[0]["commit_message"].endswith("uid=2")
 
@@ -137,7 +150,7 @@ def test_nothing_is_published_when_the_winner_shard_is_unusable(tmp_path, upload
         _submission(sub, "hkB", 550, suffix=".pt")
 
     distribute.publish_round_baseline(
-        round_obj=_round(val_losses, {2: "hkB"}), config=_config(sub),
+        round_obj=_round(val_losses, {2: "hkB"}), config=_config(sub), group_id=GROUP_ID,
     )
     assert uploads == []
 
@@ -152,7 +165,7 @@ def test_upload_failure_neither_raises_nor_leaks_the_staging_dir(tmp_path, monke
 
     monkeypatch.setattr(distribute, "upload_checkpoint_to_hf_subprocess", _boom)
     distribute.publish_round_baseline(
-        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
+        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub), group_id=GROUP_ID,
     )
 
     assert not [p for p in sub.iterdir() if p.name.startswith(".tmp_baseline_")]
@@ -164,15 +177,13 @@ def test_staging_dir_is_removed_after_a_successful_upload(tmp_path, uploads):
     src = _submission(sub, "hkB", 550)
 
     distribute.publish_round_baseline(
-        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
+        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub), group_id=GROUP_ID,
     )
 
     assert uploads
     assert sorted(p.name for p in sub.iterdir()) == [src.name]
-    # Two names for the same bytes: the submission, and the retained baseline
-    # that has to outlive the end-of-cycle prune. The staging link is gone.
-    assert os.stat(src).st_nlink == 2
-    assert (sub.parent / "baseline" / "round_9000.safetensors").exists()
+    # The staging link is gone; the submission is the only name for the bytes.
+    assert os.stat(src).st_nlink == 1
 
 
 def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
@@ -196,7 +207,7 @@ def test_cleanup_keeps_the_miner_the_baseline_will_be_published_from(tmp_path):
     round_obj = Round(
         round_id=9000, seed="s", validator_miner_assignment={},
         background_uids=tuple(uid_to_hotkey),
-        uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
+        uid_to_hotkey=dict(uid_to_hotkey), base_shard=Path("pretrained/model_expgroup_1.safetensors"),
         # uid 5 is the proven miner but has the worst round score.
         prior_avg_scores={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 2.0},
     )
@@ -235,7 +246,7 @@ def test_cleanup_keeps_the_winner_when_a_better_average_went_unevaluated(tmp_pat
     round_obj = Round(
         round_id=9000, seed="s", validator_miner_assignment={},
         background_uids=tuple(uid_to_hotkey),
-        uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
+        uid_to_hotkey=dict(uid_to_hotkey), base_shard=Path("pretrained/model_expgroup_1.safetensors"),
         # uid 6 has the best average but is never evaluated; uid 5 is the best
         # average *among those evaluated*, so it is the one publish will pick.
         prior_avg_scores={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 2.0, 6: 3.0},
@@ -268,7 +279,7 @@ def test_cleanup_keeps_the_winner_when_averages_tie(tmp_path):
     round_obj = Round(
         round_id=9000, seed="s", validator_miner_assignment={},
         background_uids=tuple(uid_to_hotkey),
-        uid_to_hotkey=dict(uid_to_hotkey), model_snapshot_cpu={},
+        uid_to_hotkey=dict(uid_to_hotkey), base_shard=Path("pretrained/model_expgroup_1.safetensors"),
         # uids 4 and 5 tie on average; 5 has the better val_loss, so publish
         # picks 5, while a uid-only tie-break would keep 4.
         prior_avg_scores={1: 0.5, 2: 0.5, 3: 0.5, 4: 1.5, 5: 1.5},
@@ -298,7 +309,7 @@ def test_a_late_download_is_still_this_round_s_submission(tmp_path, uploads):
     _submission(sub, "hkB", BLOCK_RANGE[1] + 200)
 
     distribute.publish_round_baseline(
-        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub),
+        round_obj=_round({2: 3.1}, {2: "hkB"}), config=_config(sub), group_id=GROUP_ID,
     )
 
     assert len(uploads) == 1, "late download rejected — the production failure"
@@ -324,7 +335,7 @@ def test_round_best_wins_when_no_proven_miner_submitted(tmp_path, uploads):
             # uids 10/11/12 hold the top-3 averages and did not submit.
             prior_avg_scores={10: 2.0, 11: 1.5, 12: 1.0, 7: 0.3, 8: 0.0},
         ),
-        config=_config(sub),
+        config=_config(sub), group_id=GROUP_ID,
     )
 
     assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
@@ -344,7 +355,7 @@ def test_proven_miner_still_wins_when_it_submits(tmp_path, uploads):
             {7: "hkProven", 8: "hkBest"},
             prior_avg_scores={7: 1.5, 10: 2.0, 11: 1.0, 8: 0.0},
         ),
-        config=_config(sub),
+        config=_config(sub), group_id=GROUP_ID,
     )
 
     assert uploads[0]["commit_message"].endswith("uid=7"), uploads[0]["commit_message"]

@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import re
+import string
 import sys
 from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal
@@ -229,11 +230,40 @@ class ModelCfg(BaseConfig):
         return self
 
 
+# A bare dataset column name. Deliberately narrower than Python
+# identifiers: no dots, no brackets, no leading digits.
+_COLUMN_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
 class DatasetSourceCfg(BaseConfig):
     path: str
     name: str | None = None
     weight: PositiveFloat = 1.0
     text_column: str = "text"
+    # HF split to stream for this source. `None` keeps today's behaviour:
+    # the split is derived from the train/validation flag, which in
+    # practice is always "train" (no configured source ships a
+    # "validation" split, and the validation set is carved out of the
+    # same stream by the fractional index filter, not by a split name).
+    # Set it for repos whose split is named something else. Such repos
+    # exist and carry no `train` at all, so they cannot be streamed
+    # without this.
+    split: str | None = None
+    # Render each row into `text` with `str.format` instead of selecting
+    # a single column. Needed for instruction-shaped corpora, where the
+    # text a model should see is assembled from several columns and no
+    # one column is the text — such a corpus typically carries
+    # `instruction` / `input` / `output` and no `text` at all.
+    #
+    # `None` keeps `text_column` selection, which stays the default: the
+    # groups running in the field all have a real text column, and
+    # requiring a trivial `"{text}"` template of them would buy nothing.
+    #
+    # Placeholders are restricted to bare column names by
+    # `_validate_text_template` below — this string is task data that
+    # travels from the owner API to every miner and validator, so the
+    # grammar it may use is narrower than `str.format` allows.
+    text_template: str | None = None
     # Authorize HF's `load_dataset` to execute the dataset repo's custom
     # builder script. Required for sources that ship a `<name>.py` loader
     # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
@@ -249,6 +279,72 @@ class DatasetSourceCfg(BaseConfig):
             raise ValueError("data.dataset_sources[].path cannot be empty.")
         if not self.text_column.strip():
             raise ValueError("data.dataset_sources[].text_column cannot be empty.")
+        if self.split is not None and not self.split.strip():
+            raise ValueError("data.dataset_sources[].split cannot be blank when set.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_text_template(self):
+        r"""Restrict `text_template` to `{column_name}` placeholders.
+
+        A template arrives as task data over the wire, so it is checked
+        here — at config load, before a round is running — rather than
+        being discovered mid-stream by whatever `str.format` does with
+        it. Everything rejected below either renders something the
+        author did not mean or raises an exception the rendering path
+        does not catch:
+
+          - a positional field (`{}` or `{0}`) indexes the format
+            arguments, not the row, and a row is passed by keyword;
+          - attribute or index access (`{a.__class__}`, `{a[0]}`)
+            reaches into the row's values and raises `AttributeError`
+            or `TypeError`, neither of which the renderer catches, so
+            it would kill a scored round mid-stream;
+          - a conversion or format spec (`{a!r}`, `{a:>1000000}`) hides
+            the column name from a naive `\{(\w+)\}` scan, and a width
+            is an arbitrary per-row allocation.
+        """
+        if self.text_template is None:
+            return self
+        if not self.text_template.strip():
+            raise ValueError("data.dataset_sources[].text_template cannot be blank when set.")
+
+        try:
+            fields = list(string.Formatter().parse(self.text_template))
+        except ValueError as e:
+            raise ValueError(f"data.dataset_sources[].text_template is not a valid format string: {e}") from e
+
+        named = 0
+        for _literal, field_name, format_spec, conversion in fields:
+            if field_name is None:  # trailing literal text
+                continue
+            if field_name == "" or field_name.isdigit():
+                raise ValueError(
+                    "data.dataset_sources[].text_template must not use positional fields "
+                    f"({{{field_name}}}); name the dataset column instead."
+                )
+            if not _COLUMN_NAME_RE.fullmatch(field_name):
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} is not a bare "
+                    "column name; attribute and index access are not allowed."
+                )
+            if conversion is not None:
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} must not use a "
+                    f"conversion (!{conversion})."
+                )
+            if format_spec:
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} must not use a "
+                    f"format spec (:{format_spec})."
+                )
+            named += 1
+
+        if named == 0:
+            raise ValueError(
+                "data.dataset_sources[].text_template names no columns, so every row would render "
+                "to the same constant string."
+            )
         return self
 
 
@@ -528,10 +624,6 @@ class ValidatorCheckpointCfg(CheckpointCfg):
     miner_submission_max_age_cycles: PositiveFloat = 1.5
 
 
-class DhtCfg(BaseConfig):
-    port: int = 6000
-
-
 class OwnerCheckpointCfg(CheckpointCfg):
     base_checkpoint_path: Path = Path("checkpoints/owner")
 
@@ -546,21 +638,19 @@ class ExpertCfg(BaseConfig):
 
 
 class TaskCfg(BaseConfig):
-    # `expert_group_name` is locked so the whole fleet evaluates the same task:
-    # `auto_update_config` resets any non-default value on load and logs a
-    # one-time reset warning. Validators only score miners whose chain commit
-    # carries a matching `expert_group`, so a drifting operator would simply
-    # stop seeing (and stop being seen by) everyone else.
-    #
-    # Currently `exp_nemotron_c4` (group 4): Nemotron-CC-Math + C4. This
-    # replaces the `exp_legal` switch made in #186 — see
-    # docs/exp-legal-migration-plan.md for that history and the flag-day
-    # mechanics, which apply identically in this direction.
+    # `expert_group_name` is unlocked but still not the operator's to pick:
+    # entrypoints resolve it from the owner API and pass it to `from_path`,
+    # which applies it before anything is derived from it. The lock stopped an
+    # operator drifting away from the fleet (validators only score miners whose
+    # chain commit carries a matching `expert_group`); that guarantee is
+    # unchanged, its authority just moved from a code constant to the API, so a
+    # new task no longer needs a release. The value here is the fallback used
+    # when the API is unreachable.
     #
     # `helper_group_id` and `routing_mode` stay locked for the natural-routing
     # (2Fnat) consensus contract and are independent of the dataset.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "expert_group_name", "helper_group_id", "routing_mode",
+        "helper_group_id", "routing_mode",
     })
     expert_group_name: str = "exp_nemotron_c4"
     load_all_expert_groups: bool = False
@@ -625,8 +715,22 @@ class WorkerConfig(BaseConfig):
         # Derive paths
         self._refresh_paths()
 
-        # Load per-task overrides
-        self._update_by_task()
+        # Load per-task overrides. A task this node has not got — the owner
+        # named one it has not fetched yet — falls back to the shipped default
+        # here, at construction, where raising would be a crash loop before
+        # anything can ask the API or fetch the task. A live switch has a task
+        # to stay on, so `switch_active_task` gets no such fallback.
+        try:
+            self._update_by_task()
+        except FileNotFoundError as e:
+            fallback = type(self.task).model_fields["expert_group_name"].default
+            if self.task.expert_group_name == fallback:
+                raise
+            logger.error(
+                "No task definition on disk — falling back to the shipped default",
+                task=self.task.expert_group_name, error=str(e), fallback=fallback,
+            )
+            self._update_by_task(expert_group_name=fallback)
 
         # Create directories
         self._ensure_runtime_dirs()
@@ -660,8 +764,13 @@ class WorkerConfig(BaseConfig):
             / self.run.run_name
             / self.task.expert_group_name
         )
+        # The miner's cache of downloaded validator baselines. Group in the
+        # leaf for the same reason as above: after a task switch the picker
+        # must not find the previous task's shards first.
         self.ckpt.validator_checkpoint_path = (
-            base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+            base_ckpt
+            / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
+            / self.task.expert_group_name
         )
 
         # logging paths
@@ -700,9 +809,30 @@ class WorkerConfig(BaseConfig):
             self._refresh_paths()
 
         assert self.task.path is not None
-        cfg_path = self.task.path / "config.yaml"
-        self.task.exp = ExpertCfg.from_path(cfg_path)  # type: ignore
+        self.task.exp = ExpertCfg.from_path(self.task.path / "config.yaml")  # type: ignore
         self._refresh_paths()
+
+    def switch_active_task(self, expert_group_name: str) -> None:
+        """Re-point a live config at a different task, all-or-nothing.
+
+        `_update_by_task` assigns the name and re-derives paths *before* it
+        reads the new task's `config.yaml`, so a task this node does not have
+        on disk would strand the new name against the old `task.exp` — the
+        `5e6ab4c` shape, training one dataset while committing another
+        group's id. Roll back and re-raise instead.
+
+        `_ensure_runtime_dirs` because both group-scoped paths are new.
+        """
+        previous_name = self.task.expert_group_name
+        previous_exp = self.task.exp
+        try:
+            self._update_by_task(expert_group_name=expert_group_name)
+        except Exception:
+            self.task.expert_group_name = previous_name
+            self.task.exp = previous_exp
+            self._refresh_paths()
+            raise
+        self._ensure_runtime_dirs()
 
     def _fill_wallet_data(self) -> None:
         if self.chain.hotkey_ss58 and self.chain.coldkey_ss58:
@@ -739,31 +869,29 @@ class WorkerConfig(BaseConfig):
     _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
-    def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        active_task: str | None,
+        auto_update_config: bool = False,
+    ) -> "WorkerConfig":
+        """Load a config, with the owner API's answer supplied by the caller.
+
+        `active_task` has no default so a new entrypoint cannot silently skip
+        resolving it: pass `task_sync.resolve_active_task_name(path)`, or None
+        for tooling that does not run a node. It is applied *before*
+        construction, so every derived path tracks the right task first time
+        and there is nothing to re-derive afterwards.
+        """
         path = Path(path)
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
+        if active_task:
+            data.setdefault("task", {})["expert_group_name"] = active_task
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
-        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
-        # Locked-field enforcement may have just reset task.expert_group_name
-        # (the exp_legal activation path: a YAML still saying exp_math gets
-        # reset to the locked default). task.path / task.exp were derived at
-        # construction from the PRE-reset name, so re-derive them — otherwise
-        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
-        # (wrong group_id on chain commits) until a second restart. Observed
-        # live on the pioneer validator, 2026-07-11 11:49 UTC.
-        if instance.task.expert_group_name != pre_lock_group:
-            logger.info(
-                "Locked-field reset changed the active task — re-deriving task config",
-                old_task=pre_lock_group,
-                new_task=instance.task.expert_group_name,
-            )
-            # Pass the name explicitly: the no-arg form of _update_by_task
-            # reloads task.exp from the STALE task.path before refreshing
-            # paths, so the exp config would still be the old group's.
-            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
         return instance
 
     def _prompt_new_fields(
@@ -1062,7 +1190,6 @@ class EvalCfg(BaseConfig):
 class ValidatorConfig(WorkerConfig):
     role: str = "validator"
     ckpt: ValidatorCheckpointCfg = Field(default_factory=ValidatorCheckpointCfg)
-    dht: DhtCfg = Field(default_factory=DhtCfg)
     run: ValidatorRunCfg = Field(default_factory=ValidatorRunCfg)
     evaluation: EvalCfg = Field(default_factory=EvalCfg)
 
@@ -1178,6 +1305,9 @@ if __name__ == "__main__":
             MinerConfig(**config_dict).write()
 
     elif args.command == "create_docker_env":
-        cfg = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        # Tooling, not a node: no owner-API call, no task resolution.
+        cfg = ValidatorConfig.from_path(
+            args.path, active_task=None, auto_update_config=args.auto_update_config
+        )
         cfg.write_docker_env()
 

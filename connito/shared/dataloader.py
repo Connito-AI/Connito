@@ -189,8 +189,15 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             ds_name: str,
             ds_config: str | None = None,
             trust_remote_code: bool = False,
+            split_override: str | None = None,
         ):
-            """Helper to load a dataset split safely, falling back to 'train' if 'validation' is missing."""
+            """Load one source's streaming split, falling back to 'train' when the wanted split is absent.
+
+            `split_override` is the source's own `split:`; when unset the
+            split derived from the train/validation flag is used, which
+            reproduces today's behaviour byte for byte.
+            """
+            wanted_split = split_override or split_name
             try:
                 load_kwargs: dict[str, Any] = {"streaming": True, "revision": "main"}
                 if ds_config is not None:
@@ -204,13 +211,23 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                     load_kwargs["trust_remote_code"] = True
 
                 ds = load_dataset(ds_name, **load_kwargs)
-                if split_name in ds:
-                    return ds[split_name]
-                else:
+                if wanted_split in ds:
+                    return ds[wanted_split]
+                if "train" in ds:
                     logger.warning(
-                        f"Split '{split_name}' not found for {ds_name}. Falling back to 'train' split."
+                        f"Split '{wanted_split}' not found for {ds_name}. Falling back to 'train' split."
                     )
                     return ds["train"]
+                # The old code announced a fallback to 'train' and then
+                # raised KeyError on the next line whenever 'train' was
+                # the missing split — which is exactly the case for a
+                # repo that names its splits something else. Say what is
+                # actually available instead.
+                raise KeyError(
+                    f"Split '{wanted_split}' not found for {ds_name} and there is no 'train' "
+                    f"split to fall back to. Available splits: {sorted(ds.keys())}. "
+                    f"Set `split:` on this dataset source to one of them."
+                )
             except Exception as e:
                 logger.error(f"Failed to load dataset {ds_name}: {e}")
                 raise
@@ -232,6 +249,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                             "name": src.name,
                             "weight": src.weight,
                             "text_column": src.text_column,
+                            "split": src.split,
                         }
                         for src in source_specs
                     ],
@@ -280,6 +298,21 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         def ensure_string(example: dict[str, Any], source_text_column: str):
             return {"text": str(example[source_text_column])}
 
+        def render_template(example: dict[str, Any], template: str):
+            """Assemble a whole row into `text` for instruction-shaped sources.
+
+            A row that does not carry every column the template names
+            renders to the empty string rather than raising, so one
+            malformed row cannot kill a round mid-stream; the eval
+            character floor then discards it. `text_template`'s grammar
+            is checked at config load, which is what keeps the caught
+            pair sufficient here.
+            """
+            try:
+                return {"text": template.format(**example)}
+            except (KeyError, IndexError):
+                return {"text": ""}
+
         # Convert string seed to integer. Reused as the
         # shard-pick / in-shard offset hash input AND as the
         # `interleave_datasets(seed=...)` argument, so the value must
@@ -318,6 +351,8 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             ds_name = _source_value(source, "path")
             ds_config = _source_value(source, "name")
             text_column = _source_value(source, "text_column", "text")
+            text_template = _source_value(source, "text_template")
+            source_split_name = _source_value(source, "split")
             weight = float(_source_value(source, "weight", 1.0))
             trust_remote_code = bool(_source_value(source, "trust_remote_code", False))
 
@@ -348,13 +383,34 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                     ds_name,
                     ds_config=ds_config,
                     trust_remote_code=trust_remote_code,
+                    split_override=source_split_name,
                 )
 
-            source_split = source_split.select_columns([text_column])
-            source_split = source_split.map(
-                partial(ensure_string, source_text_column=text_column),
-                features=common_features,
-            )
+            if text_template:
+                # Render here, before the single-column collapse below.
+                # `select_columns` throws the other columns away, and a
+                # custom `dataset_class` only gets to override
+                # tokenisation, which is downstream of that — so this is
+                # the last point where the whole row is still in hand.
+                # Both the miner path and the validator's shard-pick path
+                # run through it, so eval and training necessarily see
+                # the same text.
+                #
+                # `features=` already casts each row down to `{text}`;
+                # naming the source's own columns as well keeps the
+                # intermediate rows small where they are known.
+                known_columns = list(getattr(source_split, "column_names", None) or [])
+                source_split = source_split.map(
+                    partial(render_template, template=text_template),
+                    remove_columns=known_columns,
+                    features=common_features,
+                )
+            else:
+                source_split = source_split.select_columns([text_column])
+                source_split = source_split.map(
+                    partial(ensure_string, source_text_column=text_column),
+                    features=common_features,
+                )
 
             # Eval-path data-quality gate (seed is None on the miner
             # training path, which stays byte-identical). Applied

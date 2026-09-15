@@ -14,9 +14,18 @@ The pick scheme decomposes "skip N rows into the dataset" as:
 - The shard pick is O(1): it selects which HF parquet/json.gz file to
   open via `data_files=[chosen]`. No bytes downloaded by the pick
   itself; the subsequent stream fetches only that one shard.
-- The in-shard offset is bounded by ONE shard's row count (a few
-  hundred thousand) instead of the dataset's (hundreds of millions).
-  Worst-case decode-and-discard is seconds per source per round.
+- The in-shard offset is bounded by ONE shard's row count instead of
+  the dataset's (hundreds of millions).
+
+That bound is only cheap while a shard holds a few hundred thousand
+rows. `.skip(N)` on a streaming dataset is decode-and-discard — there
+is no row-group seek — so the per-round cost is proportional to the
+offset drawn, and the skip runs AFTER the character filter, making the
+underlying decode `offset / pass_rate` rows. A source whose shards hold
+millions of rows therefore decodes a large fraction of a shard every
+round: measured at ~650 MB for a ~985 k-row shard, and ~12.5 GB for a
+9.9 M-row one. `max_offset_rows` caps the draw for such sources; see
+`_SourceShardPolicy`.
 
 Across rounds with rotating seeds, every shard is eventually picked
 and every row within it is eventually offset-to. Whole-dataset reach
@@ -161,6 +170,25 @@ class _SourceShardPolicy:
     # `trust_remote_code` opt-out), while the generic builder reads the
     # raw file directly.
     load_builder: str | None = None
+    # Upper bound on the in-shard offset, independent of shard size.
+    #
+    # The offset is applied as `.skip(n)` on a streaming dataset, which
+    # decodes and discards every row it passes — `datasets` has no
+    # row-group seek, and the footer read that gives us the row count
+    # throws its row-group offsets away. So the per-round cost scales
+    # with the offset drawn, not with the shard pick.
+    #
+    # Unset means "bounded only by the shard", which is correct while
+    # shards are a few hundred thousand rows: a ~985 k-row shard costs
+    # ~650 MB of decode on an average draw. It stops being correct for
+    # multi-million-row shards — a 9.9 M-row shard averages ~12.5 GB per
+    # round, roughly 19x, against a Validate phase of ~2 minutes.
+    #
+    # Setting it trades reachable pool for round time: the pool per shard
+    # becomes `max_offset_rows` instead of the whole shard. Breadth then
+    # has to come from the shard pick rotating across seeds, which is the
+    # same trade a many-shard source already makes.
+    max_offset_rows: int | None = None
 
 
 # Known sources. Add new entries here, NOT via config — the consensus
@@ -278,6 +306,24 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
         raise ValueError(
             f"Policy {repo_id}/{name}: min_headroom_rows must be > 0"
         )
+    if policy.max_offset_rows is not None:
+        if policy.max_offset_rows <= 0:
+            raise ValueError(
+                f"Policy {repo_id}/{name}: max_offset_rows must be > 0 when set "
+                f"(got {policy.max_offset_rows})"
+            )
+        if policy.max_offset_rows < policy.min_headroom_rows:
+            # Not wrong — the two bound different things, one cost and
+            # one stream exhaustion — but a cap below the headroom means
+            # the reachable window is narrower than the safety margin,
+            # which is almost always a misplaced digit.
+            logger.warning(
+                "Policy has max_offset_rows below min_headroom_rows; the eval "
+                "read window is narrower than the reserved tail. Intended?",
+                repo_id=repo_id, name=name,
+                max_offset_rows=policy.max_offset_rows,
+                min_headroom_rows=policy.min_headroom_rows,
+            )
     if policy.row_count_source == "verified_table":
         # The table IS the shard allowlist: every listed shard must have
         # a row count that leaves at least one valid offset after the
@@ -431,17 +477,34 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
 
 
 def _shard_rows_via_parquet_footer(repo_id: str, revision: str, shard_path: str) -> int:
-    """Read num_rows from the parquet footer without downloading the full file."""
+    """Read num_rows from the parquet footer without downloading the full file.
+
+    The row count lives in the footer, a few kilobytes at the end of the
+    file, so this is a couple of range requests. Reaching it through
+    `hf_hub_download` first — which is what this did — downloaded the
+    whole shard to get at them, and cached it: one full shard per
+    distinct shard a validator's seed picks, which is how an observer
+    accumulated 58 GB for a single source on a host where disk pressure
+    had already caused an incident. A source with 25 GB shards would
+    have made that 118 GB.
+
+    `HfFileSystem` serves the same bytes over range requests and writes
+    nothing to the cache. Measured against a source with eight shards of
+    10-25 GB: the largest answered in 1.0 s, and all eight (118 GB) in
+    4.9 s. The revision is already resolved to a SHA by the caller, so
+    the count returned is identical and the pinning story is unchanged.
+    """
     # Lazy import — pyarrow is already a dependency of `datasets` but
     # importing it eagerly at module top-level slows test imports.
     import pyarrow.parquet as pq
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfFileSystem
 
     try:
-        local = hf_hub_download(
-            repo_id, shard_path, repo_type="dataset", revision=revision,
-        )
-        return int(pq.read_metadata(local).num_rows)
+        # `datasets/<repo>@<sha>/<path>` is HfFileSystem's revision
+        # syntax; the caller has already resolved `revision` to a SHA.
+        fs_path = f"datasets/{repo_id}@{revision}/{shard_path}"
+        with HfFileSystem().open(fs_path, "rb") as fh:
+            return int(pq.read_metadata(fh).num_rows)
     except Exception as e:
         # Re-raise with the (repo_id, shard, revision) context so the
         # validator log carries enough to diagnose without grepping.
@@ -564,22 +627,34 @@ def pick_shard_for_source(
         repo_id=repo_id, name=name, revision=revision,
         shard_path=chosen, policy=policy,
     )
-    # `% offset_bound` lets the mod be either the safe_floor or the
-    # footer-derived actual_rows - headroom; either way, after `.skip`
-    # the source retains at least `min_headroom_rows` for the
-    # downstream pipeline.
-    offset = (
-        h256_int("eval_in_shard_offset", repo_id, str(name), int_seed) % offset_bound
-    )
-
     # For constant policies we don't know the actual shard size;
     # surface `offset_bound` as `shard_rows` so older callers (notebook
     # / tests) that check "offset < shard_rows" still see the right
     # invariant. The parquet and verified-table paths know the real count.
+    #
+    # Derived from the UNCAPPED bound on purpose: `shard_rows` is the
+    # shard's true size and is logged as such, so capping first would
+    # make the log understate the shard.
     if policy.row_count_source in {"parquet_footer", "verified_table"}:
         actual_shard_rows = offset_bound + policy.min_headroom_rows
     else:
         actual_shard_rows = offset_bound
+
+    # Cost cap, applied here rather than inside `_resolve_offset_bound`
+    # for the reason above: that function answers "how far into this
+    # shard is it safe to skip", which is a property of the row count,
+    # while this answers "how far is it affordable to skip", which is a
+    # property of the decode budget.
+    if policy.max_offset_rows is not None:
+        offset_bound = min(offset_bound, policy.max_offset_rows)
+
+    # `% offset_bound` lets the mod be the safe_floor, the
+    # footer-derived actual_rows - headroom, or the cost cap; either
+    # way, after `.skip` the source retains at least
+    # `min_headroom_rows` for the downstream pipeline.
+    offset = (
+        h256_int("eval_in_shard_offset", repo_id, str(name), int_seed) % offset_bound
+    )
 
     return ShardPick(
         repo_id=repo_id,

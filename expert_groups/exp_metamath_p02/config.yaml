@@ -4,6 +4,15 @@ group_id: -1  # sentinel: not assigned to a functioning slot (would clash with e
 # Total experts across 26 MoE layers: 146
 data:
   dataset_sources:
+    # NOT REGISTERED for eval shard-pick. `meta-math/MetaMathQA` has no entry in
+    # `_KNOWN_SOURCES` (connito/shared/eval_shard_pick.py), so a validator would
+    # raise KeyError at its first eval dataloader build and drop the round to an
+    # unscored baseline of 100.0. Harmless only because the sentinel group_id
+    # above keeps this group from ever being the active task.
+    #
+    # Giving this group a real group_id therefore requires registering the
+    # source first, with a row count measured from its native files.
+    # `test_expert_group_sources_registered.py` enforces that.
     - path: "meta-math/MetaMathQA"
       name: null
       weight: 1.0

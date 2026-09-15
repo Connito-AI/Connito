@@ -13,7 +13,7 @@ deterministically from the current chain block height using the
 `PhaseManager` walk:
 
 ```python
-# connito/sn_owner/cycle.py:PhaseManager.get_phase
+# connito/shared/cycle.py:PhaseManager.get_phase
 cycle_index       = block // cycle_length
 cycle_block_index = block % cycle_length
 # then walk the ordered phase list, finding the phase that contains
@@ -28,9 +28,12 @@ If `cycle-api.connito.ai` is unreachable, `get_phase_from_api` returns
 will idle until the API comes back. Both workers will keep retrying with
 backoff (`api_retries = 5`, `api_backoff_sec = 2`).
 
-Code: `connito/sn_owner/cycle.py:PhaseManager`,
-`connito/shared/cycle.py:get_phase_from_api`,
-`connito/sn_owner/phase_service.py:read_phase`.
+The `/get_phase` endpoint is served by the subnet owner's cycle-api service,
+which is not part of this repository. `PhaseManager` mirrors the same block
+arithmetic locally, so you can read the phase schedule here.
+
+Code: `connito/shared/cycle.py:PhaseManager`,
+`connito/shared/cycle.py:get_phase_from_api`.
 
 ## Phase order and default lengths
 
@@ -54,7 +57,7 @@ default that is no longer authoritative.)
 > affects `wait_till`'s sleep math, not the chain-block timing.
 
 Code: `connito/shared/config.py:CycleCfg`,
-`connito/sn_owner/cycle.py:PhaseManager.init_phases`.
+`connito/shared/cycle.py:PhaseManager.init_phases`.
 
 ## Per-phase: what miners and validators do
 

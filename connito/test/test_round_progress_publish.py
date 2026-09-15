@@ -15,6 +15,7 @@ dedicated 93xxxx range to avoid colliding with other test modules.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import threading
 
 from connito.shared import telemetry as T
@@ -47,7 +48,7 @@ def _make_round(round_id: int, *, foreground=(1, 2), background=(3, 4, 5)) -> Ro
         validator_miner_assignment={},
         background_uids=tuple([*foreground, *background]),
         uid_to_hotkey={u: f"hk{u}" for u in (*foreground, *background)},
-        model_snapshot_cpu={},
+        base_shard=Path("pretrained/model_expgroup_1.safetensors"),
     )
 
 

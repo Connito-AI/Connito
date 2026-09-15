@@ -1,4 +1,3 @@
-import copy
 import gc
 import math
 import os
@@ -6,6 +5,7 @@ import secrets
 import signal
 import threading
 import time
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -58,11 +58,8 @@ def _get_build_version() -> tuple[str, str]:
 
     return version, sha
 
-import bittensor
 import torch
 import torch.nn as nn
-from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import PreTrainedTokenizerBase
 
 from connito.miner.train_helper import get_status
 from connito.shared.app_logging import configure_logging, structlog
@@ -73,41 +70,41 @@ from connito.shared.chain import (
     validate_validator_chain_commit_payload,
     setup_chain_worker,
 )
-from connito.shared.checkpoint_helper import (
-    cleanup_temporary_checkpoint_dirs,
-    load_checkpoint,
-    save_checkpoint,
-)
+from connito.shared.checkpoint_helper import save_state_dict_by_expert_group
 from connito.shared.checkpoints import (
     ModelCheckpoint,
-    build_local_checkpoint,
-    delete_old_checkpoints,
     prune_miner_submission_files,
     prune_submissions_outside_window,
-    select_best_checkpoint,
 )
 from connito.shared.config import ValidatorConfig, parse_args
+from connito.shared.task_sync import (
+    ensure_active_task,
+    get_active_task,
+    get_active_task_bundle,
+    materialize_task,
+    resolve_active_task_name,
+)
 from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
 from connito.shared.cycle import (
+    PhaseManager,
+    PhaseNames,
     check_phase_expired,
     get_blocks_from_previous_phase_from_api,
     get_phase_from_api,
     wait_till,
 )
-from connito.shared.dataloader import get_dataloader
 from connito.shared.expert_manager import (
     ExpertManager,
     get_weight_sum,
 )
-from connito.shared.helper import get_nested_attr, load_state_dict_from_path
+from connito.shared.helper import get_model_hash, load_state_dict_from_path
 from connito.shared.metrics import MetricLogger
-from connito.shared.model import load_model
+from connito.shared.model import get_model_from_checkpoint
 from connito.shared.modeling.mycelia import get_base_tokenizer
 from connito.shared.modeling.quantization import apply_from_config
-from connito.sn_owner.cycle import PhaseNames, PhaseManager
-from connito.validator.aggregator import MinerScoreAggregator
+from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
 from connito.validator.background_eval_worker import BackgroundEvalWorker
@@ -284,18 +281,20 @@ def _cuda_mem_report(tag: str = "", device: int | None = None) -> None:
 def _install_signal_logging() -> None:
     """Funnel SIGTERM / SIGHUP into the same `KeyboardInterrupt` path SIGINT
     already takes, so docker-initiated stops run the existing shutdown block
-    in `run()` (background workers, chain_submitter, poller, averagers, …).
+    in `run()` (background workers, chain_submitter, poller, metric logger).
 
     The previous implementation restored `SIG_DFL` and re-raised the signal.
     For SIGTERM that meant "terminate immediately" with no Python exception —
     the `except KeyboardInterrupt` / `except Exception` arms in `run()` never
     fired, so nothing was stopped cleanly. Watchtower then timed out after 120s
-    and dockerd was left with a zombie PID 1 (orphaned hivemind libp2p +
-    background-worker threads, no init to reap them) which couldn't be removed.
+    and dockerd was left with a zombie PID 1 (at the time, orphaned hivemind
+    libp2p + background-worker threads, no init to reap them) which couldn't be
+    removed. Hivemind has since been removed; the subprocesses that remain are
+    the spawned HF upload and the dataloader workers.
     Raising `KeyboardInterrupt` reuses the SIGINT shutdown path verbatim.
 
     Caveat: if the main thread is parked inside a C extension when the signal
-    arrives (hivemind averager step, a torch op, etc.), the exception only
+    arrives (a torch op, an HF upload, etc.), the exception only
     propagates once control returns to Python. The shutdown block itself still
     needs per-step time bounds for that, but those are separate work.
     """
@@ -376,7 +375,8 @@ def resume_open_round(
     config,
     subtensor,
     lite_subtensor,
-    global_model: nn.Module,
+    eval_model: nn.Module,
+    base_shard: Path,
     score_aggregator,
     score_path,
     round_ref: RoundRef,
@@ -423,14 +423,17 @@ def resume_open_round(
     if remaining <= 0:
         return _decline("roster already complete", round_id=sub_start)
 
-    base_path = _rj.base_snapshot_path_for(checkpoint_path, sub_start)
-    if not base_path.exists():
+    # Every round is scored against the pretrained shard this boot wrote, so
+    # the journal's base must be that exact file. Anything else — a journal
+    # from before the field existed, or a round frozen under another task —
+    # would score the rest of the roster against a different base than the
+    # miners already in `scores`. Refuse; the caller finalizes what was scored.
+    if journal.base_shard != str(base_shard):
         logger.warning(
-            "resume: no base snapshot — refusing to resume",
-            round_id=sub_start, path=str(base_path),
+            "resume: journal base is not this boot's pretrained shard — refusing to resume",
+            round_id=sub_start, journal_base=journal.base_shard, base_shard=str(base_shard),
         )
         return None
-    base_params = torch.load(base_path, map_location="cpu", weights_only=True)
 
     current_cohort_state = None
     if config.evaluation.enable_round_group_construction:
@@ -446,7 +449,7 @@ def resume_open_round(
         config=config,
         subtensor=subtensor,
         metagraph=lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False),
-        global_model=global_model,
+        base_shard=base_shard,
         round_id=sub_start,
         submission_block_range=(sub_start, sub_end),
         last_evaluated=score_aggregator.last_evaluated_per_uid(),
@@ -468,7 +471,6 @@ def resume_open_round(
         )
         return None
 
-    resumed.model_snapshot_cpu = base_params
     resumed.journal_path = _rj.journal_path_for(checkpoint_path, sub_start)
 
     # A uid that deregistered and re-registered mid-cycle must not inherit the
@@ -494,7 +496,7 @@ def resume_open_round(
     round_ref.swap(new_current=resumed)
     download_window_closed.clear()
     if eval_worker is not None and not eval_worker.has_eval_base_model():
-        eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+        eval_worker.set_eval_base_model(eval_model)
     eval_window_active.set()
 
     try:
@@ -548,73 +550,200 @@ def _shutdown_background_workers(
             logger.info("Shutdown: background worker joined", thread_name=worker.name)
 
 
-def setup_training(
-    config,
+@dataclass
+class TaskScopedState:
+    """The values `run` rebinds when the active task changes."""
+
+    expert_manager: ExpertManager
+    eval_model: nn.Module
+    base_shard: Path
+    baseline_ref: dict[str, object] = field(default_factory=dict)
+
+
+def _switch_task(
+    config: ValidatorConfig,
+    new_task: str,
+    *,
     rank: int,
     device: torch.device,
-    tokenizer: PreTrainedTokenizerBase,
-    subtensor: bittensor.Subtensor,
-    wallet: bittensor.Wallet,
-    current_model_meta: ModelCheckpoint | None,
-) -> tuple[
-    torch.nn.Module,  # global_model
-    int,  # start_step
-    "ExpertManager",  # em
-    StatefulDataLoader,
-]:
+    eval_worker: BackgroundEvalWorker,
+    eval_window_active: threading.Event,
+    merge_phase_active: threading.Event,
+) -> TaskScopedState:
+    """Move a running validator onto a different task, all-or-nothing.
+
+    `run` binds everything task-scoped once before the loop, so this is the
+    single place a switch happens — objects re-pointed in dependency order.
+
+    Both gates checked before anything moves. The eval window opens at
+    `Round.freeze` and closes at MinerCommit1 of the *next* cycle, so
+    switching inside it scores the round in flight against the wrong group.
+
+    Rolls config back if the new assignment will not load — config naming one
+    group while `ExpertManager` holds another's table is silent.
+
+    `baseline_ref` comes back *fresh*, not the old one cleared: the publish
+    thread filling it can still be uploading, and its second `out.update`
+    would repopulate a cleared dict with the previous group's shard. Costs one
+    cycle with no model advance, which `run` already handles.
+
+    The model is rebuilt from pretrained for the new group, and its pretrained
+    shard written, exactly as at boot — always, rather than keeping the module
+    tree on a same-topology switch: a switch happens once per task and the
+    rebuild costs seconds. Built *before* the old model is released, so a
+    failed build rolls everything back with the old model still serving;
+    the price is two models resident for the duration of the build. The caller
+    rebinds and then `cleanup()`s, which is what frees the old one.
+
+    Called from `_maybe_switch_task` once per cycle.
     """
-    Build model(s), experts layout, optimizers, scheduler, scaler, and optionally resume from a checkpoint.
-    """
-    # === checkpoint info ===
-    latest_checkpoint = select_best_checkpoint(primary_dir=config.ckpt.checkpoint_path)
-    resume = latest_checkpoint is not None
-    latest_checkpoint_path = latest_checkpoint.path if latest_checkpoint else None
-
-    # === model & Experts manager ===
-    logger.debug("setup training - load model and expert manager")
-    expert_manager = ExpertManager(config)
-    # global_model: partial model (only assigned experts) — used for optimization and evaluation.
-    # `load_global_checkpoint=True`: overlay the newest on-disk `globalver_*`
-    # expert state, which now holds the round baseline. That directory is the
-    # only local copy of the model, so skipping it restarts from pretrained.
-    global_model, model_meta = load_model(
-        rank, config, expert_manager, subtensor, wallet, current_model_meta,
-        partial=True, checkpoint_device=device,
-        load_global_checkpoint=True,
-    )
-    apply_from_config(global_model, config, expert_manager, role="validator")
-
-
-    # === dataloader ===
-    logger.debug("setup training - load dataloader")
-    train_dataloader = get_dataloader(
-        config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
-    )
-
-    # === load checkpoint (if any) ===
-    logger.debug(
-        "setup training - load past checkpoint"
-    )
-    if get_nested_attr(config, "resume_from_ckpt", False) and resume and latest_checkpoint_path:
-        _ = load_checkpoint(
-            config=config,
-            checkpoint_path=latest_checkpoint_path,
-            rank=rank,
-            device=device,
-            data_loader=train_dataloader,
+    if eval_window_active.is_set() or merge_phase_active.is_set():
+        raise RuntimeError(
+            f"refusing to switch to {new_task!r} mid-round: "
+            f"eval_window_active={eval_window_active.is_set()}, "
+            f"merge_phase_active={merge_phase_active.is_set()}"
         )
 
+    previous_task = config.task.expert_group_name
+    config.switch_active_task(new_task)
+    try:
+        expert_manager = ExpertManager(config)
+        eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
+    except Exception:
+        config.switch_active_task(previous_task)
+        raise
+
+    eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
+    eval_worker.set_eval_base_model(eval_model)
     logger.info(
-        "Training setup complete",
-        resumed=resume,
-        device=str(device),
+        "Switched active task",
+        previous_task=previous_task,
+        task=new_task,
+        group_id=config.task.exp.group_id,
+        base_shard=str(base_shard),
     )
-    return (
-        global_model,
-        model_meta.global_ver if model_meta else 0,
-        expert_manager,
-        train_dataloader,
+    return TaskScopedState(expert_manager=expert_manager, eval_model=eval_model, base_shard=base_shard)
+
+
+def _maybe_switch_task(
+    config: ValidatorConfig,
+    *,
+    rank: int,
+    device: torch.device,
+    eval_worker: BackgroundEvalWorker,
+    eval_window_active: threading.Event,
+    merge_phase_active: threading.Event,
+    round_ref: RoundRef,
+    gpu_eval_lock: threading.Lock,
+) -> TaskScopedState | None:
+    """Ask the owner which task is active and switch if it is not ours.
+
+    Runs at the start of Train, which gives the build the whole phase; the
+    seam after finalize is too short for it, and overrunning MinerCommit1
+    would make the loop wait for the *next* cycle's. The price is the round
+    still being evaluated: it is dropped, unscored, and the next commit and
+    freeze are already on the new task. Miners poll at Distribute, so both
+    sides commit the new group at the same MinerCommit1.
+
+    Never raises. An unreachable owner, a bad bundle or a failed build all
+    leave the node on the task it has — round included — to try again next
+    cycle: the same "keep running" choice the boot-time resolve makes.
+    """
+    active = get_active_task(config.cycle)
+    if active is None:
+        logger.warning("Owner API unreachable — staying on the current task",
+                       task=config.task.expert_group_name)
+        return None
+    if active.name == config.task.expert_group_name:
+        return None
+    try:
+        bundle = get_active_task_bundle(config.cycle)
+        if bundle is None:
+            raise RuntimeError(f"no usable bundle for {active.name!r}")
+        materialize_task(bundle, config.task.base_path)
+        # Close the window so the worker claims no more miners, then wait for
+        # the eval it may be running — it holds the lock for that — so the old
+        # model is idle before a second one is built beside it. Only on
+        # success is the round dropped; a failed build reopens the window and
+        # the round carries on, on the model it had.
+        was_open = eval_window_active.is_set()
+        eval_window_active.clear()
+        with gpu_eval_lock:
+            pass
+        try:
+            state = _switch_task(
+                config, bundle.name,
+                rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+            )
+        except Exception:
+            if was_open:
+                eval_window_active.set()
+            raise
+    except Exception as e:
+        logger.error("Task switch failed — staying on the current task",
+                     task=config.task.expert_group_name, target=active.name,
+                     error=str(e), exc_info=True)
+        return None
+    dropped = round_ref.current
+    round_ref.current = None
+    if dropped is not None:
+        logger.warning("Dropped the round in flight: its task is over",
+                       round_id=dropped.round_id, task=config.task.expert_group_name)
+    return state
+
+
+def _write_pretrained_shard(
+    model: nn.Module, expert_manager: ExpertManager, group_id: int, dest_dir: Path,
+) -> Path:
+    """The active group's pretrained experts, as the shard every round is scored against.
+
+    Same writer and filename as a miner submission, so the key set is exactly
+    what a submission must cover. Rewritten every boot: cheap, and it cannot
+    drift from the model actually loaded.
+    """
+    state_dict = model.state_dict()
+    paths = save_state_dict_by_expert_group(
+        state_dict, expert_manager.expert_group_assignment, dest_dir,
+        active_expert_group_id=group_id, save_dtype=next(model.parameters()).dtype,
     )
+    del state_dict
+    gc.collect()
+    return Path(paths[group_id])
+
+
+def _build_eval_model(
+    config, rank: int, device: torch.device, expert_manager: ExpertManager,
+) -> tuple[nn.Module, Path]:
+    """The process's only model for the active group, plus the shard every
+    round is scored against. Shared by boot and the task switch."""
+    eval_model, _ = get_model_from_checkpoint(
+        rank=rank, config=config, expert_manager=expert_manager,
+        partial=True, checkpoint_device=device, load_global_checkpoint=False,
+    )
+    # Before quantization, so the shard holds the dtype miners submit in.
+    base_shard = _write_pretrained_shard(
+        eval_model, expert_manager, config.task.exp.group_id,
+        Path(config.ckpt.checkpoint_path) / "pretrained",
+    )
+    apply_from_config(eval_model, config, expert_manager, role="validator")
+    return eval_model, base_shard
+
+
+def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, ExpertManager, Path]:
+    """Build the process's only model and record the shard every round is scored against.
+
+    The validator's model is the pretrained one and never advances. The round
+    baseline is published for miners to train from, but every submission is
+    scored against the same pretrained base — so there is no checkpoint to
+    resume, no chain fetch, and no dataloader (the eval worker builds its own
+    per round).
+    """
+    logger.debug("setup training - load model and expert manager")
+    expert_manager = ExpertManager(config)
+    eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
+    logger.info("Training setup complete", device=str(device), base_shard=str(base_shard))
+    return eval_model, expert_manager, base_shard
 
 
 def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = "") -> None:
@@ -684,14 +813,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # processes / prefetched batches don't stay resident across the whole cycle.
 
     # === set up training ===
-    (
-        global_model,
-        start_step,
-        expert_manager,
-        train_dataloader,
-    ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
+    eval_model, expert_manager, base_shard = setup_training(config, rank, device)
 
-    global_opt_step = start_step
+    global_opt_step = 0
     # Coordinates of the baseline published at finalize, read by the next
     # ValidatorCommit. Empty means "nothing to advertise this cycle".
     baseline_ref: dict[str, object] = {}
@@ -705,7 +829,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # Hard-coded for now; promote to a config field once we settle on a
     # default that won't change cross-validator behavior.
     score_history_window: int = 80
-    score_path = config.ckpt.checkpoint_path / "score_aggregator.json"
+    score_path = resolve_score_path(config.ckpt.checkpoint_path)
     if pkg_version == "v0.2.3":
         # One-time wipe: drop any prior aggregator state on disk so the v0.2.3
         # rollout starts every validator with a clean score history. Subsequent
@@ -887,13 +1011,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     current_model_hash = None
 
-    if config.ckpt.cleanup_stale_temporary_checkpoints:
-        cleanup_temporary_checkpoint_dirs(config.ckpt.checkpoint_path)
-
     # === Round-lifecycle scaffolding ===
-    # merge_phase_active: held across the baseline load and the checkpoint
-    #   save, not the whole Merge phase. Pauses both workers because those
-    #   two steps mutate state they read.
+    # merge_phase_active: never set any more — nothing mutates shared state
+    #   in Merge. The workers and `_switch_task` still gate on it; remove it
+    #   together with that gating.
     # eval_window_active: set when the round freezes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
@@ -919,7 +1040,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             download_window_closed=download_window_closed,
         )
-        # bg-eval idles until the main loop hands it a copy of global_model,
+        # bg-eval idles until the main loop hands it the eval model,
         # which now happens as soon as the round freezes.
         eval_worker = BackgroundEvalWorker(
             config=config,
@@ -951,7 +1072,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 config=config,
                 subtensor=subtensor,
                 lite_subtensor=lite_subtensor,
-                global_model=global_model,
+                eval_model=eval_model,
+                base_shard=base_shard,
                 score_aggregator=score_aggregator,
                 score_path=score_path,
                 round_ref=round_ref,
@@ -1019,7 +1141,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 threading.Thread(
                     target=publish_round_baseline,
-                    kwargs={"round_obj": pending_round, "config": config, "out": baseline_ref},
+                    kwargs={"round_obj": pending_round, "config": config,
+                            "group_id": config.task.exp.group_id, "out": baseline_ref},
                     name="publish-baseline", daemon=True,
                 ).start()
                 # Ranks 2-3 exist nowhere but this dir, and the prune at
@@ -1213,7 +1336,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 current_block=lite_subtensor.block,
             )
 
-            cleanup(global_model)
+            cleanup()
 
             # Round-group construction scheme (gated by
             # config.evaluation.enable_round_group_construction). When the
@@ -1251,13 +1374,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # (0) Lock and prioritize: build the round roster in A -> B -> C
             # order, then the previous round's A/B carry-over, then a
-            # staleness tail (see Round.freeze). Capture the seed and snapshot
-            # global_model to CPU.
+            # staleness tail (see Round.freeze). Capture the seed and pin the
+            # shard the round is scored against.
             new_round = Round.freeze(
                 config=config,
                 subtensor=subtensor,
                 metagraph=metagraph,
-                global_model=global_model,
+                base_shard=base_shard,
                 round_id=phase_response.phase_start_block,
                 submission_block_range=(
                     phase_response.phase_start_block,
@@ -1365,12 +1488,12 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 )
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
-            # bg-eval needs an architecture template and an open window; per-round
-            # state comes from `round.model_snapshot_cpu`, taken at freeze. Mirrors
-            # the resume path. Opening here rather than after Merge gives the
+            # bg-eval needs an architecture template and an open window; the
+            # round's expert weights come from `round.base_shard`. Mirrors the
+            # resume path. Opening here rather than after Merge gives the
             # worker the whole round now that nothing else competes for the GPU.
             if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(copy.deepcopy(global_model))
+                eval_worker.set_eval_base_model(eval_model)
             eval_window_active.set()
             try:
                 note_round_series(new_round.round_id)
@@ -1394,7 +1517,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             phase_response = wait_till(config, PhaseNames.validate)
 
-            cleanup(global_model)
+            cleanup()
 
             # Persist aggregator state atomically.
             try:
@@ -1403,92 +1526,14 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 logger.warning(f"Failed to persist score_aggregator: {e}")
 
             # === wait till merge phase ===
-            # Nothing is merged any more; the baseline published at
-            # MinerCommit1 is this validator's next model. The phase itself
-            # stays because the central phase API owns its boundaries and
-            # miners read the same schedule — we just do no work in it, which
-            # frees the window for the background workers.
+            # Nothing is merged: the baseline published at MinerCommit1 is
+            # the miners' next model, and this validator scores every round
+            # against the pretrained shard. The phase stays because the
+            # central phase API owns its boundaries and miners read the same
+            # schedule — we do no work in it, which frees the window for the
+            # background workers.
             check_phase_expired(lite_subtensor, phase_response)
             phase_response = wait_till(config, PhaseNames.merge)
-
-            # Still populated: the ValidatorCommit block below is what clears
-            # `baseline_ref`, and it runs after this point.
-            baseline_path = baseline_ref.get("path")
-
-            # Held across the load and save only, not the whole phase: both
-            # mutate state the background workers read.
-            merge_phase_active.set()
-            try:
-                if baseline_path:
-                    logger.info(
-                        "Adopting round baseline as the new model",
-                        round_id=baseline_ref.get("round_id"),
-                        uid=baseline_ref.get("uid"),
-                    )
-                    # Same primitives as `evaluator.load_model_from_path`, but
-                    # applied in place — a deepcopy here would double model
-                    # VRAM for nothing. `strict=False` because the file carries
-                    # only the active expert group; backbone and helper-group
-                    # keys are legitimately absent and keep their values.
-                    try:
-                        sd = load_state_dict_from_path(baseline_path)
-                        incompatible = global_model.load_state_dict(sd, strict=False)
-                        matched_keys = len(sd) - len(incompatible.unexpected_keys)
-                        del sd
-                        if matched_keys == 0:
-                            logger.error(
-                                "Round baseline shares no keys with the model; "
-                                "model unchanged this cycle",
-                                path=baseline_path,
-                            )
-                        else:
-                            logger.info("Round baseline adopted", matched_keys=matched_keys)
-                    except Exception as e:
-                        # On the main loop, so an unhandled error here exits the
-                        # process mid-cycle. Losing one cycle's advance is
-                        # strictly better; the publish side is guarded the same
-                        # way for the same reason.
-                        logger.error(
-                            "Failed to load round baseline; keeping the current model",
-                            path=baseline_path, error=str(e), exc_info=True,
-                        )
-                else:
-                    logger.warning(
-                        "No baseline published this round; keeping the current model"
-                    )
-
-                cleanup(global_model)
-
-                # === save checkpoint ===
-                logger.info("Saving checkpoint")
-                ckpt_path = config.ckpt.checkpoint_path / f"globalver_{int(global_opt_step)}"
-
-                presave_keep = None
-                if config.ckpt.checkpoint_topk is not None:
-                    presave_keep = max(config.ckpt.checkpoint_topk - 1, 0)
-                if presave_keep is not None:
-                    presave_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, presave_keep)
-                    if presave_deleted:
-                        logger.info(
-                            "Pruned older checkpoints before save",
-                            keep=presave_keep,
-                            deleted=presave_deleted,
-                        )
-
-                save_checkpoint(
-                    checkpoint_path=ckpt_path,
-                    model=global_model,
-                    loss=loss_batch.item(),
-                    data_loader=train_dataloader,
-                    save_global_state=rank == 0,
-                    rank=rank,
-                    expert_manager=expert_manager,
-                    save_model_by_expert_group=True,
-                    strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
-                    active_expert_group_id=config.task.exp.group_id,
-                )
-            finally:
-                merge_phase_active.clear()
 
             try:
                 note_round_series(new_round.round_id)
@@ -1499,94 +1544,95 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             check_phase_expired(lite_subtensor, phase_response)
 
-            # === Comit to chain for new model ===
-            model_ckpt = build_local_checkpoint(ckpt_path)
-            if model_ckpt is not None:
-
-                model_ckpt.expert_group = config.task.exp.group_id
-                if observer_mode_enabled():
-                    # The signature's only consumer is the commit below, which
-                    # observer mode suppresses — and this is the last thing in
-                    # the validator that needs the hotkey's *private* key.
-                    # Skipping it lets an observer run on a public-only
-                    # keyfile, so a live validator's key never has to be copied
-                    # onto the test host at all. Hash anyway: `model_hash` is
-                    # read on the next line and drives eval, and `sign_hash`
-                    # was what triggered it.
-                    if model_ckpt.model_hash is None:
-                        model_ckpt.hash_model()
-                else:
-                    model_ckpt.sign_hash(wallet=wallet)
-                current_model_hash = model_ckpt.model_hash
-                # Dashboard telemetry: the model's global optimization version
-                # (chain-committed `global_ver`) is the "steps" the leaderboard
-                # charts plot against. Best-effort.
-                try:
-                    VALIDATOR_GLOBAL_OPT_STEP.set(float(model_ckpt.global_ver))
-                except Exception:
-                    pass
-                # Advertise the baseline published at finalize, not the merged
-                # model. `publish_round_baseline` uploaded it ~142 blocks ago,
-                # so it is normally done by now; if it is not (still uploading,
-                # or lost to a restart) commit no HF coordinates and miners keep
-                # what they have — `fetch_model_from_chain_validator` skips a
-                # checkpoint with no repo/revision.
-                _, hf_chain_repo_id = resolve_hf_repo_ids(
-                    config.hf,
-                    max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+            # === Commit to chain for next validation ===
+            # Advertise the baseline published at finalize. It uploaded ~142
+            # blocks ago, so it is normally done by now; if not (still
+            # uploading, or lost to a restart) commit no HF coordinates and
+            # miners keep what they have — `fetch_model_from_chain_validator`
+            # skips a checkpoint with no repo/revision. The hash MUST travel
+            # with the revision: miners verify the downloaded bytes against it.
+            _, hf_chain_repo_id = resolve_hf_repo_ids(
+                config.hf,
+                max_chain_repo_chars=VALIDATOR_COMMIT_MAX_HF_REPO_ID_CHARS,
+            )
+            baseline = dict(baseline_ref)
+            baseline_ref.clear()
+            hf_revision = baseline.get("revision")
+            advertise = bool(hf_revision and baseline.get("model_hash"))
+            if advertise:
+                commit_ckpt = ModelCheckpoint(model_hash=baseline["model_hash"])
+                logger.info(
+                    "Advertising round baseline",
+                    repo_id=hf_chain_repo_id,
+                    revision=hf_revision[:HF_CHAIN_REVISION_LENGTH],
+                    round_id=baseline.get("round_id"),
+                    uid=baseline.get("uid"),
                 )
-                baseline = dict(baseline_ref)
-                baseline_ref.clear()
-                hf_revision = baseline.get("revision")
-                if hf_revision and baseline.get("model_hash"):
-                    # The hash MUST travel with the revision: miners verify the
-                    # downloaded bytes against `model_hash`, so advertising the
-                    # baseline's revision beside the merged model's hash would
-                    # make every miner reject it.
-                    commit_ckpt = ModelCheckpoint(model_hash=baseline["model_hash"])
-                    if not observer_mode_enabled():
-                        commit_ckpt.sign_hash(wallet=wallet)
-                    logger.info(
-                        "Advertising round baseline",
-                        repo_id=hf_chain_repo_id,
-                        revision=hf_revision[:HF_CHAIN_REVISION_LENGTH],
-                        round_id=baseline.get("round_id"),
-                        uid=baseline.get("uid"),
-                    )
-                else:
-                    commit_ckpt = model_ckpt
-                    logger.warning(
-                        "No baseline to advertise this cycle; committing without HF coordinates",
-                        has_revision=bool(hf_revision),
-                    )
+            else:
+                # This validator's model is the pretrained shard. Its hash keeps
+                # the commit cadence without handing miners anything to fetch.
+                commit_ckpt = ModelCheckpoint(
+                    model_hash=get_model_hash(load_state_dict_from_path(str(base_shard)), hex=True),
+                )
+                logger.warning(
+                    "No baseline to advertise this cycle; committing without HF coordinates",
+                    has_revision=bool(hf_revision),
+                )
+            if not observer_mode_enabled():
+                # Observer mode suppresses the commit itself; skipping the
+                # signature too lets it run on a public-only keyfile.
+                commit_ckpt.sign_hash(wallet=wallet)
+            current_model_hash = commit_ckpt.model_hash
+            # Dashboard telemetry: the chain-committed `global_ver` is the
+            # "steps" the leaderboard charts plot against. Best-effort.
+            try:
+                VALIDATOR_GLOBAL_OPT_STEP.set(float(global_opt_step))
+            except Exception:
+                pass
 
-                phase_response = wait_till(config, PhaseNames.validator_commit_1)
-                logger.info("Commit new signed_model_hash for next validation (non-blocking)")
-                chain_submitter.async_commit(SignedModelHashChainCommit(
-                    signed_model_hash=commit_ckpt.signed_model_hash,
-                ))
+            phase_response = wait_till(config, PhaseNames.validator_commit_1)
+            logger.info("Commit new signed_model_hash for next validation (non-blocking)")
+            chain_submitter.async_commit(SignedModelHashChainCommit(
+                signed_model_hash=commit_ckpt.signed_model_hash,
+            ))
 
-                check_phase_expired(lite_subtensor, phase_response)
+            check_phase_expired(lite_subtensor, phase_response)
 
-                phase_response = wait_till(config, PhaseNames.validator_commit_2)
-                logger.info("Commit model_hash for next validation (non-blocking)")
-                chain_submitter.async_commit(ValidatorChainCommit(
-                    model_hash=commit_ckpt.model_hash,
-                    global_ver=global_opt_step,
-                    expert_group=config.task.exp.group_id,
-                    hf_repo_id=hf_chain_repo_id if hf_revision else None,
-                    hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if hf_revision else None),
-                ))
-
-                if config.ckpt.checkpoint_topk is not None:
-                    ckpt_deleted = delete_old_checkpoints(config.ckpt.checkpoint_path, config.ckpt.checkpoint_topk)
-                    if ckpt_deleted:
-                        logger.debug(f"Deleted old checkpoints: {ckpt_deleted}")
+            phase_response = wait_till(config, PhaseNames.validator_commit_2)
+            logger.info("Commit model_hash for next validation (non-blocking)")
+            chain_submitter.async_commit(ValidatorChainCommit(
+                model_hash=commit_ckpt.model_hash,
+                global_ver=global_opt_step,
+                expert_group=config.task.exp.group_id,
+                hf_repo_id=hf_chain_repo_id if advertise else None,
+                hf_revision=(hf_revision[:HF_CHAIN_REVISION_LENGTH] if advertise else None),
+            ))
 
             # === (4) Set weight to chain ===
             # Relocated to the top of the next iteration's MinerCommit1 block
             # so it can incorporate the (3) background scores collected from
             # end-of-Validate(K) through end-of-Train(K+1).
+
+            # === Task switch, if the owner has moved on ===
+            # At the start of the next cycle's Train. The publish threads
+            # from finalize hold their own group id, so the switch races
+            # nothing; the MinerCommit1 commit later reads the new group.
+            wait_till(config, PhaseNames.train)
+            switched = _maybe_switch_task(
+                config, rank=rank, device=device, eval_worker=eval_worker,
+                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+                round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
+            )
+            if switched is not None:
+                expert_manager, eval_model, base_shard, baseline_ref = (
+                    switched.expert_manager, switched.eval_model,
+                    switched.base_shard, switched.baseline_ref,
+                )
+                # Exactly the state of a fresh boot on the new task: no hash
+                # to commit until ValidatorCommit1, and the previous model's
+                # last reference was just dropped.
+                current_model_hash = None
+                cleanup()
 
             # === Close download window before next-cycle MinerCommit1 ===
             # Wait until 30 blocks before the next MinerCommit1 so bg-download
@@ -1598,10 +1644,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             wait_till(config, PhaseNames.miner_commit_1, block_offset=-15)
             download_window_closed.set()
 
-            # === validation and log metric ===
+            # === log metric ===
             metrics = get_status(
                 config=config,
-                model=global_model,
                 step=global_opt_step,
                 training_time=training_time,
                 total_training_time=total_training_time,
@@ -1612,7 +1657,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             )
 
             metric_logger.log(metrics)
-            cleanup(global_model)
+            cleanup()
 
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt received, shutting down validator loop")
@@ -1622,7 +1667,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
-        cleanup(global_model)
+        cleanup()
         metric_logger.close()
         raise
     except Exception:
@@ -1630,11 +1675,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         _shutdown_background_workers(download_worker, eval_worker)
         chain_submitter.stop()
         poller.stop()
-        cleanup(global_model)
+        cleanup()
         metric_logger.close()
 
-        if rank == 0:
-            torch.save(global_model.state_dict(), "mycelia_final.pt")
 
 
 if __name__ == "__main__":
@@ -1650,7 +1693,11 @@ if __name__ == "__main__":
         set_test_mode(True)
 
     if args.path:
-        config = ValidatorConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        active_task = resolve_active_task_name(args.path)
+        config = ValidatorConfig.from_path(
+            args.path, active_task=active_task, auto_update_config=args.auto_update_config
+        )
+        ensure_active_task(config, active_task)
     else:
         config = ValidatorConfig()
 

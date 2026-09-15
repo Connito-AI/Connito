@@ -173,8 +173,6 @@ compose file the container binds directly to the host interface.
 
 ```bash
 sudo ufw allow 8000/tcp     # bittensor serve
-sudo ufw allow 6000/tcp     # hivemind DHT
-sudo ufw allow 6000/udp     # hivemind DHT (QUIC)
 # 8200/tcp telemetry — leave closed unless you scrape it remotely
 ```
 
@@ -352,7 +350,6 @@ writable before starting the stack.
 | `could not select device driver "" with capabilities: [[gpu]]` | NVIDIA Container Toolkit not installed or Docker not restarted. Re-run step 2. |
 | `permission denied while trying to connect to the Docker daemon socket` | You forgot `usermod -aG docker $USER` + `newgrp docker` from step 1. |
 | Validator logs spam `wallet not found` | `BITTENSOR_WALLET_PATH` in `.env` doesn't point at the right host path, or `WALLET_NAME` / `HOTKEY_NAME` don't match what's actually under that dir. |
-| Validator can't reach hivemind peers | Firewall step 7 not done, or `dht.port` in `validator.yaml` doesn't match what you opened. Both **TCP and UDP** must be open. |
 | Watchtower never upgrades | Either the registry is private and Watchtower has no creds (mount `~/.docker/config.json`), or you pinned `IMAGE` to a sha or `vX.Y.Z` tag (Watchtower only follows moving tags like `:stable` or `:staging`), or no new tagged release has been cut since you started. |
 | Image pull fails with `denied` | GHCR package is private and you haven't run `docker login ghcr.io` on the host. |
 | `CUDA error: no kernel image is available for execution on the device` | Your GPU is too old for the CUDA runtime in the image, or your host driver is < 550. |

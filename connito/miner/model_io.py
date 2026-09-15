@@ -23,8 +23,9 @@ from connito.shared.checkpoints import (
 )
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
+from connito.shared.task_sync import ensure_active_task, resolve_active_task_name, sync_active_task
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till
+from connito.shared.cycle import PhaseNames, PhaseResponse, check_phase_expired, wait_till
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_hf_repo_ids,
@@ -32,7 +33,6 @@ from connito.shared.hf_distribute import (
 )
 from connito.shared.model import fetch_model_from_chain_validator
 from connito.shared.telemetry import inc_error
-from connito.sn_owner.cycle import PhaseNames
 
 # Short SHA prefix written to the chain. Matches the validator convention so
 # HF short-SHA resolution behaves the same on both sides.
@@ -100,10 +100,15 @@ def scheduler_service(
 ):
     """
     Periodically checks whether to start download/commit phases and enqueues jobs.
+
+    Distribute is also when the owner's task is checked: a switch lands on
+    config here, before the download job reads it, so the job already fetches
+    the new group. The workers read config per job, so nothing else moves.
     """
     while True:
         # --------- DOWNLOAD SCHEDULING ---------
         phase_response = wait_till(config, phase_name=PhaseNames.distribute, poll_fallback_block=poll_fallback_block)
+        sync_active_task(config)
         download_queue.put(Job(job_type=JobType.DOWNLOAD, phase_response=phase_response))
 
         # --------- COMISSION SCHEDULING ---------
@@ -122,7 +127,6 @@ def scheduler_service(
 def download_worker(
     config,
     wallet,
-    expert_manager,
     download_queue: Queue,
     current_model_meta,
     current_model_hash,
@@ -157,7 +161,9 @@ def download_worker(
                 subtensor,
                 wallet,
                 expert_group_ids=[config.task.exp.group_id],
-                expert_group_assignment = expert_manager.expert_group_assignment
+                # Per job, like the group id above: a table built at startup
+                # would filter by the old group after a task switch.
+                expert_group_assignment=ExpertManager(config).expert_group_assignment,
             )
 
             if (
@@ -394,7 +400,7 @@ def commit_worker(
 
 
 # --- Wiring it all together ---
-def run_system(config, wallet, expert_manager, current_model_version: int = 0, current_model_hash: str = "xxx", subtensor=None):
+def run_system(config, wallet, current_model_version: int = 0, current_model_hash: str = "xxx", subtensor=None):
     if subtensor is None:
         subtensor = bittensor.Subtensor(config.chain.network)
 
@@ -405,7 +411,7 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
     # Non-daemon threads so they can be joined cleanly on shutdown.
     download_thread = Thread(
         target=download_worker,
-        args=(config, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
+        args=(config, wallet, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
         daemon=False,
     )
     commit_thread = Thread(
@@ -445,7 +451,11 @@ if __name__ == "__main__":
         logger.debug("Verbose debug logging enabled!")
 
     if args.path:
-        config = MinerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        active_task = resolve_active_task_name(args.path)
+        config = MinerConfig.from_path(
+            args.path, active_task=active_task, auto_update_config=args.auto_update_config
+        )
+        ensure_active_task(config, active_task)
     else:
         config = MinerConfig()
 
@@ -453,6 +463,4 @@ if __name__ == "__main__":
 
     wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
 
-    expert_manager = ExpertManager(config)
-
-    run_system(config, wallet, expert_manager, subtensor=subtensor)
+    run_system(config, wallet, subtensor=subtensor)

@@ -19,10 +19,10 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from connito.miner.train_helper import free_cuda_models, get_status
+from connito.miner.train_helper import free_cuda_models, get_status, model_health
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import wait_till, PhaseNames
+from connito.shared.cycle import wait_till, PhaseNames, PhaseManager
 from connito.shared.checkpoint_helper import (
     load_checkpoint,
     save_checkpoint,
@@ -33,6 +33,7 @@ from connito.shared.checkpoints import (
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, parse_args
+from connito.shared.task_sync import ensure_active_task, resolve_active_task_name, sync_active_task
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
@@ -278,7 +279,6 @@ def setup_training(
 
 
 from connito.shared.telemetry import TelemetryManager, SystemStatePoller
-from connito.sn_owner.cycle import PhaseManager
 
 def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     """
@@ -582,7 +582,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 logger.info("(2) Logging step", loss_batch=loss_batch, aux_loss_batch=aux_loss_batch)
                 metrics = get_status(
                     config=config,
-                    model=model,
                     step=step,
                     inner_opt_step=inner_opt_step,
                     training_time=training_time,
@@ -590,7 +589,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     inner_optimizer=inner_optimizer,
                     loss_batch=loss_batch,
                     aux_loss_batch=aux_loss_batch,
-                )
+                ) | model_health(model, step)
                 metric_logger.log(metrics, print_log=False)
 
             # === local validation and log metric ===
@@ -647,7 +646,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 metrics = (
                     get_status(
                         config=config,
-                        model=model,
                         step=step,
                         inner_opt_step=inner_opt_step,
                         training_time=training_time,
@@ -656,6 +654,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         loss_batch=loss_batch,
                         aux_loss_batch=aux_loss_batch,
                     )
+                    | model_health(model, step)
                     | val_metric
                 )
 
@@ -707,6 +706,25 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
                 logger.info("reached barrier, waiting for complete checkpoint saving")
                 # dist.barrier(device_ids=[rank])
+
+            # === task switch ===
+            # One light poll per inner step. On a change config has already
+            # moved — task path, expert config, group-scoped checkpoint dir —
+            # so start over the way the recovery paths below do: everything
+            # is rebuilt from config, and the old dataloader's iterator, which
+            # `for` above holds, is never resumed on the new task.
+            if is_inner_optimizer_step and sync_active_task(config):
+                logger.info(
+                    "Task changed — restarting the training loop on the new task",
+                    task=config.task.expert_group_name,
+                    group_id=config.task.exp.group_id,
+                )
+                poller.stop()
+                metric_logger.close()
+                free_cuda_models(models=[model], optimizers=[inner_optimizer], devices=[device])
+                torch.cuda.empty_cache()
+                gc.collect()
+                return train_worker(rank, world_size, config)
 
             # === reload model ===
             # Gated by ckpt.enable_peer_resync (default True). Standalone
@@ -840,7 +858,11 @@ def run_distributed_training() -> None:
         logger.debug("Verbose debug logging + autograd anomaly detection enabled")
 
     if args.path:
-        config = MinerConfig.from_path(args.path, auto_update_config=args.auto_update_config)
+        active_task = resolve_active_task_name(args.path)
+        config = MinerConfig.from_path(
+            args.path, active_task=active_task, auto_update_config=args.auto_update_config
+        )
+        ensure_active_task(config, active_task)
     else:
         config = MinerConfig()
 

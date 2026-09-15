@@ -5,10 +5,11 @@ still-pending miner scored 0. The pieces under test are the two halves of the
 fix: `Round.freeze` persisting the base parameters it snapshots, and
 `run.resume_open_round` rebuilding the round from that file plus the journal.
 
-The base file is the load-bearing part. A resumed miner must be scored against
+The base is the load-bearing part. A resumed miner must be scored against
 the same base as one scored before the restart, because
-`delta = max(0, baseline - val_loss)` is only comparable within a single base —
-so a missing or mismatched base must refuse the resume rather than degrade it.
+`delta = max(0, baseline - val_loss)` is only comparable within a single base.
+Every round's base is the pretrained shard the boot wrote, so a journal that
+names anything else must refuse the resume rather than degrade it.
 
 Fixtures follow `test_round_freeze_groups.py`: a tiny `nn.Module`, stubbed
 chain reads, no network. Run with
@@ -17,10 +18,10 @@ chain reads, no network. Run with
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -29,6 +30,11 @@ from connito.validator.round import Round, RoundRef
 
 ROUND_ID = 800
 CYCLE_LENGTH = 100
+
+
+def _shard(root, group_id: int = 1) -> Path:
+    """Where `setup_training` writes the pretrained shard for a group."""
+    return Path(root) / "pretrained" / f"model_expgroup_{group_id}.safetensors"
 
 
 class _ModelWithBuffer(nn.Module):
@@ -78,7 +84,8 @@ def _metagraph(hotkeys: list[str]) -> SimpleNamespace:
     )
 
 
-def _freeze(*, checkpoint_path, model=None, miners=("m0", "m1", "m2"), **kw):
+def _freeze(*, checkpoint_path, base_shard=None, miners=("m0", "m1", "m2"), **kw):
+    base_shard = base_shard or _shard(checkpoint_path or ".")
     hotkeys = ["vme", *miners]
     metagraph = _metagraph(hotkeys)
     assignment_result = SimpleNamespace(
@@ -102,7 +109,7 @@ def _freeze(*, checkpoint_path, model=None, miners=("m0", "m1", "m2"), **kw):
             config=_config(),
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=model if model is not None else _ModelWithBuffer(),
+            base_shard=base_shard,
             round_id=ROUND_ID,
             cycle_index=8,
             cycle_length=CYCLE_LENGTH,
@@ -112,27 +119,26 @@ def _freeze(*, checkpoint_path, model=None, miners=("m0", "m1", "m2"), **kw):
 
 
 # ---------------------------------------------------------------------------
-# Piece 1: freeze persists the base parameters
+# Piece 1: freeze records the base shard
 # ---------------------------------------------------------------------------
 
 
-def test_freeze_persists_only_named_parameters(tmp_path):
-    """The buffer must be absent: it is why parameters-only is exact."""
-    _freeze(checkpoint_path=tmp_path)
+def test_freeze_records_the_base_shard_in_the_journal(tmp_path):
+    """A path, not a parameter dump: the backbone is frozen, so the shard
+    plus a pretrained backbone reproduces the base exactly."""
+    shard = tmp_path / "baseline" / "round_99.safetensors"
+    _freeze(checkpoint_path=tmp_path, base_shard=shard)
 
-    base_path = rj.base_snapshot_path_for(tmp_path, ROUND_ID)
-    assert base_path.exists()
-
-    saved = torch.load(base_path, map_location="cpu", weights_only=True)
-    assert set(saved) == {"lin.weight"}
-    assert "scale" not in saved, "buffers must not be persisted"
-    torch.testing.assert_close(saved["lin.weight"], torch.full((2, 4), 0.1))
+    journal = rj.load(rj.journal_path_for(tmp_path, ROUND_ID))
+    assert journal.base_shard == str(shard)
+    # And nothing multi-GB landed beside it.
+    assert list(rj.journal_dir(tmp_path).glob("*.pt")) == []
 
 
 def test_freeze_without_checkpoint_path_writes_nothing(tmp_path):
-    """Legacy rounds (no journaling) must not start writing snapshots."""
+    """Legacy rounds (no journaling) must not start writing journals."""
     _freeze(checkpoint_path=None)
-    assert not rj.base_snapshot_path_for(tmp_path, ROUND_ID).exists()
+    assert not rj.journal_path_for(tmp_path, ROUND_ID).exists()
 
 
 def test_freeze_records_seed_in_journal(tmp_path):
@@ -195,7 +201,7 @@ def test_advance_cohort_false_reuses_state(tmp_path):
             config=cfg,
             subtensor=subtensor,
             metagraph=metagraph,
-            global_model=_ModelWithBuffer(),
+            base_shard=_shard("."),
             round_id=ROUND_ID,
             cycle_index=8,
             cycle_length=CYCLE_LENGTH,
@@ -215,7 +221,7 @@ def test_advance_cohort_false_reuses_state(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _resume(tmp_path, *, phase_name="Train", blocks_remaining=200, model=None):
+def _resume(tmp_path, *, phase_name="Train", blocks_remaining=200, model=None, base_shard=None):
     """Drive `run.resume_open_round` against stubbed phase + chain reads."""
     from connito.validator import run as run_mod
 
@@ -270,7 +276,8 @@ def _resume(tmp_path, *, phase_name="Train", blocks_remaining=200, model=None):
             lite_subtensor=SimpleNamespace(
                 metagraph=lambda netuid=None, lite=None: metagraph
             ),
-            global_model=model if model is not None else _ModelWithBuffer(),
+            eval_model=model if model is not None else _ModelWithBuffer(),
+            base_shard=base_shard or _shard(tmp_path),
             score_aggregator=aggregator,
             score_path=tmp_path / "score.json",
             round_ref=round_ref,
@@ -282,7 +289,12 @@ def _resume(tmp_path, *, phase_name="Train", blocks_remaining=200, model=None):
 
 
 def _seed_journal(tmp_path, **overrides):
-    """Write a partially-progressed journal, as a mid-round restart would leave."""
+    """Write a partially-progressed journal, as a mid-round restart would leave.
+
+    Records this boot's pretrained shard by default so each refusal test
+    below exercises its own reason rather than the base one.
+    """
+    overrides.setdefault("base_shard", str(_shard(tmp_path)))
     payload = dict(
         round_id=ROUND_ID,
         uid_to_hotkey={1: "m0", 2: "m1", 3: "m2"},
@@ -303,13 +315,12 @@ def _seed_journal(tmp_path, **overrides):
 
 
 def test_resume_restores_verdicts_and_base(tmp_path):
-    """The happy path: work already done is preserved, base comes from disk."""
-    model = _ModelWithBuffer()
-    _freeze(checkpoint_path=tmp_path, model=model)
-    _seed_journal(tmp_path)
+    """The happy path: work already done is preserved, base is the boot's shard."""
+    shard = _shard(tmp_path)
+    _freeze(checkpoint_path=tmp_path, base_shard=shard)
+    _seed_journal(tmp_path, base_shard=str(shard))
 
-    # A different model at resume — as after a restart, where global_model is
-    # reloaded from the pretrained backbone rather than the merged state.
+    # A different model object at resume, as after any restart.
     other = _ModelWithBuffer()
     with torch.no_grad():
         other.lin.weight.fill_(0.9)
@@ -325,21 +336,33 @@ def test_resume_restores_verdicts_and_base(tmp_path):
     assert resumed.val_losses == {1: 1.5}
     assert resumed.validation_failed_uids == {2}
     assert resumed.freeze_zero_uids == {3}
-    # The base is the ORIGINAL freeze's parameters, not a fresh snapshot of
-    # the restarted process's model — this is the whole point.
-    torch.testing.assert_close(
-        resumed.model_snapshot_cpu["lin.weight"], torch.full((2, 4), 0.1)
-    )
+    assert resumed.base_shard == shard
     # Workers are handed the round.
     assert eval_window.is_set()
     assert not dl_closed.is_set()
 
 
-def test_resume_refused_without_base_snapshot(tmp_path):
-    """No base means no provable comparability — refuse rather than degrade."""
+def test_resume_refused_when_the_journal_names_another_base(tmp_path):
+    """Frozen under another task, or by a build that adopted round baselines:
+    either way the rest of the roster would be scored against a different base
+    than the miners already in `scores`."""
+    other = _shard(tmp_path, group_id=2)
+    _freeze(checkpoint_path=tmp_path, base_shard=other)
+    _seed_journal(tmp_path, base_shard=str(other))
+
+    rid, round_ref, eval_window, _ = _resume(tmp_path)
+
+    assert rid is None
+    assert round_ref.current is None
+    assert not eval_window.is_set()
+
+
+def test_resume_refused_on_a_journal_without_a_base(tmp_path):
+    """Written before `base_shard` existed. Guessing the base would score the
+    rest of the roster against a different one than the miners already in
+    `scores`."""
     _freeze(checkpoint_path=tmp_path)
-    _seed_journal(tmp_path)
-    rj.base_snapshot_path_for(tmp_path, ROUND_ID).unlink()
+    _seed_journal(tmp_path, base_shard="")
 
     rid, round_ref, eval_window, _ = _resume(tmp_path)
 
@@ -400,13 +423,12 @@ def test_resume_marks_hotkey_drift_as_failed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_prune_removes_base_snapshot(tmp_path):
+def test_prune_removes_the_journal(tmp_path):
     _freeze(checkpoint_path=tmp_path)
-    assert rj.base_snapshot_path_for(tmp_path, ROUND_ID).exists()
+    assert rj.journal_path_for(tmp_path, ROUND_ID).exists()
 
     rj.prune_before_round(tmp_path, ROUND_ID + 1)
 
-    assert not rj.base_snapshot_path_for(tmp_path, ROUND_ID).exists()
     assert not rj.journal_path_for(tmp_path, ROUND_ID).exists()
 
 

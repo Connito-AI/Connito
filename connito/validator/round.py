@@ -15,9 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, NamedTuple
 
-import torch
-import torch.nn as nn
-
 from connito.shared.app_logging import structlog
 from connito.shared.telemetry import set_round_progress
 
@@ -91,7 +88,9 @@ class Round:
     validator_miner_assignment: dict[str, list[str]]
     background_uids: tuple[int, ...]
     uid_to_hotkey: dict[int, str]
-    model_snapshot_cpu: dict[str, torch.Tensor]
+    # The expert shard the round is scored against: the pretrained backbone
+    # plus this file *is* the base model.
+    base_shard: Path
     # On-chain Submission phase block range for this round. bg-download uses
     # it to gate `find_submission_for_hotkey` reuse — without this filter, a stale
     # .pt left over from a previous cycle would short-circuit the fresh
@@ -191,7 +190,7 @@ class Round:
         config,
         subtensor,
         metagraph,
-        global_model: nn.Module,
+        base_shard: Path,
         round_id: int | None = None,
         submission_block_range: tuple[int, int] | None = None,
         last_evaluated: dict[int, datetime] | None = None,
@@ -209,8 +208,9 @@ class Round:
         Caller pre-fetches `metagraph` (sync or async, depending on the
         validator's subtensor type) and passes it in so this method has
         no opinion on the connection model. Captures the metagraph
-        incentive snapshot and the global_model state_dict (CPU clone)
-        before Merge(K) can mutate either.
+        incentive snapshot, and records the baseline shard the round is
+        scored against — a path, because the backbone is frozen so the base
+        is reproducible from it.
         """
         from connito.shared.chain import get_chain_commits
         from connito.shared.cycle import (
@@ -328,31 +328,6 @@ class Round:
             *score_prepend_uids,
             *stale_tail,
         ])
-
-        # CPU-resident clone of the model parameters. Detach + clone + move to
-        # CPU so in-place mutations of global_model cannot leak into it.
-        #
-        # Parameters, not `state_dict()`: the rest is fp8 buffers, which no
-        # runtime path mutates and every boot rebuilds identically, and which
-        # `state_dict()` emits dequantized to fp32 — 14.5 GB held all round
-        # against 3.9 GB here. The one consumer (`background_eval_worker`)
-        # loads with `strict=False`, so the absent keys are a no-op.
-        snapshot = {
-            k: v.detach().clone().cpu() for k, v in global_model.named_parameters()
-        }
-        # Only the `named_parameters()` subset needs persisting for a resume.
-        # Everything else in the state_dict is a buffer — under
-        # `quantization_validator="all"` that is the fp8 weights, which sit
-        # outside the outer optimizer and outside
-        # `populate_global_grads_from_local`, so nothing mutates them at
-        # runtime and every boot rebuilds them identically. They also
-        # serialize dequantized to fp32, so they dominate the dump by volume
-        # while carrying nothing process-specific.
-        param_keys = set(dict(global_model.named_parameters()).keys())
-        base_params = {k: v for k, v in snapshot.items() if k in param_keys}
-
-        def _nbytes(d):
-            return sum(t.numel() * t.element_size() for t in d.values())
 
         logger.info(
             "Round.freeze: bg score prepend",
@@ -540,8 +515,7 @@ class Round:
             round_id=rid,
             roster_size=len(background_uids),
             hotkey_count=len(uid_to_hotkey),
-            base_param_bytes=_nbytes(base_params),
-            base_full_bytes=_nbytes(snapshot),
+            base_shard=str(base_shard),
         )
 
         # Resolve the journal location. If `checkpoint_path` is provided
@@ -560,7 +534,7 @@ class Round:
             validator_miner_assignment=assignment,
             background_uids=background_uids,
             uid_to_hotkey=uid_to_hotkey,
-            model_snapshot_cpu=snapshot,
+            base_shard=base_shard,
             submission_block_range=submission_block_range,
             uid_to_chain_checkpoint=uid_to_chain_checkpoint,
             prior_avg_scores=dict(prior_scores),
@@ -589,19 +563,6 @@ class Round:
                 logger.warning(
                     "Round.freeze: initial journal write failed",
                     error=str(e), round_id=rid, path=str(resolved_journal_path),
-                )
-            # Base parameters for a mid-round restart. Without these a resumed
-            # round would score later miners against a different base than the
-            # ones already in `scores` — `delta = max(0, baseline - val_loss)`
-            # is only comparable within one base.
-            try:
-                base_path = _rj.base_snapshot_path_for(checkpoint_path, rid)
-                base_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(base_params, base_path)
-            except Exception as e:
-                logger.warning(
-                    "Round.freeze: base snapshot write failed",
-                    error=str(e), round_id=rid,
                 )
 
         return new_round
@@ -646,6 +607,7 @@ class Round:
             "roster_size": len(self.background_uids),
             "lifecycle_step": int(self.lifecycle_step),
             "seed": str(self.seed),
+            "base_shard": str(self.base_shard),
             "finalized": False,
         }
 
@@ -901,7 +863,7 @@ class RoundRef:
 
     Workers re-read `current` on every iteration so a swap takes effect
     without restarting the thread. The finished round is deliberately not
-    retained — `model_snapshot_cpu` is multi-GB and nothing reads it back.
+    retained — nothing reads a finished round back.
     """
 
     current: Round | None = None
