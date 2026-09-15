@@ -431,17 +431,34 @@ def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ..
 
 
 def _shard_rows_via_parquet_footer(repo_id: str, revision: str, shard_path: str) -> int:
-    """Read num_rows from the parquet footer without downloading the full file."""
+    """Read num_rows from the parquet footer without downloading the full file.
+
+    The row count lives in the footer, a few kilobytes at the end of the
+    file, so this is a couple of range requests. Reaching it through
+    `hf_hub_download` first — which is what this did — downloaded the
+    whole shard to get at them, and cached it: one full shard per
+    distinct shard a validator's seed picks, which is how an observer
+    accumulated 58 GB for a single source on a host where disk pressure
+    had already caused an incident. A source with 25 GB shards would
+    have made that 118 GB.
+
+    `HfFileSystem` serves the same bytes over range requests and writes
+    nothing to the cache. Measured against a source with eight shards of
+    10-25 GB: the largest answered in 1.0 s, and all eight (118 GB) in
+    4.9 s. The revision is already resolved to a SHA by the caller, so
+    the count returned is identical and the pinning story is unchanged.
+    """
     # Lazy import — pyarrow is already a dependency of `datasets` but
     # importing it eagerly at module top-level slows test imports.
     import pyarrow.parquet as pq
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import HfFileSystem
 
     try:
-        local = hf_hub_download(
-            repo_id, shard_path, repo_type="dataset", revision=revision,
-        )
-        return int(pq.read_metadata(local).num_rows)
+        # `datasets/<repo>@<sha>/<path>` is HfFileSystem's revision
+        # syntax; the caller has already resolved `revision` to a SHA.
+        fs_path = f"datasets/{repo_id}@{revision}/{shard_path}"
+        with HfFileSystem().open(fs_path, "rb") as fh:
+            return int(pq.read_metadata(fh).num_rows)
     except Exception as e:
         # Re-raise with the (repo_id, shard, revision) context so the
         # validator log carries enough to diagnose without grepping.
