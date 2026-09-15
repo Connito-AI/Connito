@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import re
+import string
 import sys
 from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal
@@ -229,6 +230,11 @@ class ModelCfg(BaseConfig):
         return self
 
 
+# A bare dataset column name. Deliberately narrower than Python
+# identifiers: no dots, no brackets, no leading digits.
+_COLUMN_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
 class DatasetSourceCfg(BaseConfig):
     path: str
     name: str | None = None
@@ -243,6 +249,21 @@ class DatasetSourceCfg(BaseConfig):
     # exist and carry no `train` at all, so they cannot be streamed
     # without this.
     split: str | None = None
+    # Render each row into `text` with `str.format` instead of selecting
+    # a single column. Needed for instruction-shaped corpora, where the
+    # text a model should see is assembled from several columns and no
+    # one column is the text — such a corpus typically carries
+    # `instruction` / `input` / `output` and no `text` at all.
+    #
+    # `None` keeps `text_column` selection, which stays the default: the
+    # groups running in the field all have a real text column, and
+    # requiring a trivial `"{text}"` template of them would buy nothing.
+    #
+    # Placeholders are restricted to bare column names by
+    # `_validate_text_template` below — this string is task data that
+    # travels from the owner API to every miner and validator, so the
+    # grammar it may use is narrower than `str.format` allows.
+    text_template: str | None = None
     # Authorize HF's `load_dataset` to execute the dataset repo's custom
     # builder script. Required for sources that ship a `<name>.py` loader
     # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
@@ -260,6 +281,70 @@ class DatasetSourceCfg(BaseConfig):
             raise ValueError("data.dataset_sources[].text_column cannot be empty.")
         if self.split is not None and not self.split.strip():
             raise ValueError("data.dataset_sources[].split cannot be blank when set.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_text_template(self):
+        r"""Restrict `text_template` to `{column_name}` placeholders.
+
+        A template arrives as task data over the wire, so it is checked
+        here — at config load, before a round is running — rather than
+        being discovered mid-stream by whatever `str.format` does with
+        it. Everything rejected below either renders something the
+        author did not mean or raises an exception the rendering path
+        does not catch:
+
+          - a positional field (`{}` or `{0}`) indexes the format
+            arguments, not the row, and a row is passed by keyword;
+          - attribute or index access (`{a.__class__}`, `{a[0]}`)
+            reaches into the row's values and raises `AttributeError`
+            or `TypeError`, neither of which the renderer catches, so
+            it would kill a scored round mid-stream;
+          - a conversion or format spec (`{a!r}`, `{a:>1000000}`) hides
+            the column name from a naive `\{(\w+)\}` scan, and a width
+            is an arbitrary per-row allocation.
+        """
+        if self.text_template is None:
+            return self
+        if not self.text_template.strip():
+            raise ValueError("data.dataset_sources[].text_template cannot be blank when set.")
+
+        try:
+            fields = list(string.Formatter().parse(self.text_template))
+        except ValueError as e:
+            raise ValueError(f"data.dataset_sources[].text_template is not a valid format string: {e}") from e
+
+        named = 0
+        for _literal, field_name, format_spec, conversion in fields:
+            if field_name is None:  # trailing literal text
+                continue
+            if field_name == "" or field_name.isdigit():
+                raise ValueError(
+                    "data.dataset_sources[].text_template must not use positional fields "
+                    f"({{{field_name}}}); name the dataset column instead."
+                )
+            if not _COLUMN_NAME_RE.fullmatch(field_name):
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} is not a bare "
+                    "column name; attribute and index access are not allowed."
+                )
+            if conversion is not None:
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} must not use a "
+                    f"conversion (!{conversion})."
+                )
+            if format_spec:
+                raise ValueError(
+                    f"data.dataset_sources[].text_template placeholder {{{field_name}}} must not use a "
+                    f"format spec (:{format_spec})."
+                )
+            named += 1
+
+        if named == 0:
+            raise ValueError(
+                "data.dataset_sources[].text_template names no columns, so every row would render "
+                "to the same constant string."
+            )
         return self
 
 
