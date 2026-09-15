@@ -298,6 +298,21 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         def ensure_string(example: dict[str, Any], source_text_column: str):
             return {"text": str(example[source_text_column])}
 
+        def render_template(example: dict[str, Any], template: str):
+            """Assemble a whole row into `text` for instruction-shaped sources.
+
+            A row that does not carry every column the template names
+            renders to the empty string rather than raising, so one
+            malformed row cannot kill a round mid-stream; the eval
+            character floor then discards it. `text_template`'s grammar
+            is checked at config load, which is what keeps the caught
+            pair sufficient here.
+            """
+            try:
+                return {"text": template.format(**example)}
+            except (KeyError, IndexError):
+                return {"text": ""}
+
         # Convert string seed to integer. Reused as the
         # shard-pick / in-shard offset hash input AND as the
         # `interleave_datasets(seed=...)` argument, so the value must
@@ -336,6 +351,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             ds_name = _source_value(source, "path")
             ds_config = _source_value(source, "name")
             text_column = _source_value(source, "text_column", "text")
+            text_template = _source_value(source, "text_template")
             source_split_name = _source_value(source, "split")
             weight = float(_source_value(source, "weight", 1.0))
             trust_remote_code = bool(_source_value(source, "trust_remote_code", False))
@@ -370,11 +386,31 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                     split_override=source_split_name,
                 )
 
-            source_split = source_split.select_columns([text_column])
-            source_split = source_split.map(
-                partial(ensure_string, source_text_column=text_column),
-                features=common_features,
-            )
+            if text_template:
+                # Render here, before the single-column collapse below.
+                # `select_columns` throws the other columns away, and a
+                # custom `dataset_class` only gets to override
+                # tokenisation, which is downstream of that — so this is
+                # the last point where the whole row is still in hand.
+                # Both the miner path and the validator's shard-pick path
+                # run through it, so eval and training necessarily see
+                # the same text.
+                #
+                # `features=` already casts each row down to `{text}`;
+                # naming the source's own columns as well keeps the
+                # intermediate rows small where they are known.
+                known_columns = list(getattr(source_split, "column_names", None) or [])
+                source_split = source_split.map(
+                    partial(render_template, template=text_template),
+                    remove_columns=known_columns,
+                    features=common_features,
+                )
+            else:
+                source_split = source_split.select_columns([text_column])
+                source_split = source_split.map(
+                    partial(ensure_string, source_text_column=text_column),
+                    features=common_features,
+                )
 
             # Eval-path data-quality gate (seed is None on the miner
             # training path, which stays byte-identical). Applied
