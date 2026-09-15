@@ -234,6 +234,15 @@ class DatasetSourceCfg(BaseConfig):
     name: str | None = None
     weight: PositiveFloat = 1.0
     text_column: str = "text"
+    # HF split to stream for this source. `None` keeps today's behaviour:
+    # the split is derived from the train/validation flag, which in
+    # practice is always "train" (no configured source ships a
+    # "validation" split, and the validation set is carved out of the
+    # same stream by the fractional index filter, not by a split name).
+    # Set it for repos whose split is named something else. Such repos
+    # exist and carry no `train` at all, so they cannot be streamed
+    # without this.
+    split: str | None = None
     # Authorize HF's `load_dataset` to execute the dataset repo's custom
     # builder script. Required for sources that ship a `<name>.py` loader
     # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
@@ -249,6 +258,8 @@ class DatasetSourceCfg(BaseConfig):
             raise ValueError("data.dataset_sources[].path cannot be empty.")
         if not self.text_column.strip():
             raise ValueError("data.dataset_sources[].text_column cannot be empty.")
+        if self.split is not None and not self.split.strip():
+            raise ValueError("data.dataset_sources[].split cannot be blank when set.")
         return self
 
 
