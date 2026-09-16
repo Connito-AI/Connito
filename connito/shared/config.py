@@ -471,7 +471,11 @@ class MoECfg(BaseConfig):
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
     partial_topk: PositiveInt = 6
-    full_topk: PositiveInt = 2
+    # DeepSeek-V2-Lite's own `num_experts_per_tok`, matching `partial_topk`.
+    # Read by `mycelia.get_base_model` whenever `partial=False`, where it is the
+    # only thing that sets routing width — a wrong value routes at the wrong
+    # width and raises nothing.
+    full_topk: PositiveInt = 6
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
     partial_moe: bool = True
