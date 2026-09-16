@@ -40,8 +40,13 @@ class _Model(nn.Module):
 ASSIGNMENT = SimpleNamespace(expert_group_assignment={1: {0: [(0, 7)]}, 2: {0: [(0, 9)]}})
 
 
+def _write(model: nn.Module, dest):
+    """Boot's call: the model's own state dict, in the model's own dtype."""
+    return _write_pretrained_shard(model.state_dict(), ASSIGNMENT, 1, dest, save_dtype=torch.float32)
+
+
 def test_the_shard_holds_exactly_the_groups_experts(tmp_path):
-    shard = _write_pretrained_shard(_Model(), ASSIGNMENT, 1, tmp_path / "pretrained")
+    shard = _write(_Model(), tmp_path / "pretrained")
 
     assert shard == tmp_path / "pretrained" / "model_expgroup_1.safetensors"
     assert set(load_state_dict_from_path(str(shard))) == {"layers.0.mlp.experts.7.weight"}
@@ -52,18 +57,18 @@ def test_the_shard_carries_the_models_weights(tmp_path):
     with torch.no_grad():
         model.layers[0].mlp.experts["7"].weight.fill_(0.5)
 
-    sd = load_state_dict_from_path(str(_write_pretrained_shard(model, ASSIGNMENT, 1, tmp_path)))
+    sd = load_state_dict_from_path(str(_write(model, tmp_path)))
 
     torch.testing.assert_close(sd["layers.0.mlp.experts.7.weight"].float(), torch.full((2, 4), 0.5))
 
 
 def test_a_second_boot_overwrites_in_place(tmp_path):
-    first = _write_pretrained_shard(_Model(), ASSIGNMENT, 1, tmp_path)
+    first = _write(_Model(), tmp_path)
     model = _Model()
     with torch.no_grad():
         model.layers[0].mlp.experts["7"].weight.fill_(0.25)
 
-    second = _write_pretrained_shard(model, ASSIGNMENT, 1, tmp_path)
+    second = _write(model, tmp_path)
 
     assert second == first
     torch.testing.assert_close(
