@@ -34,11 +34,18 @@ shard-pick eval path:
 
   D8. Revision pin override is threaded through to HfApi.
 
+  D9. Policies served with the task bundle — a document in the task
+      directory registers or overrides a source, takes precedence over
+      `_KNOWN_SOURCES`, faces the same validation, and is part of
+      `_list_shards`' cache key so a policy swap cannot be served a
+      stale shard list.
+
 Tests are offline-mockable. `HfApi().dataset_info` is patched to
 return synthetic siblings so they run without network.
 """
 from __future__ import annotations
 
+import json
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -94,10 +101,15 @@ def _nemo_info(shard_count: int = 4) -> SimpleNamespace:
 
 
 def _clear_caches():
-    """All `lru_cache`-decorated helpers in eval_shard_pick. Tests
-    that patch `HfApi` must clear these or stale results leak."""
+    """All `lru_cache`-decorated helpers in eval_shard_pick, plus the
+    served-policy overlay. Tests that patch `HfApi` must clear these or
+    stale results leak; the overlay is module-level state for the same
+    reason `_KNOWN_SOURCES` is, so a document installed by one test
+    would otherwise change what the next one resolves."""
     eval_shard_pick._resolve_revision.cache_clear()
     eval_shard_pick._list_shards.cache_clear()
+    eval_shard_pick._SERVED_POLICIES = {}
+    eval_shard_pick._SERVED_FINGERPRINT = ""
 
 
 @pytest.fixture(autouse=True)
@@ -488,3 +500,226 @@ def test_revision_pin_override_is_threaded_through():
             revision_override="my-explicit-sha",
         )
     assert seen_revisions[0] == "my-explicit-sha"
+
+
+# -----------------------------------------------------------------------
+# D9 — Policies served with the task bundle
+# -----------------------------------------------------------------------
+
+def _served_doc(**overrides) -> dict:
+    """A minimal valid `shard_policy.json` for a fictional source."""
+    source = {
+        "path": "example/repo",
+        "name": "cfg",
+        "path_prefix": "alpha/",
+        "path_suffix": [".parquet"],
+        "revision": "a" * 40,
+        "row_count_source": "parquet_footer",
+        "min_headroom_rows": 10_000,
+    }
+    source.update(overrides)
+    return {"version": 1, "sources": [source]}
+
+
+def _serve(task_dir, doc: dict) -> None:
+    """Write a policy document and activate it, as a task switch would."""
+    (task_dir / eval_shard_pick.SHARD_POLICY_FILE).write_text(json.dumps(doc))
+    eval_shard_pick.activate_served_policies(task_dir)
+
+
+def _two_prefix_info() -> SimpleNamespace:
+    """Shards under two prefixes, so a policy swap has somewhere to move to."""
+    siblings = [_sibling(f"alpha/part_{i:05d}.parquet") for i in range(8)]
+    siblings += [_sibling(f"beta/part_{i:05d}.parquet") for i in range(4)]
+    siblings.append(_sibling("README.md"))
+    return SimpleNamespace(siblings=siblings, sha="beefcafe")
+
+
+def test_served_policy_registers_an_otherwise_unknown_source(tmp_path):
+    """The point of the whole mechanism: no code entry, still resolvable."""
+    with _patch_hf_info({"example/repo": _two_prefix_info()}), \
+            _patch_parquet_footer(500_000):
+        with pytest.raises(KeyError, match="No shard-pick policy"):
+            eval_shard_pick.pick_shard_for_source(
+                repo_id="example/repo", name="cfg", int_seed=1,
+            )
+        _serve(tmp_path, _served_doc())
+        pick = eval_shard_pick.pick_shard_for_source(
+            repo_id="example/repo", name="cfg", int_seed=1,
+        )
+    assert pick.shard_path.startswith("alpha/")
+
+
+def test_served_policy_takes_precedence_over_a_builtin(tmp_path):
+    """Served-wins is what lets a shipped policy be corrected by publishing.
+
+    c4's built-in policy is `constant` with a 340 000 floor. Serving a
+    footer policy with a tighter cap must change the bound, which no
+    amount of built-in lookup could produce.
+    """
+    with _patch_hf_info({"allenai/c4": _c4_info()}), _patch_parquet_footer(500_000):
+        builtin = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=7,
+        )
+        assert builtin.offset_bound == 340_000
+
+        _serve(tmp_path, _served_doc(
+            path="allenai/c4", name="en",
+            path_prefix="en/", path_suffix=[".json.gz"],
+            max_offset_rows=50_000,
+        ))
+        served = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=7,
+        )
+    assert served.offset_bound == 50_000
+    assert served.in_shard_offset < 50_000
+
+
+def test_builtin_is_still_used_for_a_source_the_document_omits(tmp_path):
+    """The overlay adds and overrides; it does not hide the rest."""
+    with _patch_hf_info({"allenai/c4": _c4_info()}), _patch_parquet_footer(500_000):
+        before = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=3,
+        )
+        _serve(tmp_path, _served_doc())  # covers example/repo only
+        after = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=3,
+        )
+    assert (after.shard_path, after.in_shard_offset) == (
+        before.shard_path, before.in_shard_offset
+    )
+
+
+def test_policy_swap_at_the_same_revision_relists_shards(tmp_path):
+    """Regression: `_list_shards` is memoized and reads the policy inside.
+
+    Without the document's hash in the cache key, the second pick here
+    would be served the first policy's shard list. It would be silent,
+    and it would only happen on nodes whose cache was warm — i.e. a
+    consensus break, not a local glitch.
+    """
+    with _patch_hf_info({"example/repo": _two_prefix_info()}), \
+            _patch_parquet_footer(500_000):
+        _serve(tmp_path, _served_doc(path_prefix="alpha/"))
+        first = eval_shard_pick.pick_shard_for_source(
+            repo_id="example/repo", name="cfg", int_seed=1,
+        )
+        # Same repo, same name, same revision — only the policy moves.
+        _serve(tmp_path, _served_doc(path_prefix="beta/"))
+        second = eval_shard_pick.pick_shard_for_source(
+            repo_id="example/repo", name="cfg", int_seed=1,
+        )
+    assert first.shard_path.startswith("alpha/")
+    assert second.shard_path.startswith("beta/")
+
+
+def test_removing_the_document_restores_the_builtin_pick(tmp_path):
+    """The overlay must unwind completely, not leave a residue."""
+    with _patch_hf_info({"allenai/c4": _c4_info()}), _patch_parquet_footer(500_000):
+        pristine = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=11,
+        )
+        _serve(tmp_path, _served_doc(
+            path="allenai/c4", name="en",
+            path_prefix="en/", path_suffix=[".json.gz"], max_offset_rows=50_000,
+        ))
+        (tmp_path / eval_shard_pick.SHARD_POLICY_FILE).unlink()
+        eval_shard_pick.activate_served_policies(tmp_path)
+        restored = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=11,
+        )
+    assert eval_shard_pick._SERVED_POLICIES == {}
+    assert (restored.shard_path, restored.in_shard_offset, restored.offset_bound) == (
+        pristine.shard_path, pristine.in_shard_offset, pristine.offset_bound
+    )
+
+
+def test_absent_document_is_the_normal_case(tmp_path):
+    """Most tasks serve no policy; that must not raise."""
+    eval_shard_pick.activate_served_policies(tmp_path)
+    assert eval_shard_pick._SERVED_POLICIES == {}
+    assert eval_shard_pick._SERVED_FINGERPRINT == ""
+
+
+@pytest.mark.parametrize(
+    "doc, match",
+    [
+        ({"version": 99, "sources": []}, "unsupported"),
+        ({"sources": []}, "version"),
+        ({"version": 1, "sources": [{"path": "a/b", "typo_field": 1}]}, "typo_field"),
+    ],
+    ids=["unknown-version", "missing-version", "unknown-field"],
+)
+def test_malformed_documents_are_rejected(doc, match):
+    with pytest.raises(Exception, match=match):
+        eval_shard_pick.parse_served_policies(doc)
+
+
+def test_duplicate_source_keys_are_rejected():
+    doc = _served_doc()
+    doc["sources"] = doc["sources"] * 2
+    with pytest.raises(Exception, match="duplicate"):
+        eval_shard_pick.parse_served_policies(doc)
+
+
+def test_load_builder_outside_the_allowlist_is_rejected():
+    """`load_builder` exists to avoid executing a repo's own script; a
+    served value must not be able to name something arbitrary."""
+    with pytest.raises(Exception, match="load_builder"):
+        eval_shard_pick.parse_served_policies(_served_doc(load_builder="not_a_builder"))
+    # ...but a generic file-format builder is exactly what it is for.
+    registry = eval_shard_pick.parse_served_policies(_served_doc(load_builder="json"))
+    assert registry[("example/repo", "cfg")].load_builder == "json"
+
+
+def test_served_policies_face_the_same_validation_as_builtins():
+    """`_validate_policy`'s invariants are not bypassed by the new path."""
+    with pytest.raises(ValueError, match="min_headroom_rows"):
+        eval_shard_pick.parse_served_policies(_served_doc(min_headroom_rows=0))
+    with pytest.raises(Exception, match="row_count_source"):
+        eval_shard_pick.parse_served_policies(_served_doc(row_count_source="guesswork"))
+
+
+def test_path_suffix_survives_json_as_a_usable_tuple():
+    """JSON gives a list, and `str.endswith` raises TypeError on a list,
+    so the coercion is what keeps shard filtering working at all."""
+    registry = eval_shard_pick.parse_served_policies(_served_doc())
+    suffix = registry[("example/repo", "cfg")].path_suffix
+    assert isinstance(suffix, tuple)
+    assert "alpha/part_00000.parquet".endswith(suffix)
+
+
+def test_the_document_hash_is_part_of_the_shard_list_cache_key():
+    """Pin the discriminator itself, not just its effect.
+
+    The swap test above goes through `pick_shard_for_source` and so
+    proves the property end to end. This one calls `_list_shards`
+    directly to pin *why* it holds: the document hash is a real part of
+    the key, which is what makes superseded entries unreachable rather
+    than merely unlikely. It is the reason activation does not also
+    clear the cache — a pick already inside `_list_shards` when a clear
+    ran would write its result back afterwards, under a key the new
+    policy still reads.
+    """
+    with _patch_hf_info({"example/repo": _two_prefix_info()}):
+        eval_shard_pick._SERVED_POLICIES = eval_shard_pick.parse_served_policies(
+            _served_doc(path_prefix="alpha/")
+        )
+        alpha = eval_shard_pick._list_shards("example/repo", "cfg", "rev", "fp-alpha")
+
+        # Swap the policy WITHOUT clearing, as a lost or raced clear would.
+        eval_shard_pick._SERVED_POLICIES = eval_shard_pick.parse_served_policies(
+            _served_doc(path_prefix="beta/")
+        )
+        under_old_key = eval_shard_pick._list_shards(
+            "example/repo", "cfg", "rev", "fp-alpha"
+        )
+        under_new_key = eval_shard_pick._list_shards(
+            "example/repo", "cfg", "rev", "fp-beta"
+        )
+
+    assert alpha and all(s.startswith("alpha/") for s in alpha)
+    # Same key, same answer — that is the cache doing its job, not a bug.
+    assert under_old_key == alpha
+    # Different key, so the new policy is re-listed rather than assumed.
+    assert under_new_key and all(s.startswith("beta/") for s in under_new_key)
