@@ -2,11 +2,11 @@
 
 This is the one failure mode in the eval path that nothing else catches.
 
-`_KNOWN_SOURCES` in `connito.shared.eval_shard_pick` is a module-level dict,
-deliberately not config-driven, because consensus requires every validator to
-use the identical policy. A group whose `data.dataset_sources` names a source
-missing from that dict therefore fails only on the seeded shard-pick path —
-which means:
+A policy comes from one of two registries: `_KNOWN_SOURCES` in
+`connito.shared.eval_shard_pick`, or a `shard_policy.json` served with the task
+(and, for a group that is never served, committed beside its `config.yaml`).
+A group whose `data.dataset_sources` names a source in neither therefore fails
+only on the seeded shard-pick path — which means:
 
   - it passes every other test in this repo, none of which enumerate
     `expert_groups/`;
@@ -23,19 +23,39 @@ configs the way a validator would.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 import yaml
 
 from connito.shared.config import ExpertCfg
-from connito.shared.eval_shard_pick import _KNOWN_SOURCES
+from connito.shared.eval_shard_pick import (
+    _KNOWN_SOURCES,
+    SHARD_POLICY_FILE,
+    parse_served_policies,
+)
 
 EXPERT_GROUPS = Path(__file__).resolve().parents[2] / "expert_groups"
 
 
 def _group_dirs() -> list[Path]:
     return sorted(p for p in EXPERT_GROUPS.iterdir() if (p / "config.yaml").is_file())
+
+
+def _committed_policies(group_dir: Path) -> dict:
+    """Policies from a `shard_policy.json` committed beside `config.yaml`.
+
+    Only groups that are NEVER served carry one in the tree: `materialize_task`
+    replaces a task directory wholesale, so a committed file for a served group
+    would be deleted at the next switch. A served group's policy is checked by
+    `cycle_api.validate` on the publishing side instead, which is the only
+    place it exists before it reaches a validator.
+    """
+    path = group_dir / SHARD_POLICY_FILE
+    if not path.is_file():
+        return {}
+    return parse_served_policies(json.loads(path.read_text(encoding="utf-8")))
 
 
 def test_expert_groups_directory_is_discoverable():
@@ -75,16 +95,16 @@ def test_group_sources_have_shard_pick_policies(group_dir: Path):
         pytest.skip(f"{group_dir.name} opts out of seeded shard pick")
 
     sources = cfg.data.dataset_sources or []
-    missing = [
-        (s.path, s.name) for s in sources if (s.path, s.name) not in _KNOWN_SOURCES
-    ]
+    registered = {**_KNOWN_SOURCES, **_committed_policies(group_dir)}
+    missing = [(s.path, s.name) for s in sources if (s.path, s.name) not in registered]
     assert not missing, (
         f"{group_dir.name}/config.yaml names dataset source(s) with no entry in "
-        f"_KNOWN_SOURCES: {missing}. A validator would raise KeyError at the first "
-        f"eval dataloader build and fall back to an unscored baseline of 100.0. "
-        f"Either register the source in connito/shared/eval_shard_pick.py (with a "
-        f"row count measured from the native files) or set "
-        f"`eval_source_seeded_shard_pick: false` on this group and say why."
+        f"any shard-pick registry: {missing}. A validator would raise KeyError at "
+        f"the first eval dataloader build and fall back to an unscored baseline of "
+        f"100.0. Either serve a policy for the source with the task, register it in "
+        f"connito/shared/eval_shard_pick.py (with a row count measured from the "
+        f"native files), or set `eval_source_seeded_shard_pick: false` on this "
+        f"group and say why."
     )
 
 
@@ -107,3 +127,16 @@ def test_group_revision_pins_name_configured_sources(group_dir: Path):
         f"{group_dir.name}/config.yaml pins revisions for sources it does not "
         f"configure: {orphaned}. Configured sources are {sorted(configured)}."
     )
+
+
+@pytest.mark.parametrize("group_dir", _group_dirs(), ids=lambda p: p.name)
+def test_committed_shard_policies_are_valid(group_dir: Path):
+    """A committed policy document must parse and validate.
+
+    `parse_served_policies` raises on a bad one, and a validator reading it
+    would raise in exactly the same way — mid-round, where the cost is a
+    dropped round rather than a red test.
+    """
+    if not (group_dir / SHARD_POLICY_FILE).is_file():
+        pytest.skip(f"{group_dir.name} commits no {SHARD_POLICY_FILE}")
+    _committed_policies(group_dir)
