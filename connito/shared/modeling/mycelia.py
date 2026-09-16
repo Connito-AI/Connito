@@ -4,11 +4,14 @@ import logging
 import warnings
 from collections import OrderedDict
 import gc
+import json
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from transformers import AutoTokenizer
+from transformers.utils.hub import cached_file
 
 # Suppress noisy upstream warnings from transformers/rope config (unless DEBUG)
 if logging.root.level > logging.DEBUG:
@@ -19,7 +22,7 @@ if logging.root.level > logging.DEBUG:
 from connito.shared.app_logging import structlog
 from connito.shared.helper import get_nested_attr
 from connito.shared.config import MinerConfig, ValidatorConfig
-from connito.shared.expert_manager import ExpertManager
+from connito.shared.expert_manager import ExpertManager, get_layer_expert_id
 from connito.shared.helper import *
 # ── Model backend selection ──────────────────────────────────────────────────
 # Change MODEL_BACKEND to swap implementations:
@@ -80,6 +83,26 @@ def load_pretrained_state_dict(
         dtype=str(dtype),
     )
     return state_dict
+
+
+def load_pretrained_expert_tensors(
+    model_path: str, layer_map: dict[int, list[tuple[int, int]]],
+) -> dict[str, torch.Tensor]:
+    """The checkpoint's own tensors for the experts one group's table names,
+    read by name from its safetensors files: no model and no full state
+    dict, so a running process can write another group's pretrained shard
+    without a second 30 GB build."""
+    wanted = {(int(layer), int(org)) for layer, pairs in layer_map.items() for _, org in pairs}
+    index = json.loads(Path(cached_file(model_path, "model.safetensors.index.json")).read_text())
+    names_by_file: dict[str, list[str]] = {}
+    for name, file in index["weight_map"].items():
+        if get_layer_expert_id(name) in wanted:
+            names_by_file.setdefault(file, []).append(name)
+    tensors: dict[str, torch.Tensor] = {}
+    for file, names in names_by_file.items():
+        with safe_open(cached_file(model_path, file), framework="pt") as f:
+            tensors.update({name: f.get_tensor(name) for name in names})
+    return tensors
 
 
 def load_pretrained_model_low_mem(

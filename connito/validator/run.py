@@ -1,4 +1,3 @@
-import gc
 import math
 import os
 import secrets
@@ -102,7 +101,7 @@ from connito.shared.expert_manager import (
 from connito.shared.helper import get_model_hash, load_state_dict_from_path
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import get_model_from_checkpoint
-from connito.shared.modeling.mycelia import get_base_tokenizer
+from connito.shared.modeling.mycelia import get_base_tokenizer, load_pretrained_expert_tensors
 from connito.shared.modeling.quantization import apply_from_config
 from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
@@ -564,8 +563,8 @@ def _switch_task(
     config: ValidatorConfig,
     new_task: str,
     *,
-    rank: int,
-    device: torch.device,
+    eval_model: nn.Module,
+    base_shard: Path,
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
@@ -587,13 +586,13 @@ def _switch_task(
     would repopulate a cleared dict with the previous group's shard. Costs one
     cycle with no model advance, which `run` already handles.
 
-    The model is rebuilt from pretrained for the new group, and its pretrained
-    shard written, exactly as at boot — always, rather than keeping the module
-    tree on a same-topology switch: a switch happens once per task and the
-    rebuild costs seconds. Built *before* the old model is released, so a
-    failed build rolls everything back with the old model still serving;
-    the price is two models resident for the duration of the build. The caller
-    rebinds and then `cleanup()`s, which is what frees the old one.
+    The model stays. Under full topology it declares every expert whatever
+    the task, so nothing in it is the group's except the experts the last
+    miner overwrote: those go back to pretrained from the shard the round was
+    scored against. The new group's shard is cut from the checkpoint files,
+    not from the model, which is fp8 by now. A second build beside the live
+    model does not fit — 16.6 GiB resident plus a 29–42 GiB build peak, past
+    every card the fleet runs on — and there is nothing in it to build.
 
     Called from `_maybe_switch_task` once per cycle.
     """
@@ -604,17 +603,25 @@ def _switch_task(
             f"merge_phase_active={merge_phase_active.is_set()}"
         )
 
+    pretrained = load_state_dict_from_path(str(base_shard))
+    eval_model.load_state_dict(pretrained, strict=False)
     previous_task = config.task.expert_group_name
     config.switch_active_task(new_task)
     try:
         expert_manager = ExpertManager(config)
-        eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
+        group_id = config.task.exp.group_id
+        base_shard = _write_pretrained_shard(
+            load_pretrained_expert_tensors(
+                config.model.model_path, expert_manager.expert_group_assignment[group_id],
+            ),
+            expert_manager, group_id, Path(config.ckpt.checkpoint_path) / "pretrained",
+            save_dtype=next(iter(pretrained.values())).dtype,
+        )
     except Exception:
         config.switch_active_task(previous_task)
         raise
 
     eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
-    eval_worker.set_eval_base_model(eval_model)
     logger.info(
         "Switched active task",
         previous_task=previous_task,
@@ -628,8 +635,8 @@ def _switch_task(
 def _maybe_switch_task(
     config: ValidatorConfig,
     *,
-    rank: int,
-    device: torch.device,
+    eval_model: nn.Module,
+    base_shard: Path,
     eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
@@ -645,7 +652,7 @@ def _maybe_switch_task(
     freeze are already on the new task. Miners poll at Distribute, so both
     sides commit the new group at the same MinerCommit1.
 
-    Never raises. An unreachable owner, a bad bundle or a failed build all
+    Never raises. An unreachable owner, a bad bundle or a failed switch all
     leave the node on the task it has — round included — to try again next
     cycle: the same "keep running" choice the boot-time resolve makes.
     """
@@ -662,10 +669,10 @@ def _maybe_switch_task(
             raise RuntimeError(f"no usable bundle for {active.name!r}")
         materialize_task(bundle, config.task.base_path)
         # Close the window so the worker claims no more miners, then wait for
-        # the eval it may be running — it holds the lock for that — so the old
-        # model is idle before a second one is built beside it. Only on
-        # success is the round dropped; a failed build reopens the window and
-        # the round carries on, on the model it had.
+        # the eval it may be running — it holds the lock for that — so the
+        # model is idle before its experts are put back. Only on success is
+        # the round dropped; a failed switch reopens the window and the round
+        # carries on.
         was_open = eval_window_active.is_set()
         eval_window_active.clear()
         with gpu_eval_lock:
@@ -673,7 +680,7 @@ def _maybe_switch_task(
         try:
             state = _switch_task(
                 config, bundle.name,
-                rank=rank, device=device, eval_worker=eval_worker,
+                eval_model=eval_model, base_shard=base_shard, eval_worker=eval_worker,
                 eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
             )
         except Exception:
@@ -694,29 +701,27 @@ def _maybe_switch_task(
 
 
 def _write_pretrained_shard(
-    model: nn.Module, expert_manager: ExpertManager, group_id: int, dest_dir: Path,
+    state_dict: dict[str, torch.Tensor], expert_manager: ExpertManager, group_id: int,
+    dest_dir: Path, save_dtype: torch.dtype,
 ) -> Path:
     """The active group's pretrained experts, as the shard every round is scored against.
 
     Same writer and filename as a miner submission, so the key set is exactly
-    what a submission must cover. Rewritten every boot: cheap, and it cannot
-    drift from the model actually loaded.
+    what a submission must cover. Rewritten at every boot and switch: cheap,
+    and it cannot drift from the weights the process actually holds.
     """
-    state_dict = model.state_dict()
     paths = save_state_dict_by_expert_group(
         state_dict, expert_manager.expert_group_assignment, dest_dir,
-        active_expert_group_id=group_id, save_dtype=next(model.parameters()).dtype,
+        active_expert_group_id=group_id, save_dtype=save_dtype,
     )
-    del state_dict
-    gc.collect()
     return Path(paths[group_id])
 
 
 def _build_eval_model(
     config, rank: int, device: torch.device, expert_manager: ExpertManager,
 ) -> tuple[nn.Module, Path]:
-    """The process's only model for the active group, plus the shard every
-    round is scored against. Shared by boot and the task switch.
+    """The process's only model, plus the shard every round is scored
+    against. Boot only: a task switch keeps the model (`_switch_task`).
 
     `partial=False`: scoring runs over all 64 routed experts per layer, not the
     active group plus its helper. Deliberately asymmetric with the miner, which
@@ -736,8 +741,9 @@ def _build_eval_model(
     )
     # Before quantization, so the shard holds the dtype miners submit in.
     base_shard = _write_pretrained_shard(
-        eval_model, expert_manager, config.task.exp.group_id,
+        eval_model.state_dict(), expert_manager, config.task.exp.group_id,
         Path(config.ckpt.checkpoint_path) / "pretrained",
+        save_dtype=next(eval_model.parameters()).dtype,
     )
     apply_from_config(eval_model, config, expert_manager, role="validator")
     return eval_model, base_shard
@@ -1632,7 +1638,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # nothing; the MinerCommit1 commit later reads the new group.
             wait_till(config, PhaseNames.train)
             switched = _maybe_switch_task(
-                config, rank=rank, device=device, eval_worker=eval_worker,
+                config, eval_model=eval_model, base_shard=base_shard, eval_worker=eval_worker,
                 eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
                 round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
             )
@@ -1642,10 +1648,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     switched.base_shard, switched.baseline_ref,
                 )
                 # Exactly the state of a fresh boot on the new task: no hash
-                # to commit until ValidatorCommit1, and the previous model's
-                # last reference was just dropped.
+                # to commit until ValidatorCommit1.
                 current_model_hash = None
-                cleanup()
 
             # === Close download window before next-cycle MinerCommit1 ===
             # Wait until 30 blocks before the next MinerCommit1 so bg-download

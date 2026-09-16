@@ -1,8 +1,9 @@
 """`_switch_task` — the one place a running validator changes task.
 
-Two properties worth pinning, both silent when broken: the gate must be
-checked *before* config moves, and a task whose assignment will not load must
-roll config back. See the routine's docstring for why each matters.
+Three properties worth pinning, all silent when broken: the gate must be
+checked *before* config moves, a task whose assignment will not load must
+roll config back, and the model must be the same object afterwards — a
+switch is not a rebuild. See the routine's docstring for why each matters.
 """
 from __future__ import annotations
 
@@ -73,30 +74,51 @@ def eval_worker(gates) -> BackgroundEvalWorker:
     )
 
 
-def _stub_builder(config, rank, device, expert_manager):
-    """Stands in for `_build_eval_model`: a tiny module and a shard path,
-    without loading DeepSeek. Tagged with the group so tests can tell
-    whose model came back."""
-    model = torch.nn.Linear(2, 2)
-    model.group_id = config.task.exp.group_id
-    shard = Path(config.ckpt.checkpoint_path) / "pretrained" / f"model_expgroup_{model.group_id}.safetensors"
-    return model, shard
+class _Model(torch.nn.Module):
+    """One parameter, so a restore from the old shard is observable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.ones(2))
 
 
-def _switch(config, eval_worker, gates, to: str, build_model=_stub_builder):
+@pytest.fixture
+def model(eval_worker) -> _Model:
+    m = _Model()
+    eval_worker.set_eval_base_model(m)
+    return m
+
+
+OLD_SHARD = Path("model_expgroup_4.safetensors")
+# What the old shard "holds": pretrained values for the model's parameter.
+PRETRAINED = {"w": torch.zeros(2, dtype=torch.bfloat16)}
+
+
+def _stub_writer(state_dict, expert_manager, group_id, dest_dir, save_dtype):
+    """Stands in for `_write_pretrained_shard`: the path it would return,
+    tagged with the group so tests can tell whose shard came back."""
+    return dest_dir / f"model_expgroup_{group_id}.safetensors"
+
+
+def _switch(config, eval_worker, gates, to: str, *, model, write_shard=_stub_writer,
+            read_experts=lambda path, layer_map: {}):
     eval_window, merge = gates
-    with patch("connito.validator.run._build_eval_model", build_model):
+    with (
+        patch("connito.validator.run.load_state_dict_from_path", lambda path: dict(PRETRAINED)),
+        patch("connito.validator.run.load_pretrained_expert_tensors", read_experts),
+        patch("connito.validator.run._write_pretrained_shard", write_shard),
+    ):
         return _switch_task(
             config, to,
-            rank=0, device=torch.device("cpu"),
+            eval_model=model, base_shard=OLD_SHARD,
             eval_worker=eval_worker,
             eval_window_active=eval_window,
             merge_phase_active=merge,
         )
 
 
-def test_config_and_routing_table_move_together(config, eval_worker, gates) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET).expert_manager
+def test_config_and_routing_table_move_together(config, eval_worker, gates, model) -> None:
+    manager = _switch(config, eval_worker, gates, TARGET, model=model).expert_manager
 
     assert config.task.expert_group_name == TARGET
     assert config.task.exp.group_id == 7
@@ -105,35 +127,36 @@ def test_config_and_routing_table_move_together(config, eval_worker, gates) -> N
     assert manager.expert_group_assignment[7][0] == [(0, 20), (1, 21)]
 
 
-def test_the_eval_worker_is_handed_the_new_table(config, eval_worker, gates) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET).expert_manager
+def test_the_eval_worker_is_handed_the_new_table(config, eval_worker, gates, model) -> None:
+    manager = _switch(config, eval_worker, gates, TARGET, model=model).expert_manager
 
     assert eval_worker._expert_group_assignment is manager.expert_group_assignment
 
 
 @pytest.mark.parametrize("gate", ["eval_window", "merge"])
-def test_switch_is_refused_mid_round(config, eval_worker, gates, gate) -> None:
+def test_switch_is_refused_mid_round(config, eval_worker, gates, model, gate) -> None:
     eval_window, merge = gates
     (eval_window if gate == "eval_window" else merge).set()
 
     with pytest.raises(RuntimeError, match="mid-round"):
-        _switch(config, eval_worker, gates, TARGET)
+        _switch(config, eval_worker, gates, TARGET, model=model)
 
 
-def test_a_refused_switch_moves_nothing(config, eval_worker, gates) -> None:
-    """The gate must be checked before config is touched, not after."""
+def test_a_refused_switch_moves_nothing(config, eval_worker, gates, model) -> None:
+    """The gate must be checked before config — or the model — is touched."""
     eval_window, _ = gates
     eval_window.set()
     before = (config.task.expert_group_name, config.task.exp.group_id)
 
     with pytest.raises(RuntimeError):
-        _switch(config, eval_worker, gates, TARGET)
+        _switch(config, eval_worker, gates, TARGET, model=model)
 
     assert (config.task.expert_group_name, config.task.exp.group_id) == before
     assert 4 in eval_worker._expert_group_assignment
+    assert torch.equal(model.w, torch.ones(2))
 
 
-def test_an_unloadable_task_rolls_config_back(config, eval_worker, gates, tmp_path) -> None:
+def test_an_unloadable_task_rolls_config_back(config, eval_worker, gates, model, tmp_path) -> None:
     """Config must not be left naming a group whose table failed to load."""
     # A task folder the config can read but ExpertManager cannot: config.yaml
     # present, expert_assignment.json missing.
@@ -144,7 +167,7 @@ def test_an_unloadable_task_rolls_config_back(config, eval_worker, gates, tmp_pa
     )
 
     with pytest.raises(Exception):
-        _switch(config, eval_worker, gates, "exp_broken")
+        _switch(config, eval_worker, gates, "exp_broken", model=model)
 
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
@@ -153,86 +176,79 @@ def test_an_unloadable_task_rolls_config_back(config, eval_worker, gates, tmp_pa
     assert 4 in eval_worker._expert_group_assignment
 
 
-def test_the_switch_hands_back_a_fresh_baseline_ref(config, eval_worker, gates) -> None:
+def test_the_switch_hands_back_a_fresh_baseline_ref(config, eval_worker, gates, model) -> None:
     """`run` must rebind to a different dict than a still-uploading publish
     holds: `publish_round_baseline` writes `out` a second time once the ~3 GB
     upload lands, routinely after the switch window, so clearing in place
     would put the previous group's shard back. Fresh means empty and new."""
-    first = _switch(config, eval_worker, gates, TARGET).baseline_ref
-    second = _switch(config, eval_worker, gates, SHIPPED).baseline_ref
+    first = _switch(config, eval_worker, gates, TARGET, model=model).baseline_ref
+    second = _switch(config, eval_worker, gates, SHIPPED, model=model).baseline_ref
 
     assert first == {} and second == {}
     assert first is not second
 
 
-# --- tier 3: the switch rebuilds the model --------------------------------
+# --- tier 3: the switch keeps the model ---------------------------------------
 
-def test_the_switch_hands_the_worker_the_new_groups_model(config, eval_worker, gates) -> None:
-    old = torch.nn.Linear(2, 2)
-    eval_worker.set_eval_base_model(old)
+def test_the_model_is_the_same_object_after_the_switch(config, eval_worker, gates, model) -> None:
+    """Under full topology the model declares every expert whatever the
+    task, so a switch has nothing to build — and a second build beside the
+    live model would not fit on the card."""
+    state = _switch(config, eval_worker, gates, TARGET, model=model)
 
-    state = _switch(config, eval_worker, gates, TARGET)
-
-    assert state.eval_model.group_id == 7
-    assert eval_worker._eval_base_model is state.eval_model
+    assert state.eval_model is model
+    assert eval_worker._eval_base_model is model
     assert state.base_shard.name == "model_expgroup_7.safetensors"
     assert 7 in eval_worker._expert_group_assignment
 
 
-def test_the_model_is_built_from_the_new_groups_table(config, eval_worker, gates) -> None:
-    """Config moves first, then the manager, then the model — a builder that
-    saw the old table would host the old group's experts."""
-    seen: list[set[int]] = []
+def test_the_old_groups_experts_go_back_to_pretrained(config, eval_worker, gates, model) -> None:
+    """The last miner's overlay is still in the model; under full routing
+    every expert takes part in the forward, so it must be undone."""
+    _switch(config, eval_worker, gates, TARGET, model=model)
 
-    def spy(cfg, rank, device, expert_manager):
-        seen.append(set(expert_manager.expert_group_assignment))
-        return _stub_builder(cfg, rank, device, expert_manager)
-
-    _switch(config, eval_worker, gates, TARGET, build_model=spy)
-
-    assert seen == [{7, 2}]  # the new group plus the helper
+    assert torch.equal(model.w, torch.zeros(2))
 
 
-def test_the_old_model_is_still_serving_while_the_new_one_builds(config, eval_worker, gates) -> None:
-    """Built before released: two models resident briefly, so a failed build
-    has something to fall back to."""
-    old = torch.nn.Linear(2, 2)
-    eval_worker.set_eval_base_model(old)
-    during: list[object] = []
+def test_the_new_shard_is_cut_from_the_new_groups_table(config, eval_worker, gates, model) -> None:
+    """Config moves first, then the manager, then the shard — the checkpoint
+    is read for the new group's experts, in the dtype of the shard it replaces."""
+    read: list[dict] = []
+    written: list[tuple] = []
 
-    def spy(cfg, rank, device, expert_manager):
-        during.append(eval_worker._eval_base_model)
-        return _stub_builder(cfg, rank, device, expert_manager)
+    def spy_read(path, layer_map):
+        read.append(layer_map)
+        return {"from": "checkpoint"}
 
-    _switch(config, eval_worker, gates, TARGET, build_model=spy)
+    def spy_write(state_dict, expert_manager, group_id, dest_dir, save_dtype):
+        written.append((state_dict, set(expert_manager.expert_group_assignment), group_id, save_dtype))
+        return _stub_writer(state_dict, expert_manager, group_id, dest_dir, save_dtype)
 
-    assert during == [old]
+    _switch(config, eval_worker, gates, TARGET, model=model, read_experts=spy_read, write_shard=spy_write)
+
+    assert read == [{0: [(0, 20), (1, 21)]}]
+    assert written == [({"from": "checkpoint"}, {7, 2}, 7, torch.bfloat16)]
 
 
-def test_a_failed_build_rolls_everything_back(config, eval_worker, gates) -> None:
-    old = torch.nn.Linear(2, 2)
-    eval_worker.set_eval_base_model(old)
+def test_a_failed_shard_write_rolls_config_back(config, eval_worker, gates, model) -> None:
+    def boom(state_dict, expert_manager, group_id, dest_dir, save_dtype):
+        raise RuntimeError("disk full")
 
-    def boom(cfg, rank, device, expert_manager):
-        raise RuntimeError("no such model")
-
-    with pytest.raises(RuntimeError, match="no such model"):
-        _switch(config, eval_worker, gates, TARGET, build_model=boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        _switch(config, eval_worker, gates, TARGET, model=model, write_shard=boom)
 
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
-    assert eval_worker._eval_base_model is old
+    assert eval_worker._eval_base_model is model
     assert 4 in eval_worker._expert_group_assignment
 
 
 # --- tier 3: the trigger ------------------------------------------------------
 
-def _poll(config, eval_worker, gates, monkeypatch, *, active, bundle=None, build_model=_stub_builder,
+def _poll(config, eval_worker, gates, monkeypatch, *, model, active, bundle=None, write_shard=_stub_writer,
           round_ref=None):
     """Run `_maybe_switch_task` against a stubbed owner. Returns the state it
     handed back and the (task, root) pairs it asked to materialize."""
-    from types import SimpleNamespace
-
     from connito.validator import run
     from connito.validator.round import RoundRef
 
@@ -242,9 +258,11 @@ def _poll(config, eval_worker, gates, monkeypatch, *, active, bundle=None, build
     monkeypatch.setattr(run, "get_active_task", lambda cycle: active and SimpleNamespace(name=active))
     monkeypatch.setattr(run, "get_active_task_bundle", lambda cycle: bundle and SimpleNamespace(name=bundle))
     monkeypatch.setattr(run, "materialize_task", lambda b, root: materialized.append((b.name, Path(root))))
-    monkeypatch.setattr(run, "_build_eval_model", build_model)
+    monkeypatch.setattr(run, "load_state_dict_from_path", lambda path: dict(PRETRAINED))
+    monkeypatch.setattr(run, "load_pretrained_expert_tensors", lambda path, layer_map: {})
+    monkeypatch.setattr(run, "_write_pretrained_shard", write_shard)
     state = run._maybe_switch_task(
-        config, rank=0, device=torch.device("cpu"), eval_worker=eval_worker,
+        config, eval_model=model, base_shard=OLD_SHARD, eval_worker=eval_worker,
         eval_window_active=eval_window, merge_phase_active=merge,
         round_ref=round_ref, gpu_eval_lock=threading.Lock(),
     )
@@ -253,74 +271,69 @@ def _poll(config, eval_worker, gates, monkeypatch, *, active, bundle=None, build
 
 def _round_in_flight(gates):
     """A round mid-evaluation: the window is open and the ref holds it."""
-    from types import SimpleNamespace
-
     from connito.validator.round import RoundRef
 
     gates[0].set()
     return RoundRef(current=SimpleNamespace(round_id=9000))
 
 
-def test_the_owner_naming_another_task_switches_to_it(config, eval_worker, gates, monkeypatch) -> None:
-    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=TARGET)
+def test_the_owner_naming_another_task_switches_to_it(config, eval_worker, gates, model, monkeypatch) -> None:
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, model=model, active=TARGET, bundle=TARGET)
 
-    assert state is not None and state.eval_model.group_id == 7
+    assert state is not None and state.base_shard.name == "model_expgroup_7.safetensors"
     assert config.task.expert_group_name == TARGET
     assert materialized == [(TARGET, config.task.base_path)]
 
 
-def test_the_round_in_flight_is_dropped_with_its_task(config, eval_worker, gates, monkeypatch) -> None:
+def test_the_round_in_flight_is_dropped_with_its_task(config, eval_worker, gates, model, monkeypatch) -> None:
     """Its task is over: no more claims (window closed) and nothing to
     finalize (ref cleared), so no weights go out for it."""
     round_ref = _round_in_flight(gates)
 
-    _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=TARGET, round_ref=round_ref)
+    _poll(config, eval_worker, gates, monkeypatch, model=model, active=TARGET, bundle=TARGET, round_ref=round_ref)
 
     assert round_ref.current is None
     assert not gates[0].is_set()
 
 
-def test_an_unreachable_owner_keeps_the_current_task(config, eval_worker, gates, monkeypatch) -> None:
+def test_an_unreachable_owner_keeps_the_current_task(config, eval_worker, gates, model, monkeypatch) -> None:
     """No answer is not a change of answer: nothing is fetched, let alone switched."""
-    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=None, bundle=TARGET)
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, model=model, active=None, bundle=TARGET)
 
     assert state is None
     assert config.task.expert_group_name == SHIPPED
     assert materialized == []
 
 
-def test_the_owner_naming_our_task_fetches_nothing(config, eval_worker, gates, monkeypatch) -> None:
+def test_the_owner_naming_our_task_fetches_nothing(config, eval_worker, gates, model, monkeypatch) -> None:
     """Had the bundle been fetched, its task would have been materialized."""
-    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=SHIPPED, bundle=TARGET)
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, model=model, active=SHIPPED, bundle=TARGET)
 
     assert state is None and materialized == []
     assert config.task.expert_group_name == SHIPPED
 
 
-def test_a_bad_bundle_keeps_the_current_task(config, eval_worker, gates, monkeypatch) -> None:
+def test_a_bad_bundle_keeps_the_current_task(config, eval_worker, gates, model, monkeypatch) -> None:
     """The bundle fetch refuses a payload that fails its hash by returning None."""
-    state, materialized = _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=None)
+    state, materialized = _poll(config, eval_worker, gates, monkeypatch, model=model, active=TARGET, bundle=None)
 
     assert state is None
     assert config.task.expert_group_name == SHIPPED
     assert materialized == []
 
 
-def test_a_failed_build_keeps_the_current_task_and_model(config, eval_worker, gates, monkeypatch) -> None:
-    old = torch.nn.Linear(2, 2)
-    eval_worker.set_eval_base_model(old)
-
-    def boom(cfg, rank, device, expert_manager):
-        raise RuntimeError("no such model")
+def test_a_failed_switch_keeps_the_current_task_and_model(config, eval_worker, gates, model, monkeypatch) -> None:
+    def boom(state_dict, expert_manager, group_id, dest_dir, save_dtype):
+        raise RuntimeError("disk full")
 
     round_ref = _round_in_flight(gates)
 
-    state, _ = _poll(config, eval_worker, gates, monkeypatch, active=TARGET, bundle=TARGET, build_model=boom,
-                     round_ref=round_ref)
+    state, _ = _poll(config, eval_worker, gates, monkeypatch, model=model, active=TARGET, bundle=TARGET,
+                     write_shard=boom, round_ref=round_ref)
 
     assert state is None
     assert config.task.expert_group_name == SHIPPED
-    assert eval_worker._eval_base_model is old
+    assert eval_worker._eval_base_model is model
     # The round carries on, on the model it had.
     assert round_ref.current is not None
     assert gates[0].is_set()
