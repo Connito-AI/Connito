@@ -83,18 +83,27 @@ That requires:
        the same seed and break weight consensus for that round.
     2. Deterministic file-list sort (plain lexicographic on the full
        `siblings.rfilename`).
-    3. The `safe_floor_rows` / `min_headroom_rows` constants must
-       match across validators — they live in code (this module), not
-       config, so the rollout discipline is just "deploy the same
-       commit." Operators MUST re-verify `verified_shard_rows` and
+    3. Every validator must resolve the SAME policy for a source.
+       The two registries satisfy this by different means. Built-in
+       entries in `_KNOWN_SOURCES` live in code, so the discipline is
+       "deploy the same commit" — which a mixed-version fleet can
+       quietly violate. Policies served with the task bundle are
+       fetched by every validator from the same locked `owner_url`
+       and checked against the bundle hash, so they are identical by
+       construction; the discipline there is that a policy-bearing
+       task must not be published until the whole fleet can read one.
+       Either way, operators MUST re-verify `verified_shard_rows` and
        bump `safe_floor_rows` together if the upstream dataset is
        ever re-uploaded with different shard sizes.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from huggingface_hub import HfApi
@@ -192,8 +201,9 @@ class _SourceShardPolicy:
     max_offset_rows: int | None = None
 
 
-# Known sources. Add new entries here, NOT via config — the consensus
-# rules require every validator to use the same policy.
+# Built-in sources. A task bundle may serve its own policy for a source
+# (see `parse_served_policies`), and that takes precedence; entries here
+# are the fallback for sources no bundle covers.
 _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
     ("allenai/c4", "en"): _SourceShardPolicy(
         path_prefix="en/",
@@ -525,14 +535,82 @@ def parse_served_policies(doc: dict[str, Any]) -> dict[tuple[str, str | None], _
     return registry
 
 
+# The active task's served policies. Consulted by `_policy_for` ahead of
+# `_KNOWN_SOURCES`. Module-level, like the built-in registry, because
+# exactly one task is active per process.
+_SERVED_POLICIES: dict[tuple[str, str | None], _SourceShardPolicy] = {}
+
+# sha256 of the document `_SERVED_POLICIES` was parsed from, "" when none
+# is active. This is a CACHE KEY, not bookkeeping: `_list_shards` is
+# keyed on (repo_id, name, revision) but reads the policy inside its
+# body, so without a fingerprint component a task switch that changes a
+# policy while leaving the revision alone would be served a stale shard
+# list — silently, and only on nodes that had warmed the cache. That is
+# a consensus break, so the fingerprint travels with the cache key.
+_SERVED_FINGERPRINT = ""
+
+SHARD_POLICY_FILE = "shard_policy.json"
+
+
+def activate_served_policies(task_dir: Path) -> None:
+    """Install, or clear, the policies served with the active task.
+
+    Called before each seeded pick rather than wired into the task
+    switch: `config.task.path` is re-derived on switch and
+    `materialize_task` has already replaced the directory, so reading
+    it here picks the change up with no lifecycle plumbing in the
+    validator or the miner. Re-reading the same document is a stat and
+    a hash, and returns early.
+
+    Absence of the file is the normal case — a task that serves no
+    policy falls through to `_KNOWN_SOURCES`.
+
+    Raises on a present-but-invalid document. See `parse_served_policies`
+    for why that must not be softened into a fallback.
+    """
+    global _SERVED_POLICIES, _SERVED_FINGERPRINT
+
+    path = Path(task_dir) / SHARD_POLICY_FILE
+    raw = path.read_bytes() if path.is_file() else b""
+    fingerprint = hashlib.sha256(raw).hexdigest() if raw else ""
+    if fingerprint == _SERVED_FINGERPRINT:
+        return
+
+    policies = parse_served_policies(json.loads(raw)) if raw else {}
+    _SERVED_POLICIES = policies
+    _SERVED_FINGERPRINT = fingerprint
+    # Deliberately no `_list_shards.cache_clear()` here. The fingerprint
+    # is part of that cache's key, so entries from a previous document
+    # are unreachable rather than stale, and the bounded LRU evicts them
+    # on its own. Clearing as well would be a second mechanism for the
+    # same guarantee, and a weaker one: a pick already inside
+    # `_list_shards` when the clear ran would write its result back
+    # afterwards, under a key the new policy still reads.
+    # Source names are deliberately not logged: the count and
+    # fingerprint are enough to diagnose a switch, and the task config
+    # is where the identities belong.
+    logger.info(
+        "served shard policies activated",
+        task_dir=str(task_dir),
+        source_count=len(policies),
+        fingerprint=fingerprint[:12] or None,
+    )
+
+
 def _policy_for(path: str, name: str | None) -> _SourceShardPolicy:
     key = (path, name)
+    # Served policies win. The bundle is the source of truth for the
+    # active task, which is what lets a wrong policy be corrected by
+    # publishing a task instead of cutting a release.
+    if key in _SERVED_POLICIES:
+        return _SERVED_POLICIES[key]
     if key not in _KNOWN_SOURCES:
         raise KeyError(
             f"No shard-pick policy registered for source ({path!r}, {name!r}). "
-            f"Add an entry to `_KNOWN_SOURCES` in `eval_shard_pick.py` and "
-            f"verify that data_files=[shard] yields the same rows as the "
-            f"canonical load path before flipping the feature flag."
+            f"Serve one in the task bundle's `{SHARD_POLICY_FILE}`, or add an "
+            f"entry to `_KNOWN_SOURCES` in `eval_shard_pick.py`, and verify that "
+            f"data_files=[shard] yields the same rows as the canonical load path "
+            f"before flipping the feature flag."
         )
     return _KNOWN_SOURCES[key]
 
@@ -564,12 +642,20 @@ def _resolve_revision(repo_id: str, requested: str) -> str:
 
 
 @lru_cache(maxsize=8)
-def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ...]:
+def _list_shards(
+    repo_id: str, name: str | None, revision: str, policy_fingerprint: str = ""
+) -> tuple[str, ...]:
     """Return the deterministically-sorted shard list for a source.
 
-    Cached per (repo_id, name, revision). Sort is plain lex over the
-    full `rfilename` string so any validator computing this against
-    the same revision gets the same tuple.
+    Cached per (repo_id, name, revision, policy_fingerprint). Sort is
+    plain lex over the full `rfilename` string so any validator
+    computing this against the same revision gets the same tuple.
+
+    `policy_fingerprint` is unread in the body and exists only to keep
+    the cache honest. The body resolves `_policy_for(...)` and filters
+    on `path_prefix`, `path_suffix`, `leaf_name_pattern` and the
+    verified table, so two different policies for one
+    (repo_id, name, revision) must not share a cache entry.
     """
     policy = _policy_for(repo_id, name)
     if policy.row_count_source == "verified_table":
@@ -745,7 +831,7 @@ def pick_shard_for_source(
     requested_revision = revision_override or policy.revision
     revision = _resolve_revision(repo_id, requested_revision)
 
-    shards = _list_shards(repo_id, name, revision)
+    shards = _list_shards(repo_id, name, revision, _SERVED_FINGERPRINT)
     if not shards:  # _list_shards already raises but be explicit
         raise RuntimeError(
             f"Empty shard list for ({repo_id!r}, {name!r}, rev={revision!r})"

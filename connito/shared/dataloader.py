@@ -336,9 +336,18 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             # Lazy import — avoids pulling the HF API stack into the
             # legacy code path.
             from connito.shared.eval_shard_pick import (
+                activate_served_policies,
                 load_streaming_shard,
                 pick_shard_for_source,
             )
+            # Pick up any policy served with the active task before
+            # resolving a source. `config.task.path` is the directory
+            # `materialize_task` writes, and it is re-derived on a task
+            # switch, so this needs no lifecycle wiring of its own.
+            # Raises on a malformed document rather than falling back —
+            # every validator holds the same bundle, so failing here
+            # fails identically fleet-wide instead of splitting weights.
+            activate_served_policies(config.task.path)
             logger.info(
                 "eval dataloader using seeded shard-pick path",
                 seed=seed, int_seed=int_seed,
