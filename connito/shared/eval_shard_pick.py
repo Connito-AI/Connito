@@ -95,9 +95,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from huggingface_hub import HfApi
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from connito.shared.app_logging import structlog
 from connito.shared.helper import h256_int
@@ -390,6 +391,138 @@ def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) ->
 # system is designed to surface.
 for _key, _policy in _KNOWN_SOURCES.items():
     _validate_policy(_key, _policy)
+
+
+# ----------------------------------------------------------- served policies
+#
+# A task bundle may carry a `shard_policy.json` beside its `config.yaml`
+# (written by `task_sync.materialize_task`, covered by `bundle_sha256`).
+# It lets a dataset's shard policy be registered by publishing a task
+# rather than by cutting a validator release.
+#
+# Consensus is preserved by a different mechanism than the built-in
+# registry's: every validator fetches the SAME bundle from the same
+# locked `owner_url` and checks it against the server's hash, so the
+# policy is identical fleet-wide by construction. That is strictly
+# stronger than "deploy the same commit", which a mixed-version fleet
+# can violate.
+
+_SERVED_POLICY_SCHEMA_VERSION = 1
+
+# Generic HF builders a served policy may name. `load_builder` exists to
+# AVOID executing a repo's own loading script, so a publisher has to be
+# able to set it; restricting it to file-format builders keeps a served
+# value from naming something with side effects of its own.
+_ALLOWED_LOAD_BUILDERS = frozenset({"arrow", "csv", "json", "parquet", "text"})
+
+
+class ServedShardPolicy(BaseModel):
+    """One source's policy as it arrives in `shard_policy.json`.
+
+    `extra="forbid"`, deliberately against this repo's usual
+    `extra="ignore"`: an ignored typo here does not fail, it silently
+    samples the wrong rows. The cost is that a policy using a field
+    added in a later release cannot be published until the whole fleet
+    carries that release — the same discipline the rest of this rollout
+    already requires.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    name: str | None = None
+    path_prefix: str
+    path_suffix: tuple[str, ...]
+    revision: str
+    row_count_source: Literal["constant", "parquet_footer", "verified_table"]
+    safe_floor_rows: int | None = None
+    min_headroom_rows: int = 10_000
+    verified_shard_rows: dict[str, int] = Field(default_factory=dict)
+    leaf_name_pattern: str | None = None
+    load_builder: str | None = None
+    max_offset_rows: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_load_builder(self) -> ServedShardPolicy:
+        if self.load_builder is not None and self.load_builder not in _ALLOWED_LOAD_BUILDERS:
+            raise ValueError(
+                f"load_builder {self.load_builder!r} is not one of {sorted(_ALLOWED_LOAD_BUILDERS)}"
+            )
+        return self
+
+    def to_policy(self) -> _SourceShardPolicy:
+        """The in-code policy object this document describes.
+
+        `path_suffix` lands as a tuple — the field type coerces it —
+        because `str.endswith` raises `TypeError` on a list and JSON
+        gives a list. Without that coercion every shard listing for a
+        served source would fail.
+        """
+        return _SourceShardPolicy(
+            path_prefix=self.path_prefix,
+            path_suffix=tuple(self.path_suffix),
+            revision=self.revision,
+            row_count_source=self.row_count_source,
+            safe_floor_rows=self.safe_floor_rows,
+            min_headroom_rows=self.min_headroom_rows,
+            verified_shard_rows=dict(self.verified_shard_rows),
+            leaf_name_pattern=self.leaf_name_pattern,
+            load_builder=self.load_builder,
+            max_offset_rows=self.max_offset_rows,
+        )
+
+
+class ServedShardPolicyDoc(BaseModel):
+    """A whole `shard_policy.json` document.
+
+    Sources are a list rather than a mapping keyed by repo id because
+    the registry key is `(path, name)` and `name` may be null, which a
+    JSON object key cannot express.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int
+    sources: list[ServedShardPolicy]
+
+    @model_validator(mode="after")
+    def _validate_version_and_keys(self) -> ServedShardPolicyDoc:
+        # Checked rather than ignored so a future schema cannot be
+        # half-understood by an older validator.
+        if self.version != _SERVED_POLICY_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported shard_policy.json version {self.version}; this validator "
+                f"understands version {_SERVED_POLICY_SCHEMA_VERSION}"
+            )
+        seen: set[tuple[str, str | None]] = set()
+        for source in self.sources:
+            key = (source.path, source.name)
+            if key in seen:
+                raise ValueError(f"duplicate policy for source {key}")
+            seen.add(key)
+        return self
+
+
+def parse_served_policies(doc: dict[str, Any]) -> dict[tuple[str, str | None], _SourceShardPolicy]:
+    """Validate a served policy document into a policy registry.
+
+    Raises on anything malformed, and callers must NOT soften that into
+    a fallback. Every validator holds the identical bundle, so a bad
+    document fails identically fleet-wide: one uniformly bad round,
+    which is recoverable and loud. Falling back to `_KNOWN_SOURCES` on
+    some nodes and not others would split weight consensus, which is
+    neither.
+    """
+    parsed = ServedShardPolicyDoc(**doc)
+    registry: dict[tuple[str, str | None], _SourceShardPolicy] = {}
+    for source in parsed.sources:
+        key = (source.path, source.name)
+        policy = source.to_policy()
+        # Held to exactly the invariants the built-in registry is held
+        # to at import time.
+        _validate_policy(key, policy)
+        registry[key] = policy
+    return registry
 
 
 def _policy_for(path: str, name: str | None) -> _SourceShardPolicy:
