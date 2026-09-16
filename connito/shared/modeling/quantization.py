@@ -127,7 +127,16 @@ def quantize_(model: nn.Module, scope: str, assignment: dict) -> list[str]:
     }
     converted: list[str] = []
 
-    for parent_name, parent in list(model.named_modules()):
+    # Names, not modules. Holding the module objects keeps every original
+    # `nn.Linear` alive for the whole loop, so no replaced weight can be freed
+    # while the fp8 copies accumulate and the peak is both sets at once. On the
+    # 1664-expert topology that is 42.0 GiB against 29.3 GiB releasing as we go
+    # — the difference between needing a 48 GB card and fitting on any of ours.
+    #
+    # Resolving each name late is safe only because every replacement is a leaf
+    # `nn.Linear`: no captured name can name a module underneath one we swap.
+    for parent_name in [name for name, _ in model.named_modules()]:
+        parent = model.get_submodule(parent_name)
         for child_name, child in list(parent.named_children()):
             if not isinstance(child, nn.Linear):
                 continue
