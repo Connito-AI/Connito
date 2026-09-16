@@ -716,10 +716,23 @@ def _build_eval_model(
     config, rank: int, device: torch.device, expert_manager: ExpertManager,
 ) -> tuple[nn.Module, Path]:
     """The process's only model for the active group, plus the shard every
-    round is scored against. Shared by boot and the task switch."""
+    round is scored against. Shared by boot and the task switch.
+
+    `partial=False`: scoring runs over all 64 routed experts per layer, not the
+    active group plus its helper. Deliberately asymmetric with the miner, which
+    still trains `partial=True` (`miner/train.py`) — this changes how
+    submissions are *measured*, not how they are produced, and the pretrained
+    shard written below is byte-identical either way, so the submission
+    contract is untouched.
+
+    Full mode also changes the routing rule, not just the pool. With no
+    trainable or helper id set, `CustomDeepseekV2Moe` skips both the 2Fnat
+    branch and the masked-topk branch and routes naturally over all 64 at
+    `moe.full_topk`, which is why that value had to be corrected first.
+    """
     eval_model, _ = get_model_from_checkpoint(
         rank=rank, config=config, expert_manager=expert_manager,
-        partial=True, checkpoint_device=device, load_global_checkpoint=False,
+        partial=False, checkpoint_device=device, load_global_checkpoint=False,
     )
     # Before quantization, so the shard holds the dtype miners submit in.
     base_shard = _write_pretrained_shard(
