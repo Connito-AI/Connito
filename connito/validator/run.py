@@ -5,7 +5,6 @@ import secrets
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from dotenv import load_dotenv
@@ -550,147 +549,74 @@ def _shutdown_background_workers(
             logger.info("Shutdown: background worker joined", thread_name=worker.name)
 
 
-@dataclass
-class TaskScopedState:
-    """The values `run` rebinds when the active task changes."""
+class _RestartForTask(KeyboardInterrupt):
+    """Raised to end the process so it reboots onto a newly published task.
 
-    expert_manager: ExpertManager
-    eval_model: nn.Module
-    base_shard: Path
-    baseline_ref: dict[str, object] = field(default_factory=dict)
+    A `KeyboardInterrupt` subclass deliberately: `run`'s existing handler
+    already stops the background workers, the chain submitter and the poller in
+    the right order, and a `BaseException` cannot be swallowed by the
+    `except Exception` that guards the switch. Nothing new is torn down.
 
-
-def _switch_task(
-    config: ValidatorConfig,
-    new_task: str,
-    *,
-    rank: int,
-    device: torch.device,
-    eval_worker: BackgroundEvalWorker,
-    eval_window_active: threading.Event,
-    merge_phase_active: threading.Event,
-) -> TaskScopedState:
-    """Move a running validator onto a different task, all-or-nothing.
-
-    `run` binds everything task-scoped once before the loop, so this is the
-    single place a switch happens — objects re-pointed in dependency order.
-
-    Both gates checked before anything moves. The eval window opens at
-    `Round.freeze` and closes at MinerCommit1 of the *next* cycle, so
-    switching inside it scores the round in flight against the wrong group.
-
-    Rolls config back if the new assignment will not load — config naming one
-    group while `ExpertManager` holds another's table is silent.
-
-    `baseline_ref` comes back *fresh*, not the old one cleared: the publish
-    thread filling it can still be uploading, and its second `out.update`
-    would repopulate a cleared dict with the previous group's shard. Costs one
-    cycle with no model advance, which `run` already handles.
-
-    The model is rebuilt from pretrained for the new group, and its pretrained
-    shard written, exactly as at boot — always, rather than keeping the module
-    tree on a same-topology switch: a switch happens once per task and the
-    rebuild costs seconds. Built *before* the old model is released, so a
-    failed build rolls everything back with the old model still serving;
-    the price is two models resident for the duration of the build. The caller
-    rebinds and then `cleanup()`s, which is what frees the old one.
-
-    Called from `_maybe_switch_task` once per cycle.
+    Switching in place is no longer possible. `_build_eval_model` builds all 64
+    routed experts per layer (~29 GiB), and the old model stays resident while
+    the new one is built — together ~46 GiB, more than any validator in the
+    fleet has. A reboot costs one model build (~30 s) inside a Train phase of
+    ~69 min, and a switch dropped the round in flight either way.
     """
-    if eval_window_active.is_set() or merge_phase_active.is_set():
-        raise RuntimeError(
-            f"refusing to switch to {new_task!r} mid-round: "
-            f"eval_window_active={eval_window_active.is_set()}, "
-            f"merge_phase_active={merge_phase_active.is_set()}"
-        )
-
-    previous_task = config.task.expert_group_name
-    config.switch_active_task(new_task)
-    try:
-        expert_manager = ExpertManager(config)
-        eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
-    except Exception:
-        config.switch_active_task(previous_task)
-        raise
-
-    eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
-    eval_worker.set_eval_base_model(eval_model)
-    logger.info(
-        "Switched active task",
-        previous_task=previous_task,
-        task=new_task,
-        group_id=config.task.exp.group_id,
-        base_shard=str(base_shard),
-    )
-    return TaskScopedState(expert_manager=expert_manager, eval_model=eval_model, base_shard=base_shard)
 
 
 def _maybe_switch_task(
     config: ValidatorConfig,
     *,
-    rank: int,
-    device: torch.device,
-    eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
-    merge_phase_active: threading.Event,
-    round_ref: RoundRef,
-    gpu_eval_lock: threading.Lock,
-) -> TaskScopedState | None:
-    """Ask the owner which task is active and switch if it is not ours.
+) -> None:
+    """Ask the owner which task is active and reboot onto it if it is not ours.
 
-    Runs at the start of Train, which gives the build the whole phase; the
-    seam after finalize is too short for it, and overrunning MinerCommit1
-    would make the loop wait for the *next* cycle's. The price is the round
-    still being evaluated: it is dropped, unscored, and the next commit and
-    freeze are already on the new task. Miners poll at Distribute, so both
-    sides commit the new group at the same MinerCommit1.
+    Runs at the start of Train, which is the quiet point of the cycle and so
+    the one place the process can end without losing anything that is not
+    already on disk: round K's weights went to chain at the top of this
+    iteration, `baseline_ref` was consumed and cleared in Merge, and the score
+    aggregator was persisted in Validate and survives the reboot because
+    `resolve_score_path` keeps it out of the group-scoped directory.
 
-    Never raises. An unreachable owner, a bad bundle or a failed build all
-    leave the node on the task it has — round included — to try again next
-    cycle: the same "keep running" choice the boot-time resolve makes.
+    Raises `_RestartForTask` when the task changes; returns normally otherwise.
+    An unreachable owner or a bad bundle leaves the node on the task it has, to
+    try again next cycle — the same "keep running" choice the boot-time resolve
+    makes. The round in flight is dropped either way; here it ends with the
+    process.
     """
     active = get_active_task(config.cycle)
     if active is None:
         logger.warning("Owner API unreachable — staying on the current task",
                        task=config.task.expert_group_name)
-        return None
+        return
     if active.name == config.task.expert_group_name:
-        return None
+        return
     try:
         bundle = get_active_task_bundle(config.cycle)
         if bundle is None:
             raise RuntimeError(f"no usable bundle for {active.name!r}")
+        # Written before the process ends so the reboot's `ensure_active_task`
+        # finds it already on disk. `materialize_task` is idempotent on a
+        # matching `.bundle_sha256`, so the fetch is not repeated.
         materialize_task(bundle, config.task.base_path)
-        # Close the window so the worker claims no more miners, then wait for
-        # the eval it may be running — it holds the lock for that — so the old
-        # model is idle before a second one is built beside it. Only on
-        # success is the round dropped; a failed build reopens the window and
-        # the round carries on, on the model it had.
-        was_open = eval_window_active.is_set()
-        eval_window_active.clear()
-        with gpu_eval_lock:
-            pass
-        try:
-            state = _switch_task(
-                config, bundle.name,
-                rank=rank, device=device, eval_worker=eval_worker,
-                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
-            )
-        except Exception:
-            if was_open:
-                eval_window_active.set()
-            raise
     except Exception as e:
         logger.error("Task switch failed — staying on the current task",
                      task=config.task.expert_group_name, target=active.name,
                      error=str(e), exc_info=True)
-        return None
-    dropped = round_ref.current
-    round_ref.current = None
-    if dropped is not None:
-        logger.warning("Dropped the round in flight: its task is over",
-                       round_id=dropped.round_id, task=config.task.expert_group_name)
-    return state
+        return
+
+    # Stop the eval worker claiming more miners while the shutdown block joins
+    # it. Nothing reopens this: the process is ending.
+    eval_window_active.clear()
+    logger.warning(
+        "Restarting to adopt the new task. The container restart policy brings "
+        "the validator back on it; a validator run outside Docker must be "
+        "restarted by hand.",
+        previous_task=config.task.expert_group_name,
+        task=bundle.name,
+    )
+    raise _RestartForTask(bundle.name)
 
 
 def _write_pretrained_shard(
@@ -1026,8 +952,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # === Round-lifecycle scaffolding ===
     # merge_phase_active: never set any more — nothing mutates shared state
-    #   in Merge. The workers and `_switch_task` still gate on it; remove it
-    #   together with that gating.
+    #   in Merge. Only the workers still gate on it; remove it together with
+    #   that gating.
     # eval_window_active: set when the round freezes so the eval worker may
     #   evaluate round K's downloaded miners; cleared at the top of the next
     #   cycle right before submit_weights for round K.
@@ -1628,24 +1554,10 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # === Task switch, if the owner has moved on ===
             # At the start of the next cycle's Train. The publish threads
-            # from finalize hold their own group id, so the switch races
-            # nothing; the MinerCommit1 commit later reads the new group.
+            # from finalize hold their own group id, so nothing is raced; the
+            # process ends here and the next boot comes up on the new group.
             wait_till(config, PhaseNames.train)
-            switched = _maybe_switch_task(
-                config, rank=rank, device=device, eval_worker=eval_worker,
-                eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
-                round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
-            )
-            if switched is not None:
-                expert_manager, eval_model, base_shard, baseline_ref = (
-                    switched.expert_manager, switched.eval_model,
-                    switched.base_shard, switched.baseline_ref,
-                )
-                # Exactly the state of a fresh boot on the new task: no hash
-                # to commit until ValidatorCommit1, and the previous model's
-                # last reference was just dropped.
-                current_model_hash = None
-                cleanup()
+            _maybe_switch_task(config, eval_window_active=eval_window_active)
 
             # === Close download window before next-cycle MinerCommit1 ===
             # Wait until 30 blocks before the next MinerCommit1 so bg-download
