@@ -90,6 +90,9 @@ def model(eval_worker) -> _Model:
 
 
 OLD_SHARD = Path("model_expgroup_4.safetensors")
+# What the checkpoint read hands back. Empty so the precision restore walks
+# nothing; the tests below care that it travels from the read to the writer.
+CHECKPOINT: dict = {}
 # What the old shard "holds": pretrained values for the model's parameter.
 PRETRAINED = {"w": torch.zeros(2, dtype=torch.bfloat16)}
 
@@ -218,7 +221,7 @@ def test_the_new_shard_is_cut_from_the_new_groups_table(config, eval_worker, gat
 
     def spy_read(path, layer_map):
         read.append(layer_map)
-        return {"from": "checkpoint"}
+        return CHECKPOINT
 
     def spy_write(state_dict, expert_manager, group_id, dest_dir, save_dtype):
         written.append((state_dict, set(expert_manager.expert_group_assignment), group_id, save_dtype))
@@ -227,7 +230,8 @@ def test_the_new_shard_is_cut_from_the_new_groups_table(config, eval_worker, gat
     _switch(config, eval_worker, gates, TARGET, model=model, read_experts=spy_read, write_shard=spy_write)
 
     assert read == [{0: [(0, 20), (1, 21)]}]
-    assert written == [({"from": "checkpoint"}, {7, 2}, 7, torch.bfloat16)]
+    assert written == [(CHECKPOINT, {7, 2}, 7, torch.bfloat16)]
+    assert written[0][0] is CHECKPOINT   # the shard is cut from what was read
 
 
 def test_a_failed_shard_write_rolls_config_back(config, eval_worker, gates, model) -> None:
