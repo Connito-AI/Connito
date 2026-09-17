@@ -167,13 +167,13 @@ def finalize_round_scores(
     score_aggregator,
     score_path=None,
 ) -> dict[int, float]:
-    """Replace this round's per-miner aggregator entries with rank-based
-    scores derived from `round.scores` (the delta-based per-round signal
-    recorded by `mark_scored`).
+    """Write this round's per-miner aggregator entries as rank-based scores
+    derived from `round.scores` (the delta-based per-round signal recorded
+    by `mark_scored`). Sole writer to the aggregator for this round_id.
 
-    Drops every aggregator point tagged with `round.round_id` first so
-    intermediate eval-time scores do not stack with the rank-based ones,
-    then re-adds:
+    Drops every point tagged with `round.round_id` first — a no-op on the
+    live path, but the startup replay of an unfinalized journal re-derives
+    a round the previous process may have partly written — then adds:
 
       - Top-1 by `round.scores` (delta desc): score 2.25.
       - Top-2: score 1.5.
@@ -206,14 +206,15 @@ def finalize_round_scores(
     Returns ``{uid: rank_score}`` for the UIDs the function wrote, for
     logging.
     """
-    # Snapshot all sets under the round's lock so the worker threads
-    # cannot race a mark_scored / mark_failed against the read.
-    scored, _failed = round_obj.processed_uids_snapshot()
-    # `round.scores` is mutated under the same lock; copy it explicitly
-    # rather than alias.
+    # Mark the round finalized atomically with the snapshot, so an eval still
+    # in flight is dropped by `mark_scored` rather than landing in a set this
+    # function has already read. `round.scores` is mutated under the same
+    # lock; copy it explicitly rather than alias.
     with round_obj._lock:  # noqa: SLF001 — same module family
+        round_obj.finalized = True
         round_scores = dict(round_obj.scores)
         validation_failed = set(round_obj.validation_failed_uids)
+    scored, _failed = round_obj.processed_uids_snapshot()
     freeze_zero = set(round_obj.freeze_zero_uids)
     freeze_hotkeys = dict(round_obj.freeze_zero_hotkeys)
 

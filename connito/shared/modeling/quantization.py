@@ -127,7 +127,16 @@ def quantize_(model: nn.Module, scope: str, assignment: dict) -> list[str]:
     }
     converted: list[str] = []
 
-    for parent_name, parent in list(model.named_modules()):
+    # Names, not modules. Holding the module objects keeps every original
+    # `nn.Linear` alive for the whole loop, so no replaced weight can be freed
+    # while the fp8 copies accumulate and the peak is both sets at once. On the
+    # 1664-expert topology that is 42.0 GiB against 29.3 GiB releasing as we go
+    # — the difference between needing a 48 GB card and fitting on any of ours.
+    #
+    # Resolving each name late is safe only because every replacement is a leaf
+    # `nn.Linear`: no captured name can name a module underneath one we swap.
+    for parent_name in [name for name, _ in model.named_modules()]:
+        parent = model.get_submodule(parent_name)
         for child_name, child in list(parent.named_children()):
             if not isinstance(child, nn.Linear):
                 continue
@@ -144,6 +153,36 @@ def quantize_(model: nn.Module, scope: str, assignment: dict) -> list[str]:
 
     logger.info("fp8 quantization applied", scope=scope, converted_modules=len(converted))
     return sorted(converted)
+
+
+def unquantize_(model: nn.Module, weights: dict[str, torch.Tensor], dtype: torch.dtype) -> list[str]:
+    """Put `FP8Linear` modules back to full-precision `nn.Linear`, in place.
+
+    The inverse of `quantize_` in effect, not in mechanism: fp8 rounding is
+    lossy, so the original weights have to be supplied. `weights` is keyed like
+    a state dict (`....gate_proj.weight`), and an entry naming a module that is
+    already `nn.Linear` is skipped — so handing it a whole group's tensors
+    restores exactly the ones that are quantized and leaves the rest untouched.
+
+    `dtype` is the model's, not the checkpoint's: boot loads pretrained weights
+    at the run's precision, and a restored module has to match it.
+    """
+    restored: list[str] = []
+    for key, tensor in weights.items():
+        name = key.rsplit(".", 1)[0]          # drop the trailing `.weight`
+        module = model.get_submodule(name)
+        if not isinstance(module, FP8Linear):
+            continue
+        linear = nn.Linear(module.in_features, module.out_features, bias=False,
+                           device=module.scale.device, dtype=dtype)
+        with torch.no_grad():
+            linear.weight.copy_(tensor)
+        parent_name, _, child_name = name.rpartition(".")
+        setattr(model.get_submodule(parent_name), child_name, linear)
+        restored.append(name)
+
+    logger.info("fp8 modules restored to full precision", restored_modules=len(restored))
+    return sorted(restored)
 
 
 def apply_from_config(model: nn.Module, config, expert_manager, role: str) -> list[str]:

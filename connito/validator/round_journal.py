@@ -386,6 +386,8 @@ class _RecoveryRound:
     lifecycle_step: int = 0
     # Carried so the finalize journal-rewrite preserves the losses.
     val_losses: dict[int, float] = field(default_factory=dict)
+    # Declared because finalize sets it; inert here, recovery is single-threaded.
+    finalized: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @classmethod

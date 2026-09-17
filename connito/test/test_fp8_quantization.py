@@ -19,7 +19,7 @@ from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2Confi
 
 from connito.shared.expert_manager import get_layer_expert_id
 from connito.shared.modeling.custom_deepseek_v2_lite import CustomDeekSeekMoE
-from connito.shared.modeling.quantization import FP8_DTYPE, FP8Linear, quantize_
+from connito.shared.modeling.quantization import FP8_DTYPE, FP8Linear, quantize_, unquantize_
 
 GROUP, HELPER_GROUP, LAYER_ID = 0, 2, 1
 # (my_expert_id, org_expert_id) — selection must key off the global id.
@@ -201,3 +201,84 @@ def test_merge_hash_must_detach_live_parameters():
     with pytest.raises(RuntimeError, match="requires grad"):
         get_model_hash(params, hex=True)
     assert get_model_hash({k: v.detach() for k, v in params.items()}, hex=True)
+
+
+# --- the task switch redoes the precision layout --------------------------
+
+# Two tasks that share an expert, which is the case a switch gets wrong in both
+# directions: 1 leaves, 3 arrives, 5 is in both and must not be touched at all.
+OLD_TABLE = {LAYER_ID: [(0, 1), (1, 5)]}
+NEW_TABLE = {LAYER_ID: [(0, 5), (1, 3)]}
+
+
+def _fp8_experts(model: nn.Module) -> set[int]:
+    return {
+        get_layer_expert_id(name)[1]
+        for name, m in model.named_modules()
+        if isinstance(m, FP8Linear)
+    }
+
+
+def _expert_weights(model: nn.Module, table) -> dict[str, torch.Tensor]:
+    """A group's pretrained weights, keyed like a state dict."""
+    wanted = {(LAYER_ID, org) for _, org in table[LAYER_ID]}
+    return {
+        f"{name}.weight": m.weight.detach().clone()
+        for name, m in model.named_modules()
+        if isinstance(m, nn.Linear) and get_layer_expert_id(name) in wanted
+    }
+
+
+def _switch(model: nn.Module, weights, table) -> None:
+    """What `_switch_task` does to the model: restore the group moving in,
+    then quantize whatever the new table no longer protects."""
+    unquantize_(model, weights, torch.float32)
+    quantize_(model, "experts", table)
+
+
+def test_unquantize_restores_the_exact_weights():
+    """fp8 is lossy, so a restore has to come from the supplied weights rather
+    than from the buffer it replaces."""
+    model = _model()
+    weights = _expert_weights(model, NEW_TABLE)
+    quantize_(model, "experts", OLD_TABLE)
+    assert 3 in _fp8_experts(model)
+
+    restored = unquantize_(model, weights, torch.float32)
+
+    assert len(restored) == 3  # expert 3's three projections; 5 was never quantized
+    for key, original in weights.items():
+        module = model.get_submodule(key.rsplit(".", 1)[0])
+        assert isinstance(module, nn.Linear) and not isinstance(module, FP8Linear)
+        torch.testing.assert_close(module.weight, original, rtol=0, atol=0)
+
+
+def test_a_switch_lands_on_the_layout_a_boot_would_build():
+    """The property the whole routine exists for: after a switch, which experts
+    are fp8 must match a validator that booted on the new task."""
+    booted = _model()
+    quantize_(booted, "experts", NEW_TABLE)
+
+    switched = _model()
+    weights = _expert_weights(switched, NEW_TABLE)
+    quantize_(switched, "experts", OLD_TABLE)
+    _switch(switched, weights, NEW_TABLE)
+
+    assert _fp8_experts(switched) == _fp8_experts(booted)
+    # The incoming group is what miners submit against; rounding it is the bug.
+    assert 3 not in _fp8_experts(switched)
+    # The outgoing group is idle now and pays the memory like every other expert.
+    assert 1 in _fp8_experts(switched)
+
+
+def test_an_expert_in_both_tables_is_never_touched():
+    """Quantizing then restoring expert 5 would round it for no reason, and the
+    weights a miner is scored against would silently stop being pretrained."""
+    model = _model()
+    weights = _expert_weights(model, NEW_TABLE)
+    quantize_(model, "experts", OLD_TABLE)
+    before = model.get_submodule(f"model.layers.{LAYER_ID}.mlp.experts.5.gate_proj")
+
+    _switch(model, weights, NEW_TABLE)
+
+    assert model.get_submodule(f"model.layers.{LAYER_ID}.mlp.experts.5.gate_proj") is before

@@ -102,7 +102,7 @@ from connito.shared.helper import get_model_hash, load_state_dict_from_path
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import get_model_from_checkpoint
 from connito.shared.modeling.mycelia import get_base_tokenizer, load_pretrained_expert_tensors
-from connito.shared.modeling.quantization import apply_from_config
+from connito.shared.modeling.quantization import apply_from_config, unquantize_
 from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
@@ -377,7 +377,6 @@ def resume_open_round(
     eval_model: nn.Module,
     base_shard: Path,
     score_aggregator,
-    score_path,
     round_ref: RoundRef,
     eval_worker,
     eval_window_active: threading.Event,
@@ -458,7 +457,6 @@ def resume_open_round(
         cycle_length=phase.cycle_length,
         cohort_state=current_cohort_state,
         score_aggregator=score_aggregator,
-        score_path=score_path,
         checkpoint_path=None,
         advance_cohort=False,
     )
@@ -605,18 +603,32 @@ def _switch_task(
 
     pretrained = load_state_dict_from_path(str(base_shard))
     eval_model.load_state_dict(pretrained, strict=False)
+    dtype = next(iter(pretrained.values())).dtype
     previous_task = config.task.expert_group_name
     config.switch_active_task(new_task)
     try:
         expert_manager = ExpertManager(config)
         group_id = config.task.exp.group_id
-        base_shard = _write_pretrained_shard(
-            load_pretrained_expert_tensors(
-                config.model.model_path, expert_manager.expert_group_assignment[group_id],
-            ),
-            expert_manager, group_id, Path(config.ckpt.checkpoint_path) / "pretrained",
-            save_dtype=next(iter(pretrained.values())).dtype,
+        weights = load_pretrained_expert_tensors(
+            config.model.model_path, expert_manager.expert_group_assignment[group_id],
         )
+        base_shard = _write_pretrained_shard(
+            weights, expert_manager, group_id,
+            Path(config.ckpt.checkpoint_path) / "pretrained", save_dtype=dtype,
+        )
+        # Quantization is per-task, not per-model: the active group's experts
+        # stay full precision because they are the weights miners submit, and
+        # every other expert is fp8. Boot decides that layout, so a switch has
+        # to redo it — otherwise the incoming group is scored through fp8
+        # rounding, which on a live round is ~140x the spread between miners.
+        #
+        # Both calls select for themselves: `unquantize_` skips what is already
+        # full precision and `quantize_` skips the new group's table, so the
+        # experts the two groups share are touched by neither. Restore before
+        # quantize so a failure in either leaves a group at full precision
+        # rather than none.
+        unquantize_(eval_model, weights, dtype)
+        apply_from_config(eval_model, config, expert_manager, role="validator")
     except Exception:
         config.switch_active_task(previous_task)
         raise
@@ -1094,7 +1106,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 eval_model=eval_model,
                 base_shard=base_shard,
                 score_aggregator=score_aggregator,
-                score_path=score_path,
                 round_ref=round_ref,
                 eval_worker=eval_worker,
                 eval_window_active=eval_window_active,
@@ -1130,17 +1141,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # === (4) Finalize round-K scoring and submit weights.
             #
-            # Close the (3) bg-eval window FIRST so no in-flight eval can
-            # add a new entry to `round.scores` after `finalize_round_scores`
-            # has snapshotted it. The archive/prune step that lives lower
-            # in this block also runs while the window is closed — same
-            # invariant we used to rely on, just hoisted up.
+            # Closing the (3) bg-eval window stops the worker claiming new
+            # miners, but not the one already on the GPU — that lands after
+            # the call below. `Round.finalized`, set inside finalize under
+            # the round lock, is what discards it.
             #
             # `finalize_round_scores` is the sole writer to the global
             # aggregator for this round_id: it computes ranks from the
-            # delta-based per-round signal in `round.scores`, drops any
-            # stale aggregator points tagged with this round_id, and
-            # writes 3/2/1 for the top-3 (with delta>0), 0 for everyone
+            # delta-based per-round signal in `round.scores` and writes
+            # 2.25/1.5/1.0 for the top-3 (with delta>0), 0 for everyone
             # else (incl. failed evals and freeze-time invalid checkpoints).
             eval_window_active.clear()
             pending_round: Round | None = round_ref.current
@@ -1413,7 +1422,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 cycle_length=phase_response.cycle_length,
                 cohort_state=current_cohort_state,
                 score_aggregator=score_aggregator,
-                score_path=score_path,
                 checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
 
