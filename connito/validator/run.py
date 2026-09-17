@@ -377,7 +377,6 @@ def resume_open_round(
     eval_model: nn.Module,
     base_shard: Path,
     score_aggregator,
-    score_path,
     round_ref: RoundRef,
     eval_worker,
     eval_window_active: threading.Event,
@@ -458,7 +457,6 @@ def resume_open_round(
         cycle_length=phase.cycle_length,
         cohort_state=current_cohort_state,
         score_aggregator=score_aggregator,
-        score_path=score_path,
         checkpoint_path=None,
         advance_cohort=False,
     )
@@ -1108,7 +1106,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 eval_model=eval_model,
                 base_shard=base_shard,
                 score_aggregator=score_aggregator,
-                score_path=score_path,
                 round_ref=round_ref,
                 eval_worker=eval_worker,
                 eval_window_active=eval_window_active,
@@ -1144,17 +1141,15 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
             # === (4) Finalize round-K scoring and submit weights.
             #
-            # Close the (3) bg-eval window FIRST so no in-flight eval can
-            # add a new entry to `round.scores` after `finalize_round_scores`
-            # has snapshotted it. The archive/prune step that lives lower
-            # in this block also runs while the window is closed — same
-            # invariant we used to rely on, just hoisted up.
+            # Closing the (3) bg-eval window stops the worker claiming new
+            # miners, but not the one already on the GPU — that lands after
+            # the call below. `Round.finalized`, set inside finalize under
+            # the round lock, is what discards it.
             #
             # `finalize_round_scores` is the sole writer to the global
             # aggregator for this round_id: it computes ranks from the
-            # delta-based per-round signal in `round.scores`, drops any
-            # stale aggregator points tagged with this round_id, and
-            # writes 3/2/1 for the top-3 (with delta>0), 0 for everyone
+            # delta-based per-round signal in `round.scores` and writes
+            # 2.25/1.5/1.0 for the top-3 (with delta>0), 0 for everyone
             # else (incl. failed evals and freeze-time invalid checkpoints).
             eval_window_active.clear()
             pending_round: Round | None = round_ref.current
@@ -1427,7 +1422,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 cycle_length=phase_response.cycle_length,
                 cohort_state=current_cohort_state,
                 score_aggregator=score_aggregator,
-                score_path=score_path,
                 checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
 
