@@ -145,6 +145,11 @@ class Round:
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
+    # Set by `finalize_round_scores` under `_lock`, atomically with its score
+    # snapshot. After it the `mark_*` methods are no-ops: the eval window flag
+    # only stops the worker picking up *new* miners, so the one already on the
+    # GPU lands after finalize has read the scores and written the ranks.
+    finalized: bool = False
     # Last live lifecycle step this round reached (set by run.py alongside
     # the VALIDATOR_ROUND_LIFECYCLE_STEP gauge: 0 freeze / 3 eval-window). Persisted to the journal so startup recovery can
     # restore the round-level gauges that only the live loop writes.
@@ -170,13 +175,9 @@ class Round:
     # mark_validation_failed` writes the round's mutation state to
     # `journal_path`. Survives a kill before `finalize_round_scores` so
     # bg-eval work isn't lost; also kept post-finalize as an audit log.
-    # `score_aggregator + score_path` let `mark_scored` write the raw
-    # in-cycle score to the aggregator alongside the journal.
-    # All three default `None` so legacy fixtures and tests that build
-    # `Round` directly (without `Round.freeze`) keep working.
+    # Defaults `None` so legacy fixtures and tests that build `Round`
+    # directly (without `Round.freeze`) keep working.
     journal_path: "Path | None" = field(default=None, repr=False, compare=False)
-    score_aggregator: "MinerScoreAggregator | None" = field(default=None, repr=False, compare=False)
-    score_path: "Path | None" = field(default=None, repr=False, compare=False)
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -199,7 +200,6 @@ class Round:
         cycle_length: int | None = None,
         cohort_state: "CohortState | None" = None,
         score_aggregator: "MinerScoreAggregator | None" = None,
-        score_path: "Path | None" = None,
         checkpoint_path: "Path | None" = None,
         advance_cohort: bool = True,
     ) -> "Round":
@@ -549,8 +549,6 @@ class Round:
             cohort_epoch=new_cohort_epoch,
             cohort_state=new_cohort_state,
             journal_path=resolved_journal_path,
-            score_aggregator=score_aggregator,
-            score_path=score_path,
         )
 
         # Initial journal write — captures `freeze_zero_*` and the
@@ -637,28 +635,20 @@ class Round:
                 error=str(e), round_id=self.round_id, path=str(self.journal_path),
             )
 
-    def _record_in_cycle_score(self, uid: int, hotkey: str, score: float) -> None:
-        """Write the raw in-cycle score to the aggregator alongside the
-        journal. `finalize_round_scores` calls
-        `score_aggregator.drop_round(round_id)` first, so these raw
-        entries get cleanly replaced with rank-based ones at finalize.
-        Until finalize runs, the aggregator on disk carries the raw
-        delta tagged with this round_id — slightly under-weights the
-        miner vs. rank-based but survives a kill.
+    def _drop_late(self, uid: int, kind: str) -> bool:
+        """True when `finalized` is set, meaning the caller must not record
+        `uid`: finalize has already snapshotted the scores and written the
+        ranks, so a later mutation would be invisible to the chain yet would
+        reopen the journal. Call under `_lock` — finalize sets the flag there.
         """
-        if self.score_aggregator is None:
-            return
-        try:
-            self.score_aggregator.add_score(
-                uid=uid, hotkey=hotkey, score=float(score), round_id=self.round_id,
-            )
-            if self.score_path is not None:
-                self.score_aggregator.persist_atomic(self.score_path)
-        except Exception as e:
-            logger.warning(
-                "Round: in-cycle aggregator write failed",
-                error=str(e), uid=uid, round_id=self.round_id,
-            )
+        if not self.finalized:
+            return False
+        self.claimed_uids.discard(uid)
+        logger.warning(
+            "Round: dropping late result for finalized round",
+            uid=uid, round_id=self.round_id, kind=kind,
+        )
+        return True
 
     def mark_scored(
         self, uid: int, score: float = 0.0, val_loss: float | None = None
@@ -674,23 +664,21 @@ class Round:
         ``delta = max(0.0, baseline - val_loss)`` clamps at zero. Optional
         so existing callers and test fixtures keep working.
 
-        Also writes to the per-round journal and (if configured) the
-        score aggregator with the raw delta tagged with this round_id,
-        so a kill before `finalize_round_scores` runs does not lose the
-        evaluation. Both writes happen OUTSIDE `self._lock` to avoid
-        blocking other workers on disk IO.
+        Also writes the per-round journal, so a kill before
+        `finalize_round_scores` runs does not lose the evaluation: startup
+        recovery replays the journal through finalize. The write happens
+        OUTSIDE `self._lock` to avoid blocking other workers on disk IO.
         """
         score_f = float(score)
         with self._lock:
+            if self._drop_late(uid, "scored"):
+                return
             self.scored_uids.add(uid)
             self.scores[uid] = score_f
             if val_loss is not None:
                 self.val_losses[uid] = float(val_loss)
             self.claimed_uids.discard(uid)
-            hotkey = self.uid_to_hotkey.get(uid)
         self._persist_journal()
-        if hotkey is not None:
-            self._record_in_cycle_score(uid, hotkey, score_f)
 
     def top_scored_ranked_this_round(self, top_k: int) -> list[tuple[int, float]]:
         """Top-`top_k` `(uid, score)` by *this round's* score, best first.
@@ -731,6 +719,8 @@ class Round:
         prior EMA is preserved.
         """
         with self._lock:
+            if self._drop_late(uid, "failed"):
+                return
             self.failed_uids.add(uid)
             self.claimed_uids.discard(uid)
         self._persist_journal()
@@ -744,6 +734,8 @@ class Round:
         `validation_failed_uids`; finalize records score=0 for it.
         """
         with self._lock:
+            if self._drop_late(uid, "validation_failed"):
+                return
             self.failed_uids.add(uid)
             self.validation_failed_uids.add(uid)
             self.claimed_uids.discard(uid)
