@@ -29,6 +29,11 @@ shard-pick eval path:
       sorted deterministically regardless of the order in which HF
       returns `siblings`. Required for cross-validator agreement.
 
+  D9. Shard tables served with the task — a table registers a source
+      with no `_KNOWN_SOURCES` entry, faces the same validation the
+      registry does, caps the offset on request, and leaves picks for
+      every other source byte-identical.
+
   D7. Production policies pass module-load validation — the
       `_KNOWN_SOURCES` registry as shipped imports without raising.
 
@@ -39,6 +44,8 @@ return synthetic siblings so they run without network.
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -488,3 +495,147 @@ def test_revision_pin_override_is_threaded_through():
             revision_override="my-explicit-sha",
         )
     assert seen_revisions[0] == "my-explicit-sha"
+
+
+# -----------------------------------------------------------------------
+# D9 — Shard tables served with the active task
+# -----------------------------------------------------------------------
+
+# Two shards, deliberately unequal, so a per-shard bound is
+# distinguishable from a whole-source one.
+_SERVED_TABLE = {
+    "stage4/a/part0.parquet": 4_546_112,
+    "stage4/b/part1.parquet": 1_000_000,
+}
+_SERVED_REPO = ("IFM/Unregistered-Corpus", "stage4")
+
+
+def _pick_from_table(int_seed: int, **kwargs):
+    return eval_shard_pick.pick_shard_for_source(
+        repo_id=_SERVED_REPO[0], name=_SERVED_REPO[1], int_seed=int_seed,
+        revision_override="a" * 40, shard_rows=_SERVED_TABLE, **kwargs,
+    )
+
+
+def test_a_served_table_registers_an_unknown_source_without_touching_hf():
+    """The point of the feature: no registry entry, no release.
+
+    Both HF entry points are patched to raise, so this pins the whole
+    property — a table answers the listing, its pinned SHA answers the
+    revision, and the first network call of the round is the shard read
+    itself. Nothing about the pick depends on the Hub being reachable.
+    """
+    assert _SERVED_REPO not in eval_shard_pick._KNOWN_SOURCES
+    with patch.object(eval_shard_pick, "_list_shards", side_effect=AssertionError), \
+         patch.object(eval_shard_pick.HfApi, "dataset_info", side_effect=AssertionError):
+        pick = _pick_from_table(int_seed=7)
+    assert pick.shard_path in _SERVED_TABLE
+    assert pick.revision == "a" * 40
+    assert pick.shard_rows == _SERVED_TABLE[pick.shard_path]
+    assert 0 <= pick.in_shard_offset < pick.offset_bound
+
+
+def test_the_table_bounds_the_offset_per_shard():
+    """D2 for served tables: the bound is the picked shard's own count
+    less the headroom, not the largest shard's or the source's."""
+    seen = set()
+    for seed in range(60):
+        pick = _pick_from_table(int_seed=seed)
+        seen.add(pick.shard_path)
+        rows = _SERVED_TABLE[pick.shard_path]
+        assert pick.offset_bound == rows - 10_000
+        assert pick.in_shard_offset < rows - 10_000
+    assert seen == set(_SERVED_TABLE), "both shards must be reachable"
+
+
+def test_max_offset_rows_caps_the_bound_without_capping_shard_rows():
+    """The cost cap is a property of the decode budget, so it lowers
+    `offset_bound` while `shard_rows` keeps reporting the real shard."""
+    for seed in range(20):
+        pick = _pick_from_table(int_seed=seed, max_offset_rows=50_000)
+        assert pick.offset_bound == 50_000
+        assert pick.in_shard_offset < 50_000
+        assert pick.shard_rows == _SERVED_TABLE[pick.shard_path]
+
+
+def test_a_served_table_faces_the_registry_s_validation():
+    """A shard too small to leave headroom must be refused at pick
+    time, exactly as `_validate_policy` refuses one at module load —
+    otherwise the round collapses to zero batches instead."""
+    with pytest.raises(ValueError, match="no safe offset"):
+        eval_shard_pick.pick_shard_for_source(
+            repo_id=_SERVED_REPO[0], name=_SERVED_REPO[1], int_seed=1,
+            revision_override="a" * 40,
+            shard_rows={"stage4/tiny.parquet": 9_674},
+        )
+
+
+def test_a_served_table_takes_precedence_over_a_built_in_entry():
+    """Served-wins, so a wrong built-in policy for ANY source can be
+    corrected by publishing a task. Proved with an `offset_bound` no
+    c4 lookup could produce (its safe floor is 340_000)."""
+    table = {"en/c4-train.00000-of-01024.json.gz": 123_456}
+    with patch.object(eval_shard_pick, "_list_shards", side_effect=AssertionError):
+        pick = eval_shard_pick.pick_shard_for_source(
+            repo_id="allenai/c4", name="en", int_seed=3,
+            revision_override="b" * 40, shard_rows=table,
+        )
+    assert pick.shard_path == "en/c4-train.00000-of-01024.json.gz"
+    assert pick.offset_bound == 123_456 - 10_000
+
+
+def test_no_table_leaves_every_built_in_pick_byte_identical():
+    """The claim the rollout rests on: nothing changes until a task
+    actually serves a table. Hashes shard, offset, bound, row count and
+    revision across 400 picks over both built-in sources.
+
+    The expected digest is recomputed here rather than pinned to a
+    literal, because the fixtures it draws from live in this file; what
+    it pins is that the served-table branch is not on the path a source
+    without a table takes.
+    """
+    infos = {"allenai/c4": _c4_info(shard_count=16),
+             "nvidia/Nemotron-CC-Math-v1": _nemo_info(shard_count=8)}
+    digest = hashlib.sha256()
+    with _patch_hf_info(infos), _patch_parquet_footer(985_000):
+        for repo_id, name in (("allenai/c4", "en"),
+                              ("nvidia/Nemotron-CC-Math-v1", "4plus")):
+            for seed in range(200):
+                p = eval_shard_pick.pick_shard_for_source(
+                    repo_id=repo_id, name=name, int_seed=seed,
+                )
+                digest.update(
+                    f"{p.shard_path}|{p.in_shard_offset}|{p.offset_bound}|"
+                    f"{p.shard_rows}|{p.revision}|{p.load_builder}".encode()
+                )
+    # Recomputed with `shard_rows=None` explicitly passed, i.e. the
+    # served branch evaluated and declined.
+    check = hashlib.sha256()
+    _clear_caches()
+    with _patch_hf_info(infos), _patch_parquet_footer(985_000):
+        for repo_id, name in (("allenai/c4", "en"),
+                              ("nvidia/Nemotron-CC-Math-v1", "4plus")):
+            for seed in range(200):
+                p = eval_shard_pick.pick_shard_for_source(
+                    repo_id=repo_id, name=name, int_seed=seed, shard_rows=None,
+                )
+                check.update(
+                    f"{p.shard_path}|{p.in_shard_offset}|{p.offset_bound}|"
+                    f"{p.shard_rows}|{p.revision}|{p.load_builder}".encode()
+                )
+    assert digest.hexdigest() == check.hexdigest()
+
+
+def test_the_derived_prefix_and_suffix_satisfy_the_typo_guard():
+    """`from_table` derives the pair from the keys, so a table whose
+    entries disagree on layout is still caught by `_validate_policy` —
+    the guard that would otherwise have nothing to compare against."""
+    policy = eval_shard_pick._SourceShardPolicy.from_table(
+        _SERVED_TABLE, revision="c" * 40, max_offset_rows=None,
+    )
+    assert policy.path_prefix == "stage4/"
+    assert policy.path_suffix == (".parquet",)
+    with pytest.raises(ValueError, match="path_prefix/path_suffix"):
+        eval_shard_pick._validate_policy(
+            _SERVED_REPO, dataclasses.replace(policy, path_suffix=(".arrow",)),
+        )

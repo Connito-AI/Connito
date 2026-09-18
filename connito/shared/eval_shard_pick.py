@@ -83,15 +83,19 @@ That requires:
        the same seed and break weight consensus for that round.
     2. Deterministic file-list sort (plain lexicographic on the full
        `siblings.rfilename`).
-    3. The `safe_floor_rows` / `min_headroom_rows` constants must
-       match across validators — they live in code (this module), not
-       config, so the rollout discipline is just "deploy the same
-       commit." Operators MUST re-verify `verified_shard_rows` and
-       bump `safe_floor_rows` together if the upstream dataset is
-       ever re-uploaded with different shard sizes.
+    3. The row-count constants must match across validators. A policy
+       reaches them one of two ways, and each needs its own discipline:
+       from `_KNOWN_SOURCES` below, where "deploy the same commit" is
+       the whole of it; or from a shard table in the active task, which
+       is identical fleet-wide by construction (one bundle, one locked
+       `owner_url`, checked against the server's hash) but must not be
+       published before every validator carries a release that reads
+       it. Either way, a re-upload of the upstream dataset invalidates
+       the counts and they MUST be re-measured.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -190,9 +194,37 @@ class _SourceShardPolicy:
     # same trade a many-shard source already makes.
     max_offset_rows: int | None = None
 
+    @classmethod
+    def from_table(
+        cls, shard_rows: dict[str, int], *, revision: str, max_offset_rows: int | None,
+    ) -> _SourceShardPolicy:
+        """A `verified_table` policy from a table shipped with the task.
 
-# Known sources. Add new entries here, NOT via config — the consensus
-# rules require every validator to use the same policy.
+        The prefix/suffix pair is derived from the table rather than
+        configured, because for a served table the table IS the shard
+        allowlist: `_list_shards` is never consulted, so the pair has no
+        filtering job left and exists only to feed `_validate_policy`'s
+        typo guard. Deriving it keeps that guard meaningful (every key
+        still has to agree with every other) without asking a publisher
+        for two fields whose only correct value is a restatement of the
+        keys they just wrote.
+        """
+        suffixes = {"." + k.rsplit(".", 1)[-1] for k in shard_rows if "." in k}
+        return cls(
+            path_prefix=os.path.commonprefix(sorted(shard_rows)),
+            path_suffix=tuple(sorted(suffixes)),
+            revision=revision,
+            row_count_source="verified_table",
+            verified_shard_rows=dict(shard_rows),
+            max_offset_rows=max_offset_rows,
+        )
+
+
+# Known sources, and the fallback for any source whose task ships no
+# shard table. A table travels with the bundle — one payload, from the
+# same locked `owner_url`, checked against the server's hash — so both
+# registries are identical fleet-wide; this one requires every validator
+# to be on the same release, which a mixed-version fleet can violate.
 _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
     ("allenai/c4", "en"): _SourceShardPolicy(
         path_prefix="en/",
@@ -286,6 +318,7 @@ _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
 
 
 _SHARD_NAME_FILTER = re.compile(r"(train|part_)", re.IGNORECASE)
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) -> None:
@@ -413,7 +446,15 @@ def _resolve_revision(repo_id: str, requested: str) -> str:
     validator-process startup and reuse that SHA for the rest of the
     process's life. That avoids the failure mode where two validators
     boot at different times and see different `main` heads.
+
+    A request that is already a commit SHA is returned as-is: there is
+    nothing to resolve, and skipping the round-trip leaves a source
+    whose task ships a shard table needing no HF call before the shard
+    read itself — the table answers the listing, the pin answers the
+    revision.
     """
+    if _SHA_RE.fullmatch(requested):
+        return requested
     api = HfApi()
     info = api.dataset_info(repo_id, revision=requested)
     sha = getattr(info, "sha", None)
@@ -434,18 +475,16 @@ def _resolve_revision(repo_id: str, requested: str) -> str:
 def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ...]:
     """Return the deterministically-sorted shard list for a source.
 
+    Listing-based policies only. A `verified_table` policy's list comes
+    from its table, which the caller reads directly — that is what lets
+    a table arrive with the task, where no key-based lookup can find it,
+    and it keeps this cache holding only what an HF listing produced.
+
     Cached per (repo_id, name, revision). Sort is plain lex over the
     full `rfilename` string so any validator computing this against
     the same revision gets the same tuple.
     """
     policy = _policy_for(repo_id, name)
-    if policy.row_count_source == "verified_table":
-        # The frozen table doubles as the shard allowlist. Listing from
-        # the HF API here would re-introduce the consensus hazard the
-        # table exists to remove (a re-uploaded repo changing the list
-        # under our feet); the pinned revision + table are the source
-        # of truth.
-        return tuple(sorted(policy.verified_shard_rows))
     info = HfApi().dataset_info(repo_id, revision=revision)
     name_filter = (
         re.compile(policy.leaf_name_pattern, re.IGNORECASE)
@@ -596,11 +635,22 @@ def pick_shard_for_source(
     name: str | None,
     int_seed: int,
     revision_override: str | None = None,
+    shard_rows: dict[str, int] | None = None,
+    max_offset_rows: int | None = None,
 ) -> ShardPick:
     """Pick one shard and a uniform in-shard offset for one source.
 
     Deterministic from (repo_id, name, revision, int_seed). All
     validators on the same revision pin produce the same pick.
+
+    `shard_rows` is a table shipped with the task. When present it
+    registers the source outright — no `_KNOWN_SOURCES` entry, so a new
+    corpus costs a task publish rather than a validator release — and it
+    faces the same `_validate_policy` invariants the built-in registry
+    meets at import. A malformed table raises rather than falling back:
+    every validator holds the same bundle, so failing here fails
+    identically fleet-wide, which is recoverable, where a per-node
+    fallback would split weights.
 
     `int_seed` is the same integer derived from `combined_seed` that
     feeds the existing `.shuffle(seed=int_seed, ...)` call — see
@@ -608,11 +658,26 @@ def pick_shard_for_source(
         `int_seed = int(str(seed)[:8], 16)`.
     Reusing it keeps the seed wiring identical to today.
     """
-    policy = _policy_for(repo_id, name)
+    if shard_rows:
+        # `_validate_policy` here rather than at config parse: it is the
+        # one place both registries are held to the same invariants, and
+        # it needs the assembled policy, not the raw table.
+        policy = _SourceShardPolicy.from_table(
+            shard_rows, revision=revision_override or "main",
+            max_offset_rows=max_offset_rows,
+        )
+        _validate_policy((repo_id, name), policy)
+    else:
+        policy = _policy_for(repo_id, name)
     requested_revision = revision_override or policy.revision
     revision = _resolve_revision(repo_id, requested_revision)
 
-    shards = _list_shards(repo_id, name, revision)
+    # A table is its own allowlist, so it answers the listing question
+    # directly; every other policy asks HF.
+    if policy.row_count_source == "verified_table":
+        shards = tuple(sorted(policy.verified_shard_rows))
+    else:
+        shards = _list_shards(repo_id, name, revision)
     if not shards:  # _list_shards already raises but be explicit
         raise RuntimeError(
             f"Empty shard list for ({repo_id!r}, {name!r}, rev={revision!r})"

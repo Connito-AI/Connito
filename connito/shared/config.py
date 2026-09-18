@@ -272,6 +272,15 @@ class DatasetSourceCfg(BaseConfig):
     # Pin the source's revision via `eval_source_revision_pin` when
     # turning this on to bound the surface to a reviewed SHA.
     trust_remote_code: bool = False
+    # Seeded shard pick without a `_KNOWN_SOURCES` entry: this source's shard
+    # list with a row count per shard, precomputed at the revision pinned in
+    # `eval_source_revision_pin` (required alongside this) and shipped with the
+    # task. The table is also the shard allowlist — a shard it omits is never
+    # picked. `_KNOWN_SOURCES` stays the fallback for sources that omit it.
+    eval_shard_rows: dict[str, PositiveInt] | None = None
+    # Cost cap on the in-shard skip, independent of shard size. See
+    # `_SourceShardPolicy.max_offset_rows` for what it trades away.
+    eval_max_offset_rows: PositiveInt | None = None
 
     @model_validator(mode="after")
     def _validate_non_empty(self):
@@ -456,6 +465,18 @@ class DataCfg(BaseConfig):
     def _validate_dataset_sources(self):
         if self.dataset_sources is not None and len(self.dataset_sources) == 0:
             raise ValueError("data.dataset_sources must contain at least one source when provided.")
+        # A shard table is only meaningful at the revision it was counted
+        # against: `main` moves, and a re-upload would leave every validator
+        # picking rows by a table that no longer describes the files. Refuse
+        # the pair here, where a task switch rolls back and leaves the node on
+        # the task it has, rather than mid-round at the first pick.
+        for source in self.dataset_sources or []:
+            if source.eval_shard_rows and source.path not in (self.eval_source_revision_pin or {}):
+                raise ValueError(
+                    f"data.dataset_sources[{source.path!r}] sets eval_shard_rows but has no "
+                    f"data.eval_source_revision_pin entry. A shard table is valid only at the "
+                    f"revision its rows were counted at."
+                )
         return self
 
 

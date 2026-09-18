@@ -2,11 +2,10 @@
 
 This is the one failure mode in the eval path that nothing else catches.
 
-`_KNOWN_SOURCES` in `connito.shared.eval_shard_pick` is a module-level dict,
-deliberately not config-driven, because consensus requires every validator to
-use the identical policy. A group whose `data.dataset_sources` names a source
-missing from that dict therefore fails only on the seeded shard-pick path —
-which means:
+A source is registered either by an entry in `_KNOWN_SOURCES`
+(`connito.shared.eval_shard_pick`) or by an `eval_shard_rows` table on the
+source itself. A group whose `data.dataset_sources` names a source in neither
+place fails only on the seeded shard-pick path — which means:
 
   - it passes every other test in this repo, none of which enumerate
     `expert_groups/`;
@@ -27,8 +26,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
-from connito.shared.config import ExpertCfg
+from connito.shared.config import DataCfg, ExpertCfg
 from connito.shared.eval_shard_pick import _KNOWN_SOURCES
 
 EXPERT_GROUPS = Path(__file__).resolve().parents[2] / "expert_groups"
@@ -76,14 +76,16 @@ def test_group_sources_have_shard_pick_policies(group_dir: Path):
 
     sources = cfg.data.dataset_sources or []
     missing = [
-        (s.path, s.name) for s in sources if (s.path, s.name) not in _KNOWN_SOURCES
+        (s.path, s.name) for s in sources
+        if not s.eval_shard_rows and (s.path, s.name) not in _KNOWN_SOURCES
     ]
     assert not missing, (
-        f"{group_dir.name}/config.yaml names dataset source(s) with no entry in "
-        f"_KNOWN_SOURCES: {missing}. A validator would raise KeyError at the first "
+        f"{group_dir.name}/config.yaml names dataset source(s) that are registered "
+        f"in neither place: {missing}. A validator would raise KeyError at the first "
         f"eval dataloader build and fall back to an unscored baseline of 100.0. "
-        f"Either register the source in connito/shared/eval_shard_pick.py (with a "
-        f"row count measured from the native files) or set "
+        f"Either give the source an `eval_shard_rows` table (with its revision "
+        f"pinned), or register it in connito/shared/eval_shard_pick.py (with a row "
+        f"count measured from the native files), or set "
         f"`eval_source_seeded_shard_pick: false` on this group and say why."
     )
 
@@ -106,4 +108,25 @@ def test_group_revision_pins_name_configured_sources(group_dir: Path):
     assert not orphaned, (
         f"{group_dir.name}/config.yaml pins revisions for sources it does not "
         f"configure: {orphaned}. Configured sources are {sorted(configured)}."
+    )
+
+
+def test_a_shard_table_without_a_revision_pin_is_refused():
+    """The counts in a table describe one revision of the files.
+
+    `main` moves, so a table published against it would keep being applied
+    after a re-upload had invalidated every row count — picks landing past
+    end-of-stream, silently, on every validator at once. `DataCfg` refuses
+    the pair, which puts the failure at config parse: a task switch rolls
+    back there and the node stays on the task it has.
+    """
+    source = {"path": "org/repo", "name": "sub", "text_column": "text",
+              "eval_shard_rows": {"data/a.parquet": 50_000}}
+    with pytest.raises(ValidationError, match="eval_source_revision_pin"):
+        DataCfg(dataset_sources=[source])
+
+    # The same table with its pin is accepted.
+    DataCfg(
+        dataset_sources=[source],
+        eval_source_revision_pin={"org/repo": "a" * 40},
     )
