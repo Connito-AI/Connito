@@ -504,10 +504,10 @@ def test_revision_pin_override_is_threaded_through():
 # Two shards, deliberately unequal, so a per-shard bound is
 # distinguishable from a whole-source one.
 _SERVED_TABLE = {
-    "stage4/a/part0.parquet": 4_546_112,
-    "stage4/b/part1.parquet": 1_000_000,
+    "data/a/part0.parquet": 4_546_112,
+    "data/b/part1.parquet": 1_000_000,
 }
-_SERVED_REPO = ("IFM/Unregistered-Corpus", "stage4")
+_SERVED_REPO = ("example-org/unregistered-corpus", "subset")
 
 
 def _pick_from_table(int_seed: int, **kwargs):
@@ -566,7 +566,7 @@ def test_a_served_table_faces_the_registry_s_validation():
         eval_shard_pick.pick_shard_for_source(
             repo_id=_SERVED_REPO[0], name=_SERVED_REPO[1], int_seed=1,
             revision_override="a" * 40,
-            shard_rows={"stage4/tiny.parquet": 9_674},
+            shard_rows={"data/tiny.parquet": 9_674},
         )
 
 
@@ -645,11 +645,11 @@ def test_a_table_mixing_file_formats_is_refused():
     policy = eval_shard_pick._SourceShardPolicy.from_table(
         _SERVED_TABLE, revision="c" * 40, max_offset_rows=None,
     )
-    assert policy.path_prefix == "stage4/"
+    assert policy.path_prefix == "data/"
     assert policy.path_suffix == (".parquet",)
     with pytest.raises(ValueError, match="one format"):
         eval_shard_pick._SourceShardPolicy.from_table(
-            {**_SERVED_TABLE, "stage4/c/part2.arrow": 500_000},
+            {**_SERVED_TABLE, "data/c/part2.arrow": 500_000},
             revision="c" * 40, max_offset_rows=None,
         )
     # And the suffix check still bites on a policy assembled by hand.
