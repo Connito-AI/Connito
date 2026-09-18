@@ -34,6 +34,10 @@ shard-pick eval path:
       registry does, caps the offset on request, and leaves picks for
       every other source byte-identical.
 
+  D10. Reaching the offset — a parquet shard is seeked to via its
+      footer rather than walked to, the two select the same rows, and
+      everything else still walks.
+
   D7. Production policies pass module-load validation — the
       `_KNOWN_SOURCES` registry as shipped imports without raising.
 
@@ -98,6 +102,16 @@ def _nemo_info(shard_count: int = 4) -> SimpleNamespace:
         _sibling("4plus_MIND/part_000000.parquet"),  # different config — filtered out
     ])
     return SimpleNamespace(siblings=siblings, sha="def456")
+
+
+class _FakeSplit:
+    """Minimal stand-in for a streaming split: records what it was skipped by."""
+    def __init__(self):
+        self.skipped = 0
+
+    def skip(self, n):
+        self.skipped = n
+        return self
 
 
 def _clear_caches():
@@ -657,3 +671,70 @@ def test_a_table_mixing_file_formats_is_refused():
         eval_shard_pick._validate_policy(
             _SERVED_REPO, dataclasses.replace(policy, path_suffix=(".arrow",)),
         )
+
+
+# -----------------------------------------------------------------------
+# D10 — Reaching the offset by seeking rather than walking
+# -----------------------------------------------------------------------
+
+def _fake_parquet_pick(shard="data/part_000000.parquet", load_builder=None):
+    return eval_shard_pick.ShardPick(
+        repo_id="org/corpus", name="sub", revision="a" * 40, shard_path=shard,
+        offset_bound=1_000_000, shard_rows=1_010_000, in_shard_offset=5,
+        load_builder=load_builder,
+    )
+
+
+def test_a_parquet_shard_with_an_offset_takes_the_seek():
+    """The whole point: a depth that would be walked is jumped to.
+
+    `load_dataset` is patched to raise, so this also pins that the seek
+    does not fall through to the streaming reader on the way.
+    """
+    with patch.object(eval_shard_pick, "_seek_parquet_shard", return_value="SEEKED") as seek, \
+         patch("datasets.load_dataset", side_effect=AssertionError):
+        got = eval_shard_pick.load_streaming_shard(_fake_parquet_pick(), offset=900_000)
+    assert got == "SEEKED"
+    assert seek.call_args[0][1] == 900_000
+
+
+def test_no_offset_and_non_parquet_shards_never_seek():
+    """Three cases that must keep the streaming reader: offset 0 (there is
+    nothing to skip), a non-parquet shard (no footer to read), and a
+    builder-loaded shard (the file is read through a generic builder, so
+    the repo's own layout is not what is being opened)."""
+    cases = [
+        (_fake_parquet_pick(), 0),
+        (_fake_parquet_pick(shard="data/part_000000.arrow"), 900_000),
+        (_fake_parquet_pick(load_builder="json"), 900_000),
+    ]
+    for pick, offset in cases:
+        with patch.object(eval_shard_pick, "_seek_parquet_shard",
+                          side_effect=AssertionError("must not seek")), \
+             patch("datasets.load_dataset", return_value={"train": _FakeSplit()}):
+            eval_shard_pick.load_streaming_shard(pick, offset=offset)
+
+
+def test_a_failed_seek_falls_back_to_walking_the_same_rows():
+    """The seek is an optimisation over `.skip`, not a different sample —
+    both index raw rows — so a failure may be absorbed. If they selected
+    different rows this fallback would be a consensus split, and would
+    have to raise instead."""
+    split = _FakeSplit()
+    with patch.object(eval_shard_pick, "_seek_parquet_shard",
+                      side_effect=RuntimeError("footer unreadable")), \
+         patch("datasets.load_dataset", return_value={"train": split}):
+        got = eval_shard_pick.load_streaming_shard(_fake_parquet_pick(), offset=900_000)
+    assert got.skipped == 900_000, "fallback must still land on the offset"
+
+
+def test_the_streaming_reader_applies_the_offset_itself():
+    """`load_streaming_shard` returns the shard *positioned*. Callers no
+    longer skip afterwards, so forgetting this would silently evaluate
+    every round from row 0 of the picked shard."""
+    split = _FakeSplit()
+    with patch("datasets.load_dataset", return_value={"train": split}):
+        got = eval_shard_pick.load_streaming_shard(
+            _fake_parquet_pick(shard="data/part_000000.arrow"), offset=1234,
+        )
+    assert got.skipped == 1234

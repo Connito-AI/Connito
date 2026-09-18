@@ -751,13 +751,71 @@ def pick_shard_for_source(
     )
 
 
+def _seek_parquet_shard(pick: ShardPick, offset: int):
+    """The picked shard from raw row `offset`, located via the footer.
+
+    `.skip(n)` on a streaming dataset is decode-and-discard: to reach row
+    nine million it pulls nine million rows over the network and throws
+    them away. A parquet footer already records how many rows each row
+    group holds, so the group containing `offset` can be found by
+    arithmetic and only the remainder walked. Cost stops scaling with
+    depth and becomes one row group — measured at 8-23 s anywhere in a
+    10 M-row shard, against ~29 min to walk the same distance.
+
+    Every column is read, not just the one a caller will select, so this
+    is a drop-in for the streamed reader: `text_template` sources need
+    the whole row. That costs bytes the caller may discard, and is the
+    obvious thing to narrow later if a source makes it worth it.
+    """
+    import pyarrow.parquet as pq
+    from datasets import Features, IterableDataset
+    from huggingface_hub import HfFileSystem
+
+    fs_path = f"datasets/{pick.repo_id}@{pick.revision}/{pick.shard_path}"
+    with HfFileSystem().open(fs_path, "rb") as fh:
+        schema = pq.ParquetFile(fh).schema_arrow
+
+    def _rows():
+        # Opened inside the generator: an IterableDataset re-runs it per
+        # epoch, and a handle captured outside would be closed by then.
+        with HfFileSystem().open(fs_path, "rb") as fh:
+            pf = pq.ParquetFile(fh)
+            md = pf.metadata
+            seen, start, within = 0, md.num_row_groups, 0
+            for i in range(md.num_row_groups):
+                n = md.row_group(i).num_rows
+                if seen + n > offset:
+                    start, within = i, offset - seen
+                    break
+                seen += n
+            for batch in pf.iter_batches(
+                batch_size=512, row_groups=list(range(start, md.num_row_groups)),
+            ):
+                for row in batch.to_pylist():
+                    if within:
+                        within -= 1
+                        continue
+                    yield row
+
+    return IterableDataset.from_generator(
+        _rows, features=Features.from_arrow_schema(schema),
+    )
+
+
 def load_streaming_shard(
     pick: ShardPick,
     *,
     split_name: str = "train",
     extra_load_kwargs: dict[str, Any] | None = None,
+    offset: int = 0,
 ):
     """Open a streaming HF dataset reading ONLY the picked shard.
+
+    Returns the shard positioned at raw row `offset`. Two ways to get
+    there, and they select the same rows: a footer seek for parquet, and
+    `.skip` for everything else. The seek is therefore a pure
+    optimisation — a failure falls back to the skip and changes nothing
+    but the wait, which is why the fallback is safe to take silently.
 
     `data_files=` bypasses the dataset's loading script (if any), so the
     returned schema is whatever the raw file format gives. The caller
@@ -772,6 +830,16 @@ def load_streaming_shard(
     # keeping this module importable without the full datasets stack
     # helps unit tests.
     from datasets import load_dataset
+
+    if offset and not pick.load_builder and pick.shard_path.endswith(".parquet"):
+        try:
+            return _seek_parquet_shard(pick, offset)
+        except Exception as e:
+            logger.warning(
+                "parquet footer seek failed; walking to the offset instead",
+                repo_id=pick.repo_id, shard=pick.shard_path,
+                offset=offset, error=f"{type(e).__name__}: {e}",
+            )
 
     if pick.load_builder:
         # Script-bypass path: the repo ships a custom loading script, so
@@ -798,13 +866,14 @@ def load_streaming_shard(
             load_kwargs.update(extra_load_kwargs)
         ds = load_dataset(pick.repo_id, **load_kwargs)
     if split_name in ds:
-        return ds[split_name]
-    # `data_files=` with a single file lands the rows under "train" by
-    # default. Fall back to whatever the only split is.
-    only = next(iter(ds.keys()))
-    if only != split_name:
+        split = ds[split_name]
+    else:
+        # `data_files=` with a single file lands the rows under "train" by
+        # default. Fall back to whatever the only split is.
+        only = next(iter(ds.keys()))
         logger.debug(
             "Streaming shard had no `train` split; using only split present",
             repo_id=pick.repo_id, only_split=only,
         )
-    return ds[only]
+        split = ds[only]
+    return split.skip(offset) if offset else split
