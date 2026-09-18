@@ -370,6 +370,8 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                     name=ds_config,
                     int_seed=int_seed,
                     revision_override=revision_pin_map.get(ds_name),
+                    shard_rows=_source_value(source, "eval_shard_rows"),
+                    max_offset_rows=_source_value(source, "eval_max_offset_rows"),
                 )
                 logger.info(
                     "shard pick",
