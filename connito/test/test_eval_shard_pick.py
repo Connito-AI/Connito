@@ -626,15 +626,33 @@ def test_no_table_leaves_every_built_in_pick_byte_identical():
     assert digest.hexdigest() == check.hexdigest()
 
 
-def test_the_derived_prefix_and_suffix_satisfy_the_typo_guard():
-    """`from_table` derives the pair from the keys, so a table whose
-    entries disagree on layout is still caught by `_validate_policy` —
-    the guard that would otherwise have nothing to compare against."""
+def test_a_table_without_a_pinned_sha_is_refused():
+    """`DataCfg` demands a pin, but the rule lives with the counts too:
+    it holds for any caller, and it catches a pin set to a branch name,
+    which a config-level check cannot tell from a SHA."""
+    for bad in (None, "main", "v1.0", "a" * 39):
+        with pytest.raises(ValueError, match="40-char commit SHA"):
+            eval_shard_pick._SourceShardPolicy.from_table(
+                _SERVED_TABLE, revision=bad, max_offset_rows=None,
+            )
+
+
+def test_a_table_mixing_file_formats_is_refused():
+    """Shards of one source are one format. This is the part of the
+    layout a served table can still be checked on — the prefix cannot
+    be, since deriving it makes `_validate_policy`'s prefix check match
+    by construction (see `from_table`)."""
     policy = eval_shard_pick._SourceShardPolicy.from_table(
         _SERVED_TABLE, revision="c" * 40, max_offset_rows=None,
     )
     assert policy.path_prefix == "stage4/"
     assert policy.path_suffix == (".parquet",)
+    with pytest.raises(ValueError, match="one format"):
+        eval_shard_pick._SourceShardPolicy.from_table(
+            {**_SERVED_TABLE, "stage4/c/part2.arrow": 500_000},
+            revision="c" * 40, max_offset_rows=None,
+        )
+    # And the suffix check still bites on a policy assembled by hand.
     with pytest.raises(ValueError, match="path_prefix/path_suffix"):
         eval_shard_pick._validate_policy(
             _SERVED_REPO, dataclasses.replace(policy, path_suffix=(".arrow",)),

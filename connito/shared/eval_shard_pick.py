@@ -196,23 +196,42 @@ class _SourceShardPolicy:
 
     @classmethod
     def from_table(
-        cls, shard_rows: dict[str, int], *, revision: str, max_offset_rows: int | None,
+        cls, shard_rows: dict[str, int], *, revision: str | None, max_offset_rows: int | None,
     ) -> _SourceShardPolicy:
         """A `verified_table` policy from a table shipped with the task.
 
-        The prefix/suffix pair is derived from the table rather than
-        configured, because for a served table the table IS the shard
-        allowlist: `_list_shards` is never consulted, so the pair has no
-        filtering job left and exists only to feed `_validate_policy`'s
-        typo guard. Deriving it keeps that guard meaningful (every key
-        still has to agree with every other) without asking a publisher
-        for two fields whose only correct value is a restatement of the
-        keys they just wrote.
+        The prefix is derived rather than configured: for a served table
+        the table IS the allowlist, `_list_shards` is never consulted, so
+        the pair has no filtering left to do. Note what that costs —
+        `_validate_policy`'s prefix check becomes vacuous here, because a
+        common prefix matches every key by construction. It cannot catch
+        a mistyped path; what catches that is generating the table from a
+        real listing rather than writing it by hand, and failing that,
+        the shard read itself, loudly and identically on every validator.
+
+        The suffix is worth checking, so it is: shards of one source are
+        one format, and a table mixing two is wrong in a way no later
+        step would call out.
+
+        The revision must already be a commit SHA. `DataCfg` demands a
+        pin for a tabled source, but the rule belongs here too: it is
+        the counts themselves that are only valid at one revision, and
+        this way the invariant holds for any caller, and catches a pin
+        set to a branch name — which `DataCfg` cannot tell from a SHA.
         """
+        if not _SHA_RE.fullmatch(revision or ""):
+            raise ValueError(
+                f"a shard table's revision must be a 40-char commit SHA, got "
+                f"{revision!r} — the row counts are only valid at one revision"
+            )
         suffixes = {"." + k.rsplit(".", 1)[-1] for k in shard_rows if "." in k}
+        if len(suffixes) != 1:
+            raise ValueError(
+                f"a shard table must name files of one format, got {sorted(suffixes)}"
+            )
         return cls(
             path_prefix=os.path.commonprefix(sorted(shard_rows)),
-            path_suffix=tuple(sorted(suffixes)),
+            path_suffix=tuple(suffixes),
             revision=revision,
             row_count_source="verified_table",
             verified_shard_rows=dict(shard_rows),
@@ -663,8 +682,7 @@ def pick_shard_for_source(
         # one place both registries are held to the same invariants, and
         # it needs the assembled policy, not the raw table.
         policy = _SourceShardPolicy.from_table(
-            shard_rows, revision=revision_override or "main",
-            max_offset_rows=max_offset_rows,
+            shard_rows, revision=revision_override, max_offset_rows=max_offset_rows,
         )
         _validate_policy((repo_id, name), policy)
     else:
