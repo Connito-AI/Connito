@@ -83,15 +83,19 @@ That requires:
        the same seed and break weight consensus for that round.
     2. Deterministic file-list sort (plain lexicographic on the full
        `siblings.rfilename`).
-    3. The `safe_floor_rows` / `min_headroom_rows` constants must
-       match across validators — they live in code (this module), not
-       config, so the rollout discipline is just "deploy the same
-       commit." Operators MUST re-verify `verified_shard_rows` and
-       bump `safe_floor_rows` together if the upstream dataset is
-       ever re-uploaded with different shard sizes.
+    3. The row-count constants must match across validators. A policy
+       reaches them one of two ways, and each needs its own discipline:
+       from `_KNOWN_SOURCES` below, where "deploy the same commit" is
+       the whole of it; or from a shard table in the active task, which
+       is identical fleet-wide by construction (one bundle, one locked
+       `owner_url`, checked against the server's hash) but must not be
+       published before every validator carries a release that reads
+       it. Either way, a re-upload of the upstream dataset invalidates
+       the counts and they MUST be re-measured.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -190,9 +194,56 @@ class _SourceShardPolicy:
     # same trade a many-shard source already makes.
     max_offset_rows: int | None = None
 
+    @classmethod
+    def from_table(
+        cls, shard_rows: dict[str, int], *, revision: str | None, max_offset_rows: int | None,
+    ) -> _SourceShardPolicy:
+        """A `verified_table` policy from a table shipped with the task.
 
-# Known sources. Add new entries here, NOT via config — the consensus
-# rules require every validator to use the same policy.
+        The prefix is derived rather than configured: for a served table
+        the table IS the allowlist, `_list_shards` is never consulted, so
+        the pair has no filtering left to do. Note what that costs —
+        `_validate_policy`'s prefix check becomes vacuous here, because a
+        common prefix matches every key by construction. It cannot catch
+        a mistyped path; what catches that is generating the table from a
+        real listing rather than writing it by hand, and failing that,
+        the shard read itself, loudly and identically on every validator.
+
+        The suffix is worth checking, so it is: shards of one source are
+        one format, and a table mixing two is wrong in a way no later
+        step would call out.
+
+        The revision must already be a commit SHA. `DataCfg` demands a
+        pin for a tabled source, but the rule belongs here too: it is
+        the counts themselves that are only valid at one revision, and
+        this way the invariant holds for any caller, and catches a pin
+        set to a branch name — which `DataCfg` cannot tell from a SHA.
+        """
+        if not _SHA_RE.fullmatch(revision or ""):
+            raise ValueError(
+                f"a shard table's revision must be a 40-char commit SHA, got "
+                f"{revision!r} — the row counts are only valid at one revision"
+            )
+        suffixes = {"." + k.rsplit(".", 1)[-1] for k in shard_rows if "." in k}
+        if len(suffixes) != 1:
+            raise ValueError(
+                f"a shard table must name files of one format, got {sorted(suffixes)}"
+            )
+        return cls(
+            path_prefix=os.path.commonprefix(sorted(shard_rows)),
+            path_suffix=tuple(suffixes),
+            revision=revision,
+            row_count_source="verified_table",
+            verified_shard_rows=dict(shard_rows),
+            max_offset_rows=max_offset_rows,
+        )
+
+
+# Known sources, and the fallback for any source whose task ships no
+# shard table. A table travels with the bundle — one payload, from the
+# same locked `owner_url`, checked against the server's hash — so both
+# registries are identical fleet-wide; this one requires every validator
+# to be on the same release, which a mixed-version fleet can violate.
 _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
     ("allenai/c4", "en"): _SourceShardPolicy(
         path_prefix="en/",
@@ -286,6 +337,7 @@ _KNOWN_SOURCES: dict[tuple[str, str | None], _SourceShardPolicy] = {
 
 
 _SHARD_NAME_FILTER = re.compile(r"(train|part_)", re.IGNORECASE)
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 def _validate_policy(key: tuple[str, str | None], policy: _SourceShardPolicy) -> None:
@@ -413,7 +465,15 @@ def _resolve_revision(repo_id: str, requested: str) -> str:
     validator-process startup and reuse that SHA for the rest of the
     process's life. That avoids the failure mode where two validators
     boot at different times and see different `main` heads.
+
+    A request that is already a commit SHA is returned as-is: there is
+    nothing to resolve, and skipping the round-trip leaves a source
+    whose task ships a shard table needing no HF call before the shard
+    read itself — the table answers the listing, the pin answers the
+    revision.
     """
+    if _SHA_RE.fullmatch(requested):
+        return requested
     api = HfApi()
     info = api.dataset_info(repo_id, revision=requested)
     sha = getattr(info, "sha", None)
@@ -434,18 +494,16 @@ def _resolve_revision(repo_id: str, requested: str) -> str:
 def _list_shards(repo_id: str, name: str | None, revision: str) -> tuple[str, ...]:
     """Return the deterministically-sorted shard list for a source.
 
+    Listing-based policies only. A `verified_table` policy's list comes
+    from its table, which the caller reads directly — that is what lets
+    a table arrive with the task, where no key-based lookup can find it,
+    and it keeps this cache holding only what an HF listing produced.
+
     Cached per (repo_id, name, revision). Sort is plain lex over the
     full `rfilename` string so any validator computing this against
     the same revision gets the same tuple.
     """
     policy = _policy_for(repo_id, name)
-    if policy.row_count_source == "verified_table":
-        # The frozen table doubles as the shard allowlist. Listing from
-        # the HF API here would re-introduce the consensus hazard the
-        # table exists to remove (a re-uploaded repo changing the list
-        # under our feet); the pinned revision + table are the source
-        # of truth.
-        return tuple(sorted(policy.verified_shard_rows))
     info = HfApi().dataset_info(repo_id, revision=revision)
     name_filter = (
         re.compile(policy.leaf_name_pattern, re.IGNORECASE)
@@ -596,11 +654,22 @@ def pick_shard_for_source(
     name: str | None,
     int_seed: int,
     revision_override: str | None = None,
+    shard_rows: dict[str, int] | None = None,
+    max_offset_rows: int | None = None,
 ) -> ShardPick:
     """Pick one shard and a uniform in-shard offset for one source.
 
     Deterministic from (repo_id, name, revision, int_seed). All
     validators on the same revision pin produce the same pick.
+
+    `shard_rows` is a table shipped with the task. When present it
+    registers the source outright — no `_KNOWN_SOURCES` entry, so a new
+    corpus costs a task publish rather than a validator release — and it
+    faces the same `_validate_policy` invariants the built-in registry
+    meets at import. A malformed table raises rather than falling back:
+    every validator holds the same bundle, so failing here fails
+    identically fleet-wide, which is recoverable, where a per-node
+    fallback would split weights.
 
     `int_seed` is the same integer derived from `combined_seed` that
     feeds the existing `.shuffle(seed=int_seed, ...)` call — see
@@ -608,11 +677,25 @@ def pick_shard_for_source(
         `int_seed = int(str(seed)[:8], 16)`.
     Reusing it keeps the seed wiring identical to today.
     """
-    policy = _policy_for(repo_id, name)
+    if shard_rows:
+        # `_validate_policy` here rather than at config parse: it is the
+        # one place both registries are held to the same invariants, and
+        # it needs the assembled policy, not the raw table.
+        policy = _SourceShardPolicy.from_table(
+            shard_rows, revision=revision_override, max_offset_rows=max_offset_rows,
+        )
+        _validate_policy((repo_id, name), policy)
+    else:
+        policy = _policy_for(repo_id, name)
     requested_revision = revision_override or policy.revision
     revision = _resolve_revision(repo_id, requested_revision)
 
-    shards = _list_shards(repo_id, name, revision)
+    # A table is its own allowlist, so it answers the listing question
+    # directly; every other policy asks HF.
+    if policy.row_count_source == "verified_table":
+        shards = tuple(sorted(policy.verified_shard_rows))
+    else:
+        shards = _list_shards(repo_id, name, revision)
     if not shards:  # _list_shards already raises but be explicit
         raise RuntimeError(
             f"Empty shard list for ({repo_id!r}, {name!r}, rev={revision!r})"
@@ -668,13 +751,71 @@ def pick_shard_for_source(
     )
 
 
+def _seek_parquet_shard(pick: ShardPick, offset: int):
+    """The picked shard from raw row `offset`, located via the footer.
+
+    `.skip(n)` on a streaming dataset is decode-and-discard: to reach row
+    nine million it pulls nine million rows over the network and throws
+    them away. A parquet footer already records how many rows each row
+    group holds, so the group containing `offset` can be found by
+    arithmetic and only the remainder walked. Cost stops scaling with
+    depth and becomes one row group — measured at 8-23 s anywhere in a
+    10 M-row shard, against ~29 min to walk the same distance.
+
+    Every column is read, not just the one a caller will select, so this
+    is a drop-in for the streamed reader: `text_template` sources need
+    the whole row. That costs bytes the caller may discard, and is the
+    obvious thing to narrow later if a source makes it worth it.
+    """
+    import pyarrow.parquet as pq
+    from datasets import Features, IterableDataset
+    from huggingface_hub import HfFileSystem
+
+    fs_path = f"datasets/{pick.repo_id}@{pick.revision}/{pick.shard_path}"
+    with HfFileSystem().open(fs_path, "rb") as fh:
+        schema = pq.ParquetFile(fh).schema_arrow
+
+    def _rows():
+        # Opened inside the generator: an IterableDataset re-runs it per
+        # epoch, and a handle captured outside would be closed by then.
+        with HfFileSystem().open(fs_path, "rb") as fh:
+            pf = pq.ParquetFile(fh)
+            md = pf.metadata
+            seen, start, within = 0, md.num_row_groups, 0
+            for i in range(md.num_row_groups):
+                n = md.row_group(i).num_rows
+                if seen + n > offset:
+                    start, within = i, offset - seen
+                    break
+                seen += n
+            for batch in pf.iter_batches(
+                batch_size=512, row_groups=list(range(start, md.num_row_groups)),
+            ):
+                for row in batch.to_pylist():
+                    if within:
+                        within -= 1
+                        continue
+                    yield row
+
+    return IterableDataset.from_generator(
+        _rows, features=Features.from_arrow_schema(schema),
+    )
+
+
 def load_streaming_shard(
     pick: ShardPick,
     *,
     split_name: str = "train",
     extra_load_kwargs: dict[str, Any] | None = None,
+    offset: int = 0,
 ):
     """Open a streaming HF dataset reading ONLY the picked shard.
+
+    Returns the shard positioned at raw row `offset`. Two ways to get
+    there, and they select the same rows: a footer seek for parquet, and
+    `.skip` for everything else. The seek is therefore a pure
+    optimisation — a failure falls back to the skip and changes nothing
+    but the wait, which is why the fallback is safe to take silently.
 
     `data_files=` bypasses the dataset's loading script (if any), so the
     returned schema is whatever the raw file format gives. The caller
@@ -689,6 +830,16 @@ def load_streaming_shard(
     # keeping this module importable without the full datasets stack
     # helps unit tests.
     from datasets import load_dataset
+
+    if offset and not pick.load_builder and pick.shard_path.endswith(".parquet"):
+        try:
+            return _seek_parquet_shard(pick, offset)
+        except Exception as e:
+            logger.warning(
+                "parquet footer seek failed; walking to the offset instead",
+                repo_id=pick.repo_id, shard=pick.shard_path,
+                offset=offset, error=f"{type(e).__name__}: {e}",
+            )
 
     if pick.load_builder:
         # Script-bypass path: the repo ships a custom loading script, so
@@ -715,13 +866,14 @@ def load_streaming_shard(
             load_kwargs.update(extra_load_kwargs)
         ds = load_dataset(pick.repo_id, **load_kwargs)
     if split_name in ds:
-        return ds[split_name]
-    # `data_files=` with a single file lands the rows under "train" by
-    # default. Fall back to whatever the only split is.
-    only = next(iter(ds.keys()))
-    if only != split_name:
+        split = ds[split_name]
+    else:
+        # `data_files=` with a single file lands the rows under "train" by
+        # default. Fall back to whatever the only split is.
+        only = next(iter(ds.keys()))
         logger.debug(
             "Streaming shard had no `train` split; using only split present",
             repo_id=pick.repo_id, only_split=only,
         )
-    return ds[only]
+        split = ds[only]
+    return split.skip(offset) if offset else split

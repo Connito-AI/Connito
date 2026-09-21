@@ -370,6 +370,8 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                     name=ds_config,
                     int_seed=int_seed,
                     revision_override=revision_pin_map.get(ds_name),
+                    shard_rows=_source_value(source, "eval_shard_rows"),
+                    max_offset_rows=_source_value(source, "eval_max_offset_rows"),
                 )
                 logger.info(
                     "shard pick",
@@ -377,7 +379,18 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                     shard=pick.shard_path, revision=pick.revision,
                     shard_rows=pick.shard_rows, offset=pick.in_shard_offset,
                 )
-                source_split = load_streaming_shard(pick, split_name=split_name)
+                # The in-shard offset is applied by the reader, not here,
+                # so it indexes RAW rows — which is what `offset_bound`
+                # (`shard_rows` less the headroom) has always counted.
+                # Skipping after the quality filter, as this did, spent
+                # the offset on *surviving* rows against a raw-row bound,
+                # so a large draw could still land past end-of-stream —
+                # the case the headroom exists to prevent. It also let a
+                # parquet source seek: a skip applied this late has the
+                # whole prefix decoded behind it.
+                source_split = load_streaming_shard(
+                    pick, split_name=split_name, offset=pick.in_shard_offset,
+                )
             else:
                 source_split = _load_streaming_split(
                     ds_name,
@@ -425,14 +438,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 source_split = source_split.filter(
                     partial(_min_text_chars_filter, min_chars=eval_min_text_chars)
                 )
-
-            if pick is not None:
-                # In-shard offset goes here so the validator's read
-                # window lands at a random depth inside the chosen
-                # shard rather than at row 0. Bounded by the chosen
-                # shard's own row count — no min-across-sources to
-                # maintain, no over-skip risk past end-of-stream.
-                source_split = source_split.skip(pick.in_shard_offset)
 
             dataset_splits.append(source_split)
             dataset_weights.append(weight)
