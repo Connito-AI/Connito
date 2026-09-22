@@ -108,6 +108,8 @@ class BackgroundEvalWorker(threading.Thread):
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
+        # Round whose incumbent was already attempted, so a failure is not retried every tick.
+        self._incumbent_tried_round: int | None = None
         # The round's base shard key set — what every submission must equal,
         # since miners are loaded into the one model in place. None until a
         # base shard has been loaded (cold start), when the check is skipped.
@@ -227,6 +229,7 @@ class BackgroundEvalWorker(threading.Thread):
                 # Reload state_dict on round transition.
                 if round_obj.round_id != self._loaded_round_id:
                     await self._load_round_base(round_obj)
+                await self._maybe_eval_incumbent(round_obj)
 
                 target = self._next_target(round_obj)
                 if target is None:
@@ -292,6 +295,55 @@ class BackgroundEvalWorker(threading.Thread):
                 logger.info("bg-eval: active — gates cleared, resuming evaluations")
                 return
             await asyncio.sleep(0.5)
+
+    async def _maybe_eval_incumbent(self, round_obj) -> None:
+        """Score the round's incumbent once, as soon as its download lands.
+
+        Measurement only (see `connito.validator.incumbent`). Same cached
+        batches and resident model as the miners, but none of the miner path:
+        no per-uid score, queue slot or telemetry. A key set that is not
+        exactly the base shard's is skipped, because a partial overlay would
+        leave the previous model's experts behind and measure a hybrid.
+        """
+        path = round_obj.incumbent_path
+        if (
+            path is None
+            or self._cached_batches is None
+            or self._incumbent_tried_round == round_obj.round_id
+        ):
+            return
+        self._incumbent_tried_round = round_obj.round_id
+        from connito.shared.evaluate import evaluate_model
+
+        def _run() -> float | None:
+            sd = load_state_dict_from_path(str(path))
+            if set(sd) != self._expected_expert_keys:
+                logger.warning(
+                    "bg-eval: incumbent key set differs from the base shard; skipped",
+                    round_id=round_obj.round_id, path=str(path),
+                )
+                return None
+            with self.gpu_eval_lock:
+                self._eval_base_model.load_state_dict(sd, strict=False)
+                metrics = evaluate_model(
+                    0, self._eval_base_model, self._cached_batches,
+                    self.device, EVAL_MAX_BATCHES, None,
+                )
+            return float(metrics.get("val_loss", float("inf")))
+
+        try:
+            loss = await asyncio.to_thread(_run)
+        except Exception as e:
+            logger.warning("bg-eval: incumbent eval failed", round_id=round_obj.round_id, error=str(e))
+            return
+        if loss is not None and not round_obj.finalized:
+            round_obj.incumbent_val_loss = loss
+            logger.info(
+                "bg-eval: incumbent scored",
+                round_id=round_obj.round_id,
+                incumbent_val_loss=round(loss, 4),
+                baseline_loss=round(self._loaded_baseline_loss or 0.0, 4),
+            )
 
     async def _load_round_base(self, round_obj) -> None:
         """Load the round's baseline shard into our GPU eval_base_model,
