@@ -61,6 +61,42 @@ def select_baseline_uid(
     return min(val_losses, key=lambda uid: (val_losses[uid], uid))
 
 
+def baseline_selection_report(
+    val_losses: dict[int, float],
+    prior_avg_scores: dict[int, float],
+    incumbent_val_loss: float | None,
+) -> dict:
+    """What `select_baseline_uid` picked next to what a ratchet would have.
+
+    Measurement only: nothing reads this to decide what is published. The
+    ratchet candidate is this round's lowest val_loss, kept only if it beats
+    the incumbent (the baseline these submissions trained from); the
+    incumbent wins ties. `legacy_regressed` is the question the measurement
+    exists to answer: did the published baseline score worse, on this
+    round's batches, than the one it replaced?
+    """
+    legacy = select_baseline_uid(val_losses, prior_avg_scores)
+    best = min(val_losses, key=lambda uid: (val_losses[uid], uid)) if val_losses else None
+    legacy_loss = val_losses.get(legacy) if legacy is not None else None
+    best_loss = val_losses.get(best) if best is not None else None
+    if best is None or (incumbent_val_loss is not None and best_loss >= incumbent_val_loss):
+        ratchet = None
+    else:
+        ratchet = best
+    return {
+        "legacy_uid": legacy,
+        "legacy_val_loss": legacy_loss,
+        "best_uid": best,
+        "best_val_loss": best_loss,
+        "incumbent_val_loss": incumbent_val_loss,
+        "ratchet_uid": ratchet,
+        "legacy_is_best": legacy is not None and legacy == best,
+        "legacy_regressed": (
+            None if legacy_loss is None or incumbent_val_loss is None
+            else legacy_loss > incumbent_val_loss
+        ),
+    }
+
 
 class RosterEntry(NamedTuple):
     """Lightweight (uid, hotkey) pair yielded by Round iteration helpers."""
@@ -126,6 +162,12 @@ class Round:
     # losses — `validator_miner_val_loss` is emitted at eval time and is
     # not derivable from `scores` (the delta clamps at 0).
     val_losses: dict[int, float] = field(default_factory=dict)
+    # The baseline these submissions trained from (the chain-advertised one at
+    # freeze) and its loss on this round's batches. Measurement only — see
+    # `baseline_selection_report`. Not journaled: a round resumed after a
+    # restart has no incumbent, and its report says so with None.
+    incumbent_path: Path | None = None
+    incumbent_val_loss: float | None = None
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
     # UIDs the miner is at fault for: explicit validation failures
