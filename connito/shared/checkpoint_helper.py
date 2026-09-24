@@ -414,7 +414,15 @@ def save_checkpoint(
         model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
 
         if save_model_by_expert_group and expert_manager is not None:
-            state_dict = model.state_dict()
+            # With one active group, every tensor the shard keeps is a trainable
+            # expert, so parameters are enough. `model.state_dict()` would
+            # dequantize every fp8 module to a CPU copy first — the whole model
+            # under full topology — only for the filter to throw it away.
+            state_dict = (
+                {name: p.detach() for name, p in model.named_parameters()}
+                if active_expert_group_id is not None
+                else model.state_dict()
+            )
             save_state_dict_by_expert_group(
                 state_dict,
                 expert_manager.expert_group_assignment,

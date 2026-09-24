@@ -63,6 +63,15 @@ def _is_streaming_timeout_error(error: Exception) -> bool:
     return any(marker in error_msg for marker in timeout_markers)
 
 
+def _trainable_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """The tensors an optimizer step can change, for the before/after hash.
+
+    `model.state_dict()` dequantizes every fp8 module to a CPU copy, which
+    under full topology is the whole frozen model, twice per step.
+    """
+    return {name: p.detach() for name, p in model.named_parameters() if p.requires_grad}
+
+
 # this is for local DP only
 def init_process(local_rank: int, config: MinerConfig, world_size: int, fn: callable, test_mode: bool = False, backend: str = "nccl") -> None:
     """
@@ -153,7 +162,16 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("init - model and expert manager")
     expert_manager = ExpertManager(config)
-    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet, partial=True)
+    # `moe.miner_topology`: "full" (the default) holds every routed expert and
+    # routes natively at `moe.full_topk`, the model the validator scores.
+    # "partial" holds only the active and helper groups and reroutes every
+    # other top-k pick to a helper. Only the active group trains either way;
+    # fp8 (`model.quantization_miner`) keeps the frozen experts small enough
+    # to fit.
+    topology = get_nested_attr(config, "moe.miner_topology", "full")
+    partial = topology == "partial"
+    logger.info("miner topology", mode=topology)
+    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet, partial=partial)
     model = model.to(device)
     model = freeze_parameters(
         model=model,
@@ -466,7 +484,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     gradient_accumulation_steps=config.local_par.gradient_accumulation_steps,
                     current_model_meta=current_model_meta,
                 )
-                old_model_hash = get_model_hash(model.state_dict(), hex=True)
+                old_model_hash = get_model_hash(_trainable_state(model), hex=True)
 
                 non_finite_grad_params = []
                 for n, p in model.named_parameters():
@@ -571,7 +589,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                new_model_hash = get_model_hash(model.state_dict(), hex=True)
+                new_model_hash = get_model_hash(_trainable_state(model), hex=True)
                 logger.info("Updated model", old_model_hash=old_model_hash, new_model_hash=new_model_hash)
 
             # === Log metric ===
