@@ -499,7 +499,12 @@ class MoECfg(BaseConfig):
     full_topk: PositiveInt = 6
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
-    partial_moe: bool = True
+    # The model the miner trains. "full" holds every routed expert and routes
+    # natively at `full_topk` — the model validators score. "partial" holds
+    # only the active and helper groups and fits smaller GPUs. Only the active
+    # group trains either way. Replaces `partial_moe`, which nothing read: a
+    # new name, so configs written with that field still get this default.
+    miner_topology: Literal["full", "partial"] = "full"
     num_worker_groups: PositiveInt = 2
 
 
