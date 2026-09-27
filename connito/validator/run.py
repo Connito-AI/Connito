@@ -1160,6 +1160,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     score_aggregator=score_aggregator,
                     score_path=score_path,
                 )
+                # Measurement only: the published pick next to what a ratchet
+                # would have published. Nothing below reads it.
+                from connito.validator.round import baseline_selection_report
+
+                logger.info(
+                    "baseline selection comparison",
+                    round_id=pending_round.round_id,
+                    **baseline_selection_report(
+                        dict(pending_round.val_losses),
+                        dict(pending_round.prior_avg_scores),
+                        pending_round.incumbent_val_loss,
+                    ),
+                )
                 # Off the main loop: a ~3 GB upload must not sit between here
                 # and MinerCommit1. Daemon so it can never hold up shutdown.
                 from connito.validator.distribute import (
@@ -1424,6 +1437,18 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 score_aggregator=score_aggregator,
                 checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
+
+            # Measurement only: fetch the baseline these submissions trained
+            # from so the eval worker can score it next to them. Its own thread
+            # and chain connection; publishing is unaffected.
+            from connito.validator.incumbent import fetch_round_incumbent
+
+            threading.Thread(
+                target=fetch_round_incumbent,
+                kwargs={"round_obj": new_round, "config": config,
+                        "expert_group_assignment": expert_manager.expert_group_assignment},
+                name="fetch-incumbent", daemon=True,
+            ).start()
 
             # Publish the active round id to Prometheus so external
             # aggregators can key per-miner score / val_loss readings to
