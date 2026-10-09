@@ -620,7 +620,7 @@ def test_no_table_leaves_every_built_in_pick_byte_identical():
                 )
                 digest.update(
                     f"{p.shard_path}|{p.in_shard_offset}|{p.offset_bound}|"
-                    f"{p.shard_rows}|{p.revision}|{p.load_builder}".encode()
+                    f"{p.shard_rows}|{p.revision}".encode()
                 )
     # Recomputed with `shard_rows=None` explicitly passed, i.e. the
     # served branch evaluated and declined.
@@ -635,7 +635,7 @@ def test_no_table_leaves_every_built_in_pick_byte_identical():
                 )
                 check.update(
                     f"{p.shard_path}|{p.in_shard_offset}|{p.offset_bound}|"
-                    f"{p.shard_rows}|{p.revision}|{p.load_builder}".encode()
+                    f"{p.shard_rows}|{p.revision}".encode()
                 )
     assert digest.hexdigest() == check.hexdigest()
 
@@ -677,11 +677,10 @@ def test_a_table_mixing_file_formats_is_refused():
 # D10 — Reaching the offset by seeking rather than walking
 # -----------------------------------------------------------------------
 
-def _fake_parquet_pick(shard="data/part_000000.parquet", load_builder=None):
+def _fake_parquet_pick(shard="data/part_000000.parquet"):
     return eval_shard_pick.ShardPick(
         repo_id="org/corpus", name="sub", revision="a" * 40, shard_path=shard,
         offset_bound=1_000_000, shard_rows=1_010_000, in_shard_offset=5,
-        load_builder=load_builder,
     )
 
 
@@ -699,14 +698,11 @@ def test_a_parquet_shard_with_an_offset_takes_the_seek():
 
 
 def test_no_offset_and_non_parquet_shards_never_seek():
-    """Three cases that must keep the streaming reader: offset 0 (there is
-    nothing to skip), a non-parquet shard (no footer to read), and a
-    builder-loaded shard (the file is read through a generic builder, so
-    the repo's own layout is not what is being opened)."""
+    """Two cases that must keep the streaming reader: offset 0 (there is
+    nothing to skip) and a non-parquet shard (no footer to read)."""
     cases = [
         (_fake_parquet_pick(), 0),
         (_fake_parquet_pick(shard="data/part_000000.arrow"), 900_000),
-        (_fake_parquet_pick(load_builder="json"), 900_000),
     ]
     for pick, offset in cases:
         with patch.object(eval_shard_pick, "_seek_parquet_shard",

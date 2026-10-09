@@ -259,14 +259,6 @@ class DatasetSourceCfg(BaseConfig):
     text_template: str | None = None
     # c4 replay rows: the miner trains its residual not to fire on them.
     replay: bool = False
-    # Authorize HF's `load_dataset` to execute the dataset repo's custom
-    # builder script. Required for sources that ship a `<name>.py` loader
-    # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
-    # malicious dataset can't piggyback through a globally-enabled flag —
-    # operators consent to executing remote code one dataset at a time.
-    # Pin the source's revision via `eval_source_revision_pin` when
-    # turning this on to bound the surface to a reviewed SHA.
-    trust_remote_code: bool = False
     # Seeded shard pick without a `_KNOWN_SOURCES` entry: this source's shard
     # list with a row count per shard, precomputed at the revision pinned in
     # `eval_source_revision_pin` (required alongside this) and shipped with the
