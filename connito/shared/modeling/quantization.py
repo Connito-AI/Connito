@@ -1,7 +1,7 @@
-"""Weight-only fp8 (e4m3) storage for modules that are never trained.
+"""Weight-only fp8 (e4m3) storage for the frozen base.
 
-`FP8Linear` is ported from `~/experiment/partial_moe.py` so loss measurements
-transfer between the two codebases.
+Conversion runs inside `from_pretrained`, one checkpoint tensor at a time, so
+the bf16 base (Qwen: 67 GiB) never has to fit in host or device memory.
 """
 
 from __future__ import annotations
@@ -9,10 +9,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers.core_model_loading import ConversionOps
+from transformers.quantizers import HfQuantizer, register_quantization_config, register_quantizer
+from transformers.utils.quantization_config import QuantizationConfigMixin
 
 from connito.shared.app_logging import structlog
-from connito.shared.expert_manager import get_layer_expert_id
 from connito.shared.helper import get_nested_attr
+from connito.shared.modeling.families import FAMILIES, ModelFamily, family
 
 logger = structlog.get_logger(__name__)
 
@@ -20,139 +23,138 @@ logger = structlog.get_logger(__name__)
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
-SCOPES = ("off", "attention", "experts", "attention+experts", "all")
+# "experts": the family's fused routed experts only. "all": also every bias-free nn.Linear not denied.
+SCOPES = ("off", "experts", "all")
 
-# Matched by dotted-path *suffix*. As a substring, "mlp.gate" also hits
-# "mlp.gate_proj" and would drop the dense MLPs.
-#   lm_head            - feeds the loss directly, error is not averaged away
-#   mlp.gate           - the router; perturbing it changes *which* experts fire
-#   kv_a_proj_with_mqa - feeds an RMSNorm that amplifies weight error
-DENY = ("lm_head", "mlp.gate", "kv_a_proj_with_mqa")
+# lm_head feeds the loss directly. No router entry: routers are excluded by type (not nn.Linear).
+DENY = ("lm_head",)
 
-# q_a/q_b exist on full V2; Lite sets q_lora_rank=null and has q_proj instead.
-ATTENTION = ("q_proj", "q_a_proj", "q_b_proj", "kv_b_proj", "o_proj")
+_QUANT_METHOD = "connito_fp8"
 
 
 def _to_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-output-row symmetric quantization. One global scale would let the
-    largest row waste e4m3's mantissa for every other row."""
-    scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / FP8_MAX
-    return (weight / scale).to(FP8_DTYPE), scale.float()
+    """Per-row symmetric quantization over the last dimension. One global scale
+    would let the largest row waste e4m3's mantissa for every other row."""
+    scale = weight.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-12) / FP8_MAX
+    return weight.to(torch.float32, copy=True).div_(scale).to(FP8_DTYPE), scale
 
 
-class FP8Linear(nn.Module):
-    """A frozen Linear held in fp8 and dequantized per call.
+class _FP8Storage(nn.Module):
+    """Frozen tensors held as fp8 buffers with fp32 scales.
 
-    Stored as buffers, so `named_parameters()` never sees them and no optimizer
-    can pick them up.
+    Buffers, so no optimizer sees them. Each keeps its checkpoint name, which
+    is where `from_pretrained` writes the converted tensor.
     """
 
-    def __init__(self, linear: nn.Linear) -> None:
-        super().__init__()
-        values, scale = _to_fp8(linear.weight.data)
-        self.register_buffer("weight_fp8", values)
-        self.register_buffer("scale", scale)
-        self.in_features = linear.in_features
-        self.out_features = linear.out_features
+    _fp8_names: tuple[str, ...] = ()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight_fp8.to(x.dtype) * self.scale.to(x.dtype))
+    def _store(self, name: str, tensor: torch.Tensor) -> None:
+        values, scale = _to_fp8(tensor)
+        self.register_buffer(name, values)
+        self.register_buffer(f"{name}_scale", scale)
+
+    def _dequantized(self, name: str, dtype: torch.dtype) -> torch.Tensor:
+        return getattr(self, name).to(dtype).mul_(getattr(self, f"{name}_scale").to(dtype))
 
     def _apply(self, fn, recurse: bool = True):
-        # fp8 is a floating dtype, so `.to(dtype=...)` upcasts the buffer and the
-        # saving disappears with no error. Casting back is lossless.
+        # `.to(dtype=...)` casts every floating buffer, fp8 values and fp32 scales alike: keep the stored ones.
+        before = dict(self._buffers)
         out = super()._apply(fn, recurse)
-        if self.weight_fp8.dtype != FP8_DTYPE:
-            self.weight_fp8.data = self.weight_fp8.data.to(FP8_DTYPE)
-        if self.scale.dtype != torch.float32:
-            self.scale.data = self.scale.data.float()
+        for name, old in before.items():
+            if self._buffers[name].dtype != old.dtype:
+                self._buffers[name] = old.to(self._buffers[name].device)
         return out
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
-        # Emit a dequantized `weight` so state_dict() matches an unquantized
-        # model. fp32: a row with amax < ~1.3e-5 dequantizes to zeros in fp16.
+        # The unquantized names and shapes, so state_dict() matches a bf16 model.
+        # On CPU, or a caller holding the dict would hold every dequantized
+        # tensor on the GPU at once.
         if keep_vars:
-            raise RuntimeError("FP8Linear cannot honour state_dict(keep_vars=True)")
-        destination[f"{prefix}weight"] = (
-            self.weight_fp8.to("cpu", torch.float32) * self.scale.to("cpu")
-        )
+            raise RuntimeError(f"{type(self).__name__} cannot honour state_dict(keep_vars=True)")
+        for name in self._fp8_names:
+            values = getattr(self, name)
+            if values.is_meta:
+                # Else transformers reads the checkpoint tensor in this dtype, not get_base_model's bf16.
+                destination[f"{prefix}{name}"] = torch.empty_like(values, dtype=torch.bfloat16)
+            else:
+                destination[f"{prefix}{name}"] = values.to("cpu", torch.float32) * getattr(self, f"{name}_scale").cpu()
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
-        key = f"{prefix}weight"
-        if key not in state_dict:
-            if strict:
-                missing_keys.append(key)
-            return
-        incoming = state_dict.pop(key)
-        if tuple(incoming.shape) != (self.out_features, self.in_features):
-            error_msgs.append(f"size mismatch for {key}: got {tuple(incoming.shape)}")
-            return
-        values, scale = _to_fp8(incoming.to(self.scale.device))
-        self.weight_fp8.copy_(values)
-        self.scale.copy_(scale)
+        for name in self._fp8_names:
+            key = f"{prefix}{name}"
+            if key not in state_dict:
+                if strict:
+                    missing_keys.append(key)
+                continue
+            incoming, values = state_dict.pop(key), getattr(self, name)
+            if incoming.shape != values.shape:
+                error_msgs.append(f"size mismatch for {key}: got {tuple(incoming.shape)}")
+                continue
+            new_values, new_scale = _to_fp8(incoming.to(values.device))
+            values.copy_(new_values)
+            getattr(self, f"{name}_scale").copy_(new_scale)
 
 
-def _denied(name: str) -> bool:
-    parts = name.split(".")
-    return any(parts[-len(t.split(".")):] == t.split(".") for t in DENY)
+class FP8Linear(_FP8Storage):
+    """A frozen bias-free Linear held in fp8 and dequantized per call."""
+
+    _fp8_names = ("weight",)
+
+    def __init__(self, linear: nn.Linear) -> None:
+        super().__init__()
+        self._store("weight", linear.weight.data)
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self._dequantized("weight", x.dtype))
 
 
-def _in_scope(name: str, expert_id: int | None, scope: str) -> bool:
-    if expert_id is not None:
-        return scope in ("experts", "attention+experts", "all")
-    if name.rsplit(".", 1)[-1] in ATTENTION:
-        return scope in ("attention", "attention+experts", "all")
-    return scope == "all"  # shared_experts and the dense MLP
+class FP8FusedExperts(_FP8Storage):
+    """A family's fused routed experts held in fp8, run through upstream's own forward."""
+
+    _fp8_names = ("gate_up_proj", "down_proj")
+
+    def __init__(self, experts: nn.Module) -> None:
+        super().__init__()
+        for name in self._fp8_names:
+            self._store(name, getattr(experts, name).data)
+        # Unregistered, so its meta parameters stay out of named_parameters() and
+        # state_dict(); it carries the config-selected experts kernel, not weights.
+        object.__setattr__(self, "_upstream", experts.to("meta"))
+
+    def forward(self, hidden_states, top_k_index, top_k_weights) -> torch.Tensor:
+        # The whole layer, not only the experts hit: at seq 4096 every expert is hit.
+        weights = {name: self._dequantized(name, hidden_states.dtype) for name in self._fp8_names}
+        return torch.func.functional_call(
+            self._upstream, weights, (hidden_states, top_k_index, top_k_weights)
+        )
 
 
-def quantize_(model: nn.Module, scope: str, assignment: dict) -> list[str]:
-    """Replace in-scope `nn.Linear` modules with `FP8Linear`, in place.
-
-    `assignment` is `expert_group_assignment[group_id]` — the experts it names
-    are this group's trainable set and are never converted. Selecting on the
-    assignment rather than `requires_grad` keeps miner and validator on one rule,
-    since only the miner marks anything frozen.
-    """
+def quantize_(model: nn.Module, scope: str, fam: ModelFamily) -> None:
+    """Replace the in-scope frozen modules with fp8 storage, in place."""
     if scope not in SCOPES:
         raise ValueError(f"quantization scope must be one of {SCOPES}, got {scope!r}")
     if scope == "off":
-        return []
+        return
 
-    trainable = {
-        (int(layer_id), int(org_expert_id))
-        for layer_id, pairs in assignment.items()
-        for _, org_expert_id in pairs
-    }
-    converted: list[str] = []
+    deny = DENY + fam.fp8_deny
+    converted = 0
+    for name, module in list(model.named_modules()):
+        if isinstance(module, fam.experts):
+            model.set_submodule(name, FP8FusedExperts(module))
+        elif (
+            scope == "all" and type(module) is nn.Linear and module.bias is None
+            and name.rsplit(".", 1)[-1] not in deny
+        ):
+            model.set_submodule(name, FP8Linear(module))
+        else:
+            continue
+        converted += 1
 
-    # Names, not modules. Holding the module objects keeps every original
-    # `nn.Linear` alive for the whole loop, so no replaced weight can be freed
-    # while the fp8 copies accumulate and the peak is both sets at once. On the
-    # 1664-expert topology that is 42.0 GiB against 29.3 GiB releasing as we go
-    # — the difference between needing a 48 GB card and fitting on any of ours.
-    #
-    # Resolving each name late is safe only because every replacement is a leaf
-    # `nn.Linear`: no captured name can name a module underneath one we swap.
-    for parent_name in [name for name, _ in model.named_modules()]:
-        parent = model.get_submodule(parent_name)
-        for child_name, child in list(parent.named_children()):
-            if not isinstance(child, nn.Linear):
-                continue
-            name = f"{parent_name}.{child_name}" if parent_name else child_name
-            if _denied(name):
-                continue
-            layer_id, expert_id = get_layer_expert_id(name)
-            if not _in_scope(name, expert_id, scope):
-                continue
-            if expert_id is not None and (layer_id, expert_id) in trainable:
-                continue
-            setattr(parent, child_name, FP8Linear(child))
-            converted.append(name)
-
-    logger.info("fp8 quantization applied", scope=scope, converted_modules=len(converted))
-    return sorted(converted)
+    logger.info("fp8 quantization applied", scope=scope, converted_modules=converted)
 
 
 def unquantize_(model: nn.Module, weights: dict[str, torch.Tensor], dtype: torch.dtype) -> list[str]:
@@ -174,7 +176,7 @@ def unquantize_(model: nn.Module, weights: dict[str, torch.Tensor], dtype: torch
         if not isinstance(module, FP8Linear):
             continue
         linear = nn.Linear(module.in_features, module.out_features, bias=False,
-                           device=module.scale.device, dtype=dtype)
+                           device=module.weight_scale.device, dtype=dtype)
         with torch.no_grad():
             linear.weight.copy_(tensor)
         parent_name, _, child_name = name.rpartition(".")
@@ -185,14 +187,49 @@ def unquantize_(model: nn.Module, weights: dict[str, torch.Tensor], dtype: torch
     return sorted(restored)
 
 
-def apply_from_config(model: nn.Module, config, expert_manager, role: str) -> list[str]:
-    """Quantize `model` per `model.quantization_<role>`. No-op unless the format
-    switch `model.quantization` is "fp8"."""
+@register_quantization_config(_QUANT_METHOD)
+class FP8StorageConfig(QuantizationConfigMixin):
+    """Asks `from_pretrained` to store the base in fp8 under `scope` as it loads."""
+
+    # The family by name: transformers keeps this object as `model.config.quantization_config`.
+    def __init__(self, scope: str, family: str) -> None:
+        self.quant_method = _QUANT_METHOD
+        self.scope = scope
+        self.family = family
+
+
+class _QuantizeOnLoad(ConversionOps):
+    def convert(self, input_dict, **kwargs) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        for key, value in input_dict.items():
+            # A renamed tensor arrives as a one-element list; one merged from per-expert keys as a tensor.
+            out[key], out[f"{key}_scale"] = _to_fp8(value[0] if isinstance(value, list) else value)
+        return out
+
+
+@register_quantizer(_QUANT_METHOD)
+class _FP8StorageQuantizer(HfQuantizer):
+    def _process_model_before_weight_loading(self, model, **kwargs):
+        cfg = self.quantization_config
+        quantize_(model, cfg.scope, FAMILIES[cfg.family])
+
+    def param_needs_quantization(self, model, param_name: str, **kwargs) -> bool:
+        return isinstance(model.get_submodule(param_name.rpartition(".")[0]), _FP8Storage)
+
+    def get_quantize_ops(self) -> ConversionOps:
+        return _QuantizeOnLoad()
+
+    def is_serializable(self) -> bool:
+        return False
+
+    @property
+    def is_trainable(self) -> bool:
+        return True
+
+
+def fp8_load_config(config) -> FP8StorageConfig | None:
+    """The `from_pretrained` quantization for this node's role; None loads bf16."""
     if get_nested_attr(config, "model.quantization", "off") != "fp8":
-        return []
-    group_id = config.task.exp.group_id
-    return quantize_(
-        model,
-        get_nested_attr(config, f"model.quantization_{role}", "off"),
-        expert_manager.expert_group_assignment.get(group_id, {}),
-    )
+        return None
+    scope = get_nested_attr(config, f"model.quantization_{config.role}", "off")
+    return None if scope == "off" else FP8StorageConfig(scope, family(config).name)

@@ -102,7 +102,7 @@ from connito.shared.helper import get_model_hash, load_state_dict_from_path
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import get_model_from_checkpoint
 from connito.shared.modeling.mycelia import get_base_tokenizer, load_pretrained_expert_tensors
-from connito.shared.modeling.quantization import apply_from_config, unquantize_
+from connito.shared.modeling.quantization import unquantize_
 from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
@@ -628,7 +628,6 @@ def _switch_task(
         # quantize so a failure in either leaves a group at full precision
         # rather than none.
         unquantize_(eval_model, weights, dtype)
-        apply_from_config(eval_model, config, expert_manager, role="validator")
     except Exception:
         config.switch_active_task(previous_task)
         raise
@@ -738,13 +737,14 @@ def _build_eval_model(
     eval_model, _ = get_model_from_checkpoint(
         rank=rank, config=config, checkpoint_device=device, load_global_checkpoint=False,
     )
-    # Before quantization, so the shard holds the dtype miners submit in.
+    # Parameters only: the model is fp8 already, and `state_dict()` would
+    # dequantize every frozen expert to a CPU copy.
     base_shard = _write_pretrained_shard(
-        eval_model.state_dict(), expert_manager, config.task.exp.group_id,
+        {name: p.detach() for name, p in eval_model.named_parameters()},
+        expert_manager, config.task.exp.group_id,
         Path(config.ckpt.checkpoint_path) / "pretrained",
         save_dtype=next(eval_model.parameters()).dtype,
     )
-    apply_from_config(eval_model, config, expert_manager, role="validator")
     return eval_model, base_shard
 
 
