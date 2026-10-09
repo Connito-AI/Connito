@@ -653,17 +653,9 @@ def load_checkpoint(
     """
 
     if model is not None:
-        precision = getattr(config.model, "precision", "fp16-mixed")
-        if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-            precision = "fp16-mixed"
-        model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
-
-        full_state_dict = compile_full_state_dict_from_path(checkpoint_path)
-        for key, value in full_state_dict.items():
-            if torch.is_tensor(value) and torch.is_floating_point(value) and value.dtype != model_dtype:
-                full_state_dict[key] = value.to(dtype=model_dtype)
-        model.load_state_dict(full_state_dict, strict=False)
-        model.to(device=device, dtype=model_dtype)
+        # Each tensor is copied into its parameter's own dtype; casting the model would round the fp32 router.
+        model.load_state_dict(compile_full_state_dict_from_path(checkpoint_path), strict=False)
+        model.to(device=device)
 
     if inner_optimizer is not None:
         load_optimizer(os.path.join(checkpoint_path, "inner_optimizer*.pt"), inner_optimizer)
