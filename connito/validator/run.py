@@ -610,7 +610,7 @@ def _switch_task(
         expert_manager = ExpertManager(config)
         group_id = config.task.exp.group_id
         weights = load_pretrained_expert_tensors(
-            config.model.model_path, expert_manager.expert_group_assignment[group_id],
+            config, expert_manager.expert_group_assignment[group_id],
         )
         base_shard = _write_pretrained_shard(
             weights, expert_manager, group_id,
@@ -736,8 +736,7 @@ def _build_eval_model(
     against. Boot only: a task switch keeps the model (`_switch_task`).
     """
     eval_model, _ = get_model_from_checkpoint(
-        rank=rank, config=config, expert_manager=expert_manager,
-        checkpoint_device=device, load_global_checkpoint=False,
+        rank=rank, config=config, checkpoint_device=device, load_global_checkpoint=False,
     )
     # Before quantization, so the shard holds the dtype miners submit in.
     base_shard = _write_pretrained_shard(

@@ -1,214 +1,71 @@
 from __future__ import annotations
 
+import json
 import logging
 import warnings
-from collections import OrderedDict
-import gc
-import json
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from safetensors import safe_open
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedModel
 from transformers.utils.hub import cached_file
 
 # Suppress noisy upstream warnings from transformers/rope config (unless DEBUG)
 if logging.root.level > logging.DEBUG:
     warnings.filterwarnings("ignore", message=r".*rope_parameters.*")
-    warnings.filterwarnings("ignore", message=r".*torch_dtype.*deprecated.*")
     logging.getLogger("transformers.modeling_rope_utils").setLevel(logging.ERROR)
 
 from connito.shared.app_logging import structlog
-from connito.shared.helper import get_nested_attr
 from connito.shared.config import MinerConfig, ValidatorConfig
-from connito.shared.expert_manager import ExpertManager, get_layer_expert_id
-from connito.shared.helper import *
-# ── Model backend selection ──────────────────────────────────────────────────
-# Change MODEL_BACKEND to swap implementations:
-#   "deepseek_v2"  → connito.shared.modeling.custom_deepseek_v2_lite
-MODEL_BACKEND = "deepseek_v2"
-
-if MODEL_BACKEND == "deepseek_v2":
-    from connito.shared.modeling.custom_deepseek_v2_lite import (
-        CustomDeekSeekMoE as _CausalLMClass,
-        get_moe_model_config as _get_moe_model_config_impl,
-    )
-
-    def get_moe_model_config(config, topk, expert_manager):
-        return _get_moe_model_config_impl(config, topk, None, expert_manager, full=True)
-
-else:
-    raise ValueError(f"Unknown MODEL_BACKEND: {MODEL_BACKEND!r}")
+from connito.shared.expert_manager import get_layer_expert_id
+from connito.shared.helper import get_nested_attr
+from connito.shared.modeling.families import family
 
 logger = structlog.get_logger(__name__)
 
 
-# ---------------------------------------------------------------------
-# Loading helpers
-# ---------------------------------------------------------------------
-def load_pretrained_state_dict(
-    model_path: str,
-    dtype: torch.dtype = torch.float32,
-) -> dict[str, torch.Tensor]:
-    """Load pretrained state dict from a HuggingFace model path (local or hub).
-
-    `dtype` selects the load-time tensor dtype. Default fp32 preserves
-    historical behavior; callers under memory pressure (e.g. the partial
-    loading path) should pass `torch.float16` / `torch.bfloat16` to halve
-    the host RAM footprint of the transient state dict."""
-    from transformers import AutoModelForCausalLM
-
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=dtype, low_cpu_mem_usage=True,
-    )
-    state_dict = hf_model.state_dict()
-    del hf_model
-    logger.debug(
-        "Loaded pretrained state dict",
-        path=model_path,
-        num_keys=len(state_dict),
-        dtype=str(dtype),
-    )
-    return state_dict
-
-
 def load_pretrained_expert_tensors(
-    model_path: str, layer_map: dict[int, list[tuple[int, int]]],
+    config: MinerConfig | ValidatorConfig, layer_map: dict[int, list[tuple[int, int]]],
 ) -> dict[str, torch.Tensor]:
     """The checkpoint's own tensors for the experts one group's table names,
     read by name from its safetensors files: no model and no full state
     dict, so a running process can write another group's pretrained shard
     without a second 30 GB build."""
+    fam = family(config)
     wanted = {(int(layer), int(org)) for layer, pairs in layer_map.items() for _, org in pairs}
-    index = json.loads(Path(cached_file(model_path, "model.safetensors.index.json")).read_text())
+    index_path = cached_file(fam.model_path, "model.safetensors.index.json", revision=fam.revision)
+    index = json.loads(Path(index_path).read_text())
     names_by_file: dict[str, list[str]] = {}
     for name, file in index["weight_map"].items():
         if get_layer_expert_id(name) in wanted:
             names_by_file.setdefault(file, []).append(name)
     tensors: dict[str, torch.Tensor] = {}
     for file, names in names_by_file.items():
-        with safe_open(cached_file(model_path, file), framework="pt") as f:
+        with safe_open(cached_file(fam.model_path, file, revision=fam.revision), framework="pt") as f:
             tensors.update({name: f.get_tensor(name) for name in names})
     return tensors
 
 
-def load_pretrained_model_low_mem(
-    model_class: type[nn.Module],
-    model_path: str,
-    moe_config,
-    model_dtype: torch.dtype = torch.float16,
-) -> nn.Module:
-    """Load pretrained weights directly into the custom model with low CPU memory usage."""
-    model = model_class.from_pretrained(
-        model_path,
-        config=moe_config,
-        # `torch_dtype` (not `dtype`): transformers 4.x has no `dtype` alias for
-        # `from_pretrained`, so passing `dtype` there is silently ignored and the
-        # model loads at the default fp32 — doubling host RAM on this low-mem path.
-        torch_dtype=model_dtype,
-        # Materialises shard by shard, so host RAM stays bounded by one shard
-        # rather than a whole state dict (~31 GB for the 64-expert topology).
-        # False previously because the custom `_load_from_state_dict` that
-        # translated per-expert keys needed a materialised state dict; parameter
-        # names are the checkpoint's own now, so nothing translates.
-        low_cpu_mem_usage=True,
+def get_base_model(config: MinerConfig | ValidatorConfig) -> PreTrainedModel:
+    """The text-only causal LM of the family's pinned checkpoint, in bf16."""
+    fam = family(config)
+    # transformers drops Qwen's language_model. prefix and visual.*/mtp.*, and fuses V2's per-expert tensors.
+    model, info = fam.causal_lm.from_pretrained(
+        fam.model_path, revision=fam.revision, dtype=torch.bfloat16, output_loading_info=True,
     )
+    # transformers only warns, and leaves a missing tensor randomly initialised.
+    if info["missing_keys"]:
+        raise ValueError(f"checkpoint is missing {sorted(info['missing_keys'])}")
+    # Keeps Qwen's router aux loss out of `outputs.loss`; after load, as DeepSeek-V2's __init__ rejects the kwarg.
+    model.config.output_router_logits = False
+    logger.info("Loaded base model", family=fam.name, path=fam.model_path, revision=fam.revision)
 
-    meta_expert_params = [
-        name
-        for name, param in model.named_parameters()
-        if getattr(param, "is_meta", False) and ".mlp.experts." in name
-    ]
-    if meta_expert_params:
-        logger.warning(
-            "Detected unresolved meta expert tensors after from_pretrained; falling back to explicit state_dict load",
-            meta_expert_param_count=len(meta_expert_params),
-            sample_meta_expert_params=meta_expert_params[:8],
-            path=model_path,
-        )
-        del model
-        gc.collect()
-
-        model = model_class(moe_config).to(dtype=model_dtype)
-        pretrained_sd = load_pretrained_state_dict(model_path, dtype=model_dtype)
-        model.load_state_dict(pretrained_sd, strict=False)
-        del pretrained_sd
-
-    logger.info("Loaded pretrained model directly", path=model_path, dtype=str(model_dtype))
-    return model
-
-
-def get_base_model(config: MinerConfig | ValidatorConfig, expert_manager: ExpertManager) -> nn.Module | None:
-    """Load the pretrained base model with every routed expert."""
-    precision = getattr(config.model, "precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        precision = "fp16-mixed"
-    model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
-
-    moe_config = get_moe_model_config(config, config.moe.full_topk, expert_manager)
-
-    model = load_pretrained_model_low_mem(
-        model_class=_CausalLMClass,
-        model_path=config.model.model_path,
-        moe_config=moe_config,
-        model_dtype=model_dtype,
-    )
-
-    if model is not None and get_nested_attr(config, "model.torch_compile", False):
+    if get_nested_attr(config, "model.torch_compile", False):
         model = torch.compile(model)
-
     return model
 
 
 def get_base_tokenizer(config: MinerConfig | ValidatorConfig):
-    """
-    Load the tokenizer for `config.model.model_path`.
-    """
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model.model_path, use_fast=True)
-    # tokenizer.pad_token = "</s>"
-    return tokenizer
-
-
-def merge_state_dicts_with_priority(
-    state_dicts: list[dict[str, torch.Tensor]],
-    model: torch.nn.Module | None = None,
-) -> tuple[OrderedDict, list[str] | None]:
-    """
-    Merge a list of state_dicts where earlier dicts have *higher* priority.
-    Unexpected keys (not present in the model) are removed automatically.
-
-    Args:
-        state_dicts: list of state dicts, in priority order.
-                     state_dicts[0] has highest priority, state_dicts[-1] lowest.
-        model: optional model, used to filter out unexpected keys
-               and check for missing keys.
-
-    Returns:
-        merged_state_dict: OrderedDict with cleaned + merged parameters.
-        missing_keys: keys that the model expects but are not in merged
-    """
-    if not state_dicts:
-        raise ValueError("state_dicts must be a non-empty list")
-
-    merged = OrderedDict()
-
-    # Build merged dict: earlier dicts override later ones.
-    for sd in reversed(state_dicts):
-        for k, v in sd.items():
-            if k not in merged:
-                merged[k] = v
-
-    # If no model provided, return as is
-    if model is None:
-        return merged, None
-
-    # Filter out unexpected keys
-    model_keys = set(model.state_dict().keys())
-    cleaned = OrderedDict((k, v) for k, v in merged.items() if k in model_keys)
-
-    # Compute missing keys
-    missing_keys = sorted(model_keys - set(cleaned.keys()))
-
-    return cleaned, missing_keys
+    fam = family(config)
+    # transformers 5 ignores DeepSeek-V2's own add_bos_token: true (its tokenizer.json has no BOS template).
+    return AutoTokenizer.from_pretrained(fam.model_path, revision=fam.revision, add_bos_token=fam.add_bos_token)

@@ -102,7 +102,7 @@ def _stub_writer(state_dict, expert_manager, group_id, dest_dir, save_dtype):
 
 
 def _switch(config, eval_worker, gates, to: str, *, model, write_shard=_stub_writer,
-            read_experts=lambda path, layer_map: {}):
+            read_experts=lambda config, layer_map: {}):
     eval_window, merge = gates
     with (
         patch("connito.validator.run.load_state_dict_from_path", lambda path: dict(PRETRAINED)),
@@ -216,7 +216,7 @@ def test_the_new_shard_is_cut_from_the_new_groups_table(config, eval_worker, gat
     read: list[dict] = []
     written: list[tuple] = []
 
-    def spy_read(path, layer_map):
+    def spy_read(config, layer_map):
         read.append(layer_map)
         return CHECKPOINT
 
@@ -260,7 +260,7 @@ def _poll(config, eval_worker, gates, monkeypatch, *, model, active, bundle=None
     monkeypatch.setattr(run, "get_active_task_bundle", lambda cycle: bundle and SimpleNamespace(name=bundle))
     monkeypatch.setattr(run, "materialize_task", lambda b, root: materialized.append((b.name, Path(root))))
     monkeypatch.setattr(run, "load_state_dict_from_path", lambda path: dict(PRETRAINED))
-    monkeypatch.setattr(run, "load_pretrained_expert_tensors", lambda path, layer_map: {})
+    monkeypatch.setattr(run, "load_pretrained_expert_tensors", lambda config, layer_map: {})
     monkeypatch.setattr(run, "_write_pretrained_shard", write_shard)
     state = run._maybe_switch_task(
         config, eval_model=model, base_shard=OLD_SHARD, eval_worker=eval_worker,

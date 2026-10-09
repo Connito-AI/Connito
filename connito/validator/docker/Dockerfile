@@ -12,7 +12,7 @@
 #
 # Miners do NOT use this image — only validators are containerized.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_IMAGE} AS base
 
 # Build-time provenance, baked into the image so `run.py` can report which
@@ -65,10 +65,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install dependencies first so the layer caches across code changes.
-# Torch is pinned in requirements.txt; we add the CUDA 12.4 wheel index
+# Torch is pinned in requirements.txt; we add the CUDA 12.8 wheel index
 # so the right binary wheel is selected.
 COPY requirements.txt ./
-RUN pip install --extra-index-url https://download.pytorch.org/whl/cu124 \
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
         -r requirements.txt
 
 # Now copy the source. .dockerignore at the repo root keeps venvs, wandb

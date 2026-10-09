@@ -7,7 +7,7 @@ import re
 import string
 import sys
 from pathlib import Path
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Iterable, Literal
 
 import bittensor
 import fsspec
@@ -192,16 +192,16 @@ class ModelCfg(BaseConfig):
     # `quantization` and `quantization_validator` are locked so the fleet cannot
     # drift into validators scoring under different scopes, which breaks
     # cross-validator val_loss comparability. `quantization_miner` is not locked
-    # — it only affects that miner's own VRAM.
+    # — it only affects that miner's own VRAM. `family` is locked because every
+    # node must load the same checkpoint.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "model_path", "base_arch_model", "quantization", "quantization_validator",
+        "family", "precision", "quantization", "quantization_validator",
     })
-    model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
-    base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
+    # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
+    family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
     foundation: bool = True
     torch_compile: bool = False
-    attn_implementation: str = "sdpa"
-    precision: str = "fp16-mixed"
+    precision: str = "bf16-mixed"  # locked: both families are published in bf16
     device: str = "cuda"
     # fp8 weight-only storage for modules a role never trains. `quantization`
     # picks the format, the per-role fields pick the scope. See
@@ -484,24 +484,6 @@ class DataloaderCfg(BaseConfig):
     world_size: int = 10  # number of distinct data shards (typically = number of validators)
 
 
-class MoECfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
-    })
-    interleave: bool = True
-    num_experts: PositiveInt = 8
-    num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 6
-    # DeepSeek-V2-Lite's own `num_experts_per_tok`, matching `partial_topk`.
-    # Read by `mycelia.get_base_model` whenever `partial=False`, where it is the
-    # only thing that sets routing width — a wrong value routes at the wrong
-    # width and raises nothing.
-    full_topk: PositiveInt = 6
-    aux_load_balance: bool = True
-    router_aux_loss_coef: float = 1.0
-    num_worker_groups: PositiveInt = 2
-
-
 class OptimizerCfg(BaseConfig):
     lr: float = 1e-4
     outer_lr: float = 0.7
@@ -556,9 +538,8 @@ class CheckpointCfg(BaseConfig):
     download_concurrency: PositiveInt = 1
     # When True, skip the chain-fetch of the validator's latest checkpoint
     # AND the on-disk overlay in get_model_from_checkpoint. The model returns
-    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
-    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
-    # backbone). Overrides resume_from_ckpt.
+    # with pretrained base weights only — useful for cold-start experiments
+    # (LR sweeps starting from the base backbone). Overrides resume_from_ckpt.
     use_pretrained_only: bool = False
     # When True (default) the miner's inner-opt-step loop calls the
     # "(5) Reload Model" branch that re-runs setup_training if it finds a
@@ -693,7 +674,6 @@ class WorkerConfig(BaseConfig):
     run: RunCfg = Field(default_factory=RunCfg)
     chain: ChainCfg = Field(default_factory=ChainCfg)
     model: ModelCfg = Field(default_factory=ModelCfg)
-    moe: MoECfg = Field(default_factory=MoECfg)
     ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
     hf: HfCfg = Field(default_factory=HfCfg)
     sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
@@ -871,7 +851,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
     def from_path(

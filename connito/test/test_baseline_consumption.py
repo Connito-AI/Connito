@@ -238,8 +238,5 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
         task=SimpleNamespace(exp=SimpleNamespace(group_id=GROUP_ID)),
         model=SimpleNamespace(device="cpu", precision="fp16-mixed"),
     )
-    shared_model.get_model_from_checkpoint(
-        rank=0, config=cfg, expert_manager=SimpleNamespace(),
-        load_global_checkpoint=load_global,
-    )
+    shared_model.get_model_from_checkpoint(rank=0, config=cfg, load_global_checkpoint=load_global)
     assert bool(consulted) is expect_consulted

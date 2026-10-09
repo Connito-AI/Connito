@@ -151,7 +151,7 @@ def freeze_parameters(
 
 
 def get_model_from_checkpoint(
-    rank: int, config: MinerConfig | ValidatorConfig, expert_manager: ExpertManager,
+    rank: int, config: MinerConfig | ValidatorConfig,
     checkpoint_device: torch.device | None = None,
     load_global_checkpoint: bool = True,
 ) -> tuple[nn.Module, ModelCheckpoint | None]:
@@ -167,7 +167,7 @@ def get_model_from_checkpoint(
         and not use_pretrained_only
     )
     logger.info("Loading base model for checkpoint", load_global_checkpoint=load_global_checkpoint)
-    model = get_base_model(config, expert_manager=expert_manager)
+    model = get_base_model(config)
 
     latest_checkpoint: ModelCheckpoint | None = None
     # load from checkpoint
@@ -227,7 +227,7 @@ def load_model(
     if use_pretrained_only:
         logger.info(
             "ckpt.use_pretrained_only=True — skipping chain fetch + on-disk overlay; "
-            "returning model with pretrained DeepSeek-V2-Lite weights only",
+            "returning the pretrained base model only",
         )
     else:
         if current_checkpoint is None:
@@ -246,8 +246,7 @@ def load_model(
         )
 
     return get_model_from_checkpoint(
-        rank=rank, config=config, expert_manager=expert_manager,
-        checkpoint_device=checkpoint_device,
+        rank=rank, config=config, checkpoint_device=checkpoint_device,
         load_global_checkpoint=load_global_checkpoint,
     )
 
