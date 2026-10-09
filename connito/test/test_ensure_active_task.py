@@ -19,7 +19,6 @@ from connito.shared.config import MinerConfig
 
 SHIPPED = "exp_nemotron_c4"
 TARGET = "exp_owner_named"
-HELPER = "exp_helper"
 
 
 def _task_dir(root: Path, name: str, group_id: int) -> None:
@@ -36,7 +35,6 @@ def config(tmp_path: Path) -> MinerConfig:
     """Booted as `from_path(active_task=TARGET)` would when TARGET is not on
     disk: on the shipped default."""
     _task_dir(tmp_path, SHIPPED, group_id=4)
-    _task_dir(tmp_path, HELPER, group_id=2)
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({
         "run": {"root_path": str(tmp_path)},

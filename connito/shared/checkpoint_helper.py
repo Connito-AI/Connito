@@ -637,7 +637,6 @@ def load_checkpoint(
     inner_scaler: torch.amp.GradScaler | None = None,
     outer_scaler: torch.amp.GradScaler | None = None,
     data_loader: StatefulDataLoader | None = None,
-    expert_groups: list[int | str] | None = None,
 ) -> float:
     """Load the model and optimizer state from a checkpoint folder
 
@@ -659,7 +658,7 @@ def load_checkpoint(
             precision = "fp16-mixed"
         model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
-        full_state_dict = compile_full_state_dict_from_path(checkpoint_path, expert_groups=expert_groups)
+        full_state_dict = compile_full_state_dict_from_path(checkpoint_path)
         for key, value in full_state_dict.items():
             if torch.is_tensor(value) and torch.is_floating_point(value) and value.dtype != model_dtype:
                 full_state_dict[key] = value.to(dtype=model_dtype)

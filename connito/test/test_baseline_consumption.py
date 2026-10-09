@@ -235,11 +235,11 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
             resume_from_ckpt=True, use_pretrained_only=False,
             validator_checkpoint_path=tmp_path, checkpoint_path=tmp_path,
         ),
-        task=SimpleNamespace(exp=SimpleNamespace(group_id=GROUP_ID), helper_group_id=2),
+        task=SimpleNamespace(exp=SimpleNamespace(group_id=GROUP_ID)),
         model=SimpleNamespace(device="cpu", precision="fp16-mixed"),
     )
     shared_model.get_model_from_checkpoint(
-        rank=0, config=cfg, expert_manager=SimpleNamespace(), partial=True,
+        rank=0, config=cfg, expert_manager=SimpleNamespace(),
         load_global_checkpoint=load_global,
     )
     assert bool(consulted) is expect_consulted

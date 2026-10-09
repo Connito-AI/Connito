@@ -7,7 +7,7 @@ import re
 import string
 import sys
 from pathlib import Path
-from typing import Any, ClassVar, Iterable, Literal
+from typing import Any, ClassVar, Iterable
 
 import bittensor
 import fsspec
@@ -499,12 +499,6 @@ class MoECfg(BaseConfig):
     full_topk: PositiveInt = 6
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
-    # The model the miner trains. "full" holds every routed expert and routes
-    # natively at `full_topk` — the model validators score. "partial" holds
-    # only the active and helper groups and fits smaller GPUs. Only the active
-    # group trains either way. Replaces `partial_moe`, which nothing read: a
-    # new name, so configs written with that field still get this default.
-    miner_topology: Literal["full", "partial"] = "full"
     num_worker_groups: PositiveInt = 2
 
 
@@ -676,30 +670,11 @@ class TaskCfg(BaseConfig):
     # unchanged, its authority just moved from a code constant to the API, so a
     # new task no longer needs a release. The value here is the fallback used
     # when the API is unreachable.
-    #
-    # `helper_group_id` and `routing_mode` stay locked for the natural-routing
-    # (2Fnat) consensus contract and are independent of the dataset.
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "helper_group_id", "routing_mode",
-    })
     expert_group_name: str = "exp_nemotron_c4"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
-    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
-    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
-    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
-    # frozen-helper slot). Set to None to disable the pairing — the routing
-    # branch self-gates and falls through to masked-topk.
-    helper_group_id: int | None = 2
-    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
-    # is the default: base gate runs unmasked, natural picks landing in the
-    # trainable set are kept as-is, non-trainable picks get replaced by the
-    # token's top-scoring helper. Falls back to masked-topk automatically when
-    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
-    # to force the pre-2Fnat behavior.
-    routing_mode: str = "natural_with_fallback"
 
 
 # ---------------------------

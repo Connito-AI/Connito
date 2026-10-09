@@ -9,9 +9,8 @@ place fails only on the seeded shard-pick path — which means:
 
   - it passes every other test in this repo, none of which enumerate
     `expert_groups/`;
-  - it passes `expert_groups/build_expert_assignment.py`, which calls
-    `get_dataloader` with `seed=None` and so never reaches the pick;
-  - it passes miner training, for the same reason;
+  - it passes miner training, which calls `get_dataloader` with
+    `seed=None` and so never reaches the pick;
   - and it fails for the first time on a VALIDATOR, mid-round, with a
     `KeyError`, three retries apart, dropping that round to an unscored
     baseline of 100.0.

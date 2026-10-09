@@ -35,20 +35,8 @@ if MODEL_BACKEND == "deepseek_v2":
         get_moe_model_config as _get_moe_model_config_impl,
     )
 
-    def get_moe_model_config(config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = False):
-        # Pipe through the 2Fnat knobs. Default routing_mode="natural_with_fallback"
-        # for the miner/validator path — the routing branch self-gates on
-        # trainable_ids and helper_ids both being non-empty, so single-group
-        # loads (only the trainable group; group_ids_helper=None) silently fall
-        # through to masked-topk with byte-identical numerics. When helper
-        # groups are also loaded, 2Fnat activates automatically.
-        routing_mode = str(get_nested_attr(config, "task.routing_mode", "natural_with_fallback"))
-        return _get_moe_model_config_impl(
-            config, topk, group_ids_trainable, expert_manager,
-            full=full,
-            routing_mode=routing_mode,
-            group_ids_helper=group_ids_helper,
-        )
+    def get_moe_model_config(config, topk, expert_manager):
+        return _get_moe_model_config_impl(config, topk, None, expert_manager, full=True)
 
 else:
     raise ValueError(f"Unknown MODEL_BACKEND: {MODEL_BACKEND!r}")
@@ -151,33 +139,15 @@ def load_pretrained_model_low_mem(
     return model
 
 
-def get_base_model(
-    config: MinerConfig | ValidatorConfig,
-    expert_manager: ExpertManager,
-    group_ids_trainable: list | None = None,
-    group_ids_helper: list | None = None,
-    partial=False,
-) -> nn.Module | None:
-    """
-    Load the pretrained base model for this role's expert topology.
-
-    Miners and validators take the same path; `partial` and the group ids pick
-    the routing top-k and which experts are declared.
-    """
+def get_base_model(config: MinerConfig | ValidatorConfig, expert_manager: ExpertManager) -> nn.Module | None:
+    """Load the pretrained base model with every routed expert."""
     precision = getattr(config.model, "precision", "fp16-mixed")
     if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
         precision = "fp16-mixed"
     model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
-    topk = config.moe.partial_topk if partial else config.moe.full_topk
+    moe_config = get_moe_model_config(config, config.moe.full_topk, expert_manager)
 
-    moe_config = get_moe_model_config(
-        config, topk, group_ids_trainable, group_ids_helper, expert_manager, full = not partial,
-    )
-
-    # `partial` no longer selects which experts exist — the model declares the
-    # experts its group assignment names, and `from_pretrained` fills them by
-    # name. It picks the routing top-k and which group stays trainable.
     model = load_pretrained_model_low_mem(
         model_class=_CausalLMClass,
         model_path=config.model.model_path,

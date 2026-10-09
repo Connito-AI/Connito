@@ -151,7 +151,7 @@ def freeze_parameters(
 
 
 def get_model_from_checkpoint(
-    rank: int, config: MinerConfig | ValidatorConfig, expert_manager: ExpertManager, partial: bool = False,
+    rank: int, config: MinerConfig | ValidatorConfig, expert_manager: ExpertManager,
     checkpoint_device: torch.device | None = None,
     load_global_checkpoint: bool = True,
 ) -> tuple[nn.Module, ModelCheckpoint | None]:
@@ -166,27 +166,8 @@ def get_model_from_checkpoint(
         and load_global_checkpoint
         and not use_pretrained_only
     )
-    group_ids_trainable = [config.task.exp.group_id] if partial else None
-    # Helper group is a peer of the trainable group on TaskCfg (see
-    # TaskCfg.helper_group_id). Only used in partial mode; the full model
-    # already includes every routed expert.
-    helper_id = get_nested_attr(config, "task.helper_group_id", None) if partial else None
-    group_ids_helper: list | None = [int(helper_id)] if helper_id is not None else None
-    logger.info(
-        "Loading base model for checkpoint",
-        mode="partial" if partial else "full",
-        group_ids_trainable=group_ids_trainable or "all",
-        group_ids_helper=group_ids_helper,
-        load_global_checkpoint=load_global_checkpoint,
-    )
-    # get base model
-    model = get_base_model(
-        config,
-        expert_manager=expert_manager,
-        group_ids_trainable=group_ids_trainable,
-        group_ids_helper=group_ids_helper,
-        partial=partial,
-    )
+    logger.info("Loading base model for checkpoint", load_global_checkpoint=load_global_checkpoint)
+    model = get_base_model(config, expert_manager=expert_manager)
 
     latest_checkpoint: ModelCheckpoint | None = None
     # load from checkpoint
@@ -204,14 +185,6 @@ def get_model_from_checkpoint(
                 model=model,
                 rank=rank,
                 device=checkpoint_device if checkpoint_device is not None else config.model.device,
-                # Only the active expert group is read from disk. Any legacy
-                # `model_shared.*` next to it is ignored — backbone state is
-                # already in `model` from `get_base_model`'s pretrained load
-                # (full path via `from_pretrained`, partial path via the
-                # full→partial port in mycelia.get_base_model), and we no
-                # longer trust on-disk shared weights (they were a source of
-                # cross-validator divergence; see PR description).
-                expert_groups=[config.task.exp.group_id] if partial else None,
             )
         else:
             logger.info("Tried to resume from checkpoint, but no checkpoint found.")
@@ -234,7 +207,6 @@ def load_model(
     subtensor: bittensor.Subtensor,
     wallet: bittensor.Wallet,
     current_checkpoint: ModelCheckpoint | None = None,
-    partial: bool = False,
     checkpoint_device: torch.device | None = None,
     load_global_checkpoint: bool = True,
 ) -> tuple[nn.Module, ModelCheckpoint | None]:
@@ -275,7 +247,7 @@ def load_model(
 
     return get_model_from_checkpoint(
         rank=rank, config=config, expert_manager=expert_manager,
-        partial=partial, checkpoint_device=checkpoint_device,
+        checkpoint_device=checkpoint_device,
         load_global_checkpoint=load_global_checkpoint,
     )
 

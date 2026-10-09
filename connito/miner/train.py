@@ -162,16 +162,7 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("init - model and expert manager")
     expert_manager = ExpertManager(config)
-    # `moe.miner_topology`: "full" (the default) holds every routed expert and
-    # routes natively at `moe.full_topk`, the model the validator scores.
-    # "partial" holds only the active and helper groups and reroutes every
-    # other top-k pick to a helper. Only the active group trains either way;
-    # fp8 (`model.quantization_miner`) keeps the frozen experts small enough
-    # to fit.
-    topology = get_nested_attr(config, "moe.miner_topology", "full")
-    partial = topology == "partial"
-    logger.info("miner topology", mode=topology)
-    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet, partial=partial)
+    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet)
     model = model.to(device)
     model = freeze_parameters(
         model=model,

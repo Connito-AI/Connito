@@ -23,7 +23,6 @@ from connito.validator.run import _switch_task
 
 SHIPPED = "exp_nemotron_c4"   # the locked default; the config boots on this
 TARGET = "exp_switch_target"
-HELPER = "exp_helper"          # task.helper_group_id defaults to 2
 
 
 def _task_dir(root: Path, name: str, group_id: int, org_base: int) -> None:
@@ -42,7 +41,6 @@ def _task_dir(root: Path, name: str, group_id: int, org_base: int) -> None:
 def config(tmp_path: Path) -> ValidatorConfig:
     _task_dir(tmp_path, SHIPPED, group_id=4, org_base=10)
     _task_dir(tmp_path, TARGET, group_id=7, org_base=20)
-    _task_dir(tmp_path, HELPER, group_id=2, org_base=30)
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({
@@ -125,8 +123,7 @@ def test_config_and_routing_table_move_together(config, eval_worker, gates, mode
 
     assert config.task.expert_group_name == TARGET
     assert config.task.exp.group_id == 7
-    # The new group's table, plus the helper that rides along with every task.
-    assert set(manager.expert_group_assignment) == {7, 2}
+    assert set(manager.expert_group_assignment) == {7}
     assert manager.expert_group_assignment[7][0] == [(0, 20), (1, 21)]
 
 
@@ -230,7 +227,7 @@ def test_the_new_shard_is_cut_from_the_new_groups_table(config, eval_worker, gat
     _switch(config, eval_worker, gates, TARGET, model=model, read_experts=spy_read, write_shard=spy_write)
 
     assert read == [{0: [(0, 20), (1, 21)]}]
-    assert written == [(CHECKPOINT, {7, 2}, 7, torch.bfloat16)]
+    assert written == [(CHECKPOINT, {7}, 7, torch.bfloat16)]
     assert written[0][0] is CHECKPOINT   # the shard is cut from what was read
 
 
