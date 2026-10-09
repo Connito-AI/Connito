@@ -489,8 +489,7 @@ class OptimizerCfg(BaseConfig):
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
     # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
-    #   32 -> torch.optim.AdamW, fp32 state (default). Fits DeepSeek-V2-Lite
-    #         2Fnat on a 47GB A6000 at sequence_length 1024.
+    #   32 -> torch.optim.AdamW, fp32 state (default), 8 bytes per trainable param.
     #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
     #         an alternative when running fp32 at a larger sequence_length.
     # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.

@@ -50,7 +50,7 @@ def _build_download_targets(expert_group_ids: list[int | str]) -> list[tuple[int
             targets.append((expert_group_id, expert_group_shard_name(expert_group_id)))
         elif expert_group_id == "shared":
             # `model_shared` is no longer persisted or distributed; backbone state
-            # is reconstructed from `config.model.model_path` at instantiation.
+            # is reconstructed from the model family's pinned checkpoint at instantiation.
             # Tolerated here for backward compatibility with callers that still
             # pass the sentinel, but it's a no-op.
             logger.debug(
@@ -105,10 +105,6 @@ def freeze_parameters(
 
     Expert parameters carry the global expert id in the name
     (``experts.7.gate_proj.weight``), so the id is read straight off it.
-
-    Experts used to share one stacked tensor per layer, and `requires_grad` is
-    per-tensor, so the helper group trained alongside the assigned one — the
-    miner's trainable set was ~2x what the assignment asks for.
     """
     assignment = expert_manager.expert_group_assignment.get(expert_group_id, {})
 
@@ -124,7 +120,7 @@ def freeze_parameters(
         if expert_id in allowed:
             param.requires_grad_(True)
         else:
-            # Helper group, and any expert not assigned to this group.
+            # Not in this group's assignment.
             param.requires_grad_(False)
 
     # Optionally upcast trainable parameters to float32 for stable mixed-precision optimization.

@@ -140,7 +140,7 @@ def setup_training(
         device (str | torch.device): Device for the local model (e.g., "cuda:0").
 
     Returns:
-        model (nn.Module): Local (possibly partial) MoE model placed on `device`.
+        model (nn.Module): Local MoE model placed on `device`.
         global_model (nn.Module): Deep-copied global model on CPU, kept in sync with `model`.
         inner_optimizer (Optimizer): Optimizer for `model`.
         outer_optimizer (Optimizer): Optimizer for `global_model`.
@@ -515,12 +515,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
                 scale_after = None
                 # Defrag before the FIRST optimizer.step(): AdamW lazily
-                # allocates exp_avg + exp_avg_sq (2× fp32 per trainable param,
-                # hundreds of MiB on DeepSeek-V2-Lite) inside optimizer.step,
-                # and it OOMs against ~1 GiB of reserved-but-unallocated
-                # fragmentation on a fresh A6000. `empty_cache` is cheap
-                # (~a few ms) and always safe here since we've just finished
-                # backward.
+                # allocates exp_avg + exp_avg_sq (2× fp32 per trainable param)
+                # inside optimizer.step, and it OOMs against ~1 GiB of
+                # reserved-but-unallocated fragmentation on a fresh A6000.
+                # `empty_cache` is cheap (~a few ms) and always safe here since
+                # we've just finished backward.
                 gc.collect()
                 torch.cuda.empty_cache()
                 if inner_scaler.is_enabled():

@@ -31,7 +31,6 @@ class ExpertManager:
     Responsibilities
     ----------------
     * Discover which transformer layers contain experts (by scanning state_dict keys).
-    * Split ranks into `num_worker_groups` groups.
     * Split experts (per expert layer) into the same number of groups.
 
     Attributes
