@@ -1,8 +1,8 @@
 """The round's base is a shard path, not a copy of the model.
 
 The backbone is frozen for the life of the subnet
-(`shared/model.freeze_parameters`), so the active group's pretrained shard
-plus that backbone is the whole base. This pins that the worker really
+(`modeling/residual.freeze_all_but_residual`), so the active group's pretrained
+shard plus that backbone is the whole base. This pins that the worker really
 rebuilds from the file, whatever it was left holding.
 """
 from __future__ import annotations

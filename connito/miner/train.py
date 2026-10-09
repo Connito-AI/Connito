@@ -39,8 +39,9 @@ from connito.shared.evaluate import evaluate_model
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
 from connito.shared.metrics import MetricLogger
-from connito.shared.model import freeze_parameters, load_model
+from connito.shared.model import load_model
 from connito.shared.modeling.mycelia import get_base_tokenizer
+from connito.shared.modeling.residual import freeze_all_but_residual
 
 configure_logging()
 logger = structlog.get_logger(__name__)
@@ -163,12 +164,7 @@ def setup_training(
     expert_manager = ExpertManager(config)
     model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet)
     model = model.to(device)
-    model = freeze_parameters(
-        model=model,
-        expert_manager=expert_manager,
-        expert_group_id=config.task.exp.group_id,
-        upcast_trainable=True,
-    )
+    freeze_all_but_residual(model)
 
     non_finite_param_names = []
     with torch.no_grad():
@@ -192,7 +188,7 @@ def setup_training(
     if len(trainable_params) == 0:
         sample_names = [name for name, _ in list(model.named_parameters())[:8]]
         logger.warning(
-            "No trainable parameters found; check expert_group_id and get_layer_expert_id() matching.",
+            "No trainable parameters found; the model has no residual experts (`.residual_` parameters).",
             expert_group_id=config.task.exp.group_id,
             sample_param_names=sample_names,
         )

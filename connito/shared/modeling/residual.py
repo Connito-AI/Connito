@@ -53,3 +53,9 @@ def install_residual_experts(model: nn.Module, config: MinerConfig | ValidatorCo
         block.residual_hook = block.register_forward_hook(functools.partial(
             _residual_hook, threshold=cfg.threshold, temperature=cfg.temperature,
         ))
+
+
+def freeze_all_but_residual(model: nn.Module) -> None:
+    """Train the residual experts and their routers; freeze everything else."""
+    for name, param in model.named_parameters():
+        param.requires_grad_(".residual_" in name)

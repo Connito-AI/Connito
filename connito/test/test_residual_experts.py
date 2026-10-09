@@ -20,7 +20,7 @@ from connito.shared import model as shared_model
 from connito.shared.config import ResidualCfg
 from connito.shared.modeling import mycelia
 from connito.shared.modeling.families import FAMILIES
-from connito.shared.modeling.residual import install_residual_experts
+from connito.shared.modeling.residual import freeze_all_but_residual, install_residual_experts
 
 FIXTURE = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_v2_checkpoint"}
 # DeepSeek-V2's layer 0 is dense.
@@ -119,6 +119,56 @@ def test_a_resumed_shard_keeps_the_router_fp32_and_the_rest_bf16(family_name, tm
     assert {n: (tuple(p.shape), p.dtype) for n, p in residual.items()} == _residual_specs(family_name, 1)
     assert all(bool((p == 0.25).all()) for p in residual.values())
     assert {p.dtype for n, p in model.named_parameters() if n not in residual} == {torch.bfloat16}
+
+
+def test_only_residual_parameters_train_routers_included(family_name):
+    model = _load(_config(family_name))
+
+    freeze_all_but_residual(model)
+
+    assert {n for n, p in model.named_parameters() if p.requires_grad} == set(_residual_specs(family_name, 1))
+
+
+def _step(model, optimizer) -> None:
+    model(input_ids=TOKENS, labels=TOKENS).loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+
+@pytest.mark.parametrize("scope", ["off", "all"])
+def test_one_step_leaves_the_base_unchanged_and_moves_the_output(family_name, scope):
+    model = _load(_config(family_name, scope))
+    freeze_all_but_residual(model)
+    before = _logits(model)
+    base = {n: t.clone() for n, t in [*model.named_parameters(), *model.named_buffers()] if ".residual_" not in n}
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+
+    model.train()
+    model(input_ids=TOKENS, labels=TOKENS).loss.backward()
+    # down_proj is 0 at init, so only it gets a gradient.
+    grads = {n: bool(p.grad.any()) for n, p in _residual(model).items()}
+    assert grads == {n: "down_proj" in n for n in grads}
+    optimizer.step()
+
+    after = {n: t for n, t in [*model.named_parameters(), *model.named_buffers()] if ".residual_" not in n}
+    assert after.keys() == base.keys()
+    assert all(torch.equal(after[n].view(torch.uint8), base[n].view(torch.uint8)) for n in base)
+    assert not torch.equal(_logits(model), before)
+
+
+def test_the_router_moves_once_down_proj_has(family_name):
+    """The task loss alone trains the router: nothing at step 1, while down_proj is 0, then from step 2."""
+    model = _load(_config(family_name)).train()
+    freeze_all_but_residual(model)
+    routers = {n: p for n, p in _residual(model).items() if "router" in n}
+    initial = {n: p.detach().clone() for n, p in routers.items()}
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2, weight_decay=0.0)
+
+    _step(model, optimizer)
+    assert all(torch.equal(p, initial[n]) for n, p in routers.items())
+    _step(model, optimizer)
+
+    assert all(not torch.equal(p, initial[n]) for n, p in routers.items())
 
 
 def test_reinstalling_replaces_the_residual(family_name):
