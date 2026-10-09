@@ -4,8 +4,7 @@ The owner decides which expert group the subnet trains and serves that from
 `cycle-api`, alongside `/get_phase`:
 
     GET /active_task         -> {name, group_id, bundle_sha256}
-    GET /active_task_bundle  -> the above plus config, expert_assignment,
-                                shard_policy
+    GET /active_task_bundle  -> the above plus config, shard_policy
 
 Nodes poll the light endpoint once per cycle and compare `name` to the task
 they are running. The endpoints take no arguments and answer only for *now* —
@@ -66,21 +65,19 @@ class TaskBundle(BaseModel):
     name: str
     group_id: int
     config: dict[str, Any]
-    expert_assignment: dict[str, Any]
     shard_policy: dict[str, Any] | None = None
     bundle_sha256: str
 
     def canonical_sha256(self) -> str:
         """Re-compute the server's hash from the payload we received.
 
-        Mirrors cycle-api's `_canonical_sha256`: the same four keys in the same
+        Mirrors cycle-api's `_canonical_sha256`: the same three keys in the same
         canonical form (sorted, no whitespace). `group_id` and `bundle_sha256`
         are excluded — they are derived from `config` and from this hash.
         """
         payload = {
             "name": self.name,
             "config": self.config,
-            "expert_assignment": self.expert_assignment,
             "shard_policy": self.shard_policy,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -180,9 +177,6 @@ def materialize_task(bundle: TaskBundle, dest_root: Path) -> Path:
         (staging / "config.yaml").write_text(
             yaml.safe_dump(bundle.config, sort_keys=False), encoding="utf-8"
         )
-        (staging / "expert_assignment.json").write_text(
-            json.dumps(bundle.expert_assignment), encoding="utf-8"
-        )
         if bundle.shard_policy is not None:
             (staging / "shard_policy.json").write_text(
                 json.dumps(bundle.shard_policy), encoding="utf-8"
@@ -222,8 +216,10 @@ def ensure_active_task(config, active: str | None) -> None:
         return
     bundle = get_active_task_bundle(config.cycle)
     if bundle is None:
-        logger.error("Owner's task is not on disk and its bundle could not be fetched — staying on the current task",
-                     task=config.task.expert_group_name, active=active)
+        logger.error(
+            "Owner's task is not on disk and its bundle could not be fetched or verified — staying on the current task",
+            task=config.task.expert_group_name, active=active,
+        )
         return
     try:
         materialize_task(bundle, config.task.base_path)
