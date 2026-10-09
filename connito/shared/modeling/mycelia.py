@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import warnings
@@ -60,11 +61,23 @@ def get_base_model(config: MinerConfig | ValidatorConfig) -> PreTrainedModel:
         raise ValueError(f"checkpoint is missing {sorted(info['missing_keys'])}")
     # Keeps Qwen's router aux loss out of `outputs.loss`; after load, as DeepSeek-V2's __init__ rejects the kwarg.
     model.config.output_router_logits = False
+    _refuse_split(model)
     logger.info("Loaded base model", family=fam.name, path=fam.model_path, revision=fam.revision)
 
     if get_nested_attr(config, "model.torch_compile", False):
         model = torch.compile(model)
     return model
+
+
+def _refuse_split(model: PreTrainedModel) -> None:
+    """Raise unless the whole model sits on one device."""
+    mapped = set(getattr(model, "hf_device_map", {}).values())
+    placed = {t.device for t in itertools.chain(model.parameters(), model.buffers())}
+    if len(mapped) > 1 or len(placed) > 1:
+        raise RuntimeError(
+            f"the base model is split over devices {sorted(map(str, mapped | placed))}. Load it onto one GPU: "
+            "split over several GPUs (transformers device_map), Qwen gives wrong outputs."
+        )
 
 
 def get_base_tokenizer(config: MinerConfig | ValidatorConfig):

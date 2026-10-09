@@ -210,3 +210,28 @@ def test_the_two_tiny_checkpoints_do_not_share_a_directory(tiny_qwen_checkpoint,
                    for p in (tiny_qwen_checkpoint, tiny_deepseek_v2_checkpoint)}
 
     assert model_types == {"qwen3_5_moe", "deepseek_v2"}
+
+
+def _splitting(causal_lm: type, how: str) -> type:
+    """`causal_lm`, but `from_pretrained` returns the model split over two devices, as device_map would."""
+    class Split(causal_lm):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            model, info = causal_lm.from_pretrained(*args, **kwargs)
+            if how == "device_map":
+                model.hf_device_map = {"model": 0, "lm_head": 1}
+            else:
+                model.lm_head.to("meta")
+            return model, info
+
+    return Split
+
+
+@pytest.mark.parametrize("how", ["device_map", "parameters"])
+def test_a_model_split_over_two_devices_is_refused(checkpoint, monkeypatch, how):
+    config, _ = checkpoint
+    name = config.model.family
+    monkeypatch.setitem(FAMILIES, name, replace(FAMILIES[name], causal_lm=_splitting(FAMILIES[name].causal_lm, how)))
+
+    with pytest.raises(RuntimeError, match="Load it onto one GPU"):
+        mycelia.get_base_model(config)
