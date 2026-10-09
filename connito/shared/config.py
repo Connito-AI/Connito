@@ -13,7 +13,7 @@ import bittensor
 import fsspec
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, ValidationError, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
@@ -257,6 +257,8 @@ class DatasetSourceCfg(BaseConfig):
     # travels from the owner API to every miner and validator, so the
     # grammar it may use is narrower than `str.format` allows.
     text_template: str | None = None
+    # c4 replay rows: the miner trains its residual not to fire on them.
+    replay: bool = False
     # Authorize HF's `load_dataset` to execute the dataset repo's custom
     # builder script. Required for sources that ship a `<name>.py` loader
     # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
@@ -625,13 +627,20 @@ class OwnerCheckpointCfg(CheckpointCfg):
     base_checkpoint_path: Path = Path("checkpoints/owner")
 
 
+class ResidualCfg(BaseConfig):
+    """The task's residual experts: K per MoE block, gate threshold A and temperature τ."""
+
+    k: PositiveInt
+    threshold: float = Field(gt=0, lt=1)  # compared with a sigmoid output
+    temperature: PositiveFloat
+
+
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    # -1 signals "not assigned to a functioning slot" — the group is defined
-    # (has an expert_assignment.json) but is not yet mapped to a stable
-    # runtime slot. Default -1 avoids silent clashes with an already-in-use
-    # slot (e.g. exp_math permanently owns 0) when the field is forgotten.
+    # -1 signals "not assigned to a functioning slot". Default -1 avoids silent
+    # clashes with an already-in-use slot when the field is forgotten.
     group_id: int = -1
+    residual: ResidualCfg
 
 
 class TaskCfg(BaseConfig):
@@ -643,11 +652,11 @@ class TaskCfg(BaseConfig):
     # unchanged, its authority just moved from a code constant to the API, so a
     # new task no longer needs a release. The value here is the fallback used
     # when the API is unreachable.
-    expert_group_name: str = "exp_nemotron_c4"
+    expert_group_name: str = "exp_pmc_residual"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
-    exp: ExpertCfg = Field(default_factory=ExpertCfg)
+    exp: ExpertCfg | None = None  # set from the task's config.yaml by model_post_init
 
 
 # ---------------------------
@@ -692,19 +701,19 @@ class WorkerConfig(BaseConfig):
         # Derive paths
         self._refresh_paths()
 
-        # Load per-task overrides. A task this node has not got — the owner
-        # named one it has not fetched yet — falls back to the shipped default
-        # here, at construction, where raising would be a crash loop before
-        # anything can ask the API or fetch the task. A live switch has a task
-        # to stay on, so `switch_active_task` gets no such fallback.
+        # Load per-task overrides. A task this node has not got, or cannot load
+        # (one materialized for an older release), falls back to the shipped
+        # default here, at construction, where raising would be a crash loop
+        # before anything can ask the API or fetch the task. A live switch has
+        # a task to stay on, so `switch_active_task` gets no such fallback.
         try:
             self._update_by_task()
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValidationError) as e:
             fallback = type(self.task).model_fields["expert_group_name"].default
             if self.task.expert_group_name == fallback:
                 raise
             logger.error(
-                "No task definition on disk — falling back to the shipped default",
+                "Task not loadable — falling back to the shipped default",
                 task=self.task.expert_group_name, error=str(e), fallback=fallback,
             )
             self._update_by_task(expert_group_name=fallback)

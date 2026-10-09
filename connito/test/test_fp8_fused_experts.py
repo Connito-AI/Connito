@@ -277,7 +277,7 @@ def test_loading_full_precision_into_fp8_requantizes(family_name):
 
 
 def _worker_yaml(tmp_path: Path, **model: str) -> Path:
-    task = Path("expert_groups/exp_nemotron_c4/config.yaml")  # the locked default task
+    task = Path("expert_groups/exp_pmc_residual/config.yaml")  # the locked default task
     (tmp_path / task.parent).mkdir(parents=True)
     (tmp_path / task).write_text(task.read_text())
     path = tmp_path / "config.yaml"

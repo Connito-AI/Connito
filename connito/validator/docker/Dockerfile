@@ -76,11 +76,9 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
 # build context.
 COPY pyproject.toml README.md LICENSE ./
 COPY connito ./connito
-# expert_groups/ ships with the code (per-task config.yaml + expert_assignment.json).
-# Baking them into the image guarantees the validator has the exact same
-# assignments as the connito/ package version it's paired with, without
-# depending on a host-side checkout. Compose can still bind-mount over
-# /app/expert_groups if a developer wants to iterate locally.
+# expert_groups/ ships the default task's config.yaml, the fallback when the
+# owner API is unreachable, without depending on a host-side checkout. Compose
+# can still bind-mount over /app/expert_groups if a developer wants to iterate locally.
 COPY expert_groups ./expert_groups
 
 # Install the package itself (editable not needed inside the image).

@@ -16,7 +16,7 @@ from connito.shared.config import ValidatorConfig
 from connito.validator import cohort_state
 from connito.validator.aggregator import resolve_score_path
 
-SHIPPED = "exp_nemotron_c4"
+SHIPPED = "exp_pmc_residual"
 TARGET = "exp_switch_target"
 
 

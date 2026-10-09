@@ -21,7 +21,7 @@ from connito.shared.config import ValidatorConfig
 from connito.validator.background_eval_worker import BackgroundEvalWorker
 from connito.validator.run import _switch_task
 
-SHIPPED = "exp_nemotron_c4"   # the locked default; the config boots on this
+SHIPPED = "exp_pmc_residual"   # the locked default; the config boots on this
 TARGET = "exp_switch_target"
 
 
