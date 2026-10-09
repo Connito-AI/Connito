@@ -38,6 +38,7 @@ from connito.shared.expert_manager import (
 from connito.shared.memory import cleanup
 from connito.shared.helper import expert_group_shard_name, get_model_hash, get_nested_attr
 from connito.shared.modeling.mycelia import get_base_model
+from connito.shared.modeling.residual import install_residual_experts
 from connito.shared.schema import verify_message
 
 logger = structlog.get_logger(__name__)
@@ -164,6 +165,7 @@ def get_model_from_checkpoint(
     )
     logger.info("Loading base model for checkpoint", load_global_checkpoint=load_global_checkpoint)
     model = get_base_model(config)
+    install_residual_experts(model, config)
 
     latest_checkpoint: ModelCheckpoint | None = None
     # load from checkpoint
@@ -187,7 +189,8 @@ def get_model_from_checkpoint(
 
     _device = checkpoint_device if checkpoint_device is not None else config.model.device
     model = model.to(device=_device)
-    model.gradient_checkpointing_enable()
+    # Non-reentrant: the setting the L40S hardware floor was measured with.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     return model, latest_checkpoint
 
 def load_model(
