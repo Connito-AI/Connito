@@ -102,7 +102,6 @@ from connito.shared.helper import get_model_hash, load_state_dict_from_path
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import get_model_from_checkpoint
 from connito.shared.modeling.mycelia import get_base_tokenizer, load_pretrained_expert_tensors
-from connito.shared.modeling.quantization import unquantize_
 from connito.validator.aggregator import MinerScoreAggregator, resolve_score_path
 from connito.validator import cohort_state as cohort_state_module
 from connito.validator.background_download_worker import BackgroundDownloadWorker
@@ -616,18 +615,6 @@ def _switch_task(
             weights, expert_manager, group_id,
             Path(config.ckpt.checkpoint_path) / "pretrained", save_dtype=dtype,
         )
-        # Quantization is per-task, not per-model: the active group's experts
-        # stay full precision because they are the weights miners submit, and
-        # every other expert is fp8. Boot decides that layout, so a switch has
-        # to redo it — otherwise the incoming group is scored through fp8
-        # rounding, which on a live round is ~140x the spread between miners.
-        #
-        # Both calls select for themselves: `unquantize_` skips what is already
-        # full precision and `quantize_` skips the new group's table, so the
-        # experts the two groups share are touched by neither. Restore before
-        # quantize so a failure in either leaves a group at full precision
-        # rather than none.
-        unquantize_(eval_model, weights, dtype)
     except Exception:
         config.switch_active_task(previous_task)
         raise

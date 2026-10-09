@@ -105,8 +105,6 @@ class FP8Linear(_FP8Storage):
     def __init__(self, linear: nn.Linear) -> None:
         super().__init__()
         self._store("weight", linear.weight.data)
-        self.in_features = linear.in_features
-        self.out_features = linear.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self._dequantized("weight", x.dtype))
@@ -155,36 +153,6 @@ def quantize_(model: nn.Module, scope: str, fam: ModelFamily) -> None:
         converted += 1
 
     logger.info("fp8 quantization applied", scope=scope, converted_modules=converted)
-
-
-def unquantize_(model: nn.Module, weights: dict[str, torch.Tensor], dtype: torch.dtype) -> list[str]:
-    """Put `FP8Linear` modules back to full-precision `nn.Linear`, in place.
-
-    The inverse of `quantize_` in effect, not in mechanism: fp8 rounding is
-    lossy, so the original weights have to be supplied. `weights` is keyed like
-    a state dict (`....gate_proj.weight`), and an entry naming a module that is
-    already `nn.Linear` is skipped — so handing it a whole group's tensors
-    restores exactly the ones that are quantized and leaves the rest untouched.
-
-    `dtype` is the model's, not the checkpoint's: boot loads pretrained weights
-    at the run's precision, and a restored module has to match it.
-    """
-    restored: list[str] = []
-    for key, tensor in weights.items():
-        name = key.rsplit(".", 1)[0]          # drop the trailing `.weight`
-        module = model.get_submodule(name)
-        if not isinstance(module, FP8Linear):
-            continue
-        linear = nn.Linear(module.in_features, module.out_features, bias=False,
-                           device=module.weight_scale.device, dtype=dtype)
-        with torch.no_grad():
-            linear.weight.copy_(tensor)
-        parent_name, _, child_name = name.rpartition(".")
-        setattr(model.get_submodule(parent_name), child_name, linear)
-        restored.append(name)
-
-    logger.info("fp8 modules restored to full precision", restored_modules=len(restored))
-    return sorted(restored)
 
 
 @register_quantization_config(_QUANT_METHOD)
