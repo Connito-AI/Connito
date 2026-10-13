@@ -666,12 +666,7 @@ def materialize_batches(
 
 
 def materialize_by_tokens(dataloader: Iterable, min_tokens: int, max_positions: int) -> list[dict]:
-    """Pull rows until they hold `min_tokens` real tokens, then batch them by length with the padding cut.
-
-    c4 rows are mostly padding at seq 4096, so one row per forward pass would spend most of the eval on
-    padding. Rows are right-padded, so cutting trailing columns drops only padding; a batch never
-    exceeds `max_positions` positions, which keeps the forward pass within the task eval's memory.
-    """
+    """Pull rows up to `min_tokens` real tokens; batch them by length, padding cut, within `max_positions`."""
     rows, tokens = [], 0
     for row in ({k: v[i] for k, v in batch.items()} for batch in dataloader for i in range(len(batch["input_ids"]))):
         rows.append(row)

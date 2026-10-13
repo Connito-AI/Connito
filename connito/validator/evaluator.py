@@ -632,8 +632,7 @@ MAX_CONCURRENT_DOWNLOADS = 4
 EVAL_WORKERS = 1
 DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
-# Real (unpadded) tokens in the c4 replay split: about 214 c4 rows, so the gate's paired difference
-# is stable to about 0.002, ten times below its tolerance.
+# Real (unpadded) tokens in the c4 replay split, about 214 c4 rows.
 REPLAY_EVAL_TOKENS = 65_536
 # ------------------------------------------------------------------------------
 
