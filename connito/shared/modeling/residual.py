@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from connito.shared.checkpoint_helper import TensorSpec
 from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.modeling.families import ModelFamily, family
 
@@ -58,6 +59,19 @@ def install_residual_experts(model: nn.Module, config: MinerConfig | ValidatorCo
         block.residual_hook = block.register_forward_hook(functools.partial(
             _residual_hook, threshold=cfg.threshold, temperature=cfg.temperature,
         ))
+
+
+def residual_shapes(config: MinerConfig | ValidatorConfig) -> dict[str, TensorSpec]:
+    """Every residual key of the family and task K, with its shape and dtype, read from config.json alone."""
+    fam = family(config)
+    text = fam.causal_lm.config_class.from_pretrained(fam.model_path, revision=fam.revision)
+    # A meta-device skeleton holds no weights, and walking it skips dense layers as the install does.
+    with torch.device("meta"):
+        skeleton = fam.causal_lm(text).to(torch.bfloat16)
+        for decoder in skeleton.model.layers:
+            if isinstance(decoder.mlp, fam.moe_block):
+                _attach(decoder.mlp, fam, text, config.task.exp.residual.k)
+    return {n: TensorSpec(tuple(p.shape), p.dtype) for n, p in skeleton.named_parameters() if ".residual_" in n}
 
 
 def freeze_all_but_residual(model: nn.Module) -> None:

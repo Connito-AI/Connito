@@ -4,6 +4,7 @@ import os
 import shutil
 from copy import deepcopy
 from pathlib import Path
+from typing import NamedTuple
 
 import fsspec
 import torch
@@ -24,6 +25,11 @@ from connito.shared.helper import (
 )
 
 logger = structlog.getLogger(__name__)
+
+
+class TensorSpec(NamedTuple):
+    shape: tuple[int, ...]
+    dtype: torch.dtype
 
 
 def _format_bytes(num_bytes: int) -> str:
