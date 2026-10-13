@@ -669,8 +669,11 @@ def materialize_by_tokens(dataloader: Iterable, min_tokens: int, max_positions: 
     """Pull rows up to `min_tokens` real tokens; batch them by length, padding cut, within `max_positions`."""
     rows, tokens = [], 0
     for row in ({k: v[i] for k, v in batch.items()} for batch in dataloader for i in range(len(batch["input_ids"]))):
+        length = int(row["attention_mask"].sum())
+        if length < 2:
+            continue  # no labelled token after the shift; a batch of only such rows is NaN for every model
         rows.append(row)
-        tokens += int(row["attention_mask"].sum())
+        tokens += length
         if tokens >= min_tokens:
             break
     rows.sort(key=lambda r: int(r["attention_mask"].sum()))

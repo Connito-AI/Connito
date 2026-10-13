@@ -97,6 +97,13 @@ def test_batches_are_cut_to_their_longest_row_and_never_exceed_the_positions():
     assert sorted(tuple(b["input_ids"].shape) for b in batches) == [(1, 24), (4, 6)]
 
 
+def test_rows_with_no_labelled_token_are_skipped():
+    loader = [_row(1, seed=9), _row(0, seed=8), *_loader()]
+    batches = materialize_by_tokens(loader, min_tokens=10_000, max_positions=24)
+
+    assert sorted(int(n) for b in batches for n in b["attention_mask"].sum(dim=1)) == sorted(LENGTHS)
+
+
 def test_the_same_stream_gives_the_same_batches():
     first, second = (materialize_by_tokens(_loader(), 10_000, 24) for _ in range(2))
     assert all(torch.equal(a[k], b[k]) for a, b in zip(first, second, strict=True) for k in a)
