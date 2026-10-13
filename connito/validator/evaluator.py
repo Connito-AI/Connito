@@ -826,21 +826,27 @@ def evaluate_one_miner_sync(
                 torch.cuda.empty_cache()
 
         val_loss = float(metrics.get("val_loss", 100))
-        replay_increase = None
+        replay_increase, replay_nan_batches = None, 0
         if replay_batches and baseline_replay_loss is not None:
             replay = evaluate_model(step, miner_model, replay_batches, device, None, rank,
                                     deadline_monotonic=deadline_monotonic)
             replay_increase = float(replay["val_loss"]) - baseline_replay_loss
+            replay_nan_batches = int(replay.get("nan_batches", 0))
             try:
                 VALIDATOR_MINER_REPLAY_LOSS_INCREASE.labels(miner_uid=str(int(uid))).set(replay_increase)
             except Exception:
                 pass
-        gated = replay_increase is not None and replay_increase > config.evaluation.max_replay_loss_increase
+        # `evaluate_model` drops non-finite batches from its mean, so a residual that blows up on the
+        # c4 rows where it fires would pass on the rest; any such batch fails the gate.
+        gated = replay_increase is not None and (
+            replay_increase > config.evaluation.max_replay_loss_increase or replay_nan_batches > 0
+        )
         if gated:
             logger.info(
                 "evaluate_one_miner: c4 replay loss rose past the tolerance; scoring 0",
                 uid=int(uid), task_loss=round(val_loss, 4), replay_loss_increase=round(replay_increase, 4),
-                tolerance=config.evaluation.max_replay_loss_increase, round_id=round_id,
+                replay_nan_batches=replay_nan_batches, tolerance=config.evaluation.max_replay_loss_increase,
+                round_id=round_id,
             )
             val_loss = float("inf")
         delta = max(0.0, baseline_loss - val_loss)

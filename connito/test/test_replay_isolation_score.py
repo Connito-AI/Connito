@@ -31,12 +31,14 @@ def statuses(monkeypatch) -> dict[int, str | None]:
 
 
 def _score(monkeypatch, *, task_loss: float, replay_loss: float, replay_batches=REPLAY,
-           baseline_replay: float | None = BASELINE_REPLAY) -> tuple[MinerEvalJob, list]:
+           baseline_replay: float | None = BASELINE_REPLAY, replay_nan_batches: int = 0) -> tuple[MinerEvalJob, list]:
     calls: list = []
 
     def _evaluate(step, model, batches, *a, **kw):
         calls.append(batches)
-        return {"val_loss": task_loss if batches is TASK else replay_loss}
+        if batches is TASK:
+            return {"val_loss": task_loss, "nan_batches": 0}
+        return {"val_loss": replay_loss, "nan_batches": replay_nan_batches}
 
     monkeypatch.setattr(evaluator, "load_model_from_path", lambda *a: MagicMock())
     monkeypatch.setattr(evaluator, "track_eval_latency", lambda: lambda fn: fn)  # the histogram is process-global
@@ -74,6 +76,14 @@ def test_a_replay_loss_exactly_at_the_tolerance_passes(monkeypatch, statuses):
     job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + TOLERANCE)
 
     assert job.val_loss == 2.5
+
+
+def test_replay_batches_that_blow_up_fail_the_gate_even_when_the_rest_improve(monkeypatch, statuses):
+    """Base replay batches 3.0 / 3.0 / 2.0; the miner's inf / inf / 2.6 averages 2.6 over the finite one."""
+    job, _ = _score(monkeypatch, task_loss=2.0, replay_loss=2.6, baseline_replay=8.0 / 3.0, replay_nan_batches=2)
+
+    assert job.score == 0.0  # 1.0 if the dropped batches went unnoticed
+    assert statuses[7] == "replay_loss_increase"
 
 
 def test_a_non_finite_replay_loss_scores_zero(monkeypatch, statuses):
