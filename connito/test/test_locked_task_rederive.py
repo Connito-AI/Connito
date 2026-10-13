@@ -121,3 +121,21 @@ def test_active_task_is_required_so_a_new_entrypoint_cannot_skip_it() -> None:
     # silently disable the whole mechanism, so it has to be a TypeError.
     with pytest.raises(TypeError):
         MinerConfig.from_path("unused.yaml")
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [b"group_id: 8\n  sources: [unclosed\n", b"group_id: 8\n\xff\xfe\x00", b"<html>502 Bad Gateway</html>\n"],
+    ids=["yaml_syntax", "not_utf8", "not_a_mapping"],
+)
+def test_a_corrupt_task_file_degrades_instead_of_crashing(tmp_path: Path, caplog, capsys, corrupt: bytes) -> None:
+    # A truncated or hand-edited config.yaml on disk must not crash-loop the node either.
+    cfg_path = _write_cfg(tmp_path, SHIPPED)
+    _task_dir(tmp_path, "exp_corrupt", group_id=8)
+    (tmp_path / "expert_groups" / "exp_corrupt" / "config.yaml").write_bytes(corrupt)
+
+    config = MinerConfig.from_path(cfg_path, active_task="exp_corrupt")
+
+    assert config.task.expert_group_name == SHIPPED
+    assert config.task.exp.group_id == 9
+    assert "falling back to the shipped default" in caplog.text + capsys.readouterr().out

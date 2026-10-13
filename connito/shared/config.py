@@ -142,7 +142,7 @@ class BaseConfig(BaseModel):
     def from_path(cls, path: str | Path) -> "BaseConfig":
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return cls(**data)
+        return cls.model_validate(data)
 
 
 # ---------------------------
@@ -700,7 +700,8 @@ class WorkerConfig(BaseConfig):
         # a task to stay on, so `switch_active_task` gets no such fallback.
         try:
             self._update_by_task()
-        except (FileNotFoundError, ValidationError) as e:
+        # YAMLError and UnicodeDecodeError: a truncated, hand-edited or corrupt config.yaml.
+        except (FileNotFoundError, ValidationError, yaml.YAMLError, UnicodeDecodeError) as e:
             fallback = type(self.task).model_fields["expert_group_name"].default
             if self.task.expert_group_name == fallback:
                 raise
