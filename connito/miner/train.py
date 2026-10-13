@@ -33,7 +33,6 @@ from connito.shared.config import MinerConfig, parse_args
 from connito.shared.task_sync import ensure_active_task, resolve_active_task_name, sync_active_task
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import chunked_lm_loss, evaluate_model
-from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
 from connito.shared.metrics import MetricLogger
 from connito.shared.model import load_model
@@ -123,12 +122,11 @@ def setup_training(
     torch.nn.Module,  # model
     torch.optim.Optimizer,  # inner_optimizer
     torch.optim.lr_scheduler.LRScheduler,  # scheduler
-    "ExpertManager",  # em
     StatefulDataLoader,
     dict,  # current model version
 ]:
     """
-    Build model(s), experts layout, optimizers, scheduler, and optionally resume from a checkpoint.
+    Build the model, optimizer, scheduler and dataloader; the model resumes a local residual checkpoint if one verifies.
 
     Args:
         config: Training/config object with attributes used here (e.g., lr, outer_lr, warmup_steps, etc.).
@@ -137,15 +135,10 @@ def setup_training(
 
     Returns:
         model (nn.Module): Local MoE model placed on `device`.
-        global_model (nn.Module): Deep-copied global model on CPU, kept in sync with `model`.
         inner_optimizer (Optimizer): Optimizer for `model`.
-        outer_optimizer (Optimizer): Optimizer for `global_model`.
         scheduler (LRScheduler): LR scheduler attached to `inner_optimizer`.
-        start_step (int): Step to resume from (0 if starting fresh).
-        expert_groups (Sequence[Sequence[int]]): Grouping returned by `create_expert_groups`; typically a list
-            (or other sequence) of groups where each group lists the ranks/experts belonging to it.
-        group_ids (int): This rank’s group id from `create_expert_groups`.
-        expert_manager (ExpertManager): The instantiated ExpertManager for this model/rank.
+        train_dataloader (StatefulDataLoader): The task's training batches.
+        model_checkpoint (ModelCheckpoint | None): The newest local checkpoint (see `get_model_from_checkpoint`).
 
     Notes:
         - Param group layouts are taken from the *target* optimizers created here.
@@ -154,9 +147,8 @@ def setup_training(
     """
     logger.info("(0) Setup training")
 
-    # === model & Experts manager ===
-    logger.debug("init - model and expert manager")
-    expert_manager = ExpertManager(config)
+    # === model ===
+    logger.debug("init - model")
     model, model_checkpoint = load_model(config, subtensor, wallet)
     model = model.to(device)
     freeze_all_but_residual(model)
@@ -230,7 +222,6 @@ def setup_training(
         model,
         inner_optimizer,
         scheduler,
-        expert_manager,
         train_dataloader,
         model_checkpoint,
     )
@@ -284,7 +275,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
         model,
         inner_optimizer,
         scheduler,
-        expert_manager,
         train_dataloader,
         current_model_meta,
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
@@ -654,7 +644,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         model,
                         inner_optimizer,
                         scheduler,
-                        expert_manager,
                         train_dataloader,
                         current_model_meta,
                     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta)
