@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import contextlib
 import weakref
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -22,19 +21,10 @@ from connito.shared.modeling import mycelia
 from connito.shared.modeling.families import FAMILIES
 from connito.shared.modeling.residual import freeze_all_but_residual, install_residual_experts
 
-FIXTURE = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_v2_checkpoint"}
 # DeepSeek-V2's layer 0 is dense.
 MOE_LAYERS = {"qwen3_5_moe": [0, 1, 2, 3], "deepseek_v2": [1, 2]}
 HIDDEN, WIDTH = 64, 32
 TOKENS = torch.randint(0, 128, (2, 12), generator=torch.Generator().manual_seed(1))
-
-
-@pytest.fixture(params=sorted(FAMILIES))
-def family_name(request, monkeypatch) -> str:
-    """A family whose record points at its tiny checkpoint."""
-    path = request.getfixturevalue(FIXTURE[request.param])
-    monkeypatch.setitem(FAMILIES, request.param, replace(FAMILIES[request.param], model_path=str(path)))
-    return request.param
 
 
 def _config(name: str, scope: str = "off", k: int = 1) -> SimpleNamespace:

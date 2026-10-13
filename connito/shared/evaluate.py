@@ -4,7 +4,9 @@ import gc
 import time
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 from connito.shared.app_logging import structlog
@@ -12,6 +14,27 @@ from connito.shared.app_logging import structlog
 logger = structlog.getLogger(__name__)
 
 tqdm(disable=True, total=0)
+
+# Positions per lm_head chunk: about 1 GiB of fp32 logits at Qwen's 248,320 vocab, as measured on the L40S floor.
+_CE_CHUNK_TOKENS = 1024
+
+
+def _chunk_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(lm_head(hidden).float(), labels, reduction="sum")
+
+
+def chunked_lm_loss(model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Next-token cross-entropy averaged over labelled tokens, as `model(**batch).loss`, without full logits."""
+    hidden = model.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask")).last_hidden_state
+    hidden = hidden[:, :-1].reshape(-1, hidden.shape[-1])
+    labels = batch["labels"][:, 1:].reshape(-1)
+    # Checkpointed, so backward keeps one chunk's logits at a time instead of the whole batch's.
+    total = sum(
+        checkpoint(_chunk_ce, model.lm_head, hidden[i : i + _CE_CHUNK_TOKENS], labels[i : i + _CE_CHUNK_TOKENS],
+                   use_reentrant=False)
+        for i in range(0, labels.numel(), _CE_CHUNK_TOKENS)
+    )
+    return total / labels.ne(-100).sum()
 
 
 class EvalDeadlineExceeded(RuntimeError):

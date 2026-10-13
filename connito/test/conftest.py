@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ from safetensors.torch import save_file
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers.models.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM
 from transformers.models.qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration
+
+from connito.shared.modeling.families import FAMILIES
 
 TINY_TEXT_CONFIG = dict(
     vocab_size=128,
@@ -113,3 +116,12 @@ def tiny_deepseek_v2_checkpoint(tmp_path: Path) -> Path:
         "tokenizer_class": "LlamaTokenizerFast", "add_bos_token": True, "bos_token": "<bos>", "eos_token": "<eos>",
     })
     return path
+
+
+@pytest.fixture(params=sorted(FAMILIES))
+def family_name(request, monkeypatch) -> str:
+    """A family whose record points at its tiny checkpoint."""
+    fixture = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_v2_checkpoint"}[request.param]
+    path = request.getfixturevalue(fixture)
+    monkeypatch.setitem(FAMILIES, request.param, replace(FAMILIES[request.param], model_path=str(path)))
+    return request.param
