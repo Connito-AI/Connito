@@ -23,7 +23,7 @@ VOCAB = 128
 def _config(name: str) -> SimpleNamespace:
     return SimpleNamespace(
         role="miner",
-        model=SimpleNamespace(family=name, torch_compile=False, device="cpu", quantization="off",
+        model=SimpleNamespace(family=name, device="cpu", quantization="off",
                               quantization_miner="off"),
         task=SimpleNamespace(exp=SimpleNamespace(residual=ResidualCfg(k=1, threshold=0.5, temperature=0.5))),
         ckpt=SimpleNamespace(resume_from_ckpt=False, use_pretrained_only=False),

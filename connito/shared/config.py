@@ -200,7 +200,6 @@ class ModelCfg(BaseConfig):
     # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
     family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
     foundation: bool = True
-    torch_compile: bool = False
     precision: str = "bf16-mixed"  # locked: both families are published in bf16
     device: str = "cuda"
     # fp8 weight-only storage for modules a role never trains. `quantization`

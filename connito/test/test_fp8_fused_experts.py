@@ -47,7 +47,7 @@ MOE_LAYERS = {"qwen3_5_moe": 4, "deepseek_v2": 2}
 def _config(name: str, *, miner: str = "all", validator: str = "all", role: str = "validator",
             quantization: str = "fp8") -> SimpleNamespace:
     model = SimpleNamespace(
-        family=name, torch_compile=False,
+        family=name,
         quantization=quantization, quantization_miner=miner, quantization_validator=validator,
     )
     return SimpleNamespace(role=role, model=model)

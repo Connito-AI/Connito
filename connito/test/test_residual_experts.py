@@ -31,7 +31,7 @@ def _config(name: str, scope: str = "off", k: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         role="miner",
         model=SimpleNamespace(
-            family=name, torch_compile=False, device="cpu",
+            family=name, device="cpu",
             quantization="off" if scope == "off" else "fp8", quantization_miner=scope,
         ),
         task=SimpleNamespace(exp=SimpleNamespace(residual=ResidualCfg(k=k, threshold=0.5, temperature=0.5))),

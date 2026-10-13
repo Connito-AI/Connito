@@ -19,7 +19,6 @@ if logging.root.level > logging.DEBUG:
 from connito.shared.app_logging import structlog
 from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.expert_manager import get_layer_expert_id
-from connito.shared.helper import get_nested_attr
 from connito.shared.modeling.families import family
 from connito.shared.modeling.quantization import fp8_load_config
 
@@ -63,9 +62,6 @@ def get_base_model(config: MinerConfig | ValidatorConfig) -> PreTrainedModel:
     model.config.output_router_logits = False
     _refuse_split(model)
     logger.info("Loaded base model", family=fam.name, path=fam.model_path, revision=fam.revision)
-
-    if get_nested_attr(config, "model.torch_compile", False):
-        model = torch.compile(model)
     return model
 
 
