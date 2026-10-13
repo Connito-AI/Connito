@@ -1,5 +1,4 @@
 import errno
-import gc
 import os
 import shutil
 from copy import deepcopy
@@ -8,13 +7,13 @@ from typing import NamedTuple
 
 import fsspec
 import torch
+from safetensors.torch import save_file
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from connito.shared.app_logging import structlog
 from connito.shared.config import MinerConfig
 from connito.shared.expert_manager import (
     ExpertAssignments,
-    ExpertManager,
     get_layer_expert_id,
 )
 from connito.shared.helper import (
@@ -335,7 +334,6 @@ def save_state_dict_by_expert_group(
     # validator host. The on-chain `model_hash` is computed from the
     # in-memory state_dict (see `get_model_hash` / `serialize_torch_model_path`),
     # so it's identical regardless of file format — no chain commit changes.
-    from safetensors.torch import save_file
     paths = {}
     for gid, sd in grouped_state.items():
         fname = expert_group_shard_name(gid)
@@ -381,9 +379,19 @@ def save_state_dict_by_expert_group(
     return paths
 
 
+def save_residual_shard(model: torch.nn.Module, dest_dir: str | Path, group_id: int) -> Path:
+    """Write the model's residual experts and routers, each in its own dtype, as the group's shard."""
+    path = Path(dest_dir) / expert_group_shard_name(group_id)
+    # Parameters, not state_dict(): that would dequantize every fp8 expert to a CPU copy first.
+    residual = {n: p.detach().cpu().contiguous() for n, p in model.named_parameters() if ".residual_" in n}
+    save_file(residual, str(path))
+    return path
+
+
 def save_checkpoint(
     checkpoint_path: str | Path,
     model: torch.nn.Module,
+    group_id: int,
     rank: int,
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     inner_optimizer: torch.optim.Optimizer | None = None,
@@ -391,10 +399,6 @@ def save_checkpoint(
     loss: float | None = None,
     data_loader: StatefulDataLoader | None = None,
     save_global_state: bool = True,
-    save_model_by_expert_group: bool = False,
-    expert_manager: ExpertManager | None = None,
-    strict_sharding: bool = False,
-    active_expert_group_id: int | None = None,
 ) -> None:
     """
     Saves the current model checkpoint.
@@ -414,39 +418,7 @@ def save_checkpoint(
     write_path = tmp_checkpoint_path
 
     try:
-        # === save model, optimizer ===
-        model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
-
-        if save_model_by_expert_group and expert_manager is not None:
-            # With one active group, every tensor the shard keeps is a trainable
-            # expert, so parameters are enough. `model.state_dict()` would
-            # dequantize every fp8 module to a CPU copy first — the whole model
-            # under full topology — only for the filter to throw it away.
-            state_dict = (
-                {name: p.detach() for name, p in model.named_parameters()}
-                if active_expert_group_id is not None
-                else model.state_dict()
-            )
-            save_state_dict_by_expert_group(
-                state_dict,
-                expert_manager.expert_group_assignment,
-                write_path,
-                strict_sharding=strict_sharding,
-                active_expert_group_id=active_expert_group_id,
-                save_dtype=model_dtype,
-            )
-            del state_dict
-            gc.collect()
-
-        else:
-            checkpoint = {
-                "model_state_dict": {k: v.detach().to(dtype=model_dtype, device="cpu", non_blocking=True) for k, v in model.state_dict().items()},
-                "loss": loss,
-            }
-            target = write_path / "model.pt"
-            if not target.exists():
-                with fsspec.open(str(target), "wb") as f:
-                    torch.save(checkpoint, f)
+        save_residual_shard(model, write_path, group_id)
 
         # === save optimizer ===
         if inner_optimizer is not None:

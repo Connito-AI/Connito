@@ -9,8 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file
 
 from connito.shared import model as shared_model
+from connito.shared.checkpoint_helper import save_checkpoint
 from connito.shared.config import ResidualCfg
 from connito.shared.modeling.residual import residual_shapes
 
@@ -58,3 +60,20 @@ def test_residual_shapes_match_the_installed_residual(family_name):
     live = {n: (tuple(p.shape), p.dtype) for n, p in _model(config).named_parameters() if ".residual_" in n}
 
     assert residual_shapes(config) == live
+
+
+def test_a_checkpoint_holds_exactly_the_residual_each_tensor_in_its_own_dtype(family_name, tmp_path):
+    config = _config(family_name, k=2)
+    model = _model(config)
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if ".residual_" in name:
+                param.normal_()  # fp32 router values that bf16 would round
+    residual = {n: p.detach().clone() for n, p in model.named_parameters() if ".residual_" in n}
+
+    save_checkpoint(checkpoint_path=tmp_path / "globalver_1_inneropt_2", model=model, group_id=9, rank=0,
+                    save_global_state=False)
+
+    saved = load_file(str(tmp_path / "globalver_1_inneropt_2" / "model_expgroup_9.safetensors"))
+    assert {n: (tuple(t.shape), t.dtype) for n, t in saved.items()} == residual_shapes(config)
+    assert all(torch.equal(saved[n], t) for n, t in residual.items())

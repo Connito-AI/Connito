@@ -610,10 +610,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     data_loader=train_dataloader,
                     save_global_state=rank == 0,
                     rank=rank,
-                    save_model_by_expert_group=True,
-                    expert_manager=expert_manager,
-                    strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
-                    active_expert_group_id=config.task.exp.group_id,
+                    group_id=config.task.exp.group_id,
                 )
 
                 if config.ckpt.checkpoint_topk is not None:
