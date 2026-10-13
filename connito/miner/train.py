@@ -23,10 +23,7 @@ from connito.miner.train_helper import free_cuda_models, get_status, model_healt
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
 from connito.shared.cycle import wait_till, PhaseNames, PhaseManager
-from connito.shared.checkpoint_helper import (
-    load_checkpoint,
-    save_checkpoint,
-)
+from connito.shared.checkpoint_helper import save_checkpoint
 from connito.shared.checkpoints import (
     ModelCheckpoint,
     delete_old_checkpoints,
@@ -227,24 +224,6 @@ def setup_training(
         config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer,
         batch_size=config.local_par.micro_batch_size,
     )
-
-    # === load checkpoint (if any) ===
-    logger.debug("init - load checkpoint")
-    resume = False
-
-    if get_nested_attr(config, "ckpt.resume_from_ckpt", False):
-        latest_checkpoint = select_best_checkpoint(config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt)
-
-    if get_nested_attr(config, "resume_from_ckpt", False) and resume and latest_checkpoint.path is not None:
-        _ = load_checkpoint(
-            config=config,
-            checkpoint_path=latest_checkpoint.path,
-            inner_optimizer=inner_optimizer,
-            scheduler=scheduler,
-            rank=rank,
-            device=device,
-            data_loader=train_dataloader,
-        )
 
     logger.info("setup_training: success!")
     return (
