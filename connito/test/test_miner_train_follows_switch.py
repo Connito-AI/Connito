@@ -20,7 +20,6 @@ import yaml
 
 from connito.miner import train
 from connito.shared.config import MinerConfig
-from connito.shared.evaluate import chunked_lm_loss
 
 SHIPPED = "exp_pmc_residual"
 TARGET = "exp_switch_target"
@@ -65,9 +64,6 @@ class _Tiny(torch.nn.Module):
 
     def model(self, input_ids, attention_mask=None):
         return SimpleNamespace(last_hidden_state=self.embed(input_ids))
-
-    def forward(self, input_ids, labels=None):
-        return SimpleNamespace(loss=chunked_lm_loss(self, {"input_ids": input_ids, "labels": labels}), logits=None)
 
 
 def _batches(n: int) -> list[dict]:

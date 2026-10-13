@@ -144,7 +144,6 @@ def get_status(
     inner_opt_step: int | None = None,
     global_opt_step: int | None = None,
     loss_batch: torch.Tensor | None | Any = None,
-    aux_loss_batch: torch.Tensor | None | Any = None,
 ) -> dict[str, Any]:
     """
     Build a dictionary of training metrics for monitoring and logging.
@@ -189,17 +188,10 @@ def get_status(
 
 
     if loss_batch is not None and loss_batch != 0:
-        if aux_loss_batch is not None and aux_loss_batch != 0:
-            metrics = metrics | {
-                "loss": float(loss_batch.item() - aux_loss_batch.item()),
-                "perplexity": float(torch.exp(loss_batch - aux_loss_batch).item()),
-                "aux_loss": float(aux_loss_batch.item()),
-            }
-        else:
-            metrics = metrics | {
-                "loss": float(loss_batch.item()),
-                "perplexity": float(torch.exp(loss_batch).item()),
-            }
+        metrics = metrics | {
+            "loss": float(loss_batch.item()),
+            "perplexity": float(torch.exp(loss_batch).item()),
+        }
             
     # Injection: System/Training Tracking Details
     if hasattr(config, "task") and hasattr(config.task, "expert_group_name"):

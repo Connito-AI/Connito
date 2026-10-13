@@ -1,4 +1,4 @@
-"""The miner's training loss on residual experts, on tiny models of each family.
+"""The miner's training loss and loop on residual experts, on tiny models of each family.
 
 CPU only, nothing downloaded: `python -m pytest connito/test/test_residual_training.py`.
 """
@@ -6,14 +6,17 @@ CPU only, nothing downloaded: `python -m pytest connito/test/test_residual_train
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
+from connito.miner import train
 from connito.shared import evaluate
 from connito.shared import model as shared_model
-from connito.shared.config import ResidualCfg
+from connito.shared.config import MinerConfig, ResidualCfg
 from connito.shared.evaluate import chunked_lm_loss
 from connito.shared.modeling.residual import freeze_all_but_residual
 
@@ -30,15 +33,15 @@ def _config(name: str) -> SimpleNamespace:
     )
 
 
-def _model(name: str, dtype: torch.dtype = torch.bfloat16) -> torch.nn.Module:
-    """The miner's model, with down_proj drawn non-zero so every residual tensor gets a gradient."""
+def _model(name: str, dtype: torch.dtype = torch.bfloat16, draw_down: bool = True) -> torch.nn.Module:
+    """The miner's model; `draw_down` makes down_proj non-zero so every residual tensor gets a gradient at once."""
     model, _ = shared_model.get_model_from_checkpoint(rank=0, config=_config(name), load_global_checkpoint=False)
     freeze_all_but_residual(model)
     if dtype is torch.float32:
         model.float()
     with torch.no_grad():
         for name_, param in model.named_parameters():
-            if ".residual_experts." in name_ and "down_proj" in name_:
+            if draw_down and ".residual_experts." in name_ and "down_proj" in name_:
                 param.normal_(std=0.02)
     return model.train()
 
@@ -131,3 +134,80 @@ def test_evaluate_model_scores_what_the_full_logits_loss_scored(family_name, mon
     assert [loss.item() for loss in scored[:3]] == pytest.approx(full[:3])
     assert (metrics["scored_batches"], metrics["nan_batches"]) == (3, 1)
     assert metrics["val_loss"] == pytest.approx(sum(full[:3]) / 3)
+
+
+def _miner_config(root: Path) -> MinerConfig:
+    task = root / "expert_groups" / "exp_pmc_residual"
+    task.mkdir(parents=True)
+    (task / "config.yaml").write_text(Path("expert_groups/exp_pmc_residual/config.yaml").read_text())
+    (root / "config.yaml").write_text(yaml.safe_dump({
+        "run": {"root_path": str(root)},
+        "chain": {"hotkey_ss58": "test-hk", "coldkey_ss58": "test-ck", "uid": 0},
+    }))
+    config = MinerConfig.from_path(root / "config.yaml", active_task=None, auto_update_config=True)
+    config.local_par.gradient_accumulation_steps = 1
+    config.log.metric_interval = 10**9  # local evaluation at inner step 0 only
+    config.ckpt.checkpoint_interval = None
+    config.ckpt.enable_peer_resync = False
+    return config
+
+
+def _run_loop(model, batches, config: MinerConfig, monkeypatch, **stubs) -> SimpleNamespace:
+    """Drive the real `train_worker` over `batches` with everything around the loop stubbed; record what it did."""
+    seen = SimpleNamespace(losses=[], logged=[])
+
+    def loss(model, batch):
+        out = chunked_lm_loss(model, batch)
+        assert torch.isfinite(out)
+        seen.losses.append((torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu"), out.item()))
+        return out
+
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+    seen.scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    setup = (model, optimizer, seen.scheduler, None, batches, None)
+    for name, stub in {
+        "setup_training": lambda *a, **k: setup,
+        "chunked_lm_loss": loss,
+        "get_dataloader": lambda *a, **k: [],
+        "setup_chain_worker": lambda config: (None, object(), None),
+        "SystemStatePoller": lambda **k: SimpleNamespace(start=lambda: None, stop=lambda: None),
+        "PhaseManager": lambda config, subtensor: None,
+        "MetricLogger": lambda *a, **k: SimpleNamespace(log=lambda *a, **k: None, close=lambda: None),
+        "TelemetryManager": lambda: SimpleNamespace(start_server=lambda **k: None),
+        "get_base_tokenizer": lambda config: None,
+        "get_status": lambda **k: seen.logged.append(float(k["loss_batch"])) or {},
+        "model_health": lambda model, step: {},
+        "sync_active_task": lambda config: False,
+        **stubs,
+    }.items():
+        monkeypatch.setattr(train, name, stub)
+    train.train_worker(rank=0, world_size=1, config=config)
+    return seen
+
+
+def test_the_training_loop_moves_only_the_residual_in_bf16(family_name, tmp_path, monkeypatch):
+    """The real loop from the null-residual init: two labelled batches train, a batch with no label is skipped."""
+    model = _model(family_name, draw_down=False)
+    unlabelled = _batch(1) | {"labels": torch.full_like(_batch(1)["labels"], -100)}
+    base = {n: t.clone() for n, t in [*model.named_parameters(), *model.named_buffers()] if ".residual_" not in n}
+    residual = {n: p.clone() for n, p in model.named_parameters() if ".residual_" in n}
+
+    seen = _run_loop(model, [_batch(0), unlabelled, _batch(2)], _miner_config(tmp_path), monkeypatch)
+
+    assert [(on, dtype) for on, dtype, _ in seen.losses] == [(True, torch.bfloat16)] * 2
+    assert seen.scheduler.last_epoch == 2
+    after = dict([*model.named_parameters(), *model.named_buffers()])
+    assert all(torch.equal(after[n].view(torch.uint8), t.view(torch.uint8)) for n, t in base.items())
+    # down_proj moves at step 1; gate, up and the router follow at step 2.
+    assert [n for n, t in residual.items() if torch.equal(after[n], t)] == []
+
+
+def test_accumulated_micro_batches_are_averaged(family_name, tmp_path, monkeypatch):
+    config = _miner_config(tmp_path)
+    config.local_par.gradient_accumulation_steps = 2
+
+    seen = _run_loop(_model(family_name), [_batch(0), _batch(2)], config, monkeypatch)
+
+    assert seen.scheduler.last_epoch == 1
+    mean = sum(loss for *_, loss in seen.losses) / 2
+    assert seen.logged and seen.logged == pytest.approx([mean] * len(seen.logged))

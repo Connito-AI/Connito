@@ -35,7 +35,7 @@ from connito.shared.checkpoints import (
 from connito.shared.config import MinerConfig, parse_args
 from connito.shared.task_sync import ensure_active_task, resolve_active_task_name, sync_active_task
 from connito.shared.dataloader import get_dataloader
-from connito.shared.evaluate import evaluate_model
+from connito.shared.evaluate import chunked_lm_loss, evaluate_model
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.helper import get_model_hash, get_nested_attr, sum_model_gradients
 from connito.shared.metrics import MetricLogger
@@ -319,7 +319,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     # === training ===
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
     loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
-    aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
     training_time = 0
     total_training_time = 0
     training_start_time = None
@@ -372,19 +371,11 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         continue
 
                 with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
-                    outputs = model(**batch_device)
-
-                    loss = outputs.loss / config.local_par.gradient_accumulation_steps
-                    # aux_loss = outputs.aux_loss / config.local_par.gradient_accumulation_steps if outputs.aux_loss is not None else torch.tensor(0)
-                    aux_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+                    batch_loss = chunked_lm_loss(model, batch_device)
+                loss = batch_loss / config.local_par.gradient_accumulation_steps
 
                 if not torch.isfinite(loss):
                     consecutive_non_finite_batches += 1
-                    logits = outputs.logits
-                    logits_finite = torch.isfinite(logits)
-                    logits_finite_ratio = float(logits_finite.float().mean().item())
-                    logits_min = float(logits.min().item())
-                    logits_max = float(logits.max().item())
                     label_min = None
                     label_max = None
                     if labels is not None and num_valid > 0:
@@ -392,10 +383,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         label_max = int(labels[valid_labels].max().item())
                     logger.warning(
                         "Non-finite loss detected, skipping batch",
-                        loss=float(outputs.loss.item()) if outputs.loss.numel() == 1 else None,
-                        logits_min=logits_min,
-                        logits_max=logits_max,
-                        logits_finite_ratio=logits_finite_ratio,
+                        loss=float(batch_loss.item()),
                         label_min=label_min,
                         label_max=label_max,
                         num_valid_labels=num_valid if labels is not None else None,
@@ -408,29 +396,18 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                             "Non-finite loss persisted for "
                             f"{consecutive_non_finite_batches} consecutive batches"
                         )
-                    del loss, aux_loss, batch_device, outputs
+                    del loss, batch_loss, batch_device
                     gc.collect()
                     continue
                 consecutive_non_finite_batches = 0
-                logger.info("batch loss", loss=outputs.loss.item(), inner_opt_step=inner_opt_step)
+                logger.info("batch loss", loss=batch_loss.item(), inner_opt_step=inner_opt_step)
 
                 loss_batch += loss.item()
-                aux_loss_batch += aux_loss.item()
 
                 loss.backward()
 
-                grad_total = sum_model_gradients(model)
-                sample_grads = []
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        p_norm = param.norm().item()
-                        grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
-                        sample_grads.append((name, grad_norm, p_norm))
-                        if len(sample_grads) >= 5:
-                            break
-
                 # === Aggressively free intermediate tensors ===
-                del loss, aux_loss, batch_device, outputs
+                del loss, batch_loss, batch_device
                 gc.collect()
 
             # === inner optimizer ===
@@ -526,7 +503,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 is_inner_optimizer_step
                 and inner_opt_step % max(round(config.local_par.global_opt_interval * 0.02), 1) == 0
             ):
-                logger.info("(2) Logging step", loss_batch=loss_batch, aux_loss_batch=aux_loss_batch)
+                logger.info("(2) Logging step", loss_batch=loss_batch)
                 metrics = get_status(
                     config=config,
                     step=step,
@@ -535,7 +512,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     total_training_time=total_training_time,
                     inner_optimizer=inner_optimizer,
                     loss_batch=loss_batch,
-                    aux_loss_batch=aux_loss_batch,
                 ) | model_health(model, step)
                 metric_logger.log(metrics, print_log=False)
 
@@ -599,7 +575,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         total_training_time=total_training_time,
                         inner_optimizer=inner_optimizer,
                         loss_batch=loss_batch,
-                        aux_loss_batch=aux_loss_batch,
                     )
                     | model_health(model, step)
                     | val_metric
@@ -722,7 +697,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
             if is_inner_optimizer_step:
                 logger.info("(6) Clean up")
                 loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
-                aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
                 gc.collect()
                 torch.cuda.empty_cache()
                 logger.info("Clean up completed")
