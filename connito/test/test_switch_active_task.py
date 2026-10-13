@@ -20,10 +20,12 @@ SHIPPED = "exp_pmc_residual"
 OTHER = "exp_switch_target"
 
 
-def _task_dir(root: Path, name: str, group_id: int, residual: bool = True) -> None:
+def _task_dir(root: Path, name: str, group_id: int | None, residual: bool = True) -> None:
     """A task folder shaped like `expert_groups/<name>/`."""
     body = yaml.safe_load(Path(f"expert_groups/{SHIPPED}/config.yaml").read_text())
     body["group_id"] = group_id
+    if group_id is None:
+        del body["group_id"]
     if not residual:
         del body["residual"]
     d = root / "expert_groups" / name
@@ -117,6 +119,20 @@ def test_a_task_without_residual_settings_is_refused_and_rolled_back(
 
     with pytest.raises(ValueError, match="residual"):
         config.switch_active_task("exp_no_residual")
+
+    assert (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp) == before
+
+
+@pytest.mark.parametrize("group_id", [-1, None], ids=["sentinel", "missing"])
+def test_a_task_without_a_real_group_id_is_refused_and_rolled_back(
+    config: MinerConfig, tmp_path: Path, group_id: int | None,
+) -> None:
+    """Every chain commit names the task's group; a forgotten or sentinel one must not reach a commit."""
+    _task_dir(tmp_path, "exp_no_group", group_id=group_id)
+    before = (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp)
+
+    with pytest.raises(ValueError, match="group_id"):
+        config.switch_active_task("exp_no_group")
 
     assert (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp) == before
 

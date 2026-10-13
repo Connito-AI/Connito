@@ -12,7 +12,16 @@ import bittensor
 import fsspec
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    ValidationError,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
@@ -634,9 +643,8 @@ class ResidualCfg(BaseConfig):
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    # -1 signals "not assigned to a functioning slot". Default -1 avoids silent
-    # clashes with an already-in-use slot when the field is forgotten.
-    group_id: int = -1
+    # Required: it is the expert group every chain commit names, so a forgotten one must not default into a slot.
+    group_id: NonNegativeInt
     residual: ResidualCfg
 
 

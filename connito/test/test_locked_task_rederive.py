@@ -29,9 +29,11 @@ SHIPPED = "exp_pmc_residual"  # the fallback default
 PREVIOUS = "exp_previous"
 
 
-def _task_dir(root: Path, name: str, group_id: int, residual: bool = True) -> None:
+def _task_dir(root: Path, name: str, group_id: int | None, residual: bool = True) -> None:
     body = yaml.safe_load(Path(f"expert_groups/{SHIPPED}/config.yaml").read_text())
     body["group_id"] = group_id
+    if group_id is None:
+        del body["group_id"]
     if not residual:
         del body["residual"]
     d = root / "expert_groups" / name
@@ -105,6 +107,17 @@ def test_a_task_materialized_for_an_older_release_degrades_instead_of_crashing(t
     assert config.task.path.name == SHIPPED
     assert config.task.exp.group_id == 9
     assert config.ckpt.checkpoint_path.name == SHIPPED
+
+
+@pytest.mark.parametrize("group_id", [-1, None], ids=["sentinel", "missing"])
+def test_a_task_without_a_real_group_id_falls_back_at_boot(tmp_path: Path, group_id: int | None) -> None:
+    cfg_path = _write_cfg(tmp_path, SHIPPED)
+    _task_dir(tmp_path, "exp_no_group", group_id=group_id)
+
+    config = MinerConfig.from_path(cfg_path, active_task="exp_no_group")
+
+    assert config.task.expert_group_name == SHIPPED
+    assert config.task.exp.group_id == 9
 
 
 def test_the_shipped_default_itself_unloadable_still_raises(tmp_path: Path, caplog) -> None:
