@@ -25,7 +25,6 @@ from connito.shared.config import ResidualCfg
 from connito.shared.modeling.residual import residual_shapes
 from connito.validator import run
 from connito.validator.background_eval_worker import BackgroundEvalWorker
-from connito.validator.distribute import unadvertised_model_hash
 from connito.validator.evaluator import load_model_from_path
 
 TOKENS = torch.randint(0, 128, (2, 12), generator=torch.Generator().manual_seed(1))
@@ -208,4 +207,16 @@ def test_validators_without_a_winner_commit_one_hash(family_name, tmp_path):
     first, second = (load_file(str(shard)) for shard in shards)
     assert any(not torch.equal(first[k], second[k]) for k in first)
 
-    assert unadvertised_model_hash(shards[0]) == unadvertised_model_hash(shards[1])
+    commits = [run._round_commit({}, shard) for shard in shards]
+    assert commits[0] == commits[1] and commits[0].hf_revision is None
+    # A revision without a hash advertises nothing either.
+    assert run._round_commit({"revision": "abc"}, shards[0]) == commits[0]
+
+
+def test_a_published_baseline_is_advertised_and_taken(tmp_path):
+    published = {"revision": "0123456789abcdef", "model_hash": "feed", "round_id": 1, "uid": 2}
+
+    assert run._round_commit(published, tmp_path / "never_read.safetensors") == run.RoundCommit(
+        "feed", "0123456789abcdef",
+    )
+    assert published == {}

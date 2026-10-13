@@ -409,13 +409,16 @@ def test_the_rollback_reads_no_file(config, gates, lock, model, monkeypatch) -> 
 # --- the trigger ----------------------------------------------------------------------
 
 
-def _poll(config, gates, lock, *, model, round_ref=None):
+def _poll(config, gates, lock, *, model, round_ref=None, state=None):
+    """The loop's poll; the state it holds if that moved, else None."""
     eval_window, merge = gates
-    return run._maybe_switch_task(
-        config, eval_model=model,
+    state = state or run.TaskScopedState(eval_model=model, base_shard=Path("old.safetensors"))
+    switched = run._maybe_switch_task(
+        config, state,
         eval_window_active=eval_window, merge_phase_active=merge,
         round_ref=round_ref or RoundRef(), gpu_eval_lock=lock,
     )
+    return state if switched else None
 
 
 @pytest.fixture
@@ -446,6 +449,19 @@ def test_the_owner_naming_another_task_switches_to_it(config, gates, lock, model
     assert state is not None and state.base_shard.name == "model_expgroup_7.safetensors"
     assert config.task.expert_group_name == TARGET
     assert materialized == [(TARGET, config.task.base_path)]
+
+
+def test_a_switch_moves_the_loops_state_in_place(config, gates, lock, model, owner) -> None:
+    """Every later round freezes on, and every no-winner commit hashes, the state's base shard."""
+    owner(active=TARGET, bundle=TARGET)
+    published = {"revision": "abc", "model_hash": "h"}  # the previous task's publish thread may still write here
+    state = run.TaskScopedState(eval_model=model, base_shard=Path("old.safetensors"), baseline_ref=published)
+
+    assert _poll(config, gates, lock, model=model, state=state) is state
+
+    assert state.base_shard == Path(config.ckpt.checkpoint_path) / "pretrained" / "model_expgroup_7.safetensors"
+    assert state.baseline_ref == {} and state.baseline_ref is not published
+    assert state.eval_model is model
 
 
 def test_the_round_in_flight_is_dropped_with_its_task(config, gates, lock, model, owner) -> None:
@@ -496,9 +512,11 @@ def test_a_failed_switch_keeps_the_current_task_and_model(config, gates, lock, m
     monkeypatch.setattr(run, "save_residual_shard", boom)
     round_ref = _round_in_flight(gates)
     spec = residual_shapes(config)
+    state = run.TaskScopedState(eval_model=model, base_shard=Path("old.safetensors"))
 
-    assert _poll(config, gates, lock, model=model, round_ref=round_ref) is None
+    assert _poll(config, gates, lock, model=model, round_ref=round_ref, state=state) is None
 
+    assert state.base_shard == Path("old.safetensors")
     assert config.task.expert_group_name == SHIPPED
     assert worker._eval_base_model is model
     assert _spec(model) == spec
