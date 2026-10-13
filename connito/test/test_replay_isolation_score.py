@@ -149,7 +149,8 @@ def _row(length: int) -> dict[str, torch.Tensor]:
 @pytest.fixture
 def worker_env(monkeypatch) -> SimpleNamespace:
     env = SimpleNamespace(loaders=[], evaluated=[], miner_kwargs=[], replay_rows=[_row(5), _row(3)],
-                          task_baseline=BASELINE, replay_baseline=BASELINE_REPLAY, logger=MagicMock())
+                          task_baseline=BASELINE, replay_baseline=BASELINE_REPLAY, replay_nan_batches=0,
+                          logger=MagicMock())
 
     def _get_dataloader(**kw):
         env.loaders.append(kw["replay"])
@@ -158,10 +159,10 @@ def worker_env(monkeypatch) -> SimpleNamespace:
     def _evaluate(step, model, batches, *a, **kw):
         env.evaluated.append(batches)
         if batches == [TASK]:
-            return {"val_loss": env.task_baseline}
+            return {"val_loss": env.task_baseline, "nan_batches": 0}
         if isinstance(env.replay_baseline, Exception):
             raise env.replay_baseline
-        return {"val_loss": env.replay_baseline}
+        return {"val_loss": env.replay_baseline, "nan_batches": env.replay_nan_batches}
 
     def _evaluate_one_miner(**kw):
         env.miner_kwargs.append(kw)
@@ -213,7 +214,7 @@ def _warned(env, event: str) -> bool:
     return any(call.args and call.args[0] == event for call in env.logger.warning.call_args_list)
 
 
-GATE_OFF = "bg-eval: no replay source or no c4 rows; isolation gate off"
+GATE_OFF = "bg-eval: task has no replay source; isolation gate off"
 
 
 def test_both_baselines_are_measured_once_per_round_and_handed_to_every_miner(worker_env):
@@ -234,32 +235,19 @@ def test_the_replay_split_is_batched_within_the_tasks_sequence_length(worker_env
 
 
 def test_a_task_without_a_replay_source_turns_the_gate_off(worker_env):
-    (kw,) = _run_round(_worker(replay_source=False), _round(), worker_env)
+    round_obj = _round()
+    (kw,) = _run_round(_worker(replay_source=False), round_obj, worker_env)
 
+    assert round_obj.baseline_fallback is False  # the round still scores and publishes normally
     assert worker_env.loaders == [False]
     assert (kw["replay_batches"], kw["baseline_replay_loss"]) == (None, None)
     assert _warned(worker_env, GATE_OFF)
 
 
-def test_an_empty_c4_split_turns_the_gate_off_with_the_same_warning(worker_env):
-    worker_env.replay_rows = []
-    (kw,) = _run_round(_worker(), _round(), worker_env)
-
-    assert kw["baseline_replay_loss"] is None
-    assert _warned(worker_env, GATE_OFF)
-
-
-def test_a_non_finite_replay_baseline_turns_the_gate_off(worker_env):
-    worker_env.replay_baseline = math.inf
-    (kw,) = _run_round(_worker(), _round(), worker_env)
-
-    assert (kw["baseline_loss"], kw["baseline_replay_loss"]) == (BASELINE, None)
-
-
 def test_a_round_never_inherits_the_previous_rounds_replay_baseline(worker_env):
     worker = _worker()
     _run_round(worker, _round(100), worker_env)
-    worker_env.replay_baseline = math.inf
+    worker.config.task.exp.data.dataset_sources[1].replay = False  # the next task has no replay source
     (kw,) = _run_round(worker, _round(101), worker_env)
 
     assert kw["baseline_replay_loss"] is None
@@ -285,12 +273,16 @@ def test_a_round_on_the_fallback_baseline_is_flagged_and_counted(worker_env, mon
     assert _fallback_counter()._value.get() == before + 1
 
 
-@pytest.mark.parametrize("task_baseline, replay_baseline", [
-    (math.inf, BASELINE_REPLAY),        # every score would be inf, and q15 would publish
-    (BASELINE, RuntimeError("oom")),   # no c4 check this round, so nothing is published from it
-])
-def test_an_unusable_baseline_takes_the_fallback(worker_env, task_baseline, replay_baseline):
-    worker_env.task_baseline, worker_env.replay_baseline = task_baseline, replay_baseline
+@pytest.mark.parametrize("unusable", [
+    {"task_baseline": math.inf},               # every score would be inf, and q15 would publish
+    {"replay_baseline": RuntimeError("oom")},  # from here on, the c4 check cannot run this round
+    {"replay_rows": []},
+    {"replay_baseline": math.inf},
+    {"replay_nan_batches": 1},
+], ids=["task-baseline-inf", "replay-baseline-raises", "empty-c4-split", "replay-baseline-inf", "replay-nan-batches"])
+def test_an_unusable_baseline_takes_the_fallback(worker_env, unusable):
+    for name, value in unusable.items():
+        setattr(worker_env, name, value)
     round_obj = _round()
     (kw,) = _run_round(_worker(), round_obj, worker_env)
 

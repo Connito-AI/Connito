@@ -401,26 +401,26 @@ class BackgroundEvalWorker(threading.Thread):
             self._cached_batches = None
             self._fall_back(round_obj, "dataloader build exhausted retries", last_error)
             return
-        if not self._replay_batches:
-            logger.warning("bg-eval: no replay source or no c4 rows; isolation gate off", round_id=round_obj.round_id)
+        if not has_replay:
+            logger.warning("bg-eval: task has no replay source; isolation gate off", round_id=round_obj.round_id)
 
-        def _baseline(batches: list, max_batches: int | None) -> float:
+        def _baseline(batches: list, max_batches: int | None) -> dict[str, float]:
             with self.gpu_eval_lock:
-                metrics = evaluate_model(0, self._eval_base_model, batches, self.device, max_batches, None)
-            return float(metrics.get("val_loss", 100))
+                return evaluate_model(0, self._eval_base_model, batches, self.device, max_batches, None)
 
+        # A task with a replay source whose c4 check cannot run publishes nothing: each case raises into the fallback.
         try:
-            self._loaded_baseline_loss = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
+            if has_replay and not self._replay_batches:
+                raise ValueError("the c4 replay split is empty")
+            task = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
+            self._loaded_baseline_loss = float(task.get("val_loss", 100))
             if not math.isfinite(self._loaded_baseline_loss):
                 raise ValueError("task baseline is not finite")  # every score would be inf, and q15 would publish
-            if self._replay_batches:
+            if has_replay:
                 replay = await asyncio.to_thread(_baseline, self._replay_batches, None)
-                if math.isfinite(replay):
-                    self._loaded_baseline_replay_loss = replay
-                else:
-                    logger.warning(
-                        "bg-eval: replay baseline not finite; isolation gate off", round_id=round_obj.round_id,
-                    )
+                if not math.isfinite(replay["val_loss"]) or replay.get("nan_batches", 0) > 0:
+                    raise ValueError("the replay baseline has non-finite batches")
+                self._loaded_baseline_replay_loss = float(replay["val_loss"])
             # Feeds the dashboard's baseline trend. Only the measured path
             # publishes: both fallbacks park the value at 100.0, and a
             # sentinel in the series reads as a real regression.
