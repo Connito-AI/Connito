@@ -120,6 +120,13 @@ VALIDATOR_MINER_VAL_LOSS = Gauge(
     "Per-miner validation loss measured against this validator's eval set",
     ["miner_uid"],
 )
+# Per-miner c4 replay loss minus the round base's: the value the isolation gate
+# compares with `max_replay_loss_increase`.
+VALIDATOR_MINER_REPLAY_LOSS_INCREASE = Gauge(
+    "validator_miner_replay_loss_increase",
+    "Per-miner c4 replay loss minus the round base's replay loss",
+    ["miner_uid"],
+)
 # Round-level baseline loss: this validator's eval loss against the
 # round's global model, computed once per round at freeze. Single value
 # (no labels) — the latest write wins. Distinct from
@@ -405,6 +412,7 @@ EvalFailureReason = Literal[
     "download_failed",
     "statedict_parse_failed",
     "repo_unavailable",
+    "replay_loss_increase",
 ]
 _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
@@ -412,7 +420,7 @@ _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "no_chain_commit", "signature_invalid", "hash_mismatch",
     "bad_residual_shard", "non_finite_loss",
     "download_failed", "statedict_parse_failed",
-    "repo_unavailable",
+    "repo_unavailable", "replay_loss_increase",
 })
 
 # Stable integer codes surfaced by VALIDATOR_MINER_EVAL_STATUS. Treat as a
@@ -435,6 +443,7 @@ EVAL_STATUS_CODES: dict[int, str] = {
     12: "repo_unavailable",
     13: "incomplete_expert_set",  # retired with expert groups; never reused
     14: "bad_residual_shard",
+    15: "replay_loss_increase",
     99: "unknown",
 }
 _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
@@ -450,6 +459,7 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "rpc": 11,
     "repo_unavailable": 12,
     "bad_residual_shard": 14,
+    "replay_loss_increase": 15,
     # Legacy aliases — fold into the closest miner-facing code so old
     # call sites continue producing meaningful status values.
     "corrupt": 2,

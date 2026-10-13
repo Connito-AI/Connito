@@ -19,6 +19,7 @@ from connito.shared.helper import (
 )
 from connito.shared.telemetry import (
     EvalFailureReason,
+    VALIDATOR_MINER_REPLAY_LOSS_INCREASE,
     VALIDATOR_MINER_VAL_LOSS,
     inc_eval_failure,
     set_miner_eval_status,
@@ -631,6 +632,9 @@ MAX_CONCURRENT_DOWNLOADS = 4
 EVAL_WORKERS = 1
 DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
+# Real (unpadded) tokens in the c4 replay split: about 214 c4 rows, so the gate's paired difference
+# is stable to about 0.002, ten times below its tolerance.
+REPLAY_EVAL_TOKENS = 65_536
 # ------------------------------------------------------------------------------
 
 # def load_model_from_path(path: str, base_model, device: torch.device) -> nn.Module:
@@ -733,6 +737,7 @@ def _evaluate_on_fresh_loader_sync(
             seed=combinded_seed,
             rank=0,
             world_size=config.dataloader.world_size,
+            replay=False,
         )
     try:
         @track_eval_latency()
@@ -764,6 +769,8 @@ def evaluate_one_miner_sync(
     rank: int | None = None,
     deadline_monotonic: float | None = None,
     cached_batches: list | None = None,
+    replay_batches: list | None = None,
+    baseline_replay_loss: float | None = None,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
 
@@ -788,6 +795,10 @@ def evaluate_one_miner_sync(
     caller's `with` block then unwinds and releases the lock — covers
     the case where the eval genuinely stalls on GPU and `wait_for`
     cancellation alone wouldn't recover.
+
+    With `replay_batches` and `baseline_replay_loss`, the same model is also
+    scored on c4 replay; a rise above `max_replay_loss_increase` sets
+    `val_loss` to inf, so the miner scores 0.
     """
     try:
         gc.collect()
@@ -815,6 +826,23 @@ def evaluate_one_miner_sync(
                 torch.cuda.empty_cache()
 
         val_loss = float(metrics.get("val_loss", 100))
+        replay_increase = None
+        if replay_batches and baseline_replay_loss is not None:
+            replay = evaluate_model(step, miner_model, replay_batches, device, None, rank,
+                                    deadline_monotonic=deadline_monotonic)
+            replay_increase = float(replay["val_loss"]) - baseline_replay_loss
+            try:
+                VALIDATOR_MINER_REPLAY_LOSS_INCREASE.labels(miner_uid=str(int(uid))).set(replay_increase)
+            except Exception:
+                pass
+        gated = replay_increase is not None and replay_increase > config.evaluation.max_replay_loss_increase
+        if gated:
+            logger.info(
+                "evaluate_one_miner: c4 replay loss rose past the tolerance; scoring 0",
+                uid=int(uid), task_loss=round(val_loss, 4), replay_loss_increase=round(replay_increase, 4),
+                tolerance=config.evaluation.max_replay_loss_increase, round_id=round_id,
+            )
+            val_loss = float("inf")
         delta = max(0.0, baseline_loss - val_loss)
         # `score` is the per-round delta-based signal stored on
         # `MinerEvalJob` and recorded in `round.scores` by the caller via
@@ -836,7 +864,9 @@ def evaluate_one_miner_sync(
         # naturally produce a 0 ranking score — but the gauge lets the
         # gateway distinguish "evaluated and clean" from "evaluated and the
         # eval blew up numerically", which the failure Counter doesn't.
-        if math.isfinite(val_loss):
+        if gated:
+            set_miner_eval_status(int(uid), "replay_loss_increase")
+        elif math.isfinite(val_loss):
             set_miner_eval_status(int(uid), None)
         else:
             set_miner_eval_status(int(uid), "non_finite_loss")
@@ -848,6 +878,7 @@ def evaluate_one_miner_sync(
             baseline_loss=round(baseline_loss, 4),
             delta=round(delta, 4),
             score=round(score, 6),
+            replay_loss_increase=None if replay_increase is None else round(replay_increase, 4),
             round_id=round_id,
         )
         return MinerEvalJob(

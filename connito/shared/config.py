@@ -16,6 +16,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeFloat,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -1162,7 +1163,8 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n",
+        "max_replay_loss_increase",
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
@@ -1171,6 +1173,8 @@ class EvalCfg(BaseConfig):
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
+    # c4 isolation gate: a miner whose replay loss rises more than this above the base's scores 0.
+    max_replay_loss_increase: NonNegativeFloat = 0.02
     # Round-group construction scheme. When true, Round.freeze() partitions
     # the roster into validation Groups A (3) / B (10) / C (17) with
     # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1

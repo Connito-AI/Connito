@@ -16,9 +16,11 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -37,6 +39,7 @@ from connito.shared.telemetry import (
 )
 from connito.validator.evaluator import (
     EVAL_MAX_BATCHES,
+    REPLAY_EVAL_TOKENS,
     cleanup_non_top_submissions,
     evaluate_one_miner_sync,
 )
@@ -70,6 +73,11 @@ EVAL_DEADLINE_GRACE_SEC = 30.0
 DATALOADER_BUILD_RETRY_DELAYS_SEC: tuple[float, ...] = (0.0, 10.0, 30.0)
 
 logger = structlog.get_logger(__name__)
+
+
+class RoundBatches(NamedTuple):
+    task: list
+    replay: list | None  # None when the task has no replay source
 
 
 class BackgroundEvalWorker(threading.Thread):
@@ -115,6 +123,10 @@ class BackgroundEvalWorker(threading.Thread):
         # → same batches, so per-miner re-streaming was wasted work AND
         # the trigger for the HF-stall lock-leak.
         self._cached_batches: list | None = None
+        # The c4 replay split and the base's loss on it, for the isolation gate; both
+        # None when the task has no replay source or the replay baseline is not finite.
+        self._replay_batches: list | None = None
+        self._loaded_baseline_replay_loss: float | None = None
         # Stuck-lock detection: incremented every iteration that observes
         # `gpu_eval_lock` held at the top-of-loop assertion, reset to 0
         # on any successful (or even attempted) eval iteration. When the
@@ -245,6 +257,7 @@ class BackgroundEvalWorker(threading.Thread):
                 del self._eval_base_model
                 self._eval_base_model = None
                 self._cached_batches = None
+                self._replay_batches = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -296,7 +309,7 @@ class BackgroundEvalWorker(threading.Thread):
         """
         # Lazy imports keep this module loadable without the heavy
         # datasets/pandas chain at module-import time (helps tests).
-        from connito.shared.dataloader import get_dataloader, materialize_batches
+        from connito.shared.dataloader import get_dataloader, materialize_batches, materialize_by_tokens
         from connito.shared.evaluate import evaluate_model
 
         # Drop any previous round's cached batches before loading the new
@@ -304,6 +317,8 @@ class BackgroundEvalWorker(threading.Thread):
         # for a full 50-batch window — leaking it across rounds compounds
         # under restart-replay scenarios.
         self._cached_batches = None
+        self._replay_batches = None
+        self._loaded_baseline_replay_loss = None
         self._expected = None
 
         def _load() -> None:
@@ -343,18 +358,27 @@ class BackgroundEvalWorker(threading.Thread):
         # wedges) typically resolve in seconds; bounded retry keeps the
         # round in normal scoring mode without dragging it into
         # degraded mode on the first failed attempt.
-        def _build_and_materialize() -> list:
-            dl = get_dataloader(
+        data = self.config.task.exp.data
+        has_replay = any(src.replay for src in data.dataset_sources or [])
+        if not has_replay:
+            logger.warning("bg-eval: task has no replay source; isolation gate off", round_id=round_obj.round_id)
+
+        def _loader(replay: bool):
+            return get_dataloader(
                 config=self.config,
                 tokenizer=self.tokenizer,
                 seed=round_obj.seed,
                 rank=0,
                 world_size=self.config.dataloader.world_size,
+                replay=replay,
             )
-            try:
-                return materialize_batches(dl, EVAL_MAX_BATCHES)
-            finally:
-                del dl
+
+        def _build_and_materialize() -> RoundBatches:
+            return RoundBatches(
+                task=materialize_batches(_loader(False), EVAL_MAX_BATCHES),
+                replay=(materialize_by_tokens(_loader(True), REPLAY_EVAL_TOKENS, data.sequence_length)
+                        if has_replay else None),
+            )
 
         last_error: Exception | None = None
         for attempt, delay in enumerate(DATALOADER_BUILD_RETRY_DELAYS_SEC):
@@ -367,7 +391,7 @@ class BackgroundEvalWorker(threading.Thread):
                 )
                 await asyncio.sleep(delay)
             try:
-                self._cached_batches = await asyncio.to_thread(_build_and_materialize)
+                self._cached_batches, self._replay_batches = await asyncio.to_thread(_build_and_materialize)
                 last_error = None
                 break
             except Exception as e:
@@ -390,16 +414,21 @@ class BackgroundEvalWorker(threading.Thread):
             self._loaded_round_id = round_obj.round_id
             return
 
-        def _baseline() -> float:
+        def _baseline(batches: list, max_batches: int | None) -> float:
             with self.gpu_eval_lock:
-                metrics = evaluate_model(
-                    0, self._eval_base_model, self._cached_batches,
-                    self.device, EVAL_MAX_BATCHES, None,
-                )
+                metrics = evaluate_model(0, self._eval_base_model, batches, self.device, max_batches, None)
             return float(metrics.get("val_loss", 100))
 
         try:
-            self._loaded_baseline_loss = await asyncio.to_thread(_baseline)
+            self._loaded_baseline_loss = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
+            if self._replay_batches:
+                replay = await asyncio.to_thread(_baseline, self._replay_batches, None)
+                if math.isfinite(replay):
+                    self._loaded_baseline_replay_loss = replay
+                else:
+                    logger.warning(
+                        "bg-eval: replay baseline not finite; isolation gate off", round_id=round_obj.round_id,
+                    )
             # Feeds the dashboard's baseline trend. Only the measured path
             # publishes: both fallbacks park the value at 100.0, and a
             # sentinel in the series reads as a real regression.
@@ -413,9 +442,12 @@ class BackgroundEvalWorker(threading.Thread):
             "bg-eval: round snapshot loaded",
             round_id=round_obj.round_id,
             baseline_loss=round(self._loaded_baseline_loss or 0.0, 4),
+            baseline_replay_loss=self._loaded_baseline_replay_loss,
             cached_batches=(
                 len(self._cached_batches) if self._cached_batches is not None else 0
             ),
+            replay_batches=len(self._replay_batches or []),
+            replay_tokens=sum(int(b["attention_mask"].sum()) for b in self._replay_batches or []),
         )
 
     async def _evaluate_one(self, round_obj, *, uid: int, hotkey: str) -> None:
@@ -534,6 +566,8 @@ class BackgroundEvalWorker(threading.Thread):
                     round_id=round_obj.round_id,
                     deadline_monotonic=deadline,
                     cached_batches=self._cached_batches,
+                    replay_batches=self._replay_batches,
+                    baseline_replay_loss=self._loaded_baseline_replay_loss,
                 )
 
         try:
@@ -637,6 +671,8 @@ class BackgroundEvalWorker(threading.Thread):
         self._loaded_round_id = None
         self._loaded_baseline_loss = None
         self._cached_batches = None
+        self._replay_batches = None
+        self._loaded_baseline_replay_loss = None
         self._stuck_lock_streak = 0
         try:
             VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS.set(0)
