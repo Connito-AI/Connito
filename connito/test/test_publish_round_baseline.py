@@ -436,3 +436,27 @@ def test_cleanup_protects_no_winner_on_the_fallback_baseline():
 
     round_obj.baseline_fallback = True
     assert round_obj.baseline_winner_uid() is None
+
+
+def test_cleanup_drops_a_proven_miner_that_did_not_beat_the_baseline_and_keeps_the_q15_winner(tmp_path):
+    """Cleanup ranks through `baseline_winner_uid`, so it must apply the same score filter as publish."""
+    from connito.validator.evaluator import cleanup_non_top_submissions
+    from connito.validator.round import Round
+
+    sub = tmp_path / "miner_submission"
+    uid_to_hotkey = {n: f"hk{n}" for n in (1, 2, 3, 4, 7)}
+    for hk in uid_to_hotkey.values():
+        _submission(sub, hk, 550)
+    round_obj = Round(
+        round_id=9000, seed="s", validator_miner_assignment={}, background_uids=tuple(uid_to_hotkey),
+        uid_to_hotkey=dict(uid_to_hotkey), base_shard=Path("base.safetensors"),
+        # uid 7 has the best record but did not beat the baseline; uid 4 is the best qualifying record.
+        prior_avg_scores={1: 0.0, 2: 0.0, 3: 0.0, 4: 2.0, 7: 3.0},
+    )
+    for uid, score in {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6, 7: 0.0}.items():
+        round_obj.mark_scored(uid, score=score, val_loss=1.0)
+
+    cleanup_non_top_submissions(round_obj=round_obj, submission_dir=sub, top_k=3)
+
+    survivors = {parse_dynamic_filename(p.name)["hotkey"] for p in sub.glob("*.safetensors")}
+    assert survivors == {"hk1", "hk2", "hk3", "hk4"}

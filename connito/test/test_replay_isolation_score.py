@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import math
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -15,6 +16,7 @@ import pytest
 import torch
 
 from connito.shared.config import DatasetSourceCfg
+from connito.shared.evaluate import EvalDeadlineExceeded
 from connito.validator import background_eval_worker as bew
 from connito.validator import evaluator
 from connito.validator.evaluator import MinerEvalJob, evaluate_one_miner_sync
@@ -99,6 +101,41 @@ def test_without_a_replay_split_or_baseline_the_gate_is_off(monkeypatch, statuse
 
     assert calls == [TASK]
     assert job.val_loss == 2.5
+
+
+def test_the_replay_eval_honours_the_miners_deadline(monkeypatch, statuses):
+    """A replay eval past the deadline unwinds like a task eval does, and the miner is not scored."""
+    def _evaluate(step, model, batches, *a, deadline_monotonic=None, **kw):
+        if batches is REPLAY and deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
+            raise EvalDeadlineExceeded("past the deadline")
+        return {"val_loss": 2.5, "nan_batches": 0}
+
+    monkeypatch.setattr(evaluator, "load_model_from_path", lambda *a: MagicMock())
+    monkeypatch.setattr(evaluator, "track_eval_latency", lambda: lambda fn: fn)
+    monkeypatch.setattr(evaluator, "evaluate_model", _evaluate)
+    job = evaluate_one_miner_sync(
+        config=SimpleNamespace(evaluation=SimpleNamespace(max_replay_loss_increase=TOLERANCE)),
+        model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
+        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
+        deadline_monotonic=0.0, cached_batches=TASK, replay_batches=REPLAY, baseline_replay_loss=BASELINE_REPLAY,
+    )
+
+    assert job is None
+
+
+def test_without_cached_batches_the_task_loader_leaves_out_replay(monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(evaluator, "get_dataloader", lambda **kw: seen.append(kw["replay"]) or TASK)
+    monkeypatch.setattr(evaluator, "load_model_from_path", lambda *a: MagicMock())
+    monkeypatch.setattr(evaluator, "track_eval_latency", lambda: lambda fn: fn)
+    monkeypatch.setattr(evaluator, "evaluate_model", lambda *a, **kw: {"val_loss": 2.5, "nan_batches": 0})
+    evaluate_one_miner_sync(
+        config=SimpleNamespace(dataloader=SimpleNamespace(world_size=1)),
+        model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
+        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
+    )
+
+    assert seen == [False]
 
 
 # --- the worker measures both baselines once per round ---------------------------------------------

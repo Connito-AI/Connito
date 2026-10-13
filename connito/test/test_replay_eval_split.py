@@ -44,6 +44,23 @@ def test_the_replay_flag_picks_the_sources(two_sources, replay, expected):
     assert seen == expected
 
 
+@pytest.mark.parametrize("replay, kept", [(False, True), (True, False)])
+def test_a_legacy_source_without_the_flag_counts_as_task_data(monkeypatch, replay, kept):
+    monkeypatch.setattr(
+        dataloader, "load_dataset",
+        lambda path, **kw: {"train": Dataset.from_dict({"text": TEXTS[path]}).to_iterable_dataset()},
+    )
+    data = SimpleNamespace(sequence_length=8, dataset_sources=None, dataset_name="task/pmc")
+    config = SimpleNamespace(task=SimpleNamespace(exp=SimpleNamespace(data=data)))
+
+    if kept:
+        ds = dataloader.DefaultStreamingTorchDataset.get_tokenised_dataset(config=config, tokenizer=None, replay=replay)
+        assert [example["text"] for example in ds.hf_iterable] == TEXTS["task/pmc"]
+    else:
+        with pytest.raises(ValueError, match="No dataset sources"):
+            dataloader.DefaultStreamingTorchDataset.get_tokenised_dataset(config=config, tokenizer=None, replay=replay)
+
+
 def _row(length: int, width: int = 24, seed: int = 0) -> dict[str, torch.Tensor]:
     """One right-padded row, batched as the eval loader yields it."""
     ids = torch.randint(1, 128, (1, width), generator=torch.Generator().manual_seed(seed))
