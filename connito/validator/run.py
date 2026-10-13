@@ -645,12 +645,11 @@ def _maybe_switch_task(
         if bundle is None:
             raise RuntimeError(f"no usable bundle for {active.name!r}")
         materialize_task(bundle, config.task.base_path)
-        # Close the window so the worker claims no more miners; `_switch_task`
-        # takes the lock, so a miner eval in flight finishes before the
-        # residual is replaced. Only on success is the round dropped; a failed
-        # switch reopens the window and the round carries on.
+        # No new claims, and the eval in flight ends before config moves: the download worker reads live config.
         was_open = eval_window_active.is_set()
         eval_window_active.clear()
+        with gpu_eval_lock:
+            pass
         try:
             state = _switch_task(
                 config, bundle.name, eval_model=eval_model,

@@ -300,6 +300,23 @@ def test_with_the_lock_held_the_switch_cannot_touch_the_model(config, gates, loc
     assert all(router.weight.shape[0] == 2 for router in _routers(model))
 
 
+def test_config_stays_on_the_old_task_while_an_eval_holds_the_lock(config, gates, lock, model, owner) -> None:
+    """The download worker names shards from live config; moving it early zeroes honest miners of the round."""
+    owner(active=TARGET, bundle=TARGET)
+    lock.acquire()
+    poll = threading.Thread(target=_poll, args=(config, gates, lock), kwargs={"model": model})
+    poll.start()
+    poll.join(timeout=1.0)
+    try:
+        assert poll.is_alive()
+        assert (config.task.expert_group_name, config.task.exp.group_id) == (SHIPPED, 4)
+    finally:
+        lock.release()
+    poll.join(timeout=30)
+
+    assert config.task.exp.group_id == 7
+
+
 def test_only_the_reinstall_and_the_write_hold_the_lock(config, gates, lock, model, monkeypatch) -> None:
     """The worker's rule: the lock covers what touches the model, never the bundle, the data or the config."""
     held: dict[str, bool] = {}
