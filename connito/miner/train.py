@@ -183,13 +183,6 @@ def setup_training(
     logger.debug("init - optimizer")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"trainable params: {len(trainable_params)} / total: {sum(1 for _ in model.parameters())}")
-    if len(trainable_params) == 0:
-        sample_names = [name for name, _ in list(model.named_parameters())[:8]]
-        logger.warning(
-            "No trainable parameters found; the model has no residual experts (`.residual_` parameters).",
-            expert_group_id=config.task.exp.group_id,
-            sample_param_names=sample_names,
-        )
     # Optimizer state precision — config.opt.adamw_optim_bits picks how
     # exp_avg + exp_avg_sq are stored:
     #   32: torch.optim.AdamW (fp32 state, 8 bytes/param).

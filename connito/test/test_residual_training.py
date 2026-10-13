@@ -211,3 +211,8 @@ def test_accumulated_micro_batches_are_averaged(family_name, tmp_path, monkeypat
     assert seen.scheduler.last_epoch == 1
     mean = sum(loss for *_, loss in seen.losses) / 2
     assert seen.logged and seen.logged == pytest.approx([mean] * len(seen.logged))
+
+
+def test_a_model_with_no_residual_experts_is_refused():
+    with pytest.raises(ValueError, match="no residual experts"):
+        freeze_all_but_residual(torch.nn.Linear(2, 2))
