@@ -88,6 +88,9 @@ class RoundJournal:
     # reproducible from this file alone. Additive — `from_json` uses
     # `raw.get`, so an older journal reads as "" and the resume path refuses.
     base_shard: str = ""
+    # The round's baseline was the 100.0 fallback, so a resume must publish no
+    # winner from it either. Additive, read with `raw.get` like `seed`.
+    baseline_fallback: bool = False
     finalized: bool = False
     schema_version: int = SCHEMA_VERSION
 
@@ -145,6 +148,7 @@ class RoundJournal:
             },
             seed=str(raw.get("seed", "")),
             base_shard=str(raw.get("base_shard", "")),
+            baseline_fallback=bool(raw.get("baseline_fallback", False)),
             finalized=bool(raw.get("finalized", False)),
             schema_version=version,
         )

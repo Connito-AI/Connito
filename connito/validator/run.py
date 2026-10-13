@@ -480,6 +480,8 @@ def resume_open_round(
         resumed.freeze_zero_uids = set(journal.freeze_zero_uids)
         resumed.freeze_zero_hotkeys = dict(journal.freeze_zero_hotkeys)
         resumed.lifecycle_step = int(journal.lifecycle_step)
+        # Its scores were measured against 100.0; this process may set it later, never clear it.
+        resumed.baseline_fallback = journal.baseline_fallback
     resumed._persist_journal()  # noqa: SLF001
 
     round_ref.swap(new_current=resumed)

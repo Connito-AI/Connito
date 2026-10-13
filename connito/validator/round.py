@@ -614,6 +614,7 @@ class Round:
             "lifecycle_step": int(self.lifecycle_step),
             "seed": str(self.seed),
             "base_shard": str(self.base_shard),
+            "baseline_fallback": self.baseline_fallback,
             "finalized": False,
         }
 
