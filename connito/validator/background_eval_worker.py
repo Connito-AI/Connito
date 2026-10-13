@@ -356,8 +356,6 @@ class BackgroundEvalWorker(threading.Thread):
         # degraded mode on the first failed attempt.
         data = self.config.task.exp.data
         has_replay = any(src.replay for src in data.dataset_sources or [])
-        if not has_replay:
-            logger.warning("bg-eval: task has no replay source; isolation gate off", round_id=round_obj.round_id)
 
         def _loader(replay: bool):
             return get_dataloader(
@@ -403,6 +401,8 @@ class BackgroundEvalWorker(threading.Thread):
             self._cached_batches = None
             self._fall_back(round_obj, "dataloader build exhausted retries", last_error)
             return
+        if not self._replay_batches:
+            logger.warning("bg-eval: no replay source or no c4 rows; isolation gate off", round_id=round_obj.round_id)
 
         def _baseline(batches: list, max_batches: int | None) -> float:
             with self.gpu_eval_lock:
@@ -411,6 +411,8 @@ class BackgroundEvalWorker(threading.Thread):
 
         try:
             self._loaded_baseline_loss = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
+            if not math.isfinite(self._loaded_baseline_loss):
+                raise ValueError("task baseline is not finite")  # every score would be inf, and q15 would publish
             if self._replay_batches:
                 replay = await asyncio.to_thread(_baseline, self._replay_batches, None)
                 if math.isfinite(replay):
