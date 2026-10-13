@@ -20,6 +20,7 @@ import yaml
 
 from connito.miner import train
 from connito.shared.config import MinerConfig
+from connito.shared.evaluate import chunked_lm_loss
 
 SHIPPED = "exp_pmc_residual"
 TARGET = "exp_switch_target"
@@ -46,27 +47,32 @@ def config(tmp_path: Path) -> MinerConfig:
     cfg = MinerConfig.from_path(cfg_path, active_task=None, auto_update_config=True)
     cfg.model.precision = "fp32"                 # no autocast on CPU
     cfg.local_par.gradient_accumulation_steps = 1  # every batch is an inner step
-    cfg.log.metric_interval = 10**9              # no local evaluation
+    cfg.log.metric_interval = 10**9              # local evaluation at inner step 0 only
     cfg.ckpt.checkpoint_interval = None          # no checkpoint saves
     return cfg
 
 
 class _Tiny(torch.nn.Module):
+    """A causal LM in shape only: what `chunked_lm_loss` reads, `model(...).last_hidden_state` and `lm_head`."""
+
     def __init__(self) -> None:
         super().__init__()
-        self.lin = torch.nn.Linear(2, 2)
+        self.embed = torch.nn.Embedding(4, 2)
+        self.lm_head = torch.nn.Linear(2, 4)
 
     @property
     def device(self) -> torch.device:
-        return self.lin.weight.device
+        return self.lm_head.weight.device
 
-    def forward(self, x, labels=None):
-        logits = self.lin(x)
-        return SimpleNamespace(loss=logits.mean(), logits=logits)
+    def model(self, input_ids, attention_mask=None):
+        return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+    def forward(self, input_ids, labels=None):
+        return SimpleNamespace(loss=chunked_lm_loss(self, {"input_ids": input_ids, "labels": labels}), logits=None)
 
 
 def _batches(n: int) -> list[dict]:
-    return [{"x": torch.ones(1, 2), "labels": torch.ones(1, 2, dtype=torch.long)} for _ in range(n)]
+    return [{"input_ids": torch.tensor([[0, 1, 2]]), "labels": torch.tensor([[0, 1, 2]])} for _ in range(n)]
 
 
 @pytest.fixture

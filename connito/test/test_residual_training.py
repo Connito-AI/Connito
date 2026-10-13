@@ -43,8 +43,8 @@ def _model(name: str, dtype: torch.dtype = torch.bfloat16) -> torch.nn.Module:
     return model.train()
 
 
-def _batch() -> dict[str, torch.Tensor]:
-    ids = torch.randint(0, VOCAB, (3, 40), generator=torch.Generator().manual_seed(0))
+def _batch(seed: int = 0) -> dict[str, torch.Tensor]:
+    ids = torch.randint(0, VOCAB, (3, 40), generator=torch.Generator().manual_seed(seed))
     mask = torch.ones_like(ids)
     mask[0, 25:] = 0  # a short row
     mask[1, 1:] = 0   # a row that is all padding but its first token
@@ -110,3 +110,24 @@ def test_a_batch_with_no_labelled_token_gives_nan_as_the_full_loss_does(family_n
     with torch.no_grad():
         assert math.isnan(chunked_lm_loss(model, batch).item())
         assert math.isnan(model(**batch).loss.item())
+
+
+def test_evaluate_model_scores_what_the_full_logits_loss_scored(family_name, monkeypatch):
+    """Each batch's loss equals `model(**batch).loss` in the same autocast; a batch with no labels still drops out."""
+    model, full, scored, chunked = _model(family_name), [], [], evaluate.chunked_lm_loss
+
+    def both(model, batch):
+        full.append(model(**batch).loss.item())
+        scored.append(chunked(model, batch))
+        return scored[-1]
+
+    monkeypatch.setattr(evaluate, "chunked_lm_loss", both)
+    unlabelled = _batch(3) | {"labels": torch.full_like(_batch(3)["labels"], -100)}
+    batches = [_batch(0), _batch(1), _batch(2), unlabelled]
+
+    metrics = evaluate.evaluate_model(step=0, model=model, eval_dataloader=batches, device=torch.device("cpu"),
+                                      max_eval_batches=None)
+
+    assert [loss.item() for loss in scored[:3]] == pytest.approx(full[:3])
+    assert (metrics["scored_batches"], metrics["nan_batches"]) == (3, 1)
+    assert metrics["val_loss"] == pytest.approx(sum(full[:3]) / 3)
