@@ -155,7 +155,8 @@ def get_status(
 
     total_batch_size: int = 0
     if inner_opt_step is not None:
-        total_batch_size = config.task.exp.data.batch_size * config.local_par.world_size
+        par = config.local_par
+        total_batch_size = par.micro_batch_size * par.gradient_accumulation_steps * par.world_size
         total_samples = inner_opt_step * total_batch_size
         total_tokens = total_samples * config.task.exp.data.sequence_length
 

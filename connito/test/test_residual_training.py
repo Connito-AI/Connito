@@ -12,9 +12,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from transformers import AutoTokenizer
 
-from connito.miner import train
-from connito.shared import evaluate
+from connito.miner import train, train_helper
+from connito.shared import dataloader, evaluate
 from connito.shared import model as shared_model
 from connito.shared.config import MinerConfig, ResidualCfg
 from connito.shared.evaluate import chunked_lm_loss
@@ -154,7 +155,7 @@ def _miner_config(root: Path) -> MinerConfig:
 
 def _run_loop(model, batches, config: MinerConfig, monkeypatch, **stubs) -> SimpleNamespace:
     """Drive the real `train_worker` over `batches` with everything around the loop stubbed; record what it did."""
-    seen = SimpleNamespace(losses=[], logged=[])
+    seen = SimpleNamespace(losses=[], logged=[], rebuilt=[])
 
     def loss(model, batch):
         out = chunked_lm_loss(model, batch)
@@ -168,7 +169,7 @@ def _run_loop(model, batches, config: MinerConfig, monkeypatch, **stubs) -> Simp
     for name, stub in {
         "setup_training": lambda *a, **k: setup,
         "chunked_lm_loss": loss,
-        "get_dataloader": lambda *a, **k: [],
+        "get_dataloader": lambda *a, **k: seen.rebuilt.append(k["batch_size"]) or [],
         "setup_chain_worker": lambda config: (None, object(), None),
         "SystemStatePoller": lambda **k: SimpleNamespace(start=lambda: None, stop=lambda: None),
         "PhaseManager": lambda config, subtensor: None,
@@ -196,6 +197,7 @@ def test_the_training_loop_moves_only_the_residual_in_bf16(family_name, tmp_path
 
     assert [(on, dtype) for on, dtype, _ in seen.losses] == [(True, torch.bfloat16)] * 2
     assert seen.scheduler.last_epoch == 2
+    assert seen.rebuilt == [2]  # the next epoch's loader, at the miner's micro-batch
     after = dict([*model.named_parameters(), *model.named_buffers()])
     assert all(torch.equal(after[n].view(torch.uint8), t.view(torch.uint8)) for n, t in base.items())
     # down_proj moves at step 1; gate, up and the router follow at step 2.
@@ -213,6 +215,55 @@ def test_accumulated_micro_batches_are_averaged(family_name, tmp_path, monkeypat
     assert seen.logged and seen.logged == pytest.approx([mean] * len(seen.logged))
 
 
+# One error for each recovery branch: the network errors, and anything else naming an HF server error.
+@pytest.mark.parametrize("error", [ConnectionError("read timed out"), Exception("HF server error 503")])
+def test_a_network_error_in_local_eval_rebuilds_the_loader_at_the_miners_micro_batch(family_name, error, tmp_path,
+                                                                                    monkeypatch):
+    def offline(**kwargs):
+        raise error
+
+    monkeypatch.setattr(train.time, "sleep", lambda seconds: None)
+    seen = _run_loop(_model(family_name), [_batch(0)], _miner_config(tmp_path), monkeypatch,
+                     evaluate_model=offline, wait_till=lambda *a, **k: None)
+
+    assert seen.rebuilt == [2, 2]  # after the network error, then for the next epoch
+
+
 def test_a_model_with_no_residual_experts_is_refused():
     with pytest.raises(ValueError, match="no residual experts"):
         freeze_all_but_residual(torch.nn.Linear(2, 2))
+
+
+def test_the_train_loader_takes_the_miners_micro_batch_and_the_eval_loader_the_tasks(tiny_qwen_checkpoint, monkeypatch):
+    rows = [{"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}] * 4
+    monkeypatch.setattr(dataloader.DefaultStreamingTorchDataset, "get_tokenised_dataset",
+                        classmethod(lambda cls, **k: rows))
+    data = SimpleNamespace(world_size=1, rank=0, vali_fraction=0.1, per_device_train_batch_size=1, num_workers=0)
+    config = SimpleNamespace(task=SimpleNamespace(exp=SimpleNamespace(data=data)))
+    tokenizer = AutoTokenizer.from_pretrained(tiny_qwen_checkpoint)
+
+    def rows_per_batch(**kw) -> int:
+        return next(iter(dataloader.get_dataloader(config, tokenizer, **kw)))["input_ids"].shape[0]
+
+    assert (rows_per_batch(train=False), rows_per_batch(batch_size=2)) == (1, 2)
+
+
+def test_setup_training_loads_at_the_miners_micro_batch(family_name, tmp_path, monkeypatch):
+    config, seen = _miner_config(tmp_path), []
+    monkeypatch.setattr(train, "ExpertManager", lambda config: None)
+    monkeypatch.setattr(train, "load_model", lambda *a: (_model(family_name, draw_down=False), None))
+    monkeypatch.setattr(train, "get_dataloader", lambda config, **kw: seen.append(kw["batch_size"]) or [])
+
+    train.setup_training(config, 0, torch.device("cpu"), None, None, None, None)
+
+    assert seen == [2]
+    assert config.task.exp.data.per_device_train_batch_size == 1  # the validator's eval batch is untouched
+
+
+def test_tokens_per_step_count_every_accumulated_micro_batch(tmp_path):
+    config = _miner_config(tmp_path)
+    config.local_par.micro_batch_size, config.local_par.gradient_accumulation_steps = 3, 5
+
+    status = train_helper.get_status(config=config, step=0, training_time=0, total_training_time=0, inner_opt_step=2)
+
+    assert status["total_tokens"] == 2 * 3 * 5 * config.task.exp.data.sequence_length

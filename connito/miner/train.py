@@ -224,7 +224,8 @@ def setup_training(
     # === dataloader ===
     logger.debug("init - train dataloader")
     train_dataloader = get_dataloader(
-        config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+        config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer,
+        batch_size=config.local_par.micro_batch_size,
     )
 
     # === load checkpoint (if any) ===
@@ -537,7 +538,8 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         # Rebuild ONLY the dataloader to recover the network stream
                         logger.info("Rebuilding dataloader after network timeout...")
                         train_dataloader = get_dataloader(
-                            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+                            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer,
+                            batch_size=config.local_par.micro_batch_size,
                         )
                         break
                     else:
@@ -554,7 +556,8 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         # Rebuild ONLY the dataloader to recover the network stream
                         logger.info("Rebuilding dataloader after network timeout...")
                         train_dataloader = get_dataloader(
-                            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+                            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer,
+                            batch_size=config.local_par.micro_batch_size,
                         )
                         break
                     raise
@@ -696,7 +699,8 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
 
         logger.info("used up train dataloader, rebuilding for next epoch")
         train_dataloader = get_dataloader(
-            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer
+            config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer,
+            batch_size=config.local_par.micro_batch_size,
         )
 
     except KeyboardInterrupt:

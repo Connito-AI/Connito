@@ -558,6 +558,7 @@ def get_dataloader(
     train: bool = True,
     format_fn: Callable | None = None,
     data_collator: DataCollator | None = None,
+    batch_size: int | None = None,
 ) -> StatefulDataLoader:
     """
     Build a `StatefulDataLoader` over a streaming HF dataset, tokenized on the fly.
@@ -581,6 +582,8 @@ def get_dataloader(
     train : bool
         If True, returns a loader over the training split; else returns a loader for validation
         (or None if the dataset has no validation split).
+    batch_size : Optional[int]
+        Rows per batch; defaults to the task's `per_device_train_batch_size`, the validator's eval batch.
 
     Returns
     -------
@@ -620,7 +623,7 @@ def get_dataloader(
     loader = StatefulDataLoader(
         tokenised_dataset,  # split
         collate_fn=data_collator,
-        batch_size=config.task.exp.data.per_device_train_batch_size,
+        batch_size=batch_size or config.task.exp.data.per_device_train_batch_size,
         num_workers=num_workers,
     )
     return loader
