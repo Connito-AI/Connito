@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 import traceback
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 import bittensor
@@ -12,9 +11,8 @@ from torch import nn
 from connito.shared.app_logging import structlog
 from connito.shared.chain import (
     SignedModelHashChainCommit,
-    get_chain_commits,
 )
-from connito.shared.checkpoint_helper import compile_full_state_dict_from_path, load_checkpoint
+from connito.shared.checkpoint_helper import load_checkpoint
 from connito.shared.checkpoints import (
     ChainCheckpoints,
     ModelCheckpoint,
@@ -28,14 +26,12 @@ from connito.shared.hf_distribute import download_checkpoint_from_hf_with_timeou
 from connito.shared.cycle import (
     PhaseNames,
     get_blocks_from_previous_phase_from_api,
-    get_validator_seed_from_commit,
 )
 from connito.shared.expert_manager import (
     ExpertManager,
     ExpertAssignments
 )
-from connito.shared.memory import cleanup
-from connito.shared.helper import expert_group_shard_name, get_model_hash, get_nested_attr
+from connito.shared.helper import expert_group_shard_name, get_nested_attr
 from connito.shared.modeling.mycelia import get_base_model
 from connito.shared.modeling.residual import install_residual_experts
 from connito.shared.schema import verify_message
@@ -66,25 +62,6 @@ def _clear_download_targets(out_folder: Path, filenames: list[str]) -> None:
         (out_folder / filename).unlink(missing_ok=True)
 
 
-def _download_checkpoint_from_hf_with_timeout(
-    *,
-    repo_id: str,
-    revision: str,
-    filenames: list[str],
-    dest_dir: Path,
-    token_env_var: str | None,
-    timeout_sec: float | None,
-) -> None:
-    download_checkpoint_from_hf_with_timeout(
-        repo_id=repo_id,
-        revision=revision,
-        filenames=filenames,
-        dest_dir=dest_dir,
-        token_env_var=token_env_var or "HF_TOKEN",
-        timeout_sec=timeout_sec,
-    )
-
-
 def grad_hook(name):
     def h(grad):
         if grad is not None and not torch.isfinite(grad).all():
@@ -102,8 +79,7 @@ def get_model_from_checkpoint(
     # `load_global_checkpoint=False` lets a caller (currently: the validator
     # at cold start) build the base model without overlaying any on-disk
     # expert state. The pretrained backbone + experts from `get_base_model`
-    # are returned as-is; mid-cycle peer resync via `reload_model_inplace`
-    # is unaffected.
+    # are returned as-is.
     use_pretrained_only = bool(get_nested_attr(config, "ckpt.use_pretrained_only", False))
     resume = (
         get_nested_attr(config, "ckpt.resume_from_ckpt", False)
@@ -198,20 +174,9 @@ def fetch_model_from_chain_validator(
     wallet: bittensor.Wallet,
     expert_group_ids: list[int | str],
     expert_group_assignment: ExpertAssignments,
-    allowed_hotkeys: set[str] | None = None,
-    download_timeout_sec: float | None = None,
 ) -> dict | None:
     """
     Fetches a model from the chain validator if it's has the right commit format from the previous phase commits (validator_commit_1 & validator_commit_2) and newer than the current model.
-
-    When ``allowed_hotkeys`` is provided, chain checkpoints whose hotkey is not
-    in the set are dropped before download. Used by peer sync to require the
-    source be one of the assignment validators.
-
-    When ``download_timeout_sec`` is set, each per-checkpoint
-    ``download_checkpoint_from_hf`` call is bounded by that wall clock and a
-    timeout is treated as a download failure (retried/skipped to the next
-    candidate by the existing retry budget).
     """
     try:
         owner_hotkey = subtensor.get_subnet_owner_hotkey(netuid=config.chain.netuid)
@@ -222,22 +187,6 @@ def fetch_model_from_chain_validator(
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
         config=config, subtensor=subtensor, for_role="validator", owner_hotkey=owner_hotkey
     )
-
-    if allowed_hotkeys is not None:
-        before = len(chain_checkpoints.checkpoints)
-        kept = [
-            ckpt for ckpt in chain_checkpoints.checkpoints
-            if ckpt.hotkey is not None and ckpt.hotkey in allowed_hotkeys
-        ]
-        dropped = before - len(kept)
-        if dropped:
-            logger.info(
-                "fetch_model_from_chain_validator: dropped checkpoints not in allowed_hotkeys",
-                dropped=dropped,
-                kept=len(kept),
-                allowed_hotkey_count=len(allowed_hotkeys),
-            )
-        chain_checkpoints = ChainCheckpoints(checkpoints=kept)
 
     # --- Filter to only newer than current model ---
     if current_model_meta is not None:
@@ -286,29 +235,14 @@ def fetch_model_from_chain_validator(
                 _clear_download_targets(out_folder, filenames)
 
                 try:
-                    _download_checkpoint_from_hf_with_timeout(
+                    download_checkpoint_from_hf_with_timeout(
                         repo_id=chain_checkpoint.hf_repo_id,
                         revision=chain_checkpoint.hf_revision,
                         filenames=filenames,
                         dest_dir=out_folder,
-                        token_env_var=config.hf.token_env_var,
-                        timeout_sec=download_timeout_sec,
+                        token_env_var=config.hf.token_env_var or "HF_TOKEN",
+                        timeout_sec=None,
                     )
-                except FuturesTimeoutError:
-                    # The thread running download_checkpoint_from_hf cannot be
-                    # killed from Python — it stays orphaned until the OS-level
-                    # socket times out — but the main loop is freed and moves
-                    # on to the next candidate / retry, which is the whole
-                    # point of this guard.
-                    logger.warning(
-                        "Checkpoint download from HF timed out",
-                        uid=chain_checkpoint.uid,
-                        hotkey=chain_checkpoint.hotkey,
-                        hf_repo_id=chain_checkpoint.hf_repo_id,
-                        hf_revision=chain_checkpoint.hf_revision,
-                        timeout_sec=download_timeout_sec,
-                    )
-                    continue
                 except Exception as e:
                     logger.warning(
                         "Checkpoint download from HF failed",
@@ -364,153 +298,3 @@ def fetch_model_from_chain_validator(
 
             return None
 
-
-def reload_model_inplace(
-    config: ValidatorConfig,
-    global_model: nn.Module,
-    expert_manager: ExpertManager,
-    device: torch.device,
-    subtensor: bittensor.Subtensor,
-    wallet: bittensor.Wallet,
-) -> bool:
-    """
-    Pull the latest committed validator checkpoint from a peer and load it
-    into *global_model* in-place.  Called at the start of the next cycle
-    when this validator was excluded from the allreduce (no miner assigned,
-    or inf/nan gradients).  By then the participating validators have
-    finished merge + optimizer + save + committed new hashes via
-    validator_commit_1/2, so build_chain_checkpoints_from_previous_phase
-    finds the fresh model.
-    Returns True on success, False on any failure (caller keeps stale model).
-    """
-    logger.info("Pulling model from peer validator to re-sync excluded validator")
-    t_start = time.monotonic()
-
-    # Restrict the peer-sync source set to the same validator pool used by
-    # validator-miner assignment (validators that committed a
-    # ValidatorChainCommit for this expert_group). Any chain entry from a
-    # non-assignment hotkey — e.g. a stake-0 / unverified commit — is
-    # rejected before the HF download so a bad source can't stall the cycle.
-    try:
-        commits = get_chain_commits(config, subtensor)
-        validator_seeds = get_validator_seed_from_commit(config, commits)
-        allowed_hotkeys = set(validator_seeds.keys())
-    except Exception as e:
-        logger.warning(
-            "Peer sync: could not resolve assignment validator whitelist; aborting",
-            error=str(e),
-        )
-        return False
-
-    if not allowed_hotkeys:
-        logger.warning(
-            "Peer sync: no assignment validators found on chain; aborting"
-        )
-        return False
-
-    download_timeout_sec = float(config.evaluation.per_miner_download_timeout_sec)
-
-    logger.info(
-        "Peer sync: fetching latest checkpoint from chain",
-        primary_dir=str(config.ckpt.validator_checkpoint_path),
-        secondary_dir=str(config.ckpt.checkpoint_path),
-        allowed_hotkey_count=len(allowed_hotkeys),
-        download_timeout_sec=download_timeout_sec,
-    )
-    t_fetch = time.monotonic()
-    try:
-        fetch_model_from_chain_validator(
-            current_model_meta=None,  # None = always try; no version gate
-            config=config,
-            subtensor=subtensor,
-            wallet=wallet,
-            expert_group_ids=[config.task.exp.group_id],
-            expert_group_assignment=expert_manager.expert_group_assignment,
-            allowed_hotkeys=allowed_hotkeys,
-            download_timeout_sec=download_timeout_sec,
-        )
-    except Exception as e:
-        logger.warning(
-            "Peer sync: fetch_model_from_chain_validator failed",
-            error=str(e),
-            elapsed_sec=round(time.monotonic() - t_fetch, 2),
-        )
-        return False
-    logger.info(
-        "Peer sync: chain fetch complete",
-        elapsed_sec=round(time.monotonic() - t_fetch, 2),
-    )
-
-    logger.info("Peer sync: selecting best local checkpoint")
-    latest = select_best_checkpoint(
-        primary_dir=config.ckpt.validator_checkpoint_path,
-        secondary_dir=config.ckpt.checkpoint_path,
-    )
-    if latest is None or latest.path is None:
-        logger.warning(
-            "Peer sync: no checkpoint found after download",
-            primary_dir=str(config.ckpt.validator_checkpoint_path),
-            secondary_dir=str(config.ckpt.checkpoint_path),
-        )
-        return False
-    logger.info(
-        "Peer sync: selected best checkpoint",
-        path=str(latest.path),
-        global_ver=latest.global_ver,
-    )
-
-    # Reclaim cached allocator memory and CPU heap before loading the multi-GB
-    # state dict. Peer sync runs while bg-eval / training buffers are still
-    # live; without this the transient allocation peak during torch.load +
-    # load_state_dict has been seen to OOM-kill the process silently.
-    cleanup(global_model)
-
-    try:
-        logger.info("Peer sync: loading state dict from disk", path=str(latest.path))
-        t_load = time.monotonic()
-        sd = compile_full_state_dict_from_path(
-            latest.path,
-            expert_groups=[config.task.exp.group_id],
-        )
-        load_elapsed = round(time.monotonic() - t_load, 2)
-        if not sd:
-            logger.warning(
-                "Peer sync: downloaded checkpoint has empty state dict",
-                path=str(latest.path),
-                elapsed_sec=load_elapsed,
-            )
-            return False
-        model_hash = get_model_hash(sd, hex=True)[:6]
-        logger.info(
-            "Peer sync: state dict loaded",
-            num_keys=len(sd),
-            elapsed_sec=load_elapsed,
-            model_hash=model_hash,
-        )
-
-        logger.info("Peer sync: copying state dict into global_model")
-        t_copy = time.monotonic()
-        result = global_model.load_state_dict(sd, strict=False)
-        copy_elapsed = round(time.monotonic() - t_copy, 2)
-        # Drop the CPU copy and reclaim heap before the success log so the
-        # caller's next cycle starts with the full memory budget back.
-        del sd
-        cleanup(global_model)
-        logger.info(
-            "Peer sync: loaded checkpoint into global_model",
-            path=str(latest.path),
-            global_ver=latest.global_ver,
-            model_hash=model_hash,
-            missing_keys=len(result.missing_keys),
-            unexpected_keys=len(result.unexpected_keys),
-            copy_elapsed_sec=copy_elapsed,
-            total_elapsed_sec=round(time.monotonic() - t_start, 2),
-        )
-        return True
-    except Exception as e:
-        logger.warning(
-            "Peer sync: failed to load state dict into global_model",
-            error=str(e),
-            path=str(latest.path),
-        )
-        return False

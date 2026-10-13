@@ -2,14 +2,11 @@
 Tests for validator gradient safety guards introduced in dev-3:
   1. aggregate_miner_gradient_change zeros grads and skips miner on inf/nan gradient
   2. grad_is_valid logic (empty merged_uids OR non-finite sum → skip allreduce)
-  3. reload_model_inplace happy path and failure modes
 """
 
 import asyncio
 import math
 import types
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -203,167 +200,7 @@ def test_grad_is_valid_all_good():
 
 
 # ---------------------------------------------------------------------------
-# 3. reload_model_inplace
-# ---------------------------------------------------------------------------
-
-def _import_pull_helper():
-    """Import only the function under test; skip top-level side effects."""
-    import importlib, sys
-
-    # Stub heavy dependencies so the import succeeds in a test environment
-    # without bittensor installed.
-    stubs = [
-        "bittensor",
-        "torchdata",
-        "torchdata.stateful_dataloader",
-        "transformers",
-        "connito.miner.train_helper",
-        "connito.shared.chain",
-        "connito.shared.checkpoint_helper",
-        "connito.shared.checkpoints",
-        "connito.shared.cycle",
-        "connito.shared.dataloader",
-        "connito.shared.evaluate",
-        "connito.shared.expert_manager",
-        "connito.shared.metrics",
-        "connito.shared.model",
-        "connito.shared.modeling.mycelia",
-        "connito.validator.aggregator",
-        "connito.validator.evaluator",
-        "connito.shared.telemetry",
-        "connito.shared.config",
-        "connito.shared.app_logging",
-        "connito.shared.helper",
-        "dotenv",
-    ]
-    for s in stubs:
-        if s not in sys.modules:
-            sys.modules[s] = MagicMock()
-
-    # Re-import or retrieve
-    if "connito.shared.model" in sys.modules:
-        mod = sys.modules["connito.shared.model"]
-    else:
-        mod = importlib.import_module("connito.shared.model")
-
-    return mod.reload_model_inplace
-
-
-# We test the logic of reload_model_inplace directly by re-implementing
-# and patching its callees, rather than importing the full module.
-
-def _make_pull_fn(fetch_side_effect, latest_ckpt, compile_result):
-    """
-    Build a standalone version of reload_model_inplace with injected
-    dependencies so we can test it without the full module import stack.
-    """
-    def reload_model_inplace(config, global_model, expert_manager, device, subtensor, wallet):
-        logger = MagicMock()
-
-        # fetch
-        try:
-            fetch_side_effect()
-        except Exception as e:
-            return False
-
-        # select_best_checkpoint
-        latest = latest_ckpt
-        if latest is None or latest.path is None:
-            return False
-
-        # compile_full_state_dict_from_path
-        sd = compile_result
-        if not sd:
-            return False
-
-        global_model.load_state_dict(sd, strict=False)
-        return True
-
-    return reload_model_inplace
-
-
-def test_pull_happy_path():
-    model = _make_model(0.0)
-    sd = model.state_dict()  # valid state dict
-
-    latest = MagicMock()
-    latest.path = Path("/fake/path")
-    latest.global_ver = 42
-
-    fn = _make_pull_fn(fetch_side_effect=lambda: None, latest_ckpt=latest, compile_result=sd)
-
-    with patch.object(model, "load_state_dict") as mock_load:
-        mock_load.return_value = MagicMock()
-        result = fn(
-            config=MagicMock(),
-            global_model=model,
-            expert_manager=MagicMock(),
-            device=torch.device("cpu"),
-            subtensor=MagicMock(),
-            wallet=MagicMock(),
-        )
-
-    assert result is True
-    mock_load.assert_called_once_with(sd, strict=False)
-
-
-def test_pull_fetch_raises_returns_false():
-    model = _make_model(0.0)
-    latest = MagicMock()
-    latest.path = Path("/fake/path")
-
-    def _raise():
-        raise RuntimeError("network error")
-
-    fn = _make_pull_fn(fetch_side_effect=_raise, latest_ckpt=latest, compile_result={})
-
-    result = fn(
-        config=MagicMock(),
-        global_model=model,
-        expert_manager=MagicMock(),
-        device=torch.device("cpu"),
-        subtensor=MagicMock(),
-        wallet=MagicMock(),
-    )
-    assert result is False
-
-
-def test_pull_no_checkpoint_returns_false():
-    model = _make_model(0.0)
-
-    fn = _make_pull_fn(fetch_side_effect=lambda: None, latest_ckpt=None, compile_result={})
-
-    result = fn(
-        config=MagicMock(),
-        global_model=model,
-        expert_manager=MagicMock(),
-        device=torch.device("cpu"),
-        subtensor=MagicMock(),
-        wallet=MagicMock(),
-    )
-    assert result is False
-
-
-def test_pull_empty_state_dict_returns_false():
-    model = _make_model(0.0)
-    latest = MagicMock()
-    latest.path = Path("/fake/path")
-
-    fn = _make_pull_fn(fetch_side_effect=lambda: None, latest_ckpt=latest, compile_result={})
-
-    result = fn(
-        config=MagicMock(),
-        global_model=model,
-        expert_manager=MagicMock(),
-        device=torch.device("cpu"),
-        subtensor=MagicMock(),
-        wallet=MagicMock(),
-    )
-    assert result is False
-
-
-# ---------------------------------------------------------------------------
-# 4. Integration-style: full aggregate → grad_is_valid → skip decision
+# 3. Integration-style: full aggregate → grad_is_valid → skip decision
 # ---------------------------------------------------------------------------
 
 def test_full_pipeline_inf_miner_leads_to_skip():
