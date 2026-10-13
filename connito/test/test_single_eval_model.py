@@ -1,8 +1,8 @@
 """One model, shared in place by every miner eval.
 
 The property that makes it safe is not a lock — it is that every accepted
-submission covers exactly the round's base key set, so each load fully
-overwrites the one before it.
+submission is exactly the residual spec, so each load fully overwrites the
+one before it.
 """
 from __future__ import annotations
 
@@ -17,16 +17,13 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
-from connito.shared.telemetry import EVAL_STATUS_CODES
+from connito.shared.config import ResidualCfg
+from connito.shared.modeling.residual import residual_shapes
+from connito.shared.telemetry import VALIDATOR_MINER_EVAL_FAILURES, VALIDATOR_MINER_EVAL_STATUS
 from connito.validator.background_eval_worker import BackgroundEvalWorker
-from connito.validator.evaluator import (
-    _VALIDATION_FAIL_TO_REASON,
-    load_model_from_path,
-    validate_miner_submission,
-)
+from connito.validator.evaluator import load_model_from_path
 
 CPU = torch.device("cpu")
-FULL = {"a.weight", "b.weight"}
 
 
 class _Two(nn.Module):
@@ -94,49 +91,7 @@ def test_a_failed_load_is_overwritten_by_the_next_miner(tmp_path):
         torch.testing.assert_close(w, torch.full((2, 4), 0.6))
 
 
-# --- the completeness rule -----------------------------------------------------
-
-def _round_with_valid_commit(uid: int = 1) -> SimpleNamespace:
-    ckpt = SimpleNamespace(
-        validate=lambda **kw: True, path=None,
-        signature_verified=True, hash_verified=True, expert_group_verified=True,
-    )
-    return SimpleNamespace(uid_to_chain_checkpoint={uid: ckpt})
-
-
-def test_an_incomplete_submission_is_rejected(tmp_path):
-    subset = _shard(tmp_path / "m.safetensors", 0.5, keys=("a.weight",))
-
-    reason = validate_miner_submission(
-        round_obj=_round_with_valid_commit(), uid=1, model_path=subset,
-        expert_group_assignment={}, expected_keys=FULL,
-    )
-
-    assert reason == "incomplete_expert_set"
-
-
-def test_a_complete_submission_passes(tmp_path):
-    full = _shard(tmp_path / "m.safetensors", 0.5)
-    assert validate_miner_submission(
-        round_obj=_round_with_valid_commit(), uid=1, model_path=full,
-        expert_group_assignment={}, expected_keys=FULL,
-    ) is None
-
-
-def test_the_check_is_skipped_without_a_base(tmp_path):
-    subset = _shard(tmp_path / "m.safetensors", 0.5, keys=("a.weight",))
-    assert validate_miner_submission(
-        round_obj=_round_with_valid_commit(), uid=1, model_path=subset,
-        expert_group_assignment={}, expected_keys=None,
-    ) is None
-
-
-def test_the_reason_is_visible_to_miners():
-    assert _VALIDATION_FAIL_TO_REASON["incomplete_expert_set"] == "incomplete_expert_set"
-    assert "incomplete_expert_set" in EVAL_STATUS_CODES.values()
-
-
-# --- the worker records the base's key set at freeze --------------------------
+# --- the worker reads the residual spec from config at each round load ---------
 
 @pytest.fixture
 def stub_eval(monkeypatch):
@@ -145,24 +100,72 @@ def stub_eval(monkeypatch):
     monkeypatch.setattr("connito.shared.evaluate.evaluate_model", lambda *a, **kw: {"val_loss": 1.0})
 
 
-def _worker(model: nn.Module) -> BackgroundEvalWorker:
+def _residual(k: int) -> ResidualCfg:
+    return ResidualCfg(k=k, threshold=0.5, temperature=0.5)
+
+
+def _worker(model: nn.Module, family_name: str) -> BackgroundEvalWorker:
     w = BackgroundEvalWorker(
         config=SimpleNamespace(
             evaluation=SimpleNamespace(per_miner_eval_timeout_sec=1.0),
             dataloader=SimpleNamespace(world_size=1),
+            model=SimpleNamespace(family=family_name),
+            task=SimpleNamespace(exp=SimpleNamespace(residual=_residual(1))),
         ),
         round_ref=MagicMock(), device=CPU, tokenizer=MagicMock(),
         merge_phase_active=threading.Event(), eval_window_active=threading.Event(),
-        gpu_eval_lock=threading.Lock(), expert_group_assignment={},
+        gpu_eval_lock=threading.Lock(),
     )
     w.set_eval_base_model(model)
     return w
 
 
-def test_the_worker_expects_the_base_shards_key_set(tmp_path, stub_eval):
-    w = _worker(_Two(0.1))
+def test_the_worker_expects_the_tasks_residual_spec_from_each_round_on(family_name, tmp_path, stub_eval):
+    w = _worker(_Two(0.1), family_name)
     shard = _shard(tmp_path / "round_9.safetensors", 0.4)
 
     asyncio.run(w._load_round_base(SimpleNamespace(round_id=9, base_shard=shard, seed="s")))
+    assert w._expected == residual_shapes(w.config)
 
-    assert w._expected_expert_keys == FULL
+    w.config.task.exp.residual = _residual(2)  # a task switch between rounds
+    asyncio.run(w._load_round_base(SimpleNamespace(round_id=10, base_shard=shard, seed="s")))
+
+    assert w._expected == residual_shapes(w.config)
+    assert any(".residual_experts.1." in key for key in w._expected)
+
+
+def test_the_worker_validates_against_that_spec(family_name, monkeypatch, tmp_path):
+    w = _worker(_Two(0.1), family_name)
+    w._expected = residual_shapes(w.config)
+    monkeypatch.setattr(w, "_prune_non_top", lambda round_obj: None)
+    seen = {}
+
+    def _capture(*, round_obj, uid, model_path, expected):
+        seen["expected"] = expected
+        return "bad_residual_shard"  # non-None short-circuits before the GPU eval
+
+    monkeypatch.setattr("connito.validator.evaluator.validate_miner_submission", _capture)
+    round_obj = MagicMock(round_id=100)
+    round_obj.claim_for_eval.return_value = True
+    round_obj.pop_downloaded.return_value = tmp_path / "model.safetensors"
+
+    asyncio.run(w._evaluate_one(round_obj, uid=1, hotkey="hk_abcdef"))
+
+    assert seen["expected"] == residual_shapes(w.config)
+
+
+def test_a_refused_submission_reaches_the_miner_as_code_14(family_name, monkeypatch, tmp_path):
+    w = _worker(_Two(0.1), family_name)
+    w._expected = residual_shapes(w.config)
+    monkeypatch.setattr(w, "_prune_non_top", lambda round_obj: None)
+    monkeypatch.setattr("connito.validator.evaluator.validate_miner_submission", lambda **kw: "bad_residual_shard")
+    round_obj = MagicMock(round_id=100)
+    round_obj.claim_for_eval.return_value = True
+    round_obj.pop_downloaded.return_value = tmp_path / "model.safetensors"
+    failures = VALIDATOR_MINER_EVAL_FAILURES.labels(miner_uid="4242", reason="bad_residual_shard")
+    before = failures._value.get()
+
+    asyncio.run(w._evaluate_one(round_obj, uid=4242, hotkey="hk_abcdef"))
+
+    assert VALIDATOR_MINER_EVAL_STATUS.labels(miner_uid="4242")._value.get() == 14
+    assert failures._value.get() == before + 1

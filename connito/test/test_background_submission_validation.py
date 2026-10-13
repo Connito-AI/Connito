@@ -674,7 +674,6 @@ class TestBackgroundEvalWorker:
             merge_phase_active=merge_active,
             eval_window_active=eval_window,
             gpu_eval_lock=gpu_lock,
-            expert_group_assignment={},
             stop_event=stop,
             poll_interval_sec=0.05,
         )

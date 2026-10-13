@@ -136,3 +136,11 @@ def test_a_threshold_outside_the_gate_range_is_refused(threshold: float) -> None
     """A is compared with a sigmoid; at 0 or 1 the gate is always open or always shut."""
     with pytest.raises(ValueError):
         ResidualCfg(k=1, threshold=threshold, temperature=0.05)
+
+
+def test_a_gate_that_fp32_could_shut_for_good_is_refused() -> None:
+    """Past A/τ ≈ 88 a token with r near 0 gets q = 0 exactly in fp32, and an honest down_proj can stay all zero."""
+    with pytest.raises(ValueError, match="below 80"):
+        ResidualCfg(k=1, threshold=0.8, temperature=0.01)
+
+    assert ResidualCfg(k=1, threshold=0.79, temperature=0.01).threshold == 0.79

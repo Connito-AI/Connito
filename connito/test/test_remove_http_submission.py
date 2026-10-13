@@ -166,7 +166,7 @@ def test_fetch_model_does_not_issue_http_when_hf_succeeds(tmp_path):
                       return_value=ChainCheckpoints(checkpoints=[chain_checkpoint])), \
          patch.object(shared_model, "download_checkpoint_from_hf_with_timeout", side_effect=fake_hf_download), \
          patch.object(shared_model, "delete_old_checkpoints"), \
-         patch.object(ChainCheckpoint, "validate", return_value=True), \
+         patch.object(ChainCheckpoint, "validate", autospec=True, return_value=True) as validate, \
          patch("requests.get", side_effect=AssertionError("HTTP distribute must not happen")), \
          patch("requests.post", side_effect=AssertionError("HTTP submission must not happen")):
         result = shared_model.fetch_model_from_chain_validator(
@@ -175,10 +175,12 @@ def test_fetch_model_does_not_issue_http_when_hf_succeeds(tmp_path):
             subtensor=SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner"),
             wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey")),
             expert_group_ids=[0],
-            expert_group_assignment={},
+            expected={"spec": "residual"},
         )
 
     assert result is chain_checkpoint
+    # The download is checked against the residual spec the caller passed.
+    validate.assert_called_once_with(chain_checkpoint, {"spec": "residual"})
 
 
 def test_fetch_model_does_not_issue_http_when_hf_fails(tmp_path):
@@ -221,7 +223,7 @@ def test_fetch_model_does_not_issue_http_when_hf_fails(tmp_path):
             subtensor=SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner"),
             wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey")),
             expert_group_ids=[0],
-            expert_group_assignment={},
+            expected={},
         )
 
     assert result is None

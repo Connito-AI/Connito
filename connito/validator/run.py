@@ -562,7 +562,6 @@ def _switch_task(
     *,
     eval_model: nn.Module,
     base_shard: Path,
-    eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
 ) -> TaskScopedState:
@@ -619,7 +618,6 @@ def _switch_task(
         config.switch_active_task(previous_task)
         raise
 
-    eval_worker.set_expert_group_assignment(expert_manager.expert_group_assignment)
     logger.info(
         "Switched active task",
         previous_task=previous_task,
@@ -635,7 +633,6 @@ def _maybe_switch_task(
     *,
     eval_model: nn.Module,
     base_shard: Path,
-    eval_worker: BackgroundEvalWorker,
     eval_window_active: threading.Event,
     merge_phase_active: threading.Event,
     round_ref: RoundRef,
@@ -678,7 +675,7 @@ def _maybe_switch_task(
         try:
             state = _switch_task(
                 config, bundle.name,
-                eval_model=eval_model, base_shard=base_shard, eval_worker=eval_worker,
+                eval_model=eval_model, base_shard=base_shard,
                 eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
             )
         except Exception:
@@ -818,7 +815,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # processes / prefetched batches don't stay resident across the whole cycle.
 
     # === set up training ===
-    eval_model, expert_manager, base_shard = setup_training(config, rank, device)
+    eval_model, _, base_shard = setup_training(config, rank, device)
 
     global_opt_step = 0
     # Coordinates of the baseline published at finalize, read by the next
@@ -1054,7 +1051,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             merge_phase_active=merge_phase_active,
             eval_window_active=eval_window_active,
             gpu_eval_lock=gpu_eval_lock,
-            expert_group_assignment=expert_manager.expert_group_assignment,
         )
         download_worker.start()
         eval_worker.start()
@@ -1619,14 +1615,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # nothing; the MinerCommit1 commit later reads the new group.
             wait_till(config, PhaseNames.train)
             switched = _maybe_switch_task(
-                config, eval_model=eval_model, base_shard=base_shard, eval_worker=eval_worker,
+                config, eval_model=eval_model, base_shard=base_shard,
                 eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
                 round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
             )
             if switched is not None:
-                expert_manager, eval_model, base_shard, baseline_ref = (
-                    switched.expert_manager, switched.eval_model,
-                    switched.base_shard, switched.baseline_ref,
+                eval_model, base_shard, baseline_ref = (
+                    switched.eval_model, switched.base_shard, switched.baseline_ref,
                 )
                 # Exactly the state of a fresh boot on the new task: no hash
                 # to commit until ValidatorCommit1.

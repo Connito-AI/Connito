@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.checkpoint_helper import TensorSpec
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
 from connito.shared.helper import (
@@ -33,13 +34,12 @@ logger = structlog.get_logger(__name__)
 # `validator_miner_eval_failures_total` Counter and the
 # `validator_miner_eval_status` Gauge. Each row gets its own miner-facing
 # bucket so a miner reading the gateway can tell a bad signature apart from
-# a hash mismatch or an expert-group / NaN-Inf violation.
+# a hash mismatch or a shard off the residual spec.
 _VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
     "no_chain_commit": "no_chain_commit",
     "signature": "signature_invalid",
     "hash": "hash_mismatch",
-    "expert_group_or_nan": "expert_group_or_nan",
-    "incomplete_expert_set": "incomplete_expert_set",
+    "bad_residual_shard": "bad_residual_shard",
     "unknown": "unknown",
 }
 
@@ -303,7 +303,7 @@ def finalize_round_scores(
     # never reach that point, so without this loop the gateway has no signal
     # for "we knew at freeze you had no/invalid commit." validation_failed
     # statuses are already set at the validate_miner_submission call site
-    # with the specific sub-reason (signature/hash/expert_group_or_nan), so
+    # with the specific sub-reason (signature/hash/bad_residual_shard), so
     # do not overwrite them here. Wrapped broadly — telemetry must never
     # block finalize.
     try:
@@ -548,57 +548,44 @@ def build_submission_uid_weights(
     )
 
 
-def _submission_keys(path: str | Path) -> set[str]:
-    """Key set without materialising tensors where the format allows."""
-    p = Path(path)
-    if p.suffix == ".safetensors":
-        from safetensors import safe_open
-
-        with safe_open(str(p), framework="pt") as f:
-            return set(f.keys())
-    return set(load_state_dict_from_path(str(p)))
-
-
 def validate_miner_submission(
     *,
     round_obj,  # connito.validator.round.Round
     uid: int,
     model_path: str | Path,
-    expert_group_assignment,
-    expected_keys: set[str] | None = None,
+    expected: dict[str, TensorSpec],
 ) -> str | None:
     """Run the existing `ChainCheckpoint.validate(...)` against a miner's
     on-disk submission before it is fed to `evaluate_one_miner`.
 
-    `expected_keys` is the round's base shard key set. A submission that is
-    not exactly that set is `incomplete_expert_set`: miners are loaded into
-    one shared model in place, so a subset would leave the previous miner's
-    experts in it. Skipped (None) only on a cold start with no base shard.
+    `expected` is the residual spec. A submission must be exactly it: miners
+    are loaded into one shared model in place, so a subset would leave the
+    previous miner's residual in it.
 
     Returns ``None`` on success. On failure returns a short reason string —
-    one of ``no_chain_commit | signature | hash | expert_group | nan_inf``,
-    or a generic ``"unknown"`` if the helper raised. The reason is intended
-    to be plumbed into telemetry labels and log lines.
+    one of ``no_chain_commit | signature | bad_residual_shard | hash``, or a
+    generic ``"unknown"`` if the helper raised. The reason is intended to be
+    plumbed into telemetry labels and log lines.
 
     The chain checkpoint is read from `round_obj.uid_to_chain_checkpoint`
     so this never re-fetches anything from the chain. The check itself is
-    `ChainCheckpoint.validate(expert_group_assignment=…)`, which runs:
+    `ChainCheckpoint.validate(expected)`, which runs:
 
     - `_verify_signature` — the chain hotkey signed `model_hash`.
-    - `_verify_hash` — the on-disk shard's hash matches the chain commit.
-    - `_verify_expert_group` — every routed-expert key in the state dict
-      belongs to the miner's assigned group, and no tensor contains NaN/Inf.
+    - `verify_residual_shard` — the header is exactly the spec, read before
+      any tensor; then every tensor is finite and every expert trained.
+    - `_verify_hash` — the shard's hash matches the chain commit.
     """
     chain_checkpoint = round_obj.uid_to_chain_checkpoint.get(int(uid))
     if chain_checkpoint is None:
         return "no_chain_commit"
 
-    # `validate()` reads the state dict from `chain_checkpoint.path`; point
-    # it at the on-disk submission for this round.
+    # `validate()` reads the shard from `chain_checkpoint.path`; point it at
+    # the on-disk submission for this round.
     chain_checkpoint.path = Path(model_path)
 
     try:
-        ok = chain_checkpoint.validate(expert_group_assignment=expert_group_assignment)
+        ok = chain_checkpoint.validate(expected)
     except Exception as e:
         logger.warning(
             "validate_miner_submission: validate() raised",
@@ -607,25 +594,17 @@ def validate_miner_submission(
         return "unknown"
 
     if ok:
-        if expected_keys is not None and _submission_keys(model_path) != expected_keys:
-            logger.warning(
-                "validate_miner_submission: incomplete expert set",
-                uid=int(uid), expected=len(expected_keys),
-            )
-            return "incomplete_expert_set"
         return None
 
     # `validate()` already logged a structured warning per failed sub-check.
-    # Map the per-check booleans to a single short reason for telemetry.
+    # Map the per-check booleans to a single short reason for telemetry. An
+    # off-spec shard is never hashed, so it is named before the hash.
     if not getattr(chain_checkpoint, "signature_verified", False):
         return "signature"
+    if not getattr(chain_checkpoint, "shard_verified", False):
+        return "bad_residual_shard"
     if not getattr(chain_checkpoint, "hash_verified", False):
         return "hash"
-    if not getattr(chain_checkpoint, "expert_group_verified", False):
-        # _verify_expert_group folds the NaN/Inf scan in with the routing
-        # check, so we cannot tell them apart from the booleans alone. The
-        # underlying logger.warning at the failure site distinguishes them.
-        return "expert_group_or_nan"
     return "unknown"
 
 

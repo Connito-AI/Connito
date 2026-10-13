@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import fsspec
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -29,6 +30,9 @@ logger = structlog.getLogger(__name__)
 class TensorSpec(NamedTuple):
     shape: tuple[int, ...]
     dtype: torch.dtype
+
+
+_SAFETENSORS_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32}
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -386,6 +390,42 @@ def save_residual_shard(model: torch.nn.Module, dest_dir: str | Path, group_id: 
     residual = {n: p.detach().cpu().contiguous() for n, p in model.named_parameters() if ".residual_" in n}
     save_file(residual, str(path))
     return path
+
+
+def verify_residual_shard(path: str | Path, expected: dict[str, TensorSpec]) -> dict[str, torch.Tensor] | None:
+    """The shard's tensors if its header is exactly `expected` and every tensor is finite and trained; else None."""
+    path = Path(path)
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            slices = {k: f.get_slice(k) for k in f.keys()}
+            header = {k: TensorSpec(tuple(t.get_shape()), _SAFETENSORS_DTYPES.get(t.get_dtype()))
+                      for k, t in slices.items()}
+            if path.suffix != ".safetensors" or header != expected:
+                logger.warning(
+                    "residual shard refused: off spec", path=str(path),
+                    missing=sorted(expected.keys() - header.keys())[:5],
+                    extra=sorted(header.keys() - expected.keys())[:5],
+                    mismatched=sorted(k for k in expected.keys() & header.keys() if header[k] != expected[k])[:5],
+                )
+                return None
+            # From the same open, so these are the tensors whose header passed.
+            state_dict = {k: f.get_tensor(k) for k in header}
+    except Exception as e:
+        logger.warning("residual shard refused: unreadable", path=str(path), error=str(e))
+        return None
+    non_finite = sorted(k for k, t in state_dict.items() if not torch.isfinite(t).all())
+
+    def zero(expert: str, proj: str) -> bool:
+        return not state_dict[f"{expert}.{proj}.weight"].any()
+
+    experts = {k.rsplit(".", 2)[0] for k in state_dict if ".residual_experts." in k}
+    # Honest training never leaves one: ResidualCfg keeps A/τ below 80, so q > 0 on every token and every
+    # down_proj moves at the first step.
+    untrained = sorted(e for e in experts if zero(e, "down_proj") or (zero(e, "gate_proj") and zero(e, "up_proj")))
+    if non_finite or untrained:
+        logger.warning("residual shard refused", path=str(path), non_finite=non_finite[:5], untrained=untrained[:5])
+        return None
+    return state_dict
 
 
 def save_checkpoint(

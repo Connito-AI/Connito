@@ -400,8 +400,7 @@ EvalFailureReason = Literal[
     "no_chain_commit",
     "signature_invalid",
     "hash_mismatch",
-    "expert_group_or_nan",
-    "incomplete_expert_set",
+    "bad_residual_shard",
     "non_finite_loss",
     "download_failed",
     "statedict_parse_failed",
@@ -411,7 +410,7 @@ _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
     "deadline",
     "no_chain_commit", "signature_invalid", "hash_mismatch",
-    "expert_group_or_nan", "non_finite_loss",
+    "bad_residual_shard", "non_finite_loss",
     "download_failed", "statedict_parse_failed",
     "repo_unavailable",
 })
@@ -426,7 +425,7 @@ EVAL_STATUS_CODES: dict[int, str] = {
     2: "statedict_parse_failed",
     3: "signature_invalid",
     4: "hash_mismatch",
-    5: "expert_group_or_nan",
+    5: "expert_group_or_nan",  # retired with expert groups; never reused
     6: "no_chain_commit",
     7: "download_failed",
     8: "oom",
@@ -434,7 +433,8 @@ EVAL_STATUS_CODES: dict[int, str] = {
     10: "deadline_exceeded",
     11: "rpc_error",
     12: "repo_unavailable",
-    13: "incomplete_expert_set",
+    13: "incomplete_expert_set",  # retired with expert groups; never reused
+    14: "bad_residual_shard",
     99: "unknown",
 }
 _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
@@ -442,7 +442,6 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "statedict_parse_failed": 2,
     "signature_invalid": 3,
     "hash_mismatch": 4,
-    "expert_group_or_nan": 5,
     "no_chain_commit": 6,
     "download_failed": 7,
     "oom": 8,
@@ -450,7 +449,7 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "deadline": 10,
     "rpc": 11,
     "repo_unavailable": 12,
-    "incomplete_expert_set": 13,
+    "bad_residual_shard": 14,
     # Legacy aliases — fold into the closest miner-facing code so old
     # call sites continue producing meaningful status values.
     "corrupt": 2,

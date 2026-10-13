@@ -12,7 +12,7 @@ from connito.shared.app_logging import structlog
 from connito.shared.chain import (
     SignedModelHashChainCommit,
 )
-from connito.shared.checkpoint_helper import load_checkpoint
+from connito.shared.checkpoint_helper import TensorSpec, load_checkpoint
 from connito.shared.checkpoints import (
     ChainCheckpoints,
     ModelCheckpoint,
@@ -27,13 +27,9 @@ from connito.shared.cycle import (
     PhaseNames,
     get_blocks_from_previous_phase_from_api,
 )
-from connito.shared.expert_manager import (
-    ExpertManager,
-    ExpertAssignments
-)
 from connito.shared.helper import expert_group_shard_name, get_nested_attr
 from connito.shared.modeling.mycelia import get_base_model
-from connito.shared.modeling.residual import install_residual_experts
+from connito.shared.modeling.residual import install_residual_experts, residual_shapes
 from connito.shared.schema import verify_message
 
 logger = structlog.get_logger(__name__)
@@ -119,7 +115,6 @@ def get_model_from_checkpoint(
 def load_model(
     rank: int,
     config: MinerConfig | ValidatorConfig,
-    expert_manager: ExpertManager,
     subtensor: bittensor.Subtensor,
     wallet: bittensor.Wallet,
     current_checkpoint: ModelCheckpoint | None = None,
@@ -158,7 +153,7 @@ def load_model(
             subtensor=subtensor,
             wallet=wallet,
             expert_group_ids=[config.task.exp.group_id],
-            expert_group_assignment=expert_manager.expert_group_assignment
+            expected=residual_shapes(config),
         )
 
     return get_model_from_checkpoint(
@@ -173,7 +168,7 @@ def fetch_model_from_chain_validator(
     subtensor: bittensor.Subtensor,
     wallet: bittensor.Wallet,
     expert_group_ids: list[int | str],
-    expert_group_assignment: ExpertAssignments,
+    expected: dict[str, TensorSpec],
 ) -> dict | None:
     """
     Fetches a model from the chain validator if it's has the right commit format from the previous phase commits (validator_commit_1 & validator_commit_2) and newer than the current model.
@@ -256,7 +251,7 @@ def fetch_model_from_chain_validator(
                     continue
 
                 chain_checkpoint.path = out_folder
-                validated = chain_checkpoint.validate(expert_group_assignment=expert_group_assignment)
+                validated = chain_checkpoint.validate(expected)
 
                 if not validated:
                     logger.warning(

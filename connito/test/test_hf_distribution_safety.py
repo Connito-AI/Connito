@@ -137,6 +137,28 @@ def test_checkpoint_cfg_restores_download_concurrency_for_compatibility():
     assert CheckpointCfg().download_concurrency == 4
 
 
+def test_the_miner_fetches_its_baseline_against_its_residual_spec(family_name, monkeypatch):
+    from connito.shared import model as shared_model
+    from connito.shared.config import ResidualCfg
+    from connito.shared.modeling.residual import residual_shapes
+
+    config = SimpleNamespace(
+        model=SimpleNamespace(family=family_name),
+        task=SimpleNamespace(exp=SimpleNamespace(
+            group_id=9, residual=ResidualCfg(k=2, threshold=0.5, temperature=0.5),
+        )),
+        ckpt=SimpleNamespace(use_pretrained_only=False, validator_checkpoint_path="v", checkpoint_path="c"),
+    )
+    asked = {}
+    monkeypatch.setattr(shared_model, "select_best_checkpoint", lambda **kw: None)
+    monkeypatch.setattr(shared_model, "fetch_model_from_chain_validator", lambda **kw: asked.update(kw))
+    monkeypatch.setattr(shared_model, "get_model_from_checkpoint", lambda **kw: (None, None))
+
+    shared_model.load_model(0, config, subtensor=None, wallet=None)
+
+    assert asked["expected"] == residual_shapes(config)
+
+
 def test_fetch_model_skips_chain_checkpoint_without_hf_metadata(tmp_path, monkeypatch):
     config = _make_config(tmp_path)
     config.ckpt.validator_checkpoint_path.mkdir(parents=True)
@@ -154,7 +176,7 @@ def test_fetch_model_skips_chain_checkpoint_without_hf_metadata(tmp_path, monkey
     )
     monkeypatch.setattr("connito.shared.model.delete_old_checkpoints", lambda **kwargs: None)
     monkeypatch.setattr("connito.shared.model.time.sleep", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ChainCheckpoint, "validate", lambda self, expert_group_assignment: True)
+    monkeypatch.setattr(ChainCheckpoint, "validate", lambda self, expected: True)
 
     result = fetch_model_from_chain_validator(
         current_model_meta=None,
@@ -162,7 +184,7 @@ def test_fetch_model_skips_chain_checkpoint_without_hf_metadata(tmp_path, monkey
         subtensor=subtensor,
         wallet=wallet,
         expert_group_ids=[0],
-        expert_group_assignment={},
+        expected={},
     )
 
     assert result is None

@@ -160,7 +160,7 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("init - model and expert manager")
     expert_manager = ExpertManager(config)
-    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet)
+    model, model_checkpoint = load_model(rank, config, subtensor, wallet)
     model = model.to(device)
     freeze_all_but_residual(model)
 

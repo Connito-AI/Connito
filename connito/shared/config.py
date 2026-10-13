@@ -623,6 +623,14 @@ class ResidualCfg(BaseConfig):
     threshold: float = Field(gt=0, lt=1)  # compared with a sigmoid output
     temperature: PositiveFloat
 
+    @model_validator(mode="after")
+    def _gate_can_open(self) -> ResidualCfg:
+        # q ≥ sigmoid(−A/τ), which is exactly 0 in fp32 from about 88; a token with q = 0 gives its expert no gradient.
+        ratio = self.threshold / self.temperature
+        if ratio >= 80:
+            raise ValueError(f"residual threshold / temperature must be below 80, got {ratio:g}")
+        return self
+
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
