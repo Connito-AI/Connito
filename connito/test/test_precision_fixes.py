@@ -1,51 +1,11 @@
-import tempfile
-
 import pytest
 import torch
 import torch.nn as nn
 
-from connito.shared.checkpoint_helper import save_state_dict_by_expert_group, compile_full_state_dict_from_path
 from connito.shared import evaluate
 from connito.shared.evaluate import evaluate_model
 
-def test_checkpoint_precision_preservation():
-    """
-    Tests if the model limits are bypassed by saving with bfloat16.
-    Standard float16 maxes out at ~65504. A value of 100,000.0 will
-    turn into float('inf') if illegally downcasted.
-    """
-    test_val = 100000.0 
-    
-    state_dict = {
-        "model.embed_tokens.weight": torch.tensor([test_val], dtype=torch.bfloat16),
-        "model.layers.0.mlp.experts.0.weight": torch.tensor([test_val], dtype=torch.bfloat16),
-    }
-    
-    expert_groups = { 0: { 0: [(0, 0)] } }
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Save explicitly with bfloat16 to verify it doesn't get hard-reverted
-        save_state_dict_by_expert_group(
-            state_dict=state_dict,
-            expert_groups=expert_groups,
-            save_dir=tmpdir,
-            save_dtype=torch.bfloat16,
-            active_expert_group_id=0
-        )
-        
-        # Reload
-        reloaded = compile_full_state_dict_from_path(tmpdir)
-        shared_weight = reloaded["model.embed_tokens.weight"]
-        expert_weight = reloaded["model.layers.0.mlp.experts.0.weight"]
-        
-        # Verify precision stayed intact
-        assert shared_weight.dtype == torch.bfloat16, "Shared weight downcast to float16!"
-        assert expert_weight.dtype == torch.bfloat16, "Expert weight downcast to float16!"
-        
-        # Verify value didn't become `inf` or `NaN`
-        assert not torch.isinf(shared_weight).any(), "Shared weight overflowed to Inf due to fp16 downcast!"
-        assert not torch.isinf(expert_weight).any(), "Expert weight overflowed to Inf due to fp16 downcast!"
-        
+
 def _scripted(monkeypatch, losses):
     """Make evaluate_model's loss for each batch come from `losses`, in order; record the autocast dtype."""
     seen = []

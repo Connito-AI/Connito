@@ -175,27 +175,6 @@ def test_deepseek_v2_moe_block_computes_from_the_per_expert_tensors(tiny_deepsee
         torch.testing.assert_close(block(h[None])[0], expected)
 
 
-def test_expert_tensors_are_read_at_the_familys_revision(tiny_deepseek_v2_checkpoint, monkeypatch):
-    config = _config(monkeypatch, "deepseek_v2", tiny_deepseek_v2_checkpoint)
-    weights = load_file(str(tiny_deepseek_v2_checkpoint / "model.safetensors"))
-    index = {"weight_map": dict.fromkeys(weights, "model.safetensors")}
-    (tiny_deepseek_v2_checkpoint / "model.safetensors.index.json").write_text(json.dumps(index))
-    revisions: list[str] = []
-
-    def _cached_file(path, filename, revision):
-        revisions.append(revision)
-        return str(Path(path) / filename)
-
-    monkeypatch.setattr(mycelia, "cached_file", _cached_file)
-
-    tensors = mycelia.load_pretrained_expert_tensors(config, {1: [(0, 3), (1, 5)]})
-
-    assert revisions == [family(config).revision] * 2
-    assert set(tensors) == {
-        f"model.layers.1.mlp.experts.{i}.{p}_proj.weight" for i in (3, 5) for p in ("gate", "up", "down")
-    }
-
-
 def test_deepseek_v2_attention_keeps_the_yarn_mscale(tiny_deepseek_v2_checkpoint, monkeypatch):
     """YaRN scales V2's attention by mscale(factor, mscale_all_dim)²; staging_v3's transformers 4 build left it out."""
     model = mycelia.get_base_model(_config(monkeypatch, "deepseek_v2", tiny_deepseek_v2_checkpoint))

@@ -658,7 +658,6 @@ class TaskCfg(BaseConfig):
     # new task no longer needs a release. The value here is the fallback used
     # when the API is unreachable.
     expert_group_name: str = "exp_pmc_residual"
-    load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg | None = None  # set from the task's config.yaml by model_post_init

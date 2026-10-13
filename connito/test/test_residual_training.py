@@ -267,3 +267,11 @@ def test_tokens_per_step_count_every_accumulated_micro_batch(tmp_path):
     status = train_helper.get_status(config=config, step=0, training_time=0, total_training_time=0, inner_opt_step=2)
 
     assert status["total_tokens"] == 2 * 3 * 5 * config.task.exp.data.sequence_length
+
+
+def test_the_param_sum_gauge_reads_the_residual_alone(family_name):
+    """The base is frozen and, unquantized here, would swamp the gauge with a constant."""
+    model = _model(family_name)
+    residual = sum(float(p.float().sum()) for n, p in model.named_parameters() if ".residual_" in n)
+
+    assert train_helper.model_health(model)["param_sum"] == pytest.approx(residual)

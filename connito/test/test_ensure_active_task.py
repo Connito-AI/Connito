@@ -27,7 +27,6 @@ def _task_dir(root: Path, name: str, group_id: int) -> None:
     d = root / "expert_groups" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.yaml").write_text(yaml.safe_dump(body))
-    (d / "expert_assignment.json").write_text(json.dumps({"0": [[0, 10], [1, 11]]}))
 
 
 @pytest.fixture
