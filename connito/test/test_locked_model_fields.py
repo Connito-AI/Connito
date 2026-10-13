@@ -20,16 +20,16 @@ def test_stale_model_fields_are_reset_on_load(tmp_path: Path) -> None:
         "run": {"root_path": str(tmp_path)},
         # Pre-filled so from_path skips the chain lookup.
         "chain": {"hotkey_ss58": "test-hk", "coldkey_ss58": "test-ck", "uid": 0},
-        # `model_path` and `torch_compile` are no longer fields: they must still load, and drop out on rewrite.
+        # Fields since removed (`model_path`, `precision`, `torch_compile`) must still load and drop out on rewrite.
         "model": {
-            "precision": "fp16-mixed", "family": "deepseek_v2", "model_path": "deepseek-ai/DeepSeek-V2-Lite",
-            "torch_compile": True,
+            "precision": "fp16-mixed", "model_path": "deepseek-ai/DeepSeek-V2-Lite", "torch_compile": True,
+            "family": "deepseek_v2", "quantization_validator": "all",
         },
     }))
 
     config = MinerConfig.from_path(cfg_path, active_task=None, auto_update_config=True)
 
-    assert (config.model.precision, config.model.family) == ("bf16-mixed", "qwen3_5_moe")
+    assert (config.model.family, config.model.quantization_validator) == ("qwen3_5_moe", "experts")
     written = yaml.safe_load(cfg_path.read_text())["model"]
-    assert (written["precision"], written["family"]) == ("bf16-mixed", "qwen3_5_moe")
-    assert "model_path" not in written and "torch_compile" not in written
+    assert (written["family"], written["quantization_validator"]) == ("qwen3_5_moe", "experts")
+    assert not {"model_path", "precision", "torch_compile"} & written.keys()

@@ -45,7 +45,6 @@ def config(tmp_path: Path) -> MinerConfig:
         "chain": {"hotkey_ss58": "test-hk", "coldkey_ss58": "test-ck", "uid": 0},
     }))
     cfg = MinerConfig.from_path(cfg_path, active_task=None, auto_update_config=True)
-    cfg.model.precision = "fp32"                 # no autocast on CPU
     cfg.local_par.gradient_accumulation_steps = 1  # every batch is an inner step
     cfg.log.metric_interval = 10**9              # local evaluation at inner step 0 only
     cfg.ckpt.checkpoint_interval = None          # no checkpoint saves
@@ -84,8 +83,7 @@ def harness(monkeypatch):
         seen.setups.append((config.task.expert_group_name, config.task.exp.group_id))
         model = _Tiny()
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
-        return (model, opt, torch.amp.GradScaler(enabled=False), SimpleNamespace(step=lambda: None),
-                None, _batches(2), None)
+        return model, opt, SimpleNamespace(step=lambda: None), None, _batches(2), None
 
     class _Poller:
         def __init__(self, **kw): pass

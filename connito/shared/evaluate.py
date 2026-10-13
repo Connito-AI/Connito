@@ -112,8 +112,7 @@ def evaluate_model(
                 device_batch["attention_mask"] = torch.ones_like(device_batch["input_ids"])
 
             autocast_device = "cuda" if device.type == "cuda" else "cpu"
-            eval_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.amp.autocast(autocast_device, dtype=eval_dtype):
+            with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
                 loss = chunked_lm_loss(model, device_batch)
 
             if torch.isnan(loss) or torch.isinf(loss):

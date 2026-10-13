@@ -195,12 +195,11 @@ class ModelCfg(BaseConfig):
     # — it only affects that miner's own VRAM. `family` is locked because every
     # node must load the same checkpoint.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "family", "precision", "quantization", "quantization_validator",
+        "family", "quantization", "quantization_validator",
     })
     # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
     family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
     foundation: bool = True
-    precision: str = "bf16-mixed"  # locked: both families are published in bf16
     device: str = "cuda"
     # fp8 weight-only storage for modules a role never trains. `quantization`
     # picks the format, the per-role fields pick the scope. See

@@ -125,14 +125,13 @@ def setup_training(
 ) -> tuple[
     torch.nn.Module,  # model
     torch.optim.Optimizer,  # inner_optimizer
-    torch.amp.GradScaler,  # inner_scaler
     torch.optim.lr_scheduler.LRScheduler,  # scheduler
     "ExpertManager",  # em
     StatefulDataLoader,
     dict,  # current model version
 ]:
     """
-    Build model(s), experts layout, optimizers, scheduler, scaler, and optionally resume from a checkpoint.
+    Build model(s), experts layout, optimizers, scheduler, and optionally resume from a checkpoint.
 
     Args:
         config: Training/config object with attributes used here (e.g., lr, outer_lr, warmup_steps, etc.).
@@ -144,7 +143,6 @@ def setup_training(
         global_model (nn.Module): Deep-copied global model on CPU, kept in sync with `model`.
         inner_optimizer (Optimizer): Optimizer for `model`.
         outer_optimizer (Optimizer): Optimizer for `global_model`.
-        scaler (torch.cuda.amp.GradScaler): GradScaler (enabled iff `config.model.precision == "fp16-mixed"`).
         scheduler (LRScheduler): LR scheduler attached to `inner_optimizer`.
         start_step (int): Step to resume from (0 if starting fresh).
         expert_groups (Sequence[Sequence[int]]): Grouping returned by `create_expert_groups`; typically a list
@@ -154,7 +152,7 @@ def setup_training(
 
     Notes:
         - Param group layouts are taken from the *target* optimizers created here.
-        - If `resume_from_ckpt` is set and a checkpoint is found, model/opt/scheduler/scaler states are restored
+        - If `resume_from_ckpt` is set and a checkpoint is found, model/opt/scheduler states are restored
           before syncing `global_model` from `model`.
     """
     logger.info("(0) Setup training")
@@ -199,8 +197,7 @@ def setup_training(
     #       state, 4× smaller than fp32. Well-tested for LLM fine-tuning
     #       (QLoRA/PEFT default) and required to fit this config on a 47GB A6000.
     # Note: bitsandbytes does NOT support 16-bit AdamW state — it errors at
-    # init_state with NotImplementedError. Only 8 and 32 are valid. fp16-mixed
-    # autocast is orthogonal — it changes compute precision, not optimizer state.
+    # init_state with NotImplementedError. Only 8 and 32 are valid.
     optim_bits = int(getattr(config.opt, "adamw_optim_bits", 8))
     if optim_bits == 8:
         import bitsandbytes as _bnb
@@ -231,19 +228,6 @@ def setup_training(
         num_training_steps=config.sched.total_steps,
     )
 
-    # === scaler ===
-    logger.debug("init - inner scaler")
-    precision = get_nested_attr(config, "model.precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        logger.warning("BF16 not supported on this device; falling back to fp16-mixed")
-        precision = "fp16-mixed"
-    scaler_enabled = precision == "fp16-mixed" and device.type == "cuda"
-    inner_scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=scaler_enabled,
-    )
-    logger.info("inner scaler configured", enabled=scaler_enabled, precision=precision, device=device.type)
-
     # === dataloader ===
     logger.debug("init - train dataloader")
     train_dataloader = get_dataloader(
@@ -263,7 +247,6 @@ def setup_training(
             checkpoint_path=latest_checkpoint.path,
             inner_optimizer=inner_optimizer,
             scheduler=scheduler,
-            inner_scaler=inner_scaler,
             rank=rank,
             device=device,
             data_loader=train_dataloader,
@@ -273,7 +256,6 @@ def setup_training(
     return (
         model,
         inner_optimizer,
-        inner_scaler,
         scheduler,
         expert_manager,
         train_dataloader,
@@ -328,7 +310,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     (
         model,
         inner_optimizer,
-        inner_scaler,
         scheduler,
         expert_manager,
         train_dataloader,
@@ -336,12 +317,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
     ) = setup_training(config, rank, device, tokenizer, subtensor, wallet, current_model_meta=None)
 
     # === training ===
-    precision = get_nested_attr(config, "model.precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        logger.warning("BF16 not supported on this device; falling back to fp16-mixed")
-        precision = "fp16-mixed"
-    amp_enabled = precision in ("fp16-mixed", "bf16-mixed")
-    autocast_dtype = torch.float16 if precision == "fp16-mixed" else torch.bfloat16
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
     loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
     aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
@@ -396,7 +371,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         logger.warning("Skipping batch with no valid labels", step=step)
                         continue
 
-                with torch.amp.autocast(autocast_device, enabled=amp_enabled, dtype=autocast_dtype):
+                with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
                     outputs = model(**batch_device)
 
                     loss = outputs.loss / config.local_par.gradient_accumulation_steps
@@ -424,7 +399,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         label_min=label_min,
                         label_max=label_max,
                         num_valid_labels=num_valid if labels is not None else None,
-                        precision=precision,
                         step=step,
                         consecutive_non_finite_batches=consecutive_non_finite_batches,
                         max_consecutive_non_finite_batches=max_consecutive_non_finite_batches,
@@ -443,7 +417,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 loss_batch += loss.item()
                 aux_loss_batch += aux_loss.item()
 
-                inner_scaler.scale(loss).backward()
+                loss.backward()
 
                 grad_total = sum_model_gradients(model)
                 sample_grads = []
@@ -489,13 +463,10 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                         sample_param_names=non_finite_grad_params[:5],
                     )
 
-                inner_scaler.unscale_(optimizer=inner_optimizer)
-
                 grad_params = [p for p in model.parameters() if p.grad is not None]
                 if len(grad_params) == 0:
                     logger.warning("No finite gradients available; skipping optimizer step", step=step)
                     inner_optimizer.zero_grad()
-                    inner_scaler.update()
                     continue
 
                 grad_norm = clip_grad_norm_(grad_params, 1.0, error_if_nonfinite=False)
@@ -503,11 +474,8 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 if not math.isfinite(grad_norm_value):
                     logger.warning("Non-finite grad norm detected; skipping optimizer step", step=step)
                     inner_optimizer.zero_grad()
-                    inner_scaler.update()
                     continue
 
-                scale_before = inner_scaler.get_scale() if inner_scaler.is_enabled() else None
-                scale_after = None
                 # Defrag before the FIRST optimizer.step(): AdamW lazily
                 # allocates exp_avg + exp_avg_sq (2× fp32 per trainable param)
                 # inside optimizer.step, and it OOMs against ~1 GiB of
@@ -516,37 +484,14 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                 # we've just finished backward.
                 gc.collect()
                 torch.cuda.empty_cache()
-                if inner_scaler.is_enabled():
-                    inner_scaler.step(inner_optimizer)
-                    inner_scaler.update()
-                    scale_after = inner_scaler.get_scale()
-                    # GradScaler skip is indicated by a scale drop after update.
-                    step_skipped = scale_after < scale_before
-                else:
-                    inner_optimizer.step()
-                    step_skipped = False
-
+                inner_optimizer.step()
+                scheduler.step()
                 logger.info(
-                    "GradScaler for optimizer step",
-                    grad_norm=grad_norm,
+                    "optimizer step",
+                    grad_norm=grad_norm_value,
                     grad_sum=sum_model_gradients(model),
-                    scale_before=scale_before,
-                    scale_after=scale_after,
-                    skipped=step_skipped,
+                    lr=inner_optimizer.param_groups[0]["lr"],
                 )
-
-                if inner_scaler.is_enabled():
-                    logger.info("Scaler updated", scale_after=scale_after)
-
-                if step_skipped:
-                    logger.warning("GradScaler skipped optimizer step due to non-finite gradients", step=step)
-
-                if not step_skipped:
-                    scheduler.step()
-                    logger.info("scheduler step", lr=inner_optimizer.param_groups[0]["lr"])
-                else:
-                    logger.warning("Skipping scheduler step because optimizer step was skipped", step=step)
-
                 inner_optimizer.zero_grad()
 
                 non_finite_params = []
@@ -691,7 +636,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     inner_optimizer=inner_optimizer,
                     scheduler=scheduler,
                     loss=loss_batch.item(),
-                    inner_scaler=inner_scaler,
                     data_loader=train_dataloader,
                     save_global_state=rank == 0,
                     rank=rank,
@@ -762,7 +706,6 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     (
                         model,
                         inner_optimizer,
-                        inner_scaler,
                         scheduler,
                         expert_manager,
                         train_dataloader,
@@ -852,10 +795,7 @@ def run_distributed_training() -> None:
     if args.debug:
         import logging
         logging.getLogger().setLevel(logging.DEBUG)
-        # Autograd anomaly detection is a debug-only tool. On fp16-mixed it
-        # raises RuntimeError on transient overflows that GradScaler is
-        # designed to catch at unscale_() — leaving it on in production
-        # antagonizes the scaler and crashes the miner on the first NaN.
+        # Debug only: anomaly detection slows every op and raises on the first NaN instead of skipping the batch.
         torch.autograd.set_detect_anomaly(True)
         logger.debug("Verbose debug logging + autograd anomaly detection enabled")
 

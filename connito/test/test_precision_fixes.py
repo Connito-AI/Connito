@@ -1,4 +1,6 @@
 import tempfile
+
+import pytest
 import torch
 import torch.nn as nn
 
@@ -64,21 +66,14 @@ def _evaluate(n_batches, device=None, **kw):
     return evaluate_model(step=0, model=model, eval_dataloader=dataloader, device=device, **kw)
 
 
-def test_evaluator_dynamic_precision(monkeypatch):
-    """
-    Tests that the evaluator uses BF16 dynamic mapping rather than strictly enforcing FP16.
-    """
-    # Needs CUDA with bf16 hardware for literal dynamic mapping, but runs safe asserts anywhere
-    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
-        print("- Skipping evaluator dynamic test (Requires CUDA device with BF16 compute)")
-        return
+def test_evaluator_runs_in_bf16(monkeypatch):
+    """Both families are published in bf16; fp16 would overflow them, so there is no fallback."""
     seen = _scripted(monkeypatch, [2.4388])
 
-    metrics = _evaluate(1, device=torch.device("cuda"))
+    metrics = _evaluate(1)
 
-    assert seen != [torch.float16], "Autocast improperly forced float16!"
-    # Prove the evaluator isn't returning 0.0 due to NaN trapping
-    assert metrics["val_loss"] > 0.0, "Evaluator yielded `val_loss=0.0` check logic"
+    assert seen == [torch.bfloat16]
+    assert metrics["val_loss"] == pytest.approx(2.4388)
 
 
 def test_evaluator_skips_nan_batches_from_divisor(monkeypatch):
