@@ -632,7 +632,7 @@ MAX_CONCURRENT_DOWNLOADS = 4
 EVAL_WORKERS = 1
 DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
-# Real (unpadded) tokens in the c4 replay split, about 214 c4 rows.
+# Real (unpadded) tokens in the c4 replay split.
 REPLAY_EVAL_TOKENS = 65_536
 # ------------------------------------------------------------------------------
 
