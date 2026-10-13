@@ -820,11 +820,15 @@ class WorkerConfig(BaseConfig):
         try:
             self._update_by_task(expert_group_name=expert_group_name)
         except Exception:
-            self.task.expert_group_name = previous_name
-            self.task.exp = previous_exp
-            self._refresh_paths()
+            self.restore_task(previous_name, previous_exp)
             raise
         self._ensure_runtime_dirs()
+
+    def restore_task(self, expert_group_name: str, exp: ExpertCfg) -> None:
+        """Put back a task this config was on, from memory: no file is read, so it cannot fail."""
+        self.task.expert_group_name = expert_group_name
+        self.task.exp = exp
+        self._refresh_paths()
 
     def _fill_wallet_data(self) -> None:
         if self.chain.hotkey_ss58 and self.chain.coldkey_ss58:

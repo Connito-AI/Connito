@@ -384,6 +384,7 @@ def save_state_dict_by_expert_group(
 def save_residual_shard(model: torch.nn.Module, dest_dir: str | Path, group_id: int) -> Path:
     """Write the model's residual experts and routers, each in its own dtype, as the group's shard."""
     path = Path(dest_dir) / expert_group_shard_name(group_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     # Parameters, not state_dict(): that would dequantize every fp8 expert to a CPU copy first.
     residual = {n: p.detach().cpu().contiguous() for n, p in model.named_parameters() if ".residual_" in n}
     save_file(residual, str(path))

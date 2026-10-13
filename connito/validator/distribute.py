@@ -124,6 +124,16 @@ def publish_round_baseline(*, round_obj, config, group_id: int, out: dict | None
 _podium_lock = threading.Lock()
 
 
+def unadvertised_model_hash(base_shard: Path) -> str:
+    """The hash a validator with no baseline to advertise commits, the same on every validator.
+
+    Only the base shard's `down_proj` tensors: zero in every fresh draw, so all such validators of one
+    family and K commit one hash and pool their stake in the miners' majority vote.
+    """
+    base = load_state_dict_from_path(str(base_shard))
+    return get_model_hash({k: t for k, t in base.items() if ".down_proj." in k}, hex=True)
+
+
 def _sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
     """Streaming sha256 — submissions are ~3 GB, so never read one whole."""
     h = hashlib.sha256()
