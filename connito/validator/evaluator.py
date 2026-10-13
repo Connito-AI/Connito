@@ -842,7 +842,8 @@ def evaluate_one_miner_sync(
         )
         if gated:
             logger.info(
-                "evaluate_one_miner: c4 replay loss rose past the tolerance; scoring 0",
+                "evaluate_one_miner: c4 isolation gate failed; scoring 0",
+                reason="non_finite_batches" if replay_nan_batches > 0 else "increase",
                 uid=int(uid), task_loss=round(val_loss, 4), replay_loss_increase=round(replay_increase, 4),
                 replay_nan_batches=replay_nan_batches, tolerance=config.evaluation.max_replay_loss_increase,
                 round_id=round_id,

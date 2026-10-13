@@ -88,6 +88,18 @@ def test_replay_batches_that_blow_up_fail_the_gate_even_when_the_rest_improve(mo
     assert statuses[7] == "replay_loss_increase"
 
 
+@pytest.mark.parametrize("replay_loss, nan_batches, reason", [
+    (BASELINE_REPLAY + 0.5, 0, "increase"), (BASELINE_REPLAY, 1, "non_finite_batches"),
+])
+def test_the_gate_log_says_why_it_tripped(monkeypatch, statuses, replay_loss, nan_batches, reason):
+    log = MagicMock()
+    monkeypatch.setattr(evaluator, "logger", log)
+    _score(monkeypatch, task_loss=2.5, replay_loss=replay_loss, replay_nan_batches=nan_batches)
+
+    event = "evaluate_one_miner: c4 isolation gate failed; scoring 0"
+    assert [c.kwargs["reason"] for c in log.info.call_args_list if c.args[0] == event] == [reason]
+
+
 def test_a_non_finite_replay_loss_scores_zero(monkeypatch, statuses):
     job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=math.inf)
 
