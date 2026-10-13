@@ -177,3 +177,20 @@ def test_a_non_finite_replay_baseline_turns_the_gate_off(worker_env):
 
     assert worker._loaded_baseline_loss == BASELINE
     assert worker._loaded_baseline_replay_loss is None
+
+
+def test_a_round_on_the_fallback_baseline_is_flagged_and_counted(worker_env, monkeypatch):
+    from connito.shared.telemetry import ERRORS_TOTAL
+
+    def _broken(path):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(bew, "load_state_dict_from_path", _broken)
+    counter = ERRORS_TOTAL.labels(component="bg_eval", kind="baseline_fallback")
+    before = counter._value.get()
+    worker, round_obj = _worker(), _round()
+    asyncio.run(worker._load_round_base(round_obj))
+
+    assert round_obj.baseline_fallback is True
+    assert worker._loaded_baseline_loss == 100.0
+    assert counter._value.get() == before + 1

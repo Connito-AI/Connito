@@ -52,13 +52,16 @@ def publish_round_baseline(*, round_obj, config, group_id: int, out: dict | None
 
     rid = getattr(round_obj, "round_id", None)
     try:
+        if getattr(round_obj, "baseline_fallback", False):
+            logger.info("publish_baseline: round baseline is the fallback; nothing published", round_id=rid)
+            return
         val_losses = dict(getattr(round_obj, "val_losses", None) or {})
         avg = dict(getattr(round_obj, "prior_avg_scores", None) or {})
         # Same call cleanup retains against, so the winner's file is still on
         # disk by construction.
-        uid = select_baseline_uid(val_losses, avg)
+        uid = select_baseline_uid(val_losses, dict(getattr(round_obj, "scores", None) or {}), avg)
         if uid is None:
-            logger.info("publish_baseline: no scored miners", round_id=rid)
+            logger.info("publish_baseline: no miner beat the baseline", round_id=rid)
             return
         val_loss = val_losses[uid]
         hotkey = round_obj.uid_to_hotkey.get(uid)

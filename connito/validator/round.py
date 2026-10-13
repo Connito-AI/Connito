@@ -28,11 +28,15 @@ logger = structlog.get_logger(__name__)
 
 def select_baseline_uid(
     val_losses: dict[int, float],
+    scores: dict[int, float],
     prior_avg_scores: dict[int, float],
     top_n: int = 3,
 ) -> int | None:
-    """The UID the round's baseline is published from, or None if nothing was
-    scored.
+    """The UID the round's baseline is published from, or None if no miner
+    beat this round's baseline.
+
+    Only a miner with a positive score this round qualifies: its val_loss is
+    below the round's baseline, and the c4 isolation gate did not zero it.
 
     Preferred: the best-ranked *proven* miner that submitted this round.
     Proven means the top-`top_n` by track record, matching the count that
@@ -49,6 +53,7 @@ def select_baseline_uid(
     `publish_round_baseline` must rank identically — the file has to survive
     until finalize, and only the scored miners are candidates.
     """
+    val_losses = {uid: loss for uid, loss in val_losses.items() if scores.get(uid, 0.0) > 0.0}
     if not val_losses:
         return None
     proven = {
@@ -145,6 +150,9 @@ class Round:
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
+    # Set by bg-eval when this round's baseline is the 100.0 fallback: every
+    # miner then "beats" it, so no winner is published.
+    baseline_fallback: bool = False
     # Set by `finalize_round_scores` under `_lock`, atomically with its score
     # snapshot. After it the `mark_*` methods are no-ops: the eval window flag
     # only stops the worker picking up *new* miners, so the one already on the
@@ -710,7 +718,9 @@ class Round:
         evaluated and pruned the one publish selected.
         """
         with self._lock:
-            return select_baseline_uid(self.val_losses, self.prior_avg_scores)
+            if self.baseline_fallback:
+                return None
+            return select_baseline_uid(self.val_losses, self.scores, self.prior_avg_scores)
 
     def mark_failed(self, uid: int) -> None:
         """Mark a UID as failed for operational reasons (download timeout,

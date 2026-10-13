@@ -34,6 +34,7 @@ from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
+    inc_error,
     note_round_series,
     set_baseline_loss,
 )
@@ -342,12 +343,7 @@ class BackgroundEvalWorker(threading.Thread):
             await asyncio.to_thread(_load)
         except Exception as e:
             # Not restored, so no baseline can be measured; the eval thread must outlive it.
-            logger.error(
-                "bg-eval: round base shard failed to load; using fallback baseline",
-                round_id=round_obj.round_id, path=str(round_obj.base_shard), error=str(e), exc_info=True,
-            )
-            self._loaded_baseline_loss = 100.0
-            self._loaded_round_id = round_obj.round_id
+            self._fall_back(round_obj, "round base shard failed to load", e)
             return
 
         # Build the dataloader and pull all batches into RAM up-front.
@@ -404,14 +400,8 @@ class BackgroundEvalWorker(threading.Thread):
                 )
 
         if last_error is not None:
-            logger.warning(
-                "bg-eval: dataloader build exhausted retries; using fallback baseline",
-                attempts=len(DATALOADER_BUILD_RETRY_DELAYS_SEC),
-                error=str(last_error),
-            )
             self._cached_batches = None
-            self._loaded_baseline_loss = 100.0
-            self._loaded_round_id = round_obj.round_id
+            self._fall_back(round_obj, "dataloader build exhausted retries", last_error)
             return
 
         def _baseline(batches: list, max_batches: int | None) -> float:
@@ -434,8 +424,7 @@ class BackgroundEvalWorker(threading.Thread):
             # sentinel in the series reads as a real regression.
             set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss)
         except Exception as e:
-            logger.warning("bg-eval: baseline failed; using fallback", error=str(e))
-            self._loaded_baseline_loss = 100.0
+            self._fall_back(round_obj, "baseline failed", e)
 
         self._loaded_round_id = round_obj.round_id
         logger.info(
@@ -448,6 +437,19 @@ class BackgroundEvalWorker(threading.Thread):
             ),
             replay_batches=len(self._replay_batches or []),
             replay_tokens=sum(int(b["attention_mask"].sum()) for b in self._replay_batches or []),
+        )
+
+    def _fall_back(self, round_obj, reason: str, error: Exception) -> None:
+        """Score the round against the 100.0 fallback baseline, from which no winner is published."""
+        self._loaded_baseline_loss = 100.0
+        self._loaded_baseline_replay_loss = None
+        self._loaded_round_id = round_obj.round_id
+        round_obj.baseline_fallback = True
+        inc_error(component="bg_eval", kind="baseline_fallback")
+        logger.warning(
+            "bg-eval: round on the fallback baseline; no winner will be published",
+            round_id=round_obj.round_id, path=str(round_obj.base_shard), reason=reason, error=str(error),
+            exc_info=error,
         )
 
     async def _evaluate_one(self, round_obj, *, uid: int, hotkey: str) -> None:

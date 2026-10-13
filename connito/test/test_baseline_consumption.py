@@ -101,6 +101,7 @@ WINNER_HASH = "cd" * 32
 def _round_with_winner(uid: int = 2) -> SimpleNamespace:
     return SimpleNamespace(
         round_id=9000, val_losses={1: 3.9, uid: 3.1},
+        scores={1: 0.1, uid: 0.9},  # both beat the round's baseline
         uid_to_hotkey={1: "hkA", uid: "hkB"},
         uid_to_chain_checkpoint={uid: _ckpt(uid, WINNER_HASH, stake=1.0)},
         submission_block_range=(500, 600),

@@ -34,9 +34,13 @@ def _config(submission_dir: Path) -> SimpleNamespace:
 
 
 def _round(val_losses: dict[int, float], uid_to_hotkey: dict[int, str],
-           prior_avg_scores: dict[int, float] | None = None) -> SimpleNamespace:
+           prior_avg_scores: dict[int, float] | None = None,
+           scores: dict[int, float] | None = None, baseline_fallback: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         round_id=9000, val_losses=val_losses, uid_to_hotkey=uid_to_hotkey,
+        # Every miner beat the baseline unless a test says otherwise.
+        scores={uid: 0.5 for uid in val_losses} if scores is None else scores,
+        baseline_fallback=baseline_fallback,
         submission_block_range=BLOCK_RANGE,
         # Freeze-time snapshot. Flat by default so tests that are not about
         # selection fall through to the val_loss tie-break.
@@ -359,3 +363,76 @@ def test_proven_miner_still_wins_when_it_submits(tmp_path, uploads):
     )
 
     assert uploads[0]["commit_message"].endswith("uid=7"), uploads[0]["commit_message"]
+
+
+def test_a_proven_miner_that_did_not_beat_the_baseline_this_round_is_not_published(tmp_path, uploads):
+    """q15: track record ranks only the miners that beat this round's baseline (score > 0)."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkProven", 550)
+    _submission(sub, "hkBest", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round(
+            {7: 2.0, 8: 1.0}, {7: "hkProven", 8: "hkBest"},
+            prior_avg_scores={7: 2.0, 8: 0.0},
+            scores={7: 0.0, 8: 0.3},  # uid 7's val_loss is at or above the baseline
+        ),
+        config=_config(sub), group_id=GROUP_ID,
+    )
+
+    assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
+
+
+def test_a_miner_the_c4_gate_zeroed_is_never_published(tmp_path, uploads):
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkGated", 550)
+    _submission(sub, "hkClean", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round(
+            {7: float("inf"), 8: 1.0}, {7: "hkGated", 8: "hkClean"},
+            prior_avg_scores={7: 2.0, 8: 0.0}, scores={7: 0.0, 8: 0.3},
+        ),
+        config=_config(sub), group_id=GROUP_ID,
+    )
+
+    assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
+
+
+def test_nothing_is_published_when_no_miner_beat_the_baseline(tmp_path, uploads):
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round({7: 2.0}, {7: "hkA"}, prior_avg_scores={7: 2.0}, scores={7: 0.0}),
+        config=_config(sub), group_id=GROUP_ID,
+    )
+
+    assert uploads == []
+
+
+def test_nothing_is_published_from_a_round_on_the_fallback_baseline(tmp_path, uploads):
+    """Against the 100.0 fallback every miner has a positive score, so the score cannot be the guard."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round({7: 2.0}, {7: "hkA"}, baseline_fallback=True),
+        config=_config(sub), group_id=GROUP_ID,
+    )
+
+    assert uploads == []
+
+
+def test_cleanup_protects_no_winner_on_the_fallback_baseline():
+    from connito.validator.round import Round
+
+    round_obj = Round(
+        round_id=9000, seed="s", validator_miner_assignment={}, background_uids=(1,),
+        uid_to_hotkey={1: "hk1"}, base_shard=Path("base.safetensors"), prior_avg_scores={1: 2.0},
+    )
+    round_obj.mark_scored(1, score=0.5, val_loss=1.0)
+    assert round_obj.baseline_winner_uid() == 1
+
+    round_obj.baseline_fallback = True
+    assert round_obj.baseline_winner_uid() is None
