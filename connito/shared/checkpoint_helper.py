@@ -392,6 +392,12 @@ def save_residual_shard(model: torch.nn.Module, dest_dir: str | Path, group_id: 
     return path
 
 
+def group_shard(path: str | Path, group_id: int | None) -> Path:
+    """`path` itself if it is a file (a submission), else the group's shard in that folder."""
+    path = Path(path)
+    return path if path.is_file() else path / expert_group_shard_name(group_id)
+
+
 def verify_residual_shard(path: str | Path, expected: dict[str, TensorSpec]) -> dict[str, torch.Tensor] | None:
     """The shard's tensors if its header is exactly `expected` and every tensor is finite and trained; else None."""
     path = Path(path)

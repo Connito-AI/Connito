@@ -34,13 +34,15 @@ def _config(name: str, scope: str = "off", k: int = 1) -> SimpleNamespace:
             family=name, device="cpu",
             quantization="off" if scope == "off" else "fp8", quantization_miner=scope,
         ),
-        task=SimpleNamespace(exp=SimpleNamespace(residual=ResidualCfg(k=k, threshold=0.5, temperature=0.5))),
+        task=SimpleNamespace(exp=SimpleNamespace(
+            group_id=9, residual=ResidualCfg(k=k, threshold=0.5, temperature=0.5),
+        )),
         ckpt=SimpleNamespace(resume_from_ckpt=False, use_pretrained_only=False),
     )
 
 
 def _load(config) -> torch.nn.Module:
-    model, _ = shared_model.get_model_from_checkpoint(rank=0, config=config, load_global_checkpoint=False)
+    model, _ = shared_model.get_model_from_checkpoint(config=config, load_global_checkpoint=False)
     return model
 
 
@@ -92,18 +94,16 @@ def test_residual_keys_shapes_and_dtypes(family_name):
     assert {p.dtype for n, p in model.named_parameters() if n not in residual} == {torch.bfloat16}
 
 
-def test_a_resumed_shard_keeps_the_router_fp32_and_the_rest_bf16(family_name, tmp_path, monkeypatch):
-    """The shard is saved fp16, so only the model's own dtypes can make its tensors bf16 and fp32."""
+def test_a_resumed_shard_keeps_the_router_fp32_and_the_rest_bf16(family_name, tmp_path):
     config = _config(family_name)
-    saved = {n: torch.full_like(p, 0.25, dtype=torch.float16) for n, p in _residual(_load(config)).items()}
-    save_file(saved, str(tmp_path / "model_expgroup_9.safetensors"))
+    saved = {n: torch.full_like(p, 0.25) for n, p in _residual(_load(config)).items()}
+    (tmp_path / "globalver_1_inneropt_1").mkdir()
+    save_file(saved, str(tmp_path / "globalver_1_inneropt_1" / "model_expgroup_9.safetensors"))
     config.ckpt = SimpleNamespace(
         resume_from_ckpt=True, use_pretrained_only=False, validator_checkpoint_path=tmp_path, checkpoint_path=tmp_path,
     )
-    monkeypatch.setattr(shared_model, "select_best_checkpoint",
-                        lambda **kw: SimpleNamespace(path=str(tmp_path / "model_expgroup_9.safetensors")))
 
-    model, _ = shared_model.get_model_from_checkpoint(rank=0, config=config)
+    model, _ = shared_model.get_model_from_checkpoint(config=config)
 
     residual = _residual(model)
     assert {n: (tuple(p.shape), p.dtype) for n, p in residual.items()} == _residual_specs(family_name, 1)

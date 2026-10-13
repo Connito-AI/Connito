@@ -228,8 +228,9 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
 
     monkeypatch.setattr(shared_model, "get_base_model", lambda *a, **k: _Model())
     monkeypatch.setattr(shared_model, "install_residual_experts", lambda *a: None)
-    monkeypatch.setattr(shared_model, "select_best_checkpoint",
-                        lambda **kw: consulted.append(True))
+    monkeypatch.setattr(shared_model, "residual_shapes", lambda config: {})
+    monkeypatch.setattr(shared_model, "local_checkpoints_best_first",
+                        lambda *a, **kw: consulted.append(True) or [])
 
     cfg = SimpleNamespace(
         ckpt=SimpleNamespace(
@@ -239,5 +240,5 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
         task=SimpleNamespace(exp=SimpleNamespace(group_id=GROUP_ID)),
         model=SimpleNamespace(device="cpu"),
     )
-    shared_model.get_model_from_checkpoint(rank=0, config=cfg, load_global_checkpoint=load_global)
+    shared_model.get_model_from_checkpoint(config=cfg, load_global_checkpoint=load_global)
     assert bool(consulted) is expect_consulted

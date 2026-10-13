@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import time
 import traceback
 from pathlib import Path
@@ -12,13 +13,14 @@ from connito.shared.app_logging import structlog
 from connito.shared.chain import (
     SignedModelHashChainCommit,
 )
-from connito.shared.checkpoint_helper import TensorSpec, load_checkpoint
+from connito.shared.checkpoint_helper import TensorSpec, group_shard, verify_residual_shard
 from connito.shared.checkpoints import (
     ChainCheckpoints,
     ModelCheckpoint,
     build_chain_checkpoints,
     build_chain_checkpoints_from_previous_phase,
     delete_old_checkpoints,
+    local_checkpoints_best_first,
     select_best_checkpoint,
 )
 from connito.shared.config import MinerConfig, ValidatorConfig, WorkerConfig
@@ -68,7 +70,7 @@ def grad_hook(name):
     return h
 
 def get_model_from_checkpoint(
-    rank: int, config: MinerConfig | ValidatorConfig,
+    config: MinerConfig | ValidatorConfig,
     checkpoint_device: torch.device | None = None,
     load_global_checkpoint: bool = True,
 ) -> tuple[nn.Module, ModelCheckpoint | None]:
@@ -89,22 +91,20 @@ def get_model_from_checkpoint(
     latest_checkpoint: ModelCheckpoint | None = None
     # load from checkpoint
     if resume:
-        latest_checkpoint = select_best_checkpoint(
-            primary_dir=config.ckpt.validator_checkpoint_path,
-            secondary_dir=config.ckpt.checkpoint_path,
-            resume=config.ckpt.resume_from_ckpt,
-        )
-
-        if resume and latest_checkpoint is not None and latest_checkpoint.path:
-            load_checkpoint(
-                config=config,
-                checkpoint_path=latest_checkpoint.path,
-                model=model,
-                rank=rank,
-                device=checkpoint_device if checkpoint_device is not None else config.model.device,
-            )
+        candidates = local_checkpoints_best_first(config.ckpt.validator_checkpoint_path, config.ckpt.checkpoint_path)
+        # Returned as before, the newest on disk: the resync check compares the next newest with it.
+        latest_checkpoint = candidates[0] if candidates else None
+        # The newest that verifies is the start. One refused (untrained, off spec, an empty download folder) must
+        # not cost the miner its own trained checkpoint below it; none verifying leaves the fresh draw, which trains.
+        spec = residual_shapes(config)
+        for candidate in candidates:
+            state_dict = verify_residual_shard(group_shard(candidate.path, config.task.exp.group_id), spec)
+            if state_dict is not None:
+                model.load_state_dict(state_dict, strict=False)
+                logger.info("Resumed the residual", path=str(candidate.path))
+                break
         else:
-            logger.info("Tried to resume from checkpoint, but no checkpoint found.")
+            logger.info("Keeping the fresh residual: no local checkpoint is a start", candidates=len(candidates))
 
     _device = checkpoint_device if checkpoint_device is not None else config.model.device
     model = model.to(device=_device)
@@ -113,7 +113,6 @@ def get_model_from_checkpoint(
     return model, latest_checkpoint
 
 def load_model(
-    rank: int,
     config: MinerConfig | ValidatorConfig,
     subtensor: bittensor.Subtensor,
     wallet: bittensor.Wallet,
@@ -157,7 +156,7 @@ def load_model(
         )
 
     return get_model_from_checkpoint(
-        rank=rank, config=config, checkpoint_device=checkpoint_device,
+        config=config, checkpoint_device=checkpoint_device,
         load_global_checkpoint=load_global_checkpoint,
     )
 
@@ -212,7 +211,6 @@ def fetch_model_from_chain_validator(
                 out_folder = Path(config.ckpt.validator_checkpoint_path) / (
                     f"uid_{chain_checkpoint.uid}_hotkey_{chain_checkpoint.hotkey}_globalver_{chain_checkpoint.global_ver}"
                 )
-                out_folder.mkdir(parents=True, exist_ok=True)
 
                 targets = _build_download_targets(expert_group_ids)
                 filenames = [filename for _, filename in targets]
@@ -227,6 +225,7 @@ def fetch_model_from_chain_validator(
                     )
                     continue
 
+                out_folder.mkdir(parents=True, exist_ok=True)
                 _clear_download_targets(out_folder, filenames)
 
                 try:
@@ -248,6 +247,8 @@ def fetch_model_from_chain_validator(
                         error=str(e),
                         exc_info=True,
                     )
+                    # A folder left behind is the newest checkpoint on disk, and a miner would try to start from it.
+                    shutil.rmtree(out_folder, ignore_errors=True)
                     continue
 
                 chain_checkpoint.path = out_folder
@@ -260,6 +261,7 @@ def fetch_model_from_chain_validator(
                         current_model_version=current_model_meta.global_ver if current_model_meta else None,
                         current_model_hash=current_model_meta.model_hash if current_model_meta else None,
                     )
+                    shutil.rmtree(out_folder, ignore_errors=True)
                     continue
 
                 download_success = True

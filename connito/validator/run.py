@@ -713,13 +713,13 @@ def _write_pretrained_shard(
 
 
 def _build_eval_model(
-    config, rank: int, device: torch.device, expert_manager: ExpertManager,
+    config, device: torch.device, expert_manager: ExpertManager,
 ) -> tuple[nn.Module, Path]:
     """The process's only model, plus the shard every round is scored
     against. Boot only: a task switch keeps the model (`_switch_task`).
     """
     eval_model, _ = get_model_from_checkpoint(
-        rank=rank, config=config, checkpoint_device=device, load_global_checkpoint=False,
+        config=config, checkpoint_device=device, load_global_checkpoint=False,
     )
     # Parameters only: the model is fp8 already, and `state_dict()` would
     # dequantize every frozen expert to a CPU copy.
@@ -732,7 +732,7 @@ def _build_eval_model(
     return eval_model, base_shard
 
 
-def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, ExpertManager, Path]:
+def setup_training(config, device: torch.device) -> tuple[nn.Module, ExpertManager, Path]:
     """Build the process's only model and record the shard every round is scored against.
 
     The validator's model is the pretrained one and never advances. The round
@@ -743,7 +743,7 @@ def setup_training(config, rank: int, device: torch.device) -> tuple[nn.Module, 
     """
     logger.debug("setup training - load model and expert manager")
     expert_manager = ExpertManager(config)
-    eval_model, base_shard = _build_eval_model(config, rank, device, expert_manager)
+    eval_model, base_shard = _build_eval_model(config, device, expert_manager)
     logger.info("Training setup complete", device=str(device), base_shard=str(base_shard))
     return eval_model, expert_manager, base_shard
 
@@ -815,7 +815,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
     # processes / prefetched batches don't stay resident across the whole cycle.
 
     # === set up training ===
-    eval_model, _, base_shard = setup_training(config, rank, device)
+    eval_model, _, base_shard = setup_training(config, device)
 
     global_opt_step = 0
     # Coordinates of the baseline published at finalize, read by the next

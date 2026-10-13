@@ -154,7 +154,7 @@ def test_the_miner_fetches_its_baseline_against_its_residual_spec(family_name, m
     monkeypatch.setattr(shared_model, "fetch_model_from_chain_validator", lambda **kw: asked.update(kw))
     monkeypatch.setattr(shared_model, "get_model_from_checkpoint", lambda **kw: (None, None))
 
-    shared_model.load_model(0, config, subtensor=None, wallet=None)
+    shared_model.load_model(config, subtensor=None, wallet=None)
 
     assert asked["expected"] == residual_shapes(config)
 

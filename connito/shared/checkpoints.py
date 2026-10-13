@@ -13,10 +13,14 @@ from fsspec.generic import GenericFileSystem
 from pydantic import BaseModel, ConfigDict, Field
 
 from connito.shared.app_logging import structlog
-from connito.shared.checkpoint_helper import TensorSpec, compile_full_state_dict_from_path, verify_residual_shard
+from connito.shared.checkpoint_helper import (
+    TensorSpec,
+    compile_full_state_dict_from_path,
+    group_shard,
+    verify_residual_shard,
+)
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
-    expert_group_shard_name,
     get_model_hash,
     parse_dynamic_filename,
 )
@@ -198,9 +202,7 @@ class ModelCheckpoint(BaseModel):
             logger.warning("Hash verification failed: missing checkpoint path", checkpoint=self)
             return False
 
-        path = Path(self.path)
-        shard = path if path.is_file() else path / expert_group_shard_name(self.expert_group)
-        state_dict = verify_residual_shard(shard, expected)
+        state_dict = verify_residual_shard(group_shard(self.path, self.expert_group), expected)
         self.shard_verified = state_dict is not None
         if state_dict is not None:
             self._verify_hash(state_dict=state_dict)
@@ -889,32 +891,18 @@ def prune_submissions_outside_window(
     return deleted_files
 
 
+def local_checkpoints_best_first(primary_dir: Path, secondary_dir: Path | None = None) -> list[ModelCheckpoint]:
+    """Every checkpoint in the two folders, newest (global_ver, inner_opt) first."""
+    checkpoints = build_local_checkpoints(primary_dir, role="miner").checkpoints
+    if secondary_dir is not None:
+        checkpoints = [*checkpoints, *build_local_checkpoints(secondary_dir, role="validator").checkpoints]
+    return ModelCheckpoints(checkpoints=checkpoints).ordered()
+
+
 def select_best_checkpoint(
     primary_dir: Path, secondary_dir: Path | None = None, resume: bool = True
 ) -> ModelCheckpoint | None:
     if not resume:
         return None
-
-    primary = build_local_checkpoints(primary_dir, role="miner")
-
-    if secondary_dir is None:
-        combined = Checkpoints(
-            local=primary,
-            chain=ChainCheckpoints(checkpoints=[]),
-        )
-        ordered = combined.ordered()
-        return ordered[0] if ordered else None
-
-    secondary = build_local_checkpoints(secondary_dir, role="validator")
-    combined_local = ModelCheckpoints(checkpoints=[*primary.checkpoints, *secondary.checkpoints])
-
-    combined = Checkpoints(
-        local=combined_local,
-        chain=ChainCheckpoints(checkpoints=[]),
-    )
-
-    for ckpt in combined.ordered():
-        if ckpt.active():
-            return ckpt
-
-    return None
+    ordered = local_checkpoints_best_first(primary_dir, secondary_dir)
+    return ordered[0] if ordered else None
