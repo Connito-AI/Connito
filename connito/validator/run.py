@@ -695,15 +695,7 @@ def _round_commit(baseline_ref: dict[str, object], base_shard: Path) -> RoundCom
 
 
 def setup_training(config, device: torch.device) -> TaskScopedState:
-    """Build the process's only model and write the shard every round is scored against.
-
-    The model is the pretrained base plus its own freshly installed residual,
-    whose `down_proj` is 0, so base + residual equals the base whatever was
-    drawn: that residual is the round base shard. It is never advanced, so
-    there is no checkpoint to resume, no chain fetch, and no dataloader (the
-    eval worker builds its own per round). A task switch keeps the model
-    (`_switch_task`).
-    """
+    """The only model: the base plus a fresh residual (`down_proj` = 0, so equal to it), saved as the round base."""
     eval_model, _ = get_model_from_checkpoint(
         config=config, checkpoint_device=device, load_global_checkpoint=False,
     )
