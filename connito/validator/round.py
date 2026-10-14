@@ -663,8 +663,8 @@ class Round:
         self, uid: int, score: float = 0.0, val_loss: float | None = None
     ) -> None:
         """Record a successful evaluation. `score` is this-round's score
-        (the task gain less the c4 and gate-usage penalties, from
-        `evaluate_one_miner`); it is stored
+        (the task gain less the c4 and gate-usage penalties, less the
+        base's own, from `evaluate_one_miner`); it is stored
         in `self.scores` so per-round ranking — used by post-eval
         submission cleanup — never has to consult the global aggregator.
 

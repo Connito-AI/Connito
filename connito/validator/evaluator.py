@@ -637,6 +637,14 @@ DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
 # Real (unpadded) tokens in the c4 replay split.
 REPLAY_EVAL_TOKENS = 65_536
+
+
+def usage_penalties(evaluation, usage: dict[str, float]) -> dict[str, float]:
+    """The score's gate-usage terms, each the positive magnitude it subtracts; the replay one only when measured."""
+    penalties = {"usage_penalty": evaluation.task_usage_weight * abs(usage["task"] - evaluation.task_usage_target)}
+    if "replay" in usage:
+        penalties["replay_usage_penalty"] = evaluation.replay_usage_weight * usage["replay"]
+    return penalties
 # ------------------------------------------------------------------------------
 
 # def load_model_from_path(path: str, base_model, device: torch.device) -> nn.Module:
@@ -773,6 +781,7 @@ def evaluate_one_miner_sync(
     cached_batches: list | None = None,
     replay_batches: list | None = None,
     baseline_replay_loss: float | None = None,
+    base_raw_score: float = 0.0,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
 
@@ -798,8 +807,9 @@ def evaluate_one_miner_sync(
     the case where the eval genuinely stalls on GPU and `wait_for`
     cancellation alone wouldn't recover.
 
-    The score is the task gain minus the c4 and gate-usage penalties weighted
-    in `config.evaluation`. With `replay_batches` and `baseline_replay_loss`,
+    The raw score is the task gain minus the c4 and gate-usage penalties
+    weighted in `config.evaluation`; the score is it minus `base_raw_score`,
+    the base's own raw score on the round's baseline evals. With `replay_batches` and `baseline_replay_loss`,
     the same model is also scored on c4 replay; a rise above
     `max_replay_loss_increase` sets `val_loss` to inf and the score to -inf,
     so the miner is never ranked or published.
@@ -832,7 +842,7 @@ def evaluate_one_miner_sync(
         val_loss = float(metrics.get("val_loss", 100))
         ev = config.evaluation
         usage = {"task": float(metrics.get("gate_usage", 0.0))}
-        penalties = {"usage_penalty": ev.task_usage_weight * abs(usage["task"] - ev.task_usage_target)}
+        penalties = {}
         replay_increase, replay_nan_batches = None, 0
         if replay_batches and baseline_replay_loss is not None:
             replay = evaluate_model(step, miner_model, replay_batches, device, None, rank,
@@ -841,15 +851,16 @@ def evaluate_one_miner_sync(
             replay_nan_batches = int(replay.get("nan_batches", 0))
             usage["replay"] = float(replay.get("gate_usage", 0.0))
             penalties["replay_penalty"] = ev.replay_loss_weight * max(0.0, replay_increase)
-            penalties["replay_usage_penalty"] = ev.replay_usage_weight * usage["replay"]
+        penalties |= usage_penalties(ev, usage)
         terms = {"task_gain": baseline_loss - val_loss, **penalties}
         # `score` is the per-round signal stored on
         # `MinerEvalJob` and recorded in `round.scores` by the caller via
         # `mark_scored`. The aggregator is intentionally NOT updated here
         # — `finalize_round_scores` is the sole writer for this round's
         # aggregator entries (see PR #93 introducing rank-based scoring).
-        # The round's baseline scores 0 by definition: only a miner above 0 is ranked or published.
-        score = terms["task_gain"] - sum(penalties.values())
+        # Measured from the base's own raw score, so the base scores 0: only a miner above it is ranked or published.
+        raw = terms["task_gain"] - sum(penalties.values())
+        score = raw - base_raw_score
         try:
             for term, value in terms.items():
                 VALIDATOR_MINER_SCORE_TERM.labels(miner_uid=str(int(uid)), term=term).set(value)
@@ -911,6 +922,8 @@ def evaluate_one_miner_sync(
             replay_loss_increase=None if replay_increase is None else round(replay_increase, 4),
             **{f"{split}_usage": round(value, 4) for split, value in usage.items()},
             **{term: round(value, 4) for term, value in terms.items()},
+            raw=round(raw, 6),
+            base_raw=round(base_raw_score, 6),
             score=round(score, 6),
             round_id=round_id,
         )

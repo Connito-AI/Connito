@@ -16,6 +16,7 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import threading
 import time
@@ -34,6 +35,7 @@ from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
+    VALIDATOR_ROUND_BASE_RAW_SCORE,
     inc_error,
     note_round_series,
     set_baseline_loss,
@@ -43,6 +45,7 @@ from connito.validator.evaluator import (
     REPLAY_EVAL_TOKENS,
     cleanup_non_top_submissions,
     evaluate_one_miner_sync,
+    usage_penalties,
 )
 from connito.validator.round import RoundRef
 
@@ -128,6 +131,8 @@ class BackgroundEvalWorker(threading.Thread):
         # None when the task has no replay source or the replay baseline is not finite.
         self._replay_batches: list | None = None
         self._loaded_baseline_replay_loss: float | None = None
+        # The base's own raw score (its gate-usage terms); every miner's score is measured from it.
+        self._loaded_base_raw_score = 0.0
         # Stuck-lock detection: incremented every iteration that observes
         # `gpu_eval_lock` held at the top-of-loop assertion, reset to 0
         # on any successful (or even attempted) eval iteration. When the
@@ -320,6 +325,7 @@ class BackgroundEvalWorker(threading.Thread):
         self._cached_batches = None
         self._replay_batches = None
         self._loaded_baseline_replay_loss = None
+        self._loaded_base_raw_score = 0.0  # stays 0 on a fallback round, scored against 100.0 alone
         self._expected = None
 
         def _load() -> None:
@@ -409,13 +415,13 @@ class BackgroundEvalWorker(threading.Thread):
                 return evaluate_model(0, self._eval_base_model, batches, self.device, max_batches, None)
 
         # A task with a replay source whose c4 check cannot run publishes nothing: each case raises into the fallback.
-        baseline_usage: dict[str, float] = {}
+        base_usage: dict[str, float] = {}
         try:
             if has_replay and not self._replay_batches:
                 raise ValueError("the c4 replay split is empty")
             task = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
             self._loaded_baseline_loss = float(task.get("val_loss", 100))
-            baseline_usage["baseline_task_usage"] = round(task.get("gate_usage", 0.0), 4)
+            base_usage["task"] = float(task.get("gate_usage", 0.0))
             if not math.isfinite(self._loaded_baseline_loss):
                 raise ValueError("task baseline is not finite")  # every score would be non-finite
             if has_replay:
@@ -423,11 +429,15 @@ class BackgroundEvalWorker(threading.Thread):
                 if not math.isfinite(replay["val_loss"]) or replay.get("nan_batches", 0) > 0:
                     raise ValueError("the replay baseline has non-finite batches")
                 self._loaded_baseline_replay_loss = float(replay["val_loss"])
-                baseline_usage["baseline_replay_usage"] = round(replay.get("gate_usage", 0.0), 4)
+                base_usage["replay"] = float(replay.get("gate_usage", 0.0))
+            # The base has no task gain or c4 rise against itself; only its gate-usage terms remain.
+            self._loaded_base_raw_score = -sum(usage_penalties(self.config.evaluation, base_usage).values())
             # Feeds the dashboard's baseline trend. Only the measured path
             # publishes: both fallbacks park the value at 100.0, and a
             # sentinel in the series reads as a real regression.
             set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss)
+            with contextlib.suppress(Exception):
+                VALIDATOR_ROUND_BASE_RAW_SCORE.set(self._loaded_base_raw_score)
         except Exception as e:
             self._fall_back(round_obj, "baseline failed", e)
 
@@ -442,7 +452,8 @@ class BackgroundEvalWorker(threading.Thread):
             ),
             replay_batches=len(self._replay_batches or []),
             replay_tokens=sum(int(b["attention_mask"].sum()) for b in self._replay_batches or []),
-            **baseline_usage,
+            **{f"baseline_{split}_usage": round(value, 4) for split, value in base_usage.items()},
+            base_raw_score=round(self._loaded_base_raw_score, 6),
         )
 
     def _fall_back(self, round_obj, reason: str, error: Exception) -> None:
@@ -576,6 +587,7 @@ class BackgroundEvalWorker(threading.Thread):
                     cached_batches=self._cached_batches,
                     replay_batches=self._replay_batches,
                     baseline_replay_loss=self._loaded_baseline_replay_loss,
+                    base_raw_score=self._loaded_base_raw_score,
                 )
 
         try:
@@ -681,6 +693,7 @@ class BackgroundEvalWorker(threading.Thread):
         self._cached_batches = None
         self._replay_batches = None
         self._loaded_baseline_replay_loss = None
+        self._loaded_base_raw_score = 0.0
         self._stuck_lock_streak = 0
         try:
             VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS.set(0)

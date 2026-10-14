@@ -20,7 +20,7 @@ from connito.shared.config import DatasetSourceCfg, EvalCfg
 from connito.shared.evaluate import EvalDeadlineExceeded
 from connito.validator import background_eval_worker as bew
 from connito.validator import evaluator
-from connito.validator.evaluator import MinerEvalJob, evaluate_one_miner_sync
+from connito.validator.evaluator import MinerEvalJob, evaluate_one_miner_sync, usage_penalties
 from connito.validator.round import select_baseline_uid
 
 TASK, REPLAY = ["task batch"], ["replay batch"]
@@ -43,7 +43,8 @@ def _config(**evaluation) -> SimpleNamespace:
 
 def _score(monkeypatch, *, task_loss: float, replay_loss: float, replay_batches=REPLAY,
            baseline_replay: float | None = BASELINE_REPLAY, replay_nan_batches: int = 0,
-           task_usage: float = TARGET, replay_usage: float = 0.0, **evaluation) -> tuple[MinerEvalJob, list]:
+           task_usage: float = TARGET, replay_usage: float = 0.0, base_raw: float = 0.0,
+           **evaluation) -> tuple[MinerEvalJob, list]:
     """Score uid 7 against BASELINE; by default its gate usage costs nothing, so only the losses count."""
     calls: list = []
 
@@ -61,6 +62,7 @@ def _score(monkeypatch, *, task_loss: float, replay_loss: float, replay_batches=
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
         combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
         cached_batches=TASK, replay_batches=replay_batches, baseline_replay_loss=baseline_replay,
+        base_raw_score=base_raw,
     )
     return job, calls
 
@@ -104,12 +106,46 @@ def test_the_weights_and_target_come_from_the_validator_config(monkeypatch, stat
     assert job.score == pytest.approx(0.5 - 2 * 0.125 - 3 * 0.25 - 4 * 0.0625)
 
 
-def test_a_miner_that_matches_the_baseline_scores_exactly_zero_like_the_baseline(monkeypatch, statuses):
-    """The baseline is never scored: 0 is its score by definition, and only a miner above it is published."""
-    job, _ = _score(monkeypatch, task_loss=BASELINE, replay_loss=BASELINE_REPLAY)
+BASE_USAGE = {"task": 0.05, "replay": 0.05}  # an untrained gate: about 0.05 on Qwen
+
+
+def _base_raw(**evaluation) -> float:
+    return -sum(usage_penalties(_config(**evaluation).evaluation, BASE_USAGE).values())
+
+
+def test_the_bases_raw_score_is_its_gate_usage_terms():
+    # |0.05 − 0.25| + 0.05, and with weights 2 and 3: 2·0.2 + 3·0.05.
+    assert _base_raw() == pytest.approx(-0.25)
+    assert _base_raw(task_usage_weight=2.0, replay_usage_weight=3.0) == pytest.approx(-0.55)
+
+
+def test_a_miner_identical_to_the_base_scores_exactly_zero_like_the_base(monkeypatch, statuses):
+    """The base's score is 0 by construction, and only a miner above it is published."""
+    job, _ = _score(monkeypatch, task_loss=BASELINE, replay_loss=BASELINE_REPLAY, task_usage=BASE_USAGE["task"],
+                    replay_usage=BASE_USAGE["replay"], base_raw=_base_raw())
 
     assert job.score == 0.0
     assert select_baseline_uid({7: job.score}, {}) is None
+
+
+def test_the_score_is_the_raw_score_minus_the_bases(monkeypatch, statuses):
+    log = MagicMock()
+    monkeypatch.setattr(evaluator, "logger", log)
+    # 0.1 of task gain with the base's usage: raw 0.1 − 0.25 is negative, the score 0.1 is positive.
+    job, _ = _score(monkeypatch, task_loss=BASELINE - 0.1, replay_loss=BASELINE_REPLAY,
+                    task_usage=BASE_USAGE["task"], replay_usage=BASE_USAGE["replay"], base_raw=_base_raw())
+
+    (complete,) = (c.kwargs for c in log.info.call_args_list if c.args[0] == "evaluate_one_miner: complete")
+    assert complete["raw"] == pytest.approx(-0.15)
+    assert complete["base_raw"] == pytest.approx(-0.25)
+    assert job.score == pytest.approx(0.1)
+    assert select_baseline_uid({7: job.score}, {}) == 7  # published although its raw score is negative
+
+
+def test_a_gate_failure_stays_minus_inf_whatever_the_bases_raw_score(monkeypatch, statuses):
+    job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.5, base_raw=-10.0)
+
+    assert job.score == -math.inf
 
 
 def test_each_term_is_logged_and_published(monkeypatch, statuses):
@@ -297,7 +333,7 @@ def _worker(*, replay_source: bool = True) -> bew.BackgroundEvalWorker:
     sources = [DatasetSourceCfg(path="pmc"), DatasetSourceCfg(path="allenai/c4", replay=replay_source)]
     worker = bew.BackgroundEvalWorker(
         config=SimpleNamespace(
-            evaluation=SimpleNamespace(per_miner_eval_timeout_sec=5, top_k_miners_to_reward=3),
+            evaluation=EvalCfg(per_miner_eval_timeout_sec=5),
             dataloader=SimpleNamespace(world_size=1),
             task=SimpleNamespace(exp=SimpleNamespace(data=SimpleNamespace(dataset_sources=sources, sequence_length=8))),
         ),
@@ -342,12 +378,27 @@ def test_both_baselines_are_measured_once_per_round_and_handed_to_every_miner(wo
         assert (kw["baseline_loss"], kw["baseline_replay_loss"]) == (BASELINE, BASELINE_REPLAY)
 
 
-def test_the_round_log_reports_the_bases_gate_usage(worker_env):
-    _run_round(_worker(), _round(), worker_env)
-
+def _snapshot_log(env) -> dict:
     event = "bg-eval: round snapshot loaded"
-    (loaded,) = (c.kwargs for c in worker_env.logger.info.call_args_list if c.args[0] == event)
+    (loaded,) = (c.kwargs for c in env.logger.info.call_args_list if c.args[0] == event)
+    return loaded
+
+
+def test_the_bases_raw_score_is_measured_once_per_round_reported_and_handed_to_every_miner(worker_env):
+    first, second = _run_round(_worker(), _round(), worker_env, miners=2)
+
+    base_raw = -(abs(0.05 - 0.2) + 0.0625)  # the worker's base usage, and the default target and weights
+    assert first["base_raw_score"] == second["base_raw_score"] == pytest.approx(base_raw)
+    loaded = _snapshot_log(worker_env)
     assert (loaded["baseline_task_usage"], loaded["baseline_replay_usage"]) == (0.05, 0.0625)
+    assert loaded["base_raw_score"] == pytest.approx(base_raw)
+    assert REGISTRY.get_sample_value("validator_round_base_raw_score") == pytest.approx(base_raw)
+
+
+def test_without_a_replay_source_the_bases_raw_score_has_no_c4_term(worker_env):
+    (kw,) = _run_round(_worker(replay_source=False), _round(), worker_env)
+
+    assert kw["base_raw_score"] == pytest.approx(-0.15)
 
 
 def test_the_replay_split_is_batched_within_the_tasks_sequence_length(worker_env):
@@ -376,6 +427,15 @@ def test_a_round_never_inherits_the_previous_rounds_replay_baseline(worker_env):
     assert kw["baseline_replay_loss"] is None
 
 
+def test_a_fallback_round_never_inherits_the_previous_rounds_base_raw_score(worker_env):
+    worker = _worker()
+    _run_round(worker, _round(100), worker_env)
+    worker_env.replay_baseline = RuntimeError("oom")  # the next round falls back after measuring the task baseline
+    (kw,) = _run_round(worker, _round(101), worker_env)
+
+    assert kw["base_raw_score"] == 0.0
+
+
 def _fallback_counter():
     from connito.shared.telemetry import ERRORS_TOTAL
 
@@ -392,12 +452,12 @@ def test_a_round_on_the_fallback_baseline_is_flagged_and_counted(worker_env, mon
     (kw,) = _run_round(_worker(), round_obj, worker_env)
 
     assert round_obj.baseline_fallback is True
-    assert (kw["baseline_loss"], kw["baseline_replay_loss"]) == (100.0, None)
+    assert (kw["baseline_loss"], kw["baseline_replay_loss"], kw["base_raw_score"]) == (100.0, None, 0.0)
     assert _fallback_counter()._value.get() == before + 1
 
 
 @pytest.mark.parametrize("unusable", [
-    {"task_baseline": math.inf},               # every score would be inf, and q15 would publish
+    {"task_baseline": math.inf},               # every score would be non-finite
     {"replay_baseline": RuntimeError("oom")},  # from here on, the c4 check cannot run this round
     {"replay_rows": []},
     {"replay_baseline": math.inf},
@@ -410,4 +470,4 @@ def test_an_unusable_baseline_takes_the_fallback(worker_env, unusable):
     (kw,) = _run_round(_worker(), round_obj, worker_env)
 
     assert round_obj.baseline_fallback is True
-    assert kw["baseline_loss"] == 100.0
+    assert (kw["baseline_loss"], kw["base_raw_score"]) == (100.0, 0.0)  # even when the task baseline was measured

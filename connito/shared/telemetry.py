@@ -148,6 +148,12 @@ VALIDATOR_BASELINE_LOSS = Gauge(
     "validator_baseline_loss",
     "Round baseline loss against this validator's eval set",
 )
+# The base's own raw score on the round's baseline evals (its gate-usage terms), which every miner's
+# score is measured from. Set only when the baselines are measured, like `validator_baseline_loss`.
+VALIDATOR_ROUND_BASE_RAW_SCORE = Gauge(
+    "validator_round_base_raw_score",
+    "Raw score of the round base on its own baseline evals; each miner's score is its raw score minus this",
+)
 # Per-round baseline loss, labeled by the round it belongs to. The unlabeled
 # gauge above is overwritten every round, so a scraper can only sample it and
 # a cycle's baseline ends up timing-dependent; this labeled family lets the
@@ -293,8 +299,9 @@ VALIDATOR_MINER_LAST_SCORED_ROUND_ID = Gauge(
 )
 VALIDATOR_MINER_ROUND_DELTA = Gauge(
     "validator_miner_round_delta",
-    "Raw per-round score from the miner's most recent evaluated round: task gain minus the c4 and "
-    "gate-usage penalties; negative below the base, -Inf when the c4 isolation gate failed. Distinct from "
+    "Per-round score from the miner's most recent evaluated round: task gain minus the c4 and "
+    "gate-usage penalties, less the base's own; negative below the base, -Inf when the c4 isolation "
+    "gate failed. Distinct from "
     "validator_miner_score_latest, which is the finalized podium rank score.",
     ["miner_uid"],
 )

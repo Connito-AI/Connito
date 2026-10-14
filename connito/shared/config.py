@@ -1176,7 +1176,8 @@ class EvalCfg(BaseConfig):
     per_miner_eval_timeout_sec: PositiveInt = 300
     # c4 isolation gate: a miner whose replay loss rises more than this above the base's is never ranked.
     max_replay_loss_increase: NonNegativeFloat = 0.02
-    # score = (task_base − task) − a·max(0, c4 − c4_base) − b·|task_usage − target| − c·c4_usage
+    # raw = (task_base − task) − a·max(0, c4 − c4_base) − b·|task_usage − target| − c·c4_usage
+    # score = raw − the base's raw on its own baseline evals (only its usage terms), so the base scores 0
     replay_loss_weight: NonNegativeFloat = 1.0  # a
     task_usage_weight: NonNegativeFloat = 1.0  # b
     task_usage_target: NonNegativeFloat = 0.2  # target
