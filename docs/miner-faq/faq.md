@@ -253,7 +253,7 @@ See `eval-status.md` for the full table. Quick reference:
   expert). Upload the stock `save_residual_shard` output.
 - `replay_loss_increase` (15) — the c4 isolation check zeroed you. Vary your
   training data every round.
-- Codes 5 (`expert_group_or_nan`) and 13 (`incomplete_expert_set`) are retired
+- Codes 5 and 13 are retired (they belonged to the old expert-group shards)
   and never set any more.
 
 The labels are authored in **validator code**

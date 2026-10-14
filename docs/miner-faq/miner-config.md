@@ -151,9 +151,9 @@ model:
   uses about 1.3 GiB more GPU memory than `all` (34.68 vs 33.37 GiB after
   load) and fits micro-batch 2 on the L40S. It is not locked: it only affects
   your own box.
-- Training is bf16 only; there is no fp16 mode.
+- Training runs in bf16 only.
 - **Upgrading an old YAML:** a config written before `micro_batch_size`
-  existed has `gradient_accumulation_steps: 4`. On load that value is dropped
+  existed sets `gradient_accumulation_steps` to 4. On load that value is dropped
   with the warning "Ignoring local_par.gradient_accumulation_steps from before
   micro_batch_size", so you get 2 × 2. Add `local_par.micro_batch_size` to
   keep your own accumulation.
