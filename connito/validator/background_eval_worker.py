@@ -3,9 +3,9 @@
 Active only inside the (3) window: from end of Validate(K) to end of
 Train(K+1). Pulls UIDs from `Round.downloaded_pool` and runs
 `evaluate_one_miner` against `eval_base_model`, whose expert weights are
-reloaded once per round from `round.base_shard`. The backbone is frozen
-(`model.freeze_parameters`), so the shard plus a pretrained backbone is
-the whole base — nothing else has to be carried between rounds.
+reloaded once per round from `round.base_shard`. The backbone never
+trains, so the shard plus a pretrained backbone is the whole base —
+nothing else has to be carried between rounds.
 
 GPU-lock yielding invariant: `gpu_eval_lock` is acquired only for the
 narrow `load_state_dict` and `evaluate_one_miner` calls. It MUST NOT be

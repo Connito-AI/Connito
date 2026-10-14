@@ -32,12 +32,12 @@ from connito.shared.cycle import (
 )
 from connito.shared.expert_manager import (
     ExpertManager,
-    get_layer_expert_id,
     ExpertAssignments
 )
 from connito.shared.memory import cleanup
 from connito.shared.helper import expert_group_shard_name, get_model_hash, get_nested_attr
 from connito.shared.modeling.mycelia import get_base_model
+from connito.shared.modeling.residual import install_residual_experts
 from connito.shared.schema import verify_message
 
 logger = structlog.get_logger(__name__)
@@ -94,58 +94,6 @@ def grad_hook(name):
 
     return h
 
-def freeze_parameters(
-    model: nn.Module,
-    expert_manager: ExpertManager,
-    expert_group_id: int,
-    upcast_trainable: bool = False,
-) -> nn.Module:
-    """
-    Freeze all parameters except the routed experts belonging to expert_group_id.
-
-    Expert parameters carry the global expert id in the name
-    (``experts.7.gate_proj.weight``), so the id is read straight off it.
-    """
-    assignment = expert_manager.expert_group_assignment.get(expert_group_id, {})
-
-    for name, param in model.named_parameters():
-        layer_id, expert_id = get_layer_expert_id(name)
-
-        if layer_id is None or expert_id is None:
-            param.requires_grad_(False)
-            continue
-
-        # `org_expert_id`: the name carries the global id, not the local slot.
-        allowed = {int(org_expert_id) for _, org_expert_id in assignment.get(layer_id, [])}
-        if expert_id in allowed:
-            param.requires_grad_(True)
-        else:
-            # Not in this group's assignment.
-            param.requires_grad_(False)
-
-    # Optionally upcast trainable parameters to float32 for stable mixed-precision optimization.
-    # Needed for AdamW (moment estimates need fp32 precision), but not for SGD.
-    upcast_count = 0
-    if upcast_trainable:
-        for p in model.parameters():
-            if p.requires_grad and p.dtype != torch.float32:
-                p.data = p.data.float()
-                upcast_count += 1
-
-    trainable = sum(1 for p in model.parameters() if p.requires_grad)
-    total = sum(1 for _ in model.parameters())
-    logger.debug(
-        "freeze_parameters: done",
-        trainable=trainable,
-        total=total,
-        upcast_trainable_to_fp32=upcast_count,
-    )
-    if hasattr(model, 'enable_input_require_grads'):
-        model.enable_input_require_grads()
-
-    return model
-
-
 def get_model_from_checkpoint(
     rank: int, config: MinerConfig | ValidatorConfig,
     checkpoint_device: torch.device | None = None,
@@ -164,6 +112,7 @@ def get_model_from_checkpoint(
     )
     logger.info("Loading base model for checkpoint", load_global_checkpoint=load_global_checkpoint)
     model = get_base_model(config)
+    install_residual_experts(model, config)
 
     latest_checkpoint: ModelCheckpoint | None = None
     # load from checkpoint
@@ -186,14 +135,9 @@ def get_model_from_checkpoint(
             logger.info("Tried to resume from checkpoint, but no checkpoint found.")
 
     _device = checkpoint_device if checkpoint_device is not None else config.model.device
-    
-    precision = getattr(config.model, "precision", "fp16-mixed")
-    if precision == "bf16-mixed" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-        precision = "fp16-mixed"
-    model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
-
-    model = model.to(device=_device, dtype=model_dtype)
-    model.gradient_checkpointing_enable()
+    model = model.to(device=_device)
+    # Non-reentrant: the setting the L40S hardware floor was measured with.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     return model, latest_checkpoint
 
 def load_model(

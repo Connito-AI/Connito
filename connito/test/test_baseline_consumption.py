@@ -223,10 +223,11 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
         def to(self, **kw):
             return self
 
-        def gradient_checkpointing_enable(self):
+        def gradient_checkpointing_enable(self, **kw):
             pass
 
     monkeypatch.setattr(shared_model, "get_base_model", lambda *a, **k: _Model())
+    monkeypatch.setattr(shared_model, "install_residual_experts", lambda *a: None)
     monkeypatch.setattr(shared_model, "select_best_checkpoint",
                         lambda **kw: consulted.append(True))
 
