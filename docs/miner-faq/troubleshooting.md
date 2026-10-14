@@ -246,14 +246,15 @@ an older shard.
 **Cause:** validators do not read your commits whenever they arrive. At round
 freeze they read the chain **as of two blocks**: the end of MinerCommit1 (your
 signed hash) and the end of MinerCommit2 (your model hash and HF
-coordinates). Whatever your commitments were at those blocks is what gets
-scored:
+coordinates). A hotkey has one commitment slot, which each commit
+overwrites, so whatever the slot held at those blocks is what gets scored:
 
-- **Signed hash committed after MinerCommit1 ended:** the validator pairs the
-  previous signed hash with the new model hash, and the signature check fails
-  (`signature_invalid`).
-- **Model hash committed after MinerCommit2 ended:** the validator sees your
-  previous MinerCommit2 commit, or none (`no_chain_commit`).
+- **Signed hash committed after MinerCommit1 ended:** at that block the slot
+  still held your previous commit, so the validator finds no signed hash for
+  this round and the signature check fails (`signature_invalid`).
+- **Model hash committed after MinerCommit2 ended:** at that block the slot
+  still held your signed hash, so the validator finds no model-hash commit
+  (`no_chain_commit`).
 - **HF upload failed:** the MinerCommit2 commit went out without HF
   coordinates (`no_chain_commit`).
 
