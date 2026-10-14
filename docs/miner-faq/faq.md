@@ -27,8 +27,9 @@ redirect), `connito/validator/run.py` (the "g1 empty — redirecting" log line).
 1. No chain commit (`no_chain_commit`).
 2. Pre-eval validation failure: `signature_invalid` / `hash_mismatch` /
    `bad_residual_shard` (the shard is not exactly the task's residual).
-3. `non_finite_loss` — eval ran, returned NaN/Inf. A miner zeroed by the c4
-   isolation check also shows `val_loss = inf`, with `replay_loss_increase`.
+3. `non_finite_loss` — eval ran, returned NaN/Inf; the score is `−inf`. A
+   miner stopped by the c4 cutoff also shows `val_loss = inf` and score
+   `−inf`, with `replay_loss_increase`.
 4. Operational failure on the validator side (download trouble, timeout,
    OOM). No new sample is written and prior EMA is preserved.
 5. The round ended before the validator reached your miner.
@@ -48,12 +49,17 @@ get 0 for the round.
 
 Other ways to land at 0 with a finite task loss:
 
-- `delta == 0`: you didn't beat the baseline, which is the **pretrained base
-  model** (Qwen with no residual) on this round's data.
-- The **c4 isolation check** zeroed you: your residual raised the loss on
-  general web text by more than the tolerance (status 15,
-  `replay_loss_increase`). Your `val_loss` then shows `inf`.
-- Your `val_loss` is *exactly equal* to another miner's — both get 0 (the
+- **Your round score is 0 or below.** The score is your task gain over the
+  **pretrained base model** minus penalties for a c4 loss rise and for where
+  your residual's gate fires (`− |task_usage − 0.2| − c4_usage` by default).
+  The base scores 0, and only a score above 0 is ranked. Shards from the
+  reference miner have measured −0.14 to −0.17: they beat the base on the
+  task, but their gate fires on c4 as much as on the task. See "Why is my
+  round score negative?".
+- The **c4 cutoff** stopped you: your residual raised the loss on general web
+  text by more than the tolerance (status 15, `replay_loss_increase`). Your
+  score is `−inf` and your `val_loss` shows `inf`.
+- Your score is *exactly equal* to another miner's — both get 0 (the
   duplicated-submission heuristic). Two miners running the stock code from
   the same published winner on the same data can hit this.
 - You hit the validator on a round where only your foreground was eval'd
@@ -181,7 +187,7 @@ where `v` ranges over all weight-setting validators. The dashboard then
 normalizes across miners.
 
 The old top-level `score` field was removed because it conflated the
-per-round `delta ** 1.2` signal with the rolling rank-based aggregator
+per-round raw score (task gain minus penalties) with the rolling rank-based aggregator
 value. Use `score_latest`, `score_avg`, `score_samples` instead. See
 `scoring.md`.
 
@@ -252,8 +258,8 @@ See `eval-status.md` for the full table. Quick reference:
 - `bad_residual_shard` (14) — the shard is not exactly the task's residual
   (a corrupt, truncated or empty file, extra/missing keys, wrong shape or
   dtype, `.pt`, NaN, or an untrained expert). Upload the stock `save_residual_shard` output.
-- `replay_loss_increase` (15) — the c4 isolation check zeroed you. Vary your
-  training data every round.
+- `replay_loss_increase` (15) — the c4 cutoff stopped you (score `−inf`, not
+  ranked or published). Vary your training data every round.
 - Codes 5 and 13 are retired (they belonged to the old expert-group shards)
   and never set any more.
 
@@ -352,8 +358,8 @@ two miners cannot share one. Point both at the same Hugging Face cache so the
 
 Give each its own data order (see "Why was my score zeroed after restarting
 from the published winner?"). Two stock miners starting from the same winner
-read identical batches; if they produce the same shard, their `val_loss` is
-exactly equal and both score 0 as a duplicate.
+read identical batches; if they produce the same shard, their score is
+exactly equal and both get 0 as a duplicate.
 
 Code: `connito/shared/config.py:TaskCfg`,
 `connito/validator/evaluator.py:finalize_round_scores`.
@@ -395,17 +401,23 @@ Most likely because you trained on the same data again. **The stock miner
 replays the same training stream every round**: its loader has no seed, it is
 rebuilt at every restart (including the restart from each round's winner),
 and every one-GPU miner reads the same slice (rank 0 of 10). Training the
-winner again on data it has already seen overfits, and the c4 isolation check
-catches it.
+winner again on data it has already seen overfits, and the c4 cutoff (a c4
+loss rise above 0.02, status 15) catches it.
 
 Measured, two miners starting from the same published winner:
 
 - **same stream again** (stock): task loss worse than the starting shard, c4
-  loss +0.064 / +0.066 above the base: both zeroed (status 15), nothing
-  published. A full two-round rehearsal on the stock code gave the same
+  loss +0.064 / +0.066 above the base: both stopped by the c4 cutoff (status
+  15), nothing published. A full two-round rehearsal on the stock code gave the same
   result in round 2 (c4 +0.061 / +0.059).
 - **each source shuffled per (hotkey, round)**: task loss −0.0014 / −0.0047
-  below the starting shard, c4 −0.024 / −0.025: a winner was published.
+  below the starting shard, c4 −0.024 / −0.025: the cutoff passed, and under
+  the scoring of that run (task gain plus the c4 cutoff, before the
+  gate-usage penalties) a winner was published.
+
+Varying your data keeps you clear of the c4 cutoff; it does not on its own
+lift the score above 0. That also needs the gate to prefer task tokens (see
+"Why is my round score negative?").
 
 **Fix:** vary or shuffle your data every round, for example by shuffling each
 streaming source with a seed built from your hotkey and the round. Do not just
@@ -472,15 +484,18 @@ compares your c4 loss with the pretrained base's on the same batches (about
 65,000 real tokens per round). The point: a residual that helps on medical
 papers but damages ordinary text should not win.
 
-- If `your c4 loss − base c4 loss` exceeds the locked
+- **The cutoff.** If `your c4 loss − base c4 loss` exceeds the locked
   `evaluation.max_replay_loss_increase` (default 0.02 nats), or any c4 batch
-  is non-finite, your `val_loss` is set to `inf`, your round score is 0, and
-  your status is 15, `replay_loss_increase`. You are never published as the
-  round winner.
-- The validator's log line `c4 isolation gate failed` shows `reason`,
-  `replay_loss_increase` and the `tolerance=` in force. The
-  `validator_miner_replay_loss_increase{miner_uid}` gauge shows your
-  increase every round.
+  is non-finite, or the rise is NaN, your score is `−inf`, your `val_loss`
+  shows `inf`, and your status is 15, `replay_loss_increase`. You are never
+  ranked, never published, and kept off the podium.
+- **The penalties.** Below the cutoff, the c4 eval still costs you: the score
+  subtracts any c4 rise (`replay_penalty`) and your gate's usage on c4 tokens
+  (`replay_usage_penalty`), each with weight 1 by default.
+- The validator's log line `evaluate_one_miner: c4 isolation gate failed; not
+  ranked` shows `reason`, `replay_loss_increase` and the `tolerance=` in
+  force. The `validator_miner_replay_loss_increase{miner_uid}` gauge shows
+  your increase every round.
 
 Honest training moves c4 loss **down**, because the c4 replay rows (20% of the
 training mix) keep their labels: −0.025 over a 300-step run, and −0.021 to
@@ -490,3 +505,33 @@ practice is overfitting on repeated data (+0.06 measured).
 Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
 `connito/shared/config.py:EvalCfg`,
 `expert_groups/exp_pmc_residual/config.yaml` (the `replay: true` source).
+
+## Why is my round score negative?
+
+Because the score is not just the task gain. Each validator computes
+
+    score = task_gain − c4_rise_penalty − |task_usage − 0.2| − c4_usage
+
+with the default (locked) weights of 1. `task_gain` is how much your residual
+lowers the task loss below the pretrained base; the usage terms are the
+residual gate's mean firing (Σ_j q_j) on task tokens and on c4 tokens. The
+pretrained base scores 0, and only a score above 0 earns a rank reward or can
+be published as the round winner.
+
+**Measured:** the base's gate usage is 0.045 on task and 0.053 on c4. Shards
+trained by the reference miner beat the base on the task by 0.03 to 0.06, but
+raised gate usage on both splits, to about 0.08 task and 0.09 c4, and scored
+**−0.14 to −0.17**. A gate that fires equally on task and c4 tokens pays
+exactly 0.2 for any usage up to 0.2, more than those task gains.
+
+**What it takes to score above 0:** a gate that fires on task tokens (toward
+0.2) and stays quiet on c4, plus more task gain than the penalty that is
+left. The reference miner trains on cross-entropy only and does not push its
+gate that way; how to do it is up to you, and there is no tested recipe. The
+weights and target are validator config and may change between releases, so
+check `connito/shared/config.py:EvalCfg` and your own terms on the
+`validator_miner_score_term` and `validator_miner_gate_usage` gauges.
+
+Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
+`connito/shared/modeling/residual.py:record_gate_usage`. More in `scoring.md`,
+"Gate usage: why a better loss can still score below 0".
