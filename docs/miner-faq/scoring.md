@@ -253,9 +253,9 @@ The most common cases, in order of frequency:
    above the base's. The score is `−inf`.
 4. **Exactly the same score as another miner** — both sides get 0 regardless
    of rank (duplicate-submission heuristic).
-5. **Recency gate failure** — the miner has plenty of history but missed the
-   most recent round, so they drop off Weight Group 1 even though
-   `score_avg` is high.
+5. **Recency gate failure** — the miner has history but fewer than 3
+   distinct scored rounds in the last 5 cycles, so it drops off Weight Group 1
+   even though `score_avg` is high.
 6. **Hotkey rotation** — the UID's hotkey changed at some point and history
    was reset; the miner has fewer than the required samples.
 
