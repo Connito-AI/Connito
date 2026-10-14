@@ -188,7 +188,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         def _load_streaming_split(
             ds_name: str,
             ds_config: str | None = None,
-            trust_remote_code: bool = False,
             split_override: str | None = None,
         ):
             """Load one source's streaming split, falling back to 'train' when the wanted split is absent.
@@ -202,13 +201,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 load_kwargs: dict[str, Any] = {"streaming": True, "revision": "main"}
                 if ds_config is not None:
                     load_kwargs["name"] = ds_config
-                if trust_remote_code:
-                    # Authorize HF to execute the dataset repo's custom
-                    # builder script. Opt-in per source via
-                    # DatasetSourceCfg.trust_remote_code; never on by
-                    # default. See config.DatasetSourceCfg for the
-                    # rationale.
-                    load_kwargs["trust_remote_code"] = True
 
                 ds = load_dataset(ds_name, **load_kwargs)
                 if wanted_split in ds:
@@ -354,7 +346,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             text_template = _source_value(source, "text_template")
             source_split_name = _source_value(source, "split")
             weight = float(_source_value(source, "weight", 1.0))
-            trust_remote_code = bool(_source_value(source, "trust_remote_code", False))
 
             if not ds_name:
                 raise ValueError("Each dataset source must define a non-empty 'path'.")
@@ -395,7 +386,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 source_split = _load_streaming_split(
                     ds_name,
                     ds_config=ds_config,
-                    trust_remote_code=trust_remote_code,
                     split_override=source_split_name,
                 )
 

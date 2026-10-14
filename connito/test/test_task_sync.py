@@ -1,12 +1,7 @@
-"""Client for the owner API's active-task endpoints.
+"""Client for the owner API's active-task endpoints, checked against the server's own hash.
 
-The fixtures under `fixtures/` are verbatim responses captured from the
-deployed cycle-api, so `test_bundle_hash_matches_the_server` is a real
-cross-repo check: it re-computes the canonical hash with this repo's code and
-asserts it equals the one the server actually sent. The server lives in a
-separate private repo with its own release cadence, and a boundary is the
-moment the two must agree — this is what makes a serialization drift fail here
-instead of during a live transition.
+`active_task*.json` come from cycle-api's bundle builder, pending its deploy (recapture then);
+`active_task_bundle_v1.json` is a deployed response under the old, expert_assignment hash.
 """
 
 from __future__ import annotations
@@ -65,13 +60,19 @@ def test_models_parse_the_deployed_responses():
     assert light.group_id == bundle.group_id
     # The light endpoint's hash is what clients compare to decide to re-fetch.
     assert light.bundle_sha256 == bundle.bundle_sha256
-    assert bundle.expert_assignment, "routing table must not be empty"
+    assert bundle.config["residual"], "the residual settings travel in the bundle"
 
 
 def test_bundle_hash_matches_the_server():
     bundle = TaskBundle(**_fixture("active_task_bundle"))
-    # Recomputed here, from a response the deployed server really sent.
+    # Recomputed here, from cycle-api's own bundle builder with the C1 change (recapture after C1 deploys).
     assert bundle.canonical_sha256() == bundle.bundle_sha256
+
+
+def test_a_bundle_hashed_with_expert_assignment_is_refused(monkeypatch):
+    """A server still on the old hash: the payload parses, its hash does not match."""
+    _stub_response(monkeypatch, _fixture("active_task_bundle_v1"))
+    assert get_active_task_bundle(_cycle()) is None
 
 
 def test_unknown_fields_are_ignored():
@@ -98,7 +99,7 @@ def test_malformed_payload_returns_none_without_raising(monkeypatch, payload):
 
 def test_bundle_failing_its_own_hash_is_refused(monkeypatch):
     tampered = _fixture("active_task_bundle")
-    tampered["expert_assignment"] = {"1": [[0, 999]]}   # hash no longer matches
+    tampered["config"]["residual"]["k"] = 2   # hash no longer matches
     _stub_response(monkeypatch, tampered)
     # Refusing beats materializing a payload the two repos disagree about.
     assert get_active_task_bundle(_cycle()) is None
@@ -107,7 +108,7 @@ def test_bundle_failing_its_own_hash_is_refused(monkeypatch):
 def test_valid_bundle_is_returned(monkeypatch):
     _stub_response(monkeypatch, _fixture("active_task_bundle"))
     bundle = get_active_task_bundle(_cycle())
-    assert bundle is not None and bundle.group_id == 4
+    assert bundle is not None and bundle.group_id == 9
 
 
 # --------------------------------------------------------------- materialize
@@ -118,10 +119,8 @@ def test_materialize_writes_the_payload(tmp_path: Path):
 
     assert task_dir == tmp_path / bundle.name
     assert yaml.safe_load((task_dir / "config.yaml").read_text()) == bundle.config
-    assert json.loads((task_dir / "expert_assignment.json").read_text()) == bundle.expert_assignment
-    # The deployed task has no shard policy; the file must then be absent
-    # rather than written as "null".
-    assert not (task_dir / "shard_policy.json").exists()
+    # No shard policy served, so the file is absent rather than "null".
+    assert sorted(p.name for p in task_dir.iterdir()) == [task_sync.STAMP_FILE, "config.yaml"]
 
 
 def test_shard_policy_is_written_when_served(tmp_path: Path):
@@ -144,35 +143,34 @@ def test_materialize_is_idempotent(tmp_path: Path):
 
 def test_a_changed_bundle_replaces_the_directory(tmp_path: Path):
     materialize_task(_bundle(), tmp_path)
-    stale = tmp_path / "exp_nemotron_c4" / "stale.txt"
-    stale.write_text("from the previous bundle")
+    stale = tmp_path / "exp_pmc_residual" / "expert_assignment.json"
+    stale.write_text("from a previous release")
 
-    changed = _bundle(expert_assignment={"1": [[0, 5]]})
+    changed = _bundle(config={"group_id": 9, "residual": {"k": 2}})
     changed.bundle_sha256 = changed.canonical_sha256()
     task_dir = materialize_task(changed, tmp_path)
 
-    assert json.loads((task_dir / "expert_assignment.json").read_text()) == {"1": [[0, 5]]}
+    assert yaml.safe_load((task_dir / "config.yaml").read_text()) == changed.config
     assert not stale.exists(), "a replaced task must not keep the old files"
 
 
 def test_a_crash_mid_write_leaves_no_half_written_task(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(task_sync.json, "dumps", _explode)
     with pytest.raises(OSError):
-        materialize_task(_bundle(), tmp_path)
+        materialize_task(_bundle(shard_policy={"allenai/c4": {}}), tmp_path)
 
     # Nothing at the path the loader reads, and no staging left behind.
-    assert not (tmp_path / "exp_nemotron_c4").exists()
+    assert not (tmp_path / "exp_pmc_residual").exists()
     assert list(tmp_path.iterdir()) == []
 
 
 def test_a_failed_write_leaves_the_existing_task_intact(tmp_path: Path, monkeypatch):
     materialize_task(_bundle(), tmp_path)
-    task_dir = tmp_path / "exp_nemotron_c4"
+    task_dir = tmp_path / "exp_pmc_residual"
 
-    # Differ in BOTH files: config.yaml is written before expert_assignment.json,
-    # so a non-atomic write would leave the new config beside the old routing
-    # table — a mixed directory that loads without complaint.
-    changed = _bundle(config={"group_id": 9}, expert_assignment={"1": [[0, 5]]})
+    # config.yaml is written before shard_policy.json, so a non-atomic write
+    # would leave the new config in place with no stamp to say so.
+    changed = _bundle(config={"group_id": 9}, shard_policy={"allenai/c4": {}})
     changed.bundle_sha256 = changed.canonical_sha256()
 
     monkeypatch.setattr(task_sync.json, "dumps", _explode)
@@ -181,9 +179,7 @@ def test_a_failed_write_leaves_the_existing_task_intact(tmp_path: Path, monkeypa
 
     served = _fixture("active_task_bundle")
     assert yaml.safe_load((task_dir / "config.yaml").read_text()) == served["config"]
-    assert json.loads(
-        (task_dir / "expert_assignment.json").read_text()
-    ) == served["expert_assignment"]
+    assert not (task_dir / "shard_policy.json").exists()
     assert (task_dir / task_sync.STAMP_FILE).read_text() == served["bundle_sha256"]
 
 
@@ -193,7 +189,7 @@ def test_resolver_returns_the_served_name(tmp_path, monkeypatch):
     _stub_response(monkeypatch, _fixture("active_task"))
     cfg = tmp_path / "config.yaml"
     cfg.write_text("cycle:\n  owner_url: https://cycle-api.example\n")
-    assert resolve_active_task_name(cfg) == "exp_nemotron_c4"
+    assert resolve_active_task_name(cfg) == "exp_pmc_residual"
 
 
 def test_resolver_returns_none_when_the_api_is_unreachable(tmp_path, monkeypatch):
@@ -208,4 +204,4 @@ def test_resolver_survives_an_unreadable_config(tmp_path, monkeypatch):
     _stub_response(monkeypatch, _fixture("active_task"))
     # No config file at all: fall through to the shipped owner_url rather than
     # raising, since every node uses the same one anyway.
-    assert resolve_active_task_name(tmp_path / "missing.yaml") == "exp_nemotron_c4"
+    assert resolve_active_task_name(tmp_path / "missing.yaml") == "exp_pmc_residual"

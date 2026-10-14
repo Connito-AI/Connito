@@ -8,7 +8,7 @@ import yaml
 
 from connito.shared.config import MinerConfig
 
-SHIPPED = "exp_nemotron_c4"  # the locked default task
+SHIPPED = "exp_pmc_residual"  # the locked default task
 
 
 def test_stale_model_fields_are_reset_on_load(tmp_path: Path) -> None:

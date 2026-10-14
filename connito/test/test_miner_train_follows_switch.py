@@ -21,7 +21,7 @@ import yaml
 from connito.miner import train
 from connito.shared.config import MinerConfig
 
-SHIPPED = "exp_nemotron_c4"
+SHIPPED = "exp_pmc_residual"
 TARGET = "exp_switch_target"
 
 
