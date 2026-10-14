@@ -4,7 +4,9 @@ q_j = sigmoid((sigmoid(w_j·x) − A) / τ). Children of the block, run by a for
 """
 from __future__ import annotations
 
+import contextlib
 import functools
+from collections.abc import Iterator
 
 import torch
 import torch.nn.functional as F
@@ -21,8 +23,46 @@ def _residual_hook(block: nn.Module, args, out: torch.Tensor, *, threshold: floa
     with torch.autocast(flat.device.type, enabled=False):
         r = torch.sigmoid(F.linear(flat.float(), block.residual_router.weight))
         q = torch.sigmoid((r - threshold) / temperature)
+    usage = getattr(block, "gate_usage", None)
+    if usage is not None:
+        usage.add(q)
     h = sum(q[:, j, None].to(flat.dtype) * expert(flat) for j, expert in enumerate(block.residual_experts))
     return out + h.view_as(out)
+
+
+class GateUsage:
+    """Σ_j q_j summed over real tokens and MoE layers, while `record_gate_usage` attaches it."""
+
+    def __init__(self) -> None:
+        self.mask: torch.Tensor | None = None  # the current batch's attention_mask; 1 marks a real token
+        self.total = self.tokens = 0
+
+    def add(self, q: torch.Tensor) -> None:
+        real = self.mask.reshape(-1).to(q.device).bool()
+        # Selected, not multiplied by the mask: a NaN gate on a padded position would poison the sum (NaN·0 = NaN).
+        gates = torch.where(real, q.sum(-1), 0.0).sum(dtype=torch.float64)
+        # Kept on the mask's device as 0-dim tensors: no sync per layer, and a model split across GPUs still adds up.
+        # Rebound, not added in place, so `evaluate_model` can restore a snapshot when it drops a batch.
+        self.total = self.total + gates.to(self.mask.device)
+        self.tokens = self.tokens + real.sum().to(self.mask.device)
+
+    def mean(self) -> float:
+        """Mean over MoE layers and real tokens; 0.0 when no residual gate ran."""
+        return float(self.total / self.tokens) if self.tokens else 0.0
+
+
+@contextlib.contextmanager
+def record_gate_usage(model: nn.Module) -> Iterator[GateUsage]:
+    """Attach one `GateUsage` to every residual block for the duration; each block's hook adds its gates."""
+    usage = GateUsage()
+    blocks = [module for module in model.modules() if hasattr(module, "residual_hook")]
+    for block in blocks:
+        block.gate_usage = usage
+    try:
+        yield usage
+    finally:
+        for block in blocks:
+            del block.gate_usage
 
 
 def _attach(block: nn.Module, fam: ModelFamily, text, k: int) -> None:

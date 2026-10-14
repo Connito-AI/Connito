@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
 
+import torch
 from datasets import load_dataset, interleave_datasets, Features, Value
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import IterableDataset as TorchIterableDataset
@@ -182,6 +183,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         train: bool = True,
         seed: str | int | None = None,
         fraction: float | None = None,
+        replay: bool | None = None,
     ):
         split_name = "train" if train else "validation"
 
@@ -283,6 +285,9 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             if isinstance(source, dict):
                 return source.get(key, default)
             return getattr(source, key, default)
+
+        if replay is not None:
+            source_specs = [s for s in source_specs if bool(_source_value(s, "replay", False)) == replay]
 
         # Force all source text columns to be a standard 'string' under the common key 'text'
         common_features = Features({"text": Value("string")})
@@ -559,6 +564,7 @@ def get_dataloader(
     format_fn: Callable | None = None,
     data_collator: DataCollator | None = None,
     batch_size: int | None = None,
+    replay: bool | None = None,
 ) -> StatefulDataLoader:
     """
     Build a `StatefulDataLoader` over a streaming HF dataset, tokenized on the fly.
@@ -584,6 +590,8 @@ def get_dataloader(
         (or None if the dataset has no validation split).
     batch_size : Optional[int]
         Rows per batch; defaults to the task's `per_device_train_batch_size`, the validator's eval batch.
+    replay : Optional[bool]
+        Keep only the sources whose `replay` flag equals it; None keeps them all.
 
     Returns
     -------
@@ -609,6 +617,7 @@ def get_dataloader(
         train=train,
         seed=seed,  # e.g. combined validator seed
         fraction=config.task.exp.data.vali_fraction,  # use ~20% of the dataset
+        replay=replay,
     )
 
     # Collator for causal LM (no MLM)
@@ -654,3 +663,28 @@ def materialize_batches(
     GPU per-batch as before.
     """
     return list(itertools.islice(dataloader, max_batches + 1))
+
+
+def materialize_by_tokens(dataloader: Iterable, min_tokens: int, max_positions: int) -> list[dict]:
+    """Pull rows up to `min_tokens` real tokens; batch them by length, padding cut, within `max_positions`."""
+    rows, tokens = [], 0
+    for row in ({k: v[i] for k, v in batch.items()} for batch in dataloader for i in range(len(batch["input_ids"]))):
+        length = int(row["attention_mask"].sum())
+        if length < 2:
+            continue  # no labelled token after the shift; a batch of only such rows is NaN for every model
+        rows.append(row)
+        tokens += length
+        if tokens >= min_tokens:
+            break
+    rows.sort(key=lambda r: int(r["attention_mask"].sum()))
+    groups: list[list[dict]] = []
+    for row in rows:
+        length = int(row["attention_mask"].sum())
+        if not groups or (len(groups[-1]) + 1) * length > max_positions:
+            groups.append([])
+        groups[-1].append(row)
+    # Sorted ascending, so a group's last row is its longest.
+    return [
+        {k: torch.stack([r[k][: int(g[-1]["attention_mask"].sum())] for r in g]) for k in g[0]}
+        for g in groups
+    ]

@@ -110,7 +110,9 @@ def _worker(model: nn.Module, family_name: str) -> BackgroundEvalWorker:
             evaluation=SimpleNamespace(per_miner_eval_timeout_sec=1.0),
             dataloader=SimpleNamespace(world_size=1),
             model=SimpleNamespace(family=family_name),
-            task=SimpleNamespace(exp=SimpleNamespace(residual=_residual(1))),
+            task=SimpleNamespace(exp=SimpleNamespace(
+                residual=_residual(1), data=SimpleNamespace(dataset_sources=[], sequence_length=8),
+            )),
         ),
         round_ref=MagicMock(), device=CPU, tokenizer=MagicMock(),
         merge_phase_active=threading.Event(), eval_window_active=threading.Event(),

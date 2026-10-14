@@ -882,7 +882,7 @@ class TestDelayedSubmission:
 
 # ---------------------------------------------------------------------------
 # Rank-based scoring: finalize_round_scores writes 3/2/1/0 to the aggregator
-# using `round.scores` (delta**1.2) as the ranking signal.
+# using `round.scores` (the per-round score) as the ranking signal.
 # ---------------------------------------------------------------------------
 
 class TestFinalizeRoundScores:
@@ -922,7 +922,7 @@ class TestFinalizeRoundScores:
         from connito.validator.evaluator import finalize_round_scores
 
         rnd = self._round_with_five_miners()
-        # mark_scored stores delta**1.2; pick distinct values so ranking
+        # mark_scored stores the round score; pick distinct values so ranking
         # is unambiguous.
         rnd.mark_scored(rnd.roster[0].uid, score=0.10)  # rank 4
         rnd.mark_scored(rnd.roster[1].uid, score=0.40)  # rank 1 → 2.25
@@ -939,6 +939,24 @@ class TestFinalizeRoundScores:
         assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [1.0]
         assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [0.0]
         assert self._scores_for_uid(agg, rnd.roster[4].uid, rnd.round_id) == [0.0]
+
+    def test_scores_at_or_below_the_baselines_zero_rank_nowhere(self) -> None:
+        from connito.validator.evaluator import finalize_round_scores
+
+        rnd = self._round_with_five_miners()
+        rnd.mark_scored(rnd.roster[0].uid, score=0.10)  # rank 1 → 2.25
+        rnd.mark_scored(rnd.roster[1].uid, score=0.0)  # the baseline's score
+        rnd.mark_scored(rnd.roster[2].uid, score=-0.20)  # passed the c4 gate, worse than the base
+        rnd.mark_scored(rnd.roster[3].uid, score=float("-inf"), val_loss=float("inf"))  # failed the c4 gate
+
+        agg = MinerScoreAggregator(max_points=8)
+        finalize_round_scores(round_obj=rnd, score_aggregator=agg)
+
+        assert self._scores_for_uid(agg, rnd.roster[0].uid, rnd.round_id) == [2.25]
+        for miner in rnd.roster[1:4]:
+            assert self._scores_for_uid(agg, miner.uid, rnd.round_id) == [0.0]
+        # The gate failure sorts last, below the miner that passed with a negative score.
+        assert [uid for uid, _ in rnd.top_scored_ranked_this_round(4)][-2:] == [rnd.roster[2].uid, rnd.roster[3].uid]
 
     def test_tied_scores_get_zero_and_skip_rank_slot(self) -> None:
         # A tied val_loss between two miners is evidence of a duplicated
@@ -985,8 +1003,8 @@ class TestFinalizeRoundScores:
         assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.25]
 
     def test_zero_delta_excluded_from_top_three(self) -> None:
-        # If only one miner has delta > 0, only that miner gets the
-        # rank-1 reward (2.25). The other "scored but delta==0" miners
+        # If only one miner has score > 0, only that miner gets the
+        # rank-1 reward (2.25). The other "scored but score==0" miners
         # receive 0.0 — they did not actually improve over baseline so
         # they should not collect reward weight just for showing up.
         from connito.validator.evaluator import finalize_round_scores

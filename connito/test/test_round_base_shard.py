@@ -43,6 +43,7 @@ def _worker(model: nn.Module) -> BackgroundEvalWorker:
         config=SimpleNamespace(
             evaluation=SimpleNamespace(per_miner_eval_timeout_sec=1.0),
             dataloader=SimpleNamespace(world_size=1),
+            task=SimpleNamespace(exp=SimpleNamespace(data=SimpleNamespace(dataset_sources=[], sequence_length=8))),
         ),
         round_ref=MagicMock(),
         device=torch.device("cpu"),

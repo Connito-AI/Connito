@@ -480,6 +480,8 @@ def resume_open_round(
         resumed.freeze_zero_uids = set(journal.freeze_zero_uids)
         resumed.freeze_zero_hotkeys = dict(journal.freeze_zero_hotkeys)
         resumed.lifecycle_step = int(journal.lifecycle_step)
+        # Its scores were measured against 100.0; this process may set it later, never clear it.
+        resumed.baseline_fallback = journal.baseline_fallback
     resumed._persist_journal()  # noqa: SLF001
 
     round_ref.swap(new_current=resumed)
@@ -1074,8 +1076,8 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             #
             # `finalize_round_scores` is the sole writer to the global
             # aggregator for this round_id: it computes ranks from the
-            # delta-based per-round signal in `round.scores` and writes
-            # 2.25/1.5/1.0 for the top-3 (with delta>0), 0 for everyone
+            # per-round score in `round.scores` and writes
+            # 2.25/1.5/1.0 for the top-3 (with score>0), 0 for everyone
             # else (incl. failed evals and freeze-time invalid checkpoints).
             eval_window_active.clear()
             pending_round: Round | None = round_ref.current

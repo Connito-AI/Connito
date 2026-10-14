@@ -27,19 +27,23 @@ logger = structlog.get_logger(__name__)
 
 
 def select_baseline_uid(
-    val_losses: dict[int, float],
+    scores: dict[int, float],
     prior_avg_scores: dict[int, float],
     top_n: int = 3,
 ) -> int | None:
-    """The UID the round's baseline is published from, or None if nothing was
-    scored.
+    """The UID the round's baseline is published from, or None if no miner
+    beat this round's baseline.
+
+    Only a miner with a positive score this round qualifies: the baseline
+    scores 0 by construction (its raw score minus itself), and a miner the
+    c4 isolation gate failed scores -inf.
 
     Preferred: the best-ranked *proven* miner that submitted this round.
     Proven means the top-`top_n` by track record, matching the count that
     scores points each round (`_RANK_TO_SCORE`).
 
     Fallback: if none of them submitted, this round's best submission by
-    val_loss. A miner whose single top-3 placing has nearly aged out should
+    score. A miner whose single top-3 placing has nearly aged out should
     not outrank a fresh measurement on the validator's own held-out data —
     the baseline is a starting model, not a reward.
 
@@ -49,16 +53,17 @@ def select_baseline_uid(
     `publish_round_baseline` must rank identically — the file has to survive
     until finalize, and only the scored miners are candidates.
     """
-    if not val_losses:
+    scores = {uid: score for uid, score in scores.items() if score > 0.0}
+    if not scores:
         return None
     proven = {
         uid for uid, _ in
         sorted(prior_avg_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
     }
-    submitted = {uid: loss for uid, loss in val_losses.items() if uid in proven}
+    submitted = {uid: score for uid, score in scores.items() if uid in proven}
     if submitted:
-        return min(submitted, key=lambda uid: (-prior_avg_scores[uid], val_losses[uid], uid))
-    return min(val_losses, key=lambda uid: (val_losses[uid], uid))
+        return min(submitted, key=lambda uid: (-prior_avg_scores[uid], -scores[uid], uid))
+    return min(scores, key=lambda uid: (-scores[uid], uid))
 
 
 
@@ -104,7 +109,7 @@ class Round:
     # Per-uid average score over the aggregator's rolling window, snapshotted
     # at freeze. Already fetched to order the eval queue; kept because it is
     # the only stable ranking available all round — the live aggregator holds
-    # this round's *raw deltas* until finalize replaces them with rank scores,
+    # this round's *raw scores* until finalize replaces them with rank scores,
     # so a mid-round average mixes incompatible units.
     prior_avg_scores: dict[int, float] = field(default_factory=dict)
     # The cycle this round belongs to, as the cycle API numbers them. Carried
@@ -124,7 +129,7 @@ class Round:
     # Per-uid raw evaluation loss, recorded by `mark_scored` alongside the
     # score. Journaled so a mid-round restart doesn't lose the cycle's
     # losses — `validator_miner_val_loss` is emitted at eval time and is
-    # not derivable from `scores` (the delta clamps at 0).
+    # not derivable from `scores` (the score adds the c4 and gate-usage terms).
     val_losses: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
@@ -145,6 +150,9 @@ class Round:
     freeze_zero_uids: set[int] = field(default_factory=set)
     freeze_zero_hotkeys: dict[int, str] = field(default_factory=dict)
     weights_submitted: bool = False
+    # Set by bg-eval when this round's baseline is the 100.0 fallback: every
+    # miner then "beats" it, so no winner is published.
+    baseline_fallback: bool = False
     # Set by `finalize_round_scores` under `_lock`, atomically with its score
     # snapshot. After it the `mark_*` methods are no-ops: the eval window flag
     # only stops the worker picking up *new* miners, so the one already on the
@@ -606,6 +614,7 @@ class Round:
             "lifecycle_step": int(self.lifecycle_step),
             "seed": str(self.seed),
             "base_shard": str(self.base_shard),
+            "baseline_fallback": self.baseline_fallback,
             "finalized": False,
         }
 
@@ -654,15 +663,16 @@ class Round:
         self, uid: int, score: float = 0.0, val_loss: float | None = None
     ) -> None:
         """Record a successful evaluation. `score` is this-round's score
-        (e.g. ``delta ** 1.2`` from `evaluate_one_miner`); it is stored
+        (the task gain less the c4 and gate-usage penalties, less the
+        base's own, from `evaluate_one_miner`); it is stored
         in `self.scores` so per-round ranking — used by post-eval
         submission cleanup — never has to consult the global aggregator.
 
         `val_loss` is the raw evaluation loss. It is recorded purely so the
         journal can carry it: `validator_miner_val_loss` is published at
-        eval time and cannot be reconstructed from `score`, because
-        ``delta = max(0.0, baseline - val_loss)`` clamps at zero. Optional
-        so existing callers and test fixtures keep working.
+        eval time and cannot be reconstructed from `score`, which also
+        carries the c4 and gate-usage terms. Optional so existing callers and
+        test fixtures keep working.
 
         Also writes the per-round journal, so a kill before
         `finalize_round_scores` runs does not lose the evaluation: startup
@@ -710,7 +720,9 @@ class Round:
         evaluated and pruned the one publish selected.
         """
         with self._lock:
-            return select_baseline_uid(self.val_losses, self.prior_avg_scores)
+            if self.baseline_fallback:
+                return None
+            return select_baseline_uid(self.scores, self.prior_avg_scores)
 
     def mark_failed(self, uid: int) -> None:
         """Mark a UID as failed for operational reasons (download timeout,

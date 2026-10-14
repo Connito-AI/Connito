@@ -6,6 +6,7 @@ CPU only, tiny models, nothing downloaded: `python -m pytest connito/test/test_r
 from __future__ import annotations
 
 import contextlib
+import math
 import weakref
 from types import SimpleNamespace
 
@@ -17,9 +18,15 @@ from torch.utils._pytree import tree_flatten
 
 from connito.shared import model as shared_model
 from connito.shared.config import ResidualCfg
+from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
 from connito.shared.modeling import mycelia
 from connito.shared.modeling.families import FAMILIES
-from connito.shared.modeling.residual import freeze_all_but_residual, install_residual_experts
+from connito.shared.modeling.residual import (
+    GateUsage,
+    freeze_all_but_residual,
+    install_residual_experts,
+    record_gate_usage,
+)
 
 # DeepSeek-V2's layer 0 is dense.
 MOE_LAYERS = {"qwen3_5_moe": [0, 1, 2, 3], "deepseek_v2": [1, 2]}
@@ -266,3 +273,75 @@ def test_checkpointing_keeps_no_layer_alive_into_another_layers_backward(family_
     assert tracker.made
     assert tracker.most_alive_from_other_layers == 0
     assert tracker.alive() == 0
+
+
+def _batch(real_lengths: tuple[int, int]) -> dict[str, torch.Tensor]:
+    """TOKENS, each row right-padded after its real length."""
+    mask = (torch.arange(TOKENS.shape[1]) < torch.tensor(real_lengths)[:, None]).long()
+    return {"input_ids": TOKENS, "attention_mask": mask, "labels": TOKENS.masked_fill(mask == 0, -100)}
+
+
+def _padded_batch() -> dict[str, torch.Tensor]:
+    return _batch((12, 5))
+
+
+def test_eval_reports_the_mean_gate_over_real_tokens_and_moe_layers(family_name):
+    """Σ over K = 2 experts, mean over layers and real tokens, across batches padded differently."""
+    model = _load(_config(family_name, k=2))
+    batches = [_batch((12, 5)), _batch((3, 12))]
+    inputs = []
+    blocks = [model.model.layers[i].mlp for i in MOE_LAYERS[family_name]]
+    handles = [b.register_forward_pre_hook(lambda m, args: inputs.append((m, args[0]))) for b in blocks]
+
+    usage = evaluate_model(0, model, batches, torch.device("cpu"), None)["gate_usage"]
+
+    for h in handles:
+        h.remove()
+    assert len(inputs) == len(blocks) * len(batches)
+    # ResidualCfg(threshold=0.5, temperature=0.5) in `_config`.
+    gates = [
+        torch.stack([
+            torch.sigmoid((torch.sigmoid(x.float() @ m.residual_router.weight.T) - 0.5) / 0.5).sum(-1)
+            for m, x in inputs[i * len(blocks):(i + 1) * len(blocks)]
+        ])  # [layers, rows, positions]
+        for i in range(len(batches))
+    ]
+    real = torch.cat([g[:, b["attention_mask"].bool()] for g, b in zip(gates, batches, strict=True)], dim=1)
+    assert usage == pytest.approx(float(real.mean()), rel=1e-5)
+    assert usage != pytest.approx(float(torch.cat(gates, dim=1).mean()), rel=1e-5)  # padding is left out
+
+
+def test_a_batch_whose_loss_is_dropped_adds_nothing_to_the_gate_usage(family_name):
+    model = _load(_config(family_name))
+    unlabelled = {**_batch((3, 12)), "labels": torch.full_like(TOKENS, -100)}  # loss 0/0, dropped from val_loss
+
+    alone = evaluate_model(0, model, [_padded_batch()], torch.device("cpu"), None)
+    with_dropped = evaluate_model(0, model, [_padded_batch(), unlabelled], torch.device("cpu"), None)
+
+    assert with_dropped["nan_batches"] == 1
+    assert with_dropped["gate_usage"] == alone["gate_usage"]
+
+
+def test_a_nan_gate_on_a_padded_position_leaves_the_usage_finite():
+    usage = GateUsage()
+    usage.mask = torch.tensor([[1, 1, 0]])
+    usage.add(torch.tensor([[0.25, 0.5], [0.5, 0.25], [math.nan, math.nan]]))  # [tokens, K]
+
+    assert usage.mean() == 0.75
+
+
+@pytest.mark.parametrize("deadline", [None, 0.0])
+def test_no_block_keeps_the_usage_recorder_after_an_eval(family_name, deadline):
+    model = _load(_config(family_name))
+
+    with contextlib.suppress(EvalDeadlineExceeded):
+        evaluate_model(0, model, [_padded_batch()], torch.device("cpu"), None, deadline_monotonic=deadline)
+
+    assert not any(hasattr(module, "gate_usage") for module in model.modules())
+
+
+def test_a_model_without_residual_experts_reports_no_gate_usage():
+    model = torch.nn.Linear(2, 2)
+    with record_gate_usage(model) as usage:
+        pass
+    assert usage.mean() == 0.0

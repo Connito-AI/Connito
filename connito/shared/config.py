@@ -16,6 +16,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeFloat,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -1162,7 +1163,9 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n",
+        "max_replay_loss_increase", "replay_loss_weight", "task_usage_weight", "task_usage_target",
+        "replay_usage_weight",
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
@@ -1171,6 +1174,14 @@ class EvalCfg(BaseConfig):
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
+    # c4 isolation gate: a miner whose replay loss rises more than this above the base's is never ranked.
+    max_replay_loss_increase: NonNegativeFloat = 0.02
+    # raw = (task_base − task) − a·max(0, c4 − c4_base) − b·|task_usage − target| − c·c4_usage
+    # score = raw − the base's raw on its own baseline evals (only its usage terms), so the base scores 0
+    replay_loss_weight: NonNegativeFloat = 1.0  # a
+    task_usage_weight: NonNegativeFloat = 1.0  # b
+    task_usage_target: NonNegativeFloat = 0.2  # target
+    replay_usage_weight: NonNegativeFloat = 1.0  # c
     # Round-group construction scheme. When true, Round.freeze() partitions
     # the roster into validation Groups A (3) / B (10) / C (17) with
     # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1
