@@ -523,9 +523,9 @@ pretrained base scores 0, and only a score above 0 earns a rank reward or can
 be published as the round winner.
 
 **Measured:** the base's gate usage is 0.045 on task and 0.053 on c4. Shards
-trained by the reference miner beat the base on the task by 0.03 to 0.06, but
-raised gate usage on both splits, to about 0.08 task and 0.09 c4, and scored
-**−0.14 to −0.17**. A gate that fires equally on task and c4 tokens pays
+trained by the reference miner beat the base on the task by 0.03 to 0.06 and
+scored **−0.14 to −0.17**; a full Train phase raised gate usage on both
+splits, to about 0.08 task and 0.09 c4. A gate that fires equally on task and c4 tokens pays
 exactly 0.2 for any usage up to 0.2, more than those task gains.
 
 **What it takes to score above 0:** a gate that fires on task tokens (toward

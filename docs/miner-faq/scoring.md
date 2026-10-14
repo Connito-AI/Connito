@@ -329,9 +329,10 @@ pretrained base, with the validator's fresh residual, has a gate usage of
 **What was measured** (production scoring code, real shards, two eval seeds):
 
 - Shards trained by the reference miner beat the base on the task by 0.03 to
-  0.06 nats, but training raised gate usage on **both** splits, to about 0.08
-  on task tokens and 0.09 on c4. They scored **−0.14 to −0.17**: nothing
-  published, no rank rewards.
+  0.06 nats and scored **−0.14 to −0.17**: nothing published, no rank
+  rewards. A full Train phase raised gate usage on **both** splits, to about
+  0.08 on task tokens and 0.09 on c4; a shard trained for a few steps stayed
+  near the base's usage and scored about the same.
 - A deliberately leaky shard (its residual scaled ×32) failed the c4 cutoff:
   `−inf`, status 15.
 
