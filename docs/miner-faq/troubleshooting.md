@@ -247,8 +247,7 @@ Code: `connito/validator/evaluator.py:finalize_round_scores`.
 ## My miner committed, but the validator used an older commit or none
 
 **Symptom:** your miner logged its MinerCommit1 and MinerCommit2 commits, but
-the round shows `signature_invalid` (3), `no_chain_commit` (6), or a score for
-an older shard.
+the round shows `signature_invalid` (3) or `no_chain_commit` (6).
 
 **Cause:** validators do not read your commits whenever they arrive. At round
 freeze they read the chain **as of two blocks**: the end of MinerCommit1 (your
@@ -257,8 +256,10 @@ coordinates). A hotkey has one commitment slot, which each commit
 overwrites, so whatever the slot held at those blocks is what gets scored:
 
 - **Signed hash committed after MinerCommit1 ended:** at that block the slot
-  still held your previous commit, so the validator finds no signed hash for
-  this round and the signature check fails (`signature_invalid`).
+  still held your previous commit, which carries no signed hash, so the
+  validator drops you as having no complete commit (`no_chain_commit`). If
+  that previous commit was itself an older signed hash, the signature check
+  fails instead (`signature_invalid`).
 - **Model hash committed after MinerCommit2 ended:** at that block the slot
   still held your signed hash, so the validator finds no model-hash commit
   (`no_chain_commit`).
