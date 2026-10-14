@@ -72,11 +72,11 @@ and the miner never trains from a published round winner.
 1. **Nothing was published.** Validators publish a round winner only if some
    miner's round score is above 0: a raw score, c4 and gate-usage penalties
    included, above the pretrained base's own (which also means it passed the
-   c4 cutoff). On
-   the first round of a task, or a round where nobody qualified, they commit a
-   hash with **no HF coordinates**, and there is nothing to download. This is
-   normal. With nothing published, the miner resumes its own last trained
-   checkpoint, or keeps its fresh draw if it has none.
+   c4 cutoff). On the first round of a task, or a round where nobody
+   qualified, they commit a hash with **no HF coordinates**, and there is
+   nothing to download. This is normal. With nothing published, the miner
+   resumes its own last trained checkpoint, or keeps its fresh draw if it has
+   none.
 2. **The published shard was refused.** The miner checks a downloaded
    winner exactly as validators check submissions (keys, shapes, dtypes,
    finite, trained). A shard for another K, for example right after a task
