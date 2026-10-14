@@ -112,6 +112,7 @@ def evaluate_model(
             if device_batch.get("attention_mask") is None and "input_ids" in device_batch:
                 device_batch["attention_mask"] = torch.ones_like(device_batch["input_ids"])
             usage.mask = device_batch["attention_mask"]
+            kept_usage = usage.total, usage.tokens
 
             autocast_device = "cuda" if device.type == "cuda" else "cpu"
             with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
@@ -121,6 +122,7 @@ def evaluate_model(
                 # NaN/Inf batches add nothing to the sum and do NOT increment
                 # `scored_batches`, so they drop out of the divisor as well.
                 nan_batches += 1
+                usage.total, usage.tokens = kept_usage  # nor to the gate usage
             else:
                 loss_sum += float(loss.item())
                 scored_batches += 1

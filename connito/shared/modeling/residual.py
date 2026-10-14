@@ -35,13 +35,16 @@ class GateUsage:
 
     def __init__(self) -> None:
         self.mask: torch.Tensor | None = None  # the current batch's attention_mask; 1 marks a real token
-        self.total = self.tokens = 0.0
+        self.total = self.tokens = 0
 
     def add(self, q: torch.Tensor) -> None:
-        real = self.mask.reshape(-1).to(q)
+        real = self.mask.reshape(-1).to(q.device).bool()
+        # Selected, not multiplied by the mask: a NaN gate on a padded position would poison the sum (NaN·0 = NaN).
+        gates = torch.where(real, q.sum(-1), 0.0).sum(dtype=torch.float64)
         # Kept on the mask's device as 0-dim tensors: no sync per layer, and a model split across GPUs still adds up.
-        self.total += (q.sum(-1) * real).sum().to(self.mask.device)
-        self.tokens += real.sum().to(self.mask.device)
+        # Rebound, not added in place, so `evaluate_model` can restore a snapshot when it drops a batch.
+        self.total = self.total + gates.to(self.mask.device)
+        self.tokens = self.tokens + real.sum().to(self.mask.device)
 
     def mean(self) -> float:
         """Mean over MoE layers and real tokens; 0.0 when no residual gate ran."""
