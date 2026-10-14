@@ -212,7 +212,7 @@ def publish_round_podium(*, round_obj, config) -> None:
         podium = [(uid, score) for uid, score in round_obj.top_scored_ranked_this_round(
             int(config.evaluation.top_k_miners_to_reward)) if math.isfinite(score)]
         if not podium:
-            logger.info("publish_podium: nothing scored this round", round_id=rid)
+            logger.info("publish_podium: no finite score this round", round_id=rid)
             return
 
         submission_dir = Path(config.ckpt.miner_submission_path)

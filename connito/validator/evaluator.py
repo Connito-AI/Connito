@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import math
 from dataclasses import dataclass
@@ -856,12 +857,18 @@ def evaluate_one_miner_sync(
                 VALIDATOR_MINER_GATE_USAGE.labels(miner_uid=str(int(uid)), split=split).set(value)
             if replay_increase is not None:
                 VALIDATOR_MINER_REPLAY_LOSS_INCREASE.labels(miner_uid=str(int(uid))).set(replay_increase)
+            else:  # no c4 eval this time: drop the replay series an earlier round left for this miner
+                for gauge, label in ((VALIDATOR_MINER_SCORE_TERM, "replay_penalty"),
+                                     (VALIDATOR_MINER_SCORE_TERM, "replay_usage_penalty"),
+                                     (VALIDATOR_MINER_GATE_USAGE, "replay")):
+                    with contextlib.suppress(KeyError):
+                        gauge.remove(str(int(uid)), label)
         except Exception:
             pass
         # `evaluate_model` drops non-finite batches from its mean, so a residual that blows up on the
         # c4 rows where it fires would pass on the rest; any such batch fails the gate.
         gated = replay_increase is not None and (
-            replay_increase > ev.max_replay_loss_increase or replay_nan_batches > 0
+            not replay_increase <= ev.max_replay_loss_increase or replay_nan_batches > 0  # a NaN rise fails too
         )
         if gated:
             logger.info(

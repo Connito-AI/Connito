@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from prometheus_client import REGISTRY
 
 from connito.shared.config import DatasetSourceCfg, EvalCfg
 from connito.shared.evaluate import EvalDeadlineExceeded
@@ -147,11 +148,11 @@ def test_a_replay_loss_past_the_tolerance_is_never_ranked(monkeypatch, statuses)
     assert _replay_increase_gauge() == 0.5
 
 
-def test_a_gate_failure_sorts_below_a_passing_miner_with_a_negative_score(monkeypatch, statuses):
-    failed, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.5)
-    negative, _ = _score(monkeypatch, task_loss=3.5, replay_loss=BASELINE_REPLAY)
+def test_a_nan_replay_increase_fails_the_gate(monkeypatch, statuses):
+    job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=math.nan)
 
-    assert failed.score < negative.score < 0.0
+    assert job.score == -math.inf
+    assert statuses[7] == "replay_loss_increase"
 
 
 def test_a_replay_loss_exactly_at_the_tolerance_passes(monkeypatch, statuses):
@@ -200,6 +201,20 @@ def test_without_a_replay_split_or_baseline_the_gate_and_c4_terms_are_off(
     assert (job.val_loss, job.score) == (2.5, 0.5)
     (complete,) = (c.kwargs for c in log.info.call_args_list if c.args[0] == "evaluate_one_miner: complete")
     assert not {"replay_penalty", "replay_usage_penalty", "replay_usage"} & complete.keys()
+
+
+def test_a_miner_scored_without_a_c4_eval_loses_its_earlier_replay_series(monkeypatch, statuses):
+    _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.125, replay_usage=0.125)
+    _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY, replay_batches=None)
+
+    def sample(name: str, **labels: str) -> float | None:
+        return REGISTRY.get_sample_value(name, {"miner_uid": "7", **labels})
+
+    assert sample("validator_miner_score_term", term="replay_penalty") is None
+    assert sample("validator_miner_score_term", term="replay_usage_penalty") is None
+    assert sample("validator_miner_gate_usage", split="replay") is None
+    assert sample("validator_miner_score_term", term="task_gain") == 0.5
+    assert sample("validator_miner_gate_usage", split="task") == TARGET
 
 
 def test_the_replay_eval_honours_the_miners_deadline(monkeypatch, statuses):
