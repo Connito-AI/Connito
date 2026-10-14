@@ -289,11 +289,16 @@ that moves the ML stack needs a **new Python environment**; `pip install -U`
 over the old one is not enough. After `git checkout vX.Y.Z`:
 
 ```bash
-uv venv --seed -p 3.10 .venv && source .venv/bin/activate
+uv venv --seed --managed-python -p 3.10 .venv && source .venv/bin/activate
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+pip install --no-deps -e .
 ```
 
 This is the same install the image runs (`connito/validator/docker/Dockerfile`).
+`--managed-python` makes uv use its own Python build, which ships the
+headers, even when a system Python 3.10 is installed. On a uv release without
+that flag, run `uv python install 3.10` first and pass
+`--python-preference only-managed` instead.
 
 - `requirements.txt` pins the stack the image is built from: torch 2.10.0
   (cu128 wheels), transformers 5.18.0, huggingface_hub 1.x, datasets 4.8.5,
@@ -302,8 +307,11 @@ This is the same install the image runs (`connito/validator/docker/Dockerfile`).
 - **Python must ship its headers (`Python.h`).** The Gated DeltaNet layers run
   on flash-linear-attention's Triton kernels, which compile at first use.
   Without the headers, fla only warns "Triton is not supported on current
-  platform, roll back to CPU" and runs far slower. A uv-managed Python (as
-  above) ships them; a distribution Python needs its `-dev` package.
+  platform, roll back to CPU" and falls back to a slower path. A uv-managed
+  Python (as above) ships them. A system Python does not by default: on
+  Ubuntu 22.04, `uv venv -p 3.10` without `--managed-python` can pick the
+  system Python 3.10, which has no headers unless `python3.10-dev` is
+  installed.
 - NVIDIA driver ≥ 570, one GPU, and the model pre-downloaded at the pinned
   revision, as in the Docker case.
 

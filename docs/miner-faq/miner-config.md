@@ -238,8 +238,8 @@ Code: `connito/shared/config.py:CycleCfg`.
    previous checkpoint and will start from the published winner or a fresh
    residual instead of your own work.
 5. **A Python without headers.** If `Python.h` is missing, the fla Triton
-   kernels cannot build and training silently falls back to a far slower
-   path. See "Software environment".
+   kernels cannot build and training silently falls back to a slower path.
+   See "Software environment".
 
 ## Telemetry / observability
 
@@ -317,14 +317,18 @@ environment built for transformers 4.x cannot load it.
 - **Python 3.10 with its headers (`Python.h`).** The model's Gated DeltaNet
   layers run on flash-linear-attention's Triton kernels, which compile at
   first use. Without the headers, fla only prints the warning "Triton is not
-  supported on current platform, roll back to CPU" and training runs far
-  slower. A uv-managed Python ships the headers; a distribution Python needs
-  its `-dev` package.
+  supported on current platform, roll back to CPU" and training falls back to
+  a slower path. A uv-managed Python ships the headers; a system Python needs
+  its `-dev` package (on Ubuntu 22.04, `python3.10-dev`).
 - **A new virtual environment**, installed from the repo's pins:
   ```bash
-  uv venv --seed -p 3.10 .venv && source .venv/bin/activate
+  uv venv --seed --managed-python -p 3.10 .venv && source .venv/bin/activate
   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
   ```
+  `--managed-python` makes uv use its own Python build, which ships the
+  headers, even when a system Python 3.10 is installed. On a uv release
+  without that flag, run `uv python install 3.10` first and pass
+  `--python-preference only-managed` instead.
   This brings torch 2.10.0 (cu128), transformers 5.18.0, huggingface_hub 1.x,
   datasets 4.8.5, safetensors 0.8.0 and flash-linear-attention 0.5.2.
 - **Pre-download the model** at the pinned revision, so the first start does

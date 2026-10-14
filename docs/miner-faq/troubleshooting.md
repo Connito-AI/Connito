@@ -314,7 +314,7 @@ Code: `connito/shared/modeling/mycelia.py:get_base_model`.
 Triton is not supported on current platform, roll back to CPU
 ```
 
-Training then runs, but far slower than it should.
+Training then runs, but falls back to a slower path.
 
 **Cause:** the model's Gated DeltaNet layers run on flash-linear-attention
 (fla) Triton kernels, which compile a small C launcher at first use. Without
@@ -322,12 +322,17 @@ the Python headers (`Python.h`), the compile fails, and fla only warns and
 falls back. A system Python without its `-dev` package is the usual cause.
 
 **Fix:** build the environment on a Python that ships its headers. A
-uv-managed Python does:
+uv-managed Python does; `--managed-python` makes uv use it even when a system
+Python 3.10 exists (on Ubuntu 22.04, `uv venv -p 3.10` alone can pick the
+system one, which has no headers):
 
 ```bash
-uv venv --seed -p 3.10 .venv && source .venv/bin/activate
+uv venv --seed --managed-python -p 3.10 .venv && source .venv/bin/activate
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
 ```
+
+On a uv release without `--managed-python`, run `uv python install 3.10`
+first and pass `--python-preference only-managed` instead.
 
 On a distribution Python, install its development package (for example
 `python3.10-dev`) instead. Also check the NVIDIA driver is 570 or newer.
