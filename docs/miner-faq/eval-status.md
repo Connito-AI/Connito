@@ -58,7 +58,8 @@ in the round's score map. This is the only "good" code.
 **`ok` does not mean a positive score.** The round score is the task gain
 over the pretrained base minus the c4-rise and gate-usage penalties, and it
 can be negative. Only a score above 0 earns a rank reward or can be
-published; shards from the reference miner have measured −0.14 to −0.17.
+published; shards trained with the reference training code have measured
+−0.14 to −0.17.
 
 **Set by:** `connito/validator/evaluator.py:evaluate_one_miner_sync`, after the
 c4 cutoff passes and the score is finite.
