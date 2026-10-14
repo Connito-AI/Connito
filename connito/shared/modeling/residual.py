@@ -56,6 +56,8 @@ def install_residual_experts(model: nn.Module, config: MinerConfig | ValidatorCo
 
 
 def freeze_all_but_residual(model: nn.Module) -> None:
-    """Train the residual experts and their routers; freeze everything else."""
+    """Train the residual experts and their routers; freeze everything else. Refuse a model that has none."""
     for name, param in model.named_parameters():
         param.requires_grad_(".residual_" in name)
+    if not any(param.requires_grad for param in model.parameters()):
+        raise ValueError("the model has no residual experts (`.residual_` parameters) to train")

@@ -1010,7 +1010,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
     # === training ===
     loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
-    aux_loss_batch = torch.tensor(0, dtype=torch.float32, device=device)
     training_time = 0
     total_training_time = 0
 
@@ -1652,7 +1651,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 inner_opt_step=None,
                 global_opt_step=global_opt_step,
                 loss_batch=loss_batch,
-                aux_loss_batch=aux_loss_batch,
             )
 
             metric_logger.log(metrics)

@@ -42,7 +42,7 @@ FIXTURE = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_
 def _config(monkeypatch, name: str, path: Path) -> SimpleNamespace:
     """A config naming `name`, whose family record points at the tiny checkpoint in `path`."""
     monkeypatch.setitem(FAMILIES, name, replace(FAMILIES[name], model_path=str(path)))
-    return SimpleNamespace(model=SimpleNamespace(family=name, torch_compile=False))
+    return SimpleNamespace(model=SimpleNamespace(family=name))
 
 
 @pytest.fixture(params=sorted(FAMILIES))

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
 import string
@@ -195,13 +194,11 @@ class ModelCfg(BaseConfig):
     # — it only affects that miner's own VRAM. `family` is locked because every
     # node must load the same checkpoint.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "family", "precision", "quantization", "quantization_validator",
+        "family", "quantization", "quantization_validator",
     })
     # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
     family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
     foundation: bool = True
-    torch_compile: bool = False
-    precision: str = "bf16-mixed"  # locked: both families are published in bf16
     device: str = "cuda"
     # fp8 weight-only storage for modules a role never trains. `quantization`
     # picks the format, the per-role fields pick the scope. See
@@ -349,7 +346,6 @@ class DataCfg(BaseConfig):
     dataset_name: str = "allenai/c4"
     data_dir: str | None = 'en'
     dataset_sources: list[DatasetSourceCfg] | None = None
-    batch_size: PositiveInt = 4
     sequence_length: PositiveInt = 1024
     per_device_train_batch_size: PositiveInt = 1
     world_size: int = 10
@@ -484,7 +480,9 @@ class OptimizerCfg(BaseConfig):
 
 
 class ParallelismCfg(BaseConfig):
-    gradient_accumulation_steps: PositiveInt = 4
+    # Rows per forward. 2 x 2 fits the L40S at seq 4096 under either fp8 scope; "all" also fits 4 x 1, barely.
+    micro_batch_size: PositiveInt = 2
+    gradient_accumulation_steps: PositiveInt = 2
     global_opt_interval: PositiveInt = 100
     world_size: PositiveInt = 1
     port: PositiveInt = 29500
@@ -1098,15 +1096,24 @@ class MinerConfig(WorkerConfig):
     role: str = "miner"
     local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accumulation_from_before_micro_batch(cls, data: Any) -> Any:
+        """A YAML from before micro_batch_size accumulated 1-row micro-batches; take the new default instead."""
+        local_par = data.get("local_par") if isinstance(data, dict) else None
+        if not isinstance(local_par, dict) or "micro_batch_size" in local_par:
+            return data
+        if "gradient_accumulation_steps" in local_par:
+            logger.warning(
+                "Ignoring local_par.gradient_accumulation_steps from before micro_batch_size; add "
+                "local_par.micro_batch_size to keep your own gradient_accumulation_steps",
+                ignored=local_par["gradient_accumulation_steps"],
+            )
+        # Persisted by from_path's rewrite; without auto_update or a TTY it is redone on every load.
+        return data | {"local_par": {k: v for k, v in local_par.items() if k != "gradient_accumulation_steps"}}
+
     @model_validator(mode="after")
     def _derive_all(self):
-        # derive grad accumulation if user explicitly set 0
-        if self.local_par.gradient_accumulation_steps == 0:
-            effective_batch = self.task.exp.data.batch_size
-            device_batch = self.task.exp.data.per_device_train_batch_size
-            g = math.ceil(effective_batch / (device_batch * self.local_par.world_size))
-            self.local_par.gradient_accumulation_steps = max(1, int(g))
-
         goi = self.local_par.global_opt_interval
         frac = 0.2
 

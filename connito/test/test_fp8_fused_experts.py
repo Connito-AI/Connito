@@ -35,7 +35,6 @@ from connito.shared.modeling.quantization import (
 )
 from connito.test.conftest import TINY_DEEPSEEK_V2_CONFIG, TINY_TEXT_CONFIG
 
-FIXTURE = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_v2_checkpoint"}
 # Each family's MoE block, built from its tiny config.
 BLOCK = {
     "qwen3_5_moe": (Qwen3_5MoeSparseMoeBlock, Qwen3_5MoeTextConfig, TINY_TEXT_CONFIG),
@@ -48,7 +47,7 @@ MOE_LAYERS = {"qwen3_5_moe": 4, "deepseek_v2": 2}
 def _config(name: str, *, miner: str = "all", validator: str = "all", role: str = "validator",
             quantization: str = "fp8") -> SimpleNamespace:
     model = SimpleNamespace(
-        family=name, torch_compile=False,
+        family=name,
         quantization=quantization, quantization_miner=miner, quantization_validator=validator,
     )
     return SimpleNamespace(role=role, model=model)
@@ -56,13 +55,6 @@ def _config(name: str, *, miner: str = "all", validator: str = "all", role: str 
 
 def _point_at(monkeypatch, name: str, path: Path) -> None:
     monkeypatch.setitem(FAMILIES, name, replace(FAMILIES[name], model_path=str(path)))
-
-
-@pytest.fixture(params=sorted(FAMILIES))
-def family_name(request, monkeypatch) -> str:
-    """A family whose record points at its tiny checkpoint."""
-    _point_at(monkeypatch, request.param, request.getfixturevalue(FIXTURE[request.param]))
-    return request.param
 
 
 def _load(name: str, scope: str = "all") -> nn.Module:

@@ -382,8 +382,6 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     inner_optimizer: torch.optim.Optimizer | None = None,
     outer_optimizer: torch.optim.Optimizer | None = None,
-    inner_scaler: torch.amp.GradScaler | None = None,
-    outer_scaler: torch.amp.GradScaler | None = None,
     loss: float | None = None,
     data_loader: StatefulDataLoader | None = None,
     save_global_state: bool = True,
@@ -482,12 +480,6 @@ def save_checkpoint(
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "loss": loss if loss is not None else 0,
             }
-
-            if inner_scaler is not None:
-                global_state_dict["inner_scaler_state_dict"] = inner_scaler.state_dict()
-
-            if outer_scaler is not None:
-                global_state_dict["outer_scaler_state_dict"] = outer_scaler.state_dict()
 
             target = write_path / "global_state.pt"
             if not target.exists():
@@ -634,8 +626,6 @@ def load_checkpoint(
     inner_optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     outer_optimizer: torch.optim.Optimizer | None = None,
-    inner_scaler: torch.amp.GradScaler | None = None,
-    outer_scaler: torch.amp.GradScaler | None = None,
     data_loader: StatefulDataLoader | None = None,
 ) -> float:
     """Load the model and optimizer state from a checkpoint folder
@@ -668,7 +658,7 @@ def load_checkpoint(
             rank_state_dict = torch.load(f, map_location=torch.device("cpu"))
         data_loader.load_state_dict(rank_state_dict["data_loader"])
 
-    if scheduler is not None or inner_scaler is not None or outer_scaler is not None:
+    if scheduler is not None:
         with fsspec.open(os.path.join(checkpoint_path, "global_state.pt"), "rb") as f:
             global_state_dict = torch.load(f, map_location=torch.device("cpu"))
     else:
@@ -683,12 +673,6 @@ def load_checkpoint(
             for k, v in st.items():
                 if torch.is_tensor(v):
                     st[k] = v.to(device)
-
-    if inner_scaler is not None:
-        inner_scaler.load_state_dict(global_state_dict["inner_scaler_state_dict"])
-
-    if outer_scaler is not None:
-        outer_scaler.load_state_dict(global_state_dict["outer_scaler_state_dict"])
 
     return global_state_dict["loss"]
 

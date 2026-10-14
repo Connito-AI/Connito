@@ -144,7 +144,6 @@ def get_status(
     inner_opt_step: int | None = None,
     global_opt_step: int | None = None,
     loss_batch: torch.Tensor | None | Any = None,
-    aux_loss_batch: torch.Tensor | None | Any = None,
 ) -> dict[str, Any]:
     """
     Build a dictionary of training metrics for monitoring and logging.
@@ -156,7 +155,8 @@ def get_status(
 
     total_batch_size: int = 0
     if inner_opt_step is not None:
-        total_batch_size = config.task.exp.data.batch_size * config.local_par.world_size
+        par = config.local_par
+        total_batch_size = par.micro_batch_size * par.gradient_accumulation_steps * par.world_size
         total_samples = inner_opt_step * total_batch_size
         total_tokens = total_samples * config.task.exp.data.sequence_length
 
@@ -189,17 +189,10 @@ def get_status(
 
 
     if loss_batch is not None and loss_batch != 0:
-        if aux_loss_batch is not None and aux_loss_batch != 0:
-            metrics = metrics | {
-                "loss": float(loss_batch.item() - aux_loss_batch.item()),
-                "perplexity": float(torch.exp(loss_batch - aux_loss_batch).item()),
-                "aux_loss": float(aux_loss_batch.item()),
-            }
-        else:
-            metrics = metrics | {
-                "loss": float(loss_batch.item()),
-                "perplexity": float(torch.exp(loss_batch).item()),
-            }
+        metrics = metrics | {
+            "loss": float(loss_batch.item()),
+            "perplexity": float(torch.exp(loss_batch).item()),
+        }
             
     # Injection: System/Training Tracking Details
     if hasattr(config, "task") and hasattr(config.task, "expert_group_name"):
