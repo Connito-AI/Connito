@@ -465,3 +465,13 @@ def test_a_journal_written_before_the_fallback_flag_still_loads():
     del raw["baseline_fallback"]
 
     assert rj.RoundJournal.from_json(json.dumps(raw)).baseline_fallback is False
+
+
+def test_a_c4_gate_failure_survives_the_journal_round_trip():
+    payload = rj.RoundJournal(round_id=ROUND_ID, uid_to_hotkey={1: "m1"}, scores={1: float("-inf"), 2: -0.2},
+                              scored_uids=(1, 2), failed_uids=(), validation_failed_uids=(), freeze_zero_uids=(),
+                              freeze_zero_hotkeys={}, uid_to_val_loss={1: float("inf")}).to_json()
+
+    restored = rj.RoundJournal.from_json(payload)
+    assert restored.scores == {1: float("-inf"), 2: -0.2}
+    assert restored.uid_to_val_loss == {1: float("inf")}

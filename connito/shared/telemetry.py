@@ -127,6 +127,17 @@ VALIDATOR_MINER_REPLAY_LOSS_INCREASE = Gauge(
     "Per-miner c4 replay loss minus the round base's replay loss",
     ["miner_uid"],
 )
+# Per-miner terms of the round score, each as it enters the sum; replay terms only when the c4 eval ran.
+VALIDATOR_MINER_SCORE_TERM = Gauge(
+    "validator_miner_score_term",
+    "Per-miner term of the round score: task_gain, replay_penalty, usage_penalty or replay_usage_penalty",
+    ["miner_uid", "term"],
+)
+VALIDATOR_MINER_GATE_USAGE = Gauge(
+    "validator_miner_gate_usage",
+    "Per-miner mean residual gate usage (sum of q over the K experts) on real tokens, on the task or replay split",
+    ["miner_uid", "split"],
+)
 # Round-level baseline loss: this validator's eval loss against the
 # round's global model, computed once per round at freeze. Single value
 # (no labels) — the latest write wins. Distinct from
@@ -281,8 +292,8 @@ VALIDATOR_MINER_LAST_SCORED_ROUND_ID = Gauge(
 )
 VALIDATOR_MINER_ROUND_DELTA = Gauge(
     "validator_miner_round_delta",
-    "Raw per-round improvement signal ((baseline - val_loss) ** 1.2, >= 0) "
-    "from the miner's most recent evaluated round. Distinct from "
+    "Raw per-round score from the miner's most recent evaluated round: task gain minus the c4 and "
+    "gate-usage penalties; negative below the base, -Inf when the c4 isolation gate failed. Distinct from "
     "validator_miner_score_latest, which is the finalized podium rank score.",
     ["miner_uid"],
 )

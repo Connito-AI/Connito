@@ -409,18 +409,21 @@ class BackgroundEvalWorker(threading.Thread):
                 return evaluate_model(0, self._eval_base_model, batches, self.device, max_batches, None)
 
         # A task with a replay source whose c4 check cannot run publishes nothing: each case raises into the fallback.
+        baseline_usage: dict[str, float] = {}
         try:
             if has_replay and not self._replay_batches:
                 raise ValueError("the c4 replay split is empty")
             task = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
             self._loaded_baseline_loss = float(task.get("val_loss", 100))
+            baseline_usage["baseline_task_usage"] = round(task.get("gate_usage", 0.0), 4)
             if not math.isfinite(self._loaded_baseline_loss):
-                raise ValueError("task baseline is not finite")  # every score would be inf, and q15 would publish
+                raise ValueError("task baseline is not finite")  # every score would be non-finite
             if has_replay:
                 replay = await asyncio.to_thread(_baseline, self._replay_batches, None)
                 if not math.isfinite(replay["val_loss"]) or replay.get("nan_batches", 0) > 0:
                     raise ValueError("the replay baseline has non-finite batches")
                 self._loaded_baseline_replay_loss = float(replay["val_loss"])
+                baseline_usage["baseline_replay_usage"] = round(replay.get("gate_usage", 0.0), 4)
             # Feeds the dashboard's baseline trend. Only the measured path
             # publishes: both fallbacks park the value at 100.0, and a
             # sentinel in the series reads as a real regression.
@@ -439,6 +442,7 @@ class BackgroundEvalWorker(threading.Thread):
             ),
             replay_batches=len(self._replay_batches or []),
             replay_tokens=sum(int(b["attention_mask"].sum()) for b in self._replay_batches or []),
+            **baseline_usage,
         )
 
     def _fall_back(self, round_obj, reason: str, error: Exception) -> None:

@@ -129,7 +129,7 @@ class Round:
     # Per-uid raw evaluation loss, recorded by `mark_scored` alongside the
     # score. Journaled so a mid-round restart doesn't lose the cycle's
     # losses — `validator_miner_val_loss` is emitted at eval time and is
-    # not derivable from `scores` (the delta clamps at 0).
+    # not derivable from `scores` (the score adds the c4 and gate-usage terms).
     val_losses: dict[int, float] = field(default_factory=dict)
     claimed_uids: set[int] = field(default_factory=set)
     failed_uids: set[int] = field(default_factory=set)
@@ -663,15 +663,16 @@ class Round:
         self, uid: int, score: float = 0.0, val_loss: float | None = None
     ) -> None:
         """Record a successful evaluation. `score` is this-round's score
-        (e.g. ``delta ** 1.2`` from `evaluate_one_miner`); it is stored
+        (the task gain less the c4 and gate-usage penalties, from
+        `evaluate_one_miner`); it is stored
         in `self.scores` so per-round ranking — used by post-eval
         submission cleanup — never has to consult the global aggregator.
 
         `val_loss` is the raw evaluation loss. It is recorded purely so the
         journal can carry it: `validator_miner_val_loss` is published at
-        eval time and cannot be reconstructed from `score`, because
-        ``delta = max(0.0, baseline - val_loss)`` clamps at zero. Optional
-        so existing callers and test fixtures keep working.
+        eval time and cannot be reconstructed from `score`, which also
+        carries the c4 and gate-usage terms. Optional so existing callers and
+        test fixtures keep working.
 
         Also writes the per-round journal, so a kill before
         `finalize_round_scores` runs does not lose the evaluation: startup

@@ -1,4 +1,4 @@
-"""The c4 isolation gate: a miner whose replay loss rises past the locked tolerance scores 0.
+"""The round score, task gain minus the c4 and gate-usage penalties, and the c4 isolation gate beneath it.
 
 CPU only, `evaluate_model` stubbed: `python -m pytest connito/test/test_replay_isolation_score.py`.
 """
@@ -15,14 +15,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from connito.shared.config import DatasetSourceCfg
+from connito.shared.config import DatasetSourceCfg, EvalCfg
 from connito.shared.evaluate import EvalDeadlineExceeded
 from connito.validator import background_eval_worker as bew
 from connito.validator import evaluator
 from connito.validator.evaluator import MinerEvalJob, evaluate_one_miner_sync
+from connito.validator.round import select_baseline_uid
 
 TASK, REPLAY = ["task batch"], ["replay batch"]
-BASELINE, BASELINE_REPLAY, TOLERANCE = 3.0, 2.0, 0.25
+BASELINE, BASELINE_REPLAY, TOLERANCE, TARGET = 3.0, 2.0, 0.25, 0.25
 
 
 @pytest.fixture
@@ -32,21 +33,30 @@ def statuses(monkeypatch) -> dict[int, str | None]:
     return seen
 
 
+def _config(**evaluation) -> SimpleNamespace:
+    return SimpleNamespace(
+        evaluation=EvalCfg(**{"max_replay_loss_increase": TOLERANCE, "task_usage_target": TARGET, **evaluation}),
+        dataloader=SimpleNamespace(world_size=1),
+    )
+
+
 def _score(monkeypatch, *, task_loss: float, replay_loss: float, replay_batches=REPLAY,
-           baseline_replay: float | None = BASELINE_REPLAY, replay_nan_batches: int = 0) -> tuple[MinerEvalJob, list]:
+           baseline_replay: float | None = BASELINE_REPLAY, replay_nan_batches: int = 0,
+           task_usage: float = TARGET, replay_usage: float = 0.0, **evaluation) -> tuple[MinerEvalJob, list]:
+    """Score uid 7 against BASELINE; by default its gate usage costs nothing, so only the losses count."""
     calls: list = []
 
     def _evaluate(step, model, batches, *a, **kw):
         calls.append(batches)
         if batches is TASK:
-            return {"val_loss": task_loss, "nan_batches": 0}
-        return {"val_loss": replay_loss, "nan_batches": replay_nan_batches}
+            return {"val_loss": task_loss, "nan_batches": 0, "gate_usage": task_usage}
+        return {"val_loss": replay_loss, "nan_batches": replay_nan_batches, "gate_usage": replay_usage}
 
     monkeypatch.setattr(evaluator, "load_model_from_path", lambda *a: MagicMock())
     monkeypatch.setattr(evaluator, "track_eval_latency", lambda: lambda fn: fn)  # the histogram is process-global
     monkeypatch.setattr(evaluator, "evaluate_model", _evaluate)
     job = evaluate_one_miner_sync(
-        config=SimpleNamespace(evaluation=SimpleNamespace(max_replay_loss_increase=TOLERANCE)),
+        config=_config(**evaluation),
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
         combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
         cached_batches=TASK, replay_batches=replay_batches, baseline_replay_loss=baseline_replay,
@@ -58,33 +68,104 @@ def _replay_increase_gauge() -> float:
     return evaluator.VALIDATOR_MINER_REPLAY_LOSS_INCREASE.labels(miner_uid="7")._value.get()
 
 
-def test_a_replay_loss_past_the_tolerance_scores_zero(monkeypatch, statuses):
+# --- the score ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("change, score", [
+    ({"task_loss": 2.5}, 0.5),  # task loss down: gain
+    ({"task_loss": 3.25}, -0.25),  # task loss up: loss
+    ({"replay_loss": BASELINE_REPLAY + 0.125}, 0.375),  # c4 loss up: penalty
+    ({"replay_loss": BASELINE_REPLAY - 0.5}, 0.5),  # c4 loss down: no reward
+    ({"task_usage": TARGET + 0.25}, 0.25),  # gate above the target on task tokens: penalty
+    ({"task_usage": TARGET - 0.125}, 0.375),  # below it: the same penalty
+    ({"replay_usage": 0.125}, 0.375),  # gate open on c4 tokens: penalty
+])
+def test_each_term_moves_the_score_with_its_sign(monkeypatch, statuses, change, score):
+    job, _ = _score(monkeypatch, **{"task_loss": 2.5, "replay_loss": BASELINE_REPLAY, **change})
+
+    assert job.score == pytest.approx(score)
+    assert statuses[7] is None
+
+
+def test_the_weights_and_target_are_locked_validator_fields():
+    locked = EvalCfg().locked_defaults()
+    assert {k: locked[k] for k in ("replay_loss_weight", "task_usage_weight", "task_usage_target",
+                                   "replay_usage_weight")} == {
+        "replay_loss_weight": 1.0, "task_usage_weight": 1.0, "task_usage_target": 0.2, "replay_usage_weight": 1.0,
+    }
+
+
+def test_the_weights_and_target_come_from_the_validator_config(monkeypatch, statuses):
+    job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.125, task_usage=0.25,
+                    replay_usage=0.0625, replay_loss_weight=2.0, task_usage_weight=3.0, task_usage_target=0.5,
+                    replay_usage_weight=4.0)
+
+    assert job.score == pytest.approx(0.5 - 2 * 0.125 - 3 * 0.25 - 4 * 0.0625)
+
+
+def test_a_miner_that_matches_the_baseline_scores_exactly_zero_like_the_baseline(monkeypatch, statuses):
+    """The baseline is never scored: 0 is its score by definition, and only a miner above it is published."""
+    job, _ = _score(monkeypatch, task_loss=BASELINE, replay_loss=BASELINE_REPLAY)
+
+    assert job.score == 0.0
+    assert select_baseline_uid({7: BASELINE}, {7: job.score}, {}) is None
+
+
+def test_each_term_is_logged_and_published(monkeypatch, statuses):
+    log = MagicMock()
+    monkeypatch.setattr(evaluator, "logger", log)
+    job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.125, task_usage=0.5,
+                    replay_usage=0.125)
+
+    terms = {"task_gain": 0.5, "replay_penalty": 0.125, "usage_penalty": 0.25, "replay_usage_penalty": 0.125}
+    (complete,) = (c.kwargs for c in log.info.call_args_list if c.args[0] == "evaluate_one_miner: complete")
+    assert {k: complete[k] for k in (*terms, "task_usage", "replay_usage", "score")} == {
+        **terms, "task_usage": 0.5, "replay_usage": 0.125, "score": 0.0,
+    }
+    for term, value in terms.items():
+        assert evaluator.VALIDATOR_MINER_SCORE_TERM.labels(miner_uid="7", term=term)._value.get() == value
+    for split, value in {"task": 0.5, "replay": 0.125}.items():
+        assert evaluator.VALIDATOR_MINER_GATE_USAGE.labels(miner_uid="7", split=split)._value.get() == value
+    assert _replay_increase_gauge() == 0.125
+
+
+def test_a_non_finite_gate_usage_scores_minus_inf(monkeypatch, statuses):
+    job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY, task_usage=math.nan)
+
+    assert job.score == -math.inf
+    assert statuses[7] == "non_finite_loss"
+
+
+# --- the c4 isolation gate ------------------------------------------------------------------------
+
+
+def test_a_replay_loss_past_the_tolerance_is_never_ranked(monkeypatch, statuses):
     job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.5)
 
-    assert (job.val_loss, job.score) == (math.inf, 0.0)
+    assert (job.val_loss, job.score) == (math.inf, -math.inf)
     assert statuses[7] == "replay_loss_increase"
     assert _replay_increase_gauge() == 0.5
 
 
-def test_a_replay_loss_within_the_tolerance_keeps_the_task_score(monkeypatch, statuses):
-    job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.125)
+def test_a_gate_failure_sorts_below_a_passing_miner_with_a_negative_score(monkeypatch, statuses):
+    failed, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + 0.5)
+    negative, _ = _score(monkeypatch, task_loss=3.5, replay_loss=BASELINE_REPLAY)
 
-    assert job.val_loss == 2.5
-    assert job.score == pytest.approx(0.5 ** 1.2)
-    assert statuses[7] is None
+    assert failed.score < negative.score < 0.0
 
 
 def test_a_replay_loss_exactly_at_the_tolerance_passes(monkeypatch, statuses):
     job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=BASELINE_REPLAY + TOLERANCE)
 
     assert job.val_loss == 2.5
+    assert job.score == pytest.approx(0.5 - TOLERANCE)
 
 
 def test_replay_batches_that_blow_up_fail_the_gate_even_when_the_rest_improve(monkeypatch, statuses):
     """Base replay batches 3.0 / 3.0 / 2.0; the miner's inf / inf / 2.6 averages 2.6 over the finite one."""
     job, _ = _score(monkeypatch, task_loss=2.0, replay_loss=2.6, baseline_replay=8.0 / 3.0, replay_nan_batches=2)
 
-    assert job.score == 0.0  # 1.0 if the dropped batches went unnoticed
+    assert job.score == -math.inf  # 1.0 if the dropped batches went unnoticed
     assert statuses[7] == "replay_loss_increase"
 
 
@@ -96,23 +177,29 @@ def test_the_gate_log_says_why_it_tripped(monkeypatch, statuses, replay_loss, na
     monkeypatch.setattr(evaluator, "logger", log)
     _score(monkeypatch, task_loss=2.5, replay_loss=replay_loss, replay_nan_batches=nan_batches)
 
-    event = "evaluate_one_miner: c4 isolation gate failed; scoring 0"
+    event = "evaluate_one_miner: c4 isolation gate failed; not ranked"
     assert [c.kwargs["reason"] for c in log.info.call_args_list if c.args[0] == event] == [reason]
 
 
-def test_a_non_finite_replay_loss_scores_zero(monkeypatch, statuses):
+def test_a_non_finite_replay_loss_is_never_ranked(monkeypatch, statuses):
     job, _ = _score(monkeypatch, task_loss=2.5, replay_loss=math.inf)
 
-    assert job.score == 0.0
+    assert job.score == -math.inf
 
 
 @pytest.mark.parametrize("replay_batches, baseline_replay", [(None, BASELINE_REPLAY), (REPLAY, None)])
-def test_without_a_replay_split_or_baseline_the_gate_is_off(monkeypatch, statuses, replay_batches, baseline_replay):
-    job, calls = _score(monkeypatch, task_loss=2.5, replay_loss=99.0,
+def test_without_a_replay_split_or_baseline_the_gate_and_c4_terms_are_off(
+    monkeypatch, statuses, replay_batches, baseline_replay,
+):
+    log = MagicMock()
+    monkeypatch.setattr(evaluator, "logger", log)
+    job, calls = _score(monkeypatch, task_loss=2.5, replay_loss=99.0, replay_usage=1.0,
                         replay_batches=replay_batches, baseline_replay=baseline_replay)
 
     assert calls == [TASK]
-    assert job.val_loss == 2.5
+    assert (job.val_loss, job.score) == (2.5, 0.5)
+    (complete,) = (c.kwargs for c in log.info.call_args_list if c.args[0] == "evaluate_one_miner: complete")
+    assert not {"replay_penalty", "replay_usage_penalty", "replay_usage"} & complete.keys()
 
 
 def test_the_replay_eval_honours_the_miners_deadline(monkeypatch, statuses):
@@ -126,7 +213,7 @@ def test_the_replay_eval_honours_the_miners_deadline(monkeypatch, statuses):
     monkeypatch.setattr(evaluator, "track_eval_latency", lambda: lambda fn: fn)
     monkeypatch.setattr(evaluator, "evaluate_model", _evaluate)
     job = evaluate_one_miner_sync(
-        config=SimpleNamespace(evaluation=SimpleNamespace(max_replay_loss_increase=TOLERANCE)),
+        config=_config(),
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
         combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
         deadline_monotonic=0.0, cached_batches=TASK, replay_batches=REPLAY, baseline_replay_loss=BASELINE_REPLAY,
@@ -141,13 +228,14 @@ def test_without_cached_batches_the_task_loader_leaves_out_replay(monkeypatch):
     monkeypatch.setattr(evaluator, "load_model_from_path", lambda *a: MagicMock())
     monkeypatch.setattr(evaluator, "track_eval_latency", lambda: lambda fn: fn)
     monkeypatch.setattr(evaluator, "evaluate_model", lambda *a, **kw: {"val_loss": 2.5, "nan_batches": 0})
-    evaluate_one_miner_sync(
-        config=SimpleNamespace(dataloader=SimpleNamespace(world_size=1)),
+    job = evaluate_one_miner_sync(
+        config=_config(),
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
         combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
     )
 
     assert seen == [False]
+    assert job is not None
 
 
 # --- the worker measures both baselines once per round ---------------------------------------------
@@ -171,10 +259,10 @@ def worker_env(monkeypatch) -> SimpleNamespace:
     def _evaluate(step, model, batches, *a, **kw):
         env.evaluated.append(batches)
         if batches == [TASK]:
-            return {"val_loss": env.task_baseline, "nan_batches": 0}
+            return {"val_loss": env.task_baseline, "nan_batches": 0, "gate_usage": 0.05}
         if isinstance(env.replay_baseline, Exception):
             raise env.replay_baseline
-        return {"val_loss": env.replay_baseline, "nan_batches": env.replay_nan_batches}
+        return {"val_loss": env.replay_baseline, "nan_batches": env.replay_nan_batches, "gate_usage": 0.0625}
 
     def _evaluate_one_miner(**kw):
         env.miner_kwargs.append(kw)
@@ -237,6 +325,14 @@ def test_both_baselines_are_measured_once_per_round_and_handed_to_every_miner(wo
     assert first["replay_batches"] is second["replay_batches"] is worker_env.evaluated[1]
     for kw in (first, second):
         assert (kw["baseline_loss"], kw["baseline_replay_loss"]) == (BASELINE, BASELINE_REPLAY)
+
+
+def test_the_round_log_reports_the_bases_gate_usage(worker_env):
+    _run_round(_worker(), _round(), worker_env)
+
+    event = "bg-eval: round snapshot loaded"
+    (loaded,) = (c.kwargs for c in worker_env.logger.info.call_args_list if c.args[0] == event)
+    assert (loaded["baseline_task_usage"], loaded["baseline_replay_usage"]) == (0.05, 0.0625)
 
 
 def test_the_replay_split_is_batched_within_the_tasks_sequence_length(worker_env):
