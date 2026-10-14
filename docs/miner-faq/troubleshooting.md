@@ -69,10 +69,10 @@ or Distribute logs `Fetching model from chain` with `should_download=False`,
 and the miner never trains from a published round winner.
 
 **Causes, in order of likelihood:**
-
 1. **Nothing was published.** Validators publish a round winner only if some
-   miner's round score is above 0: better than the pretrained base after the
-   c4 and gate-usage penalties (which also means it passed the c4 cutoff). On
+   miner's round score is above 0: a raw score, c4 and gate-usage penalties
+   included, above the pretrained base's own (which also means it passed the
+   c4 cutoff). On
    the first round of a task, or a round where nobody qualified, they commit a
    hash with **no HF coordinates**, and there is nothing to download. This is
    normal. With nothing published, the miner resumes its own last trained
