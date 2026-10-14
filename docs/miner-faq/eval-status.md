@@ -166,7 +166,7 @@ Code: `connito/shared/checkpoints.py:_verify_hash`.
 The shard is not exactly the residual the task asks for. A submission must be
 the task's residual experts and routers and nothing else, in the protocol's
 shapes and dtypes, all finite, and actually trained. The validator refuses it
-before scoring; the miner's round score is 0.
+before scoring; the miner gets rank score 0 for the round.
 
 **Condition in code:** `verify_residual_shard` returns `None`, checking in
 this order. A file it cannot read at all (truncated, malformed, 0 bytes, not
@@ -266,7 +266,7 @@ shard.
 
 **Condition in code:** `torch.cuda.OutOfMemoryError` is caught in
 `evaluate_one_miner_sync`. The miner is marked operationally-failed; the
-round score is **not** zeroed — the prior EMA is preserved.
+miner gets **no** rank score for the round — the prior EMA is preserved.
 
 **Miner action:** none. This is the validator's hardware problem. A miner's
 residual has a fixed size and fixed dtypes (the shard is refused otherwise),
@@ -342,7 +342,7 @@ The miner's committed HF repo, revision or file is definitively gone: the repo
 was deleted, made private or gated, or the revision was rewritten. Unlike
 `download_failed` (a transient or validator-side failure, which preserves the
 miner's prior average), this is treated as the **miner's fault** and the
-round score is 0.
+miner gets rank score 0 for the round.
 
 **Condition in code:** the background download worker gets a definitive "not
 found" from Hugging Face for every candidate file (typed HF errors, not
@@ -369,8 +369,8 @@ scores each miner on a c4 replay split (general web text, about 65,000 real
 tokens per round) and compares the miner's c4 loss with the pretrained base's
 on the same batches. A residual that improves the task but damages general
 text fails here. The miner's score is `−inf` and its `val_loss` is reported
-as `inf`: it is never ranked (rank score 0), never published as the round
-winner, and kept off the podium.
+as `inf`: it is never ranked (rank score 0) and never published as the round
+winner.
 
 A c4 rise below the cutoff is not free: it is subtracted from the score as
 `replay_penalty`, along with the gate's usage on c4 tokens.

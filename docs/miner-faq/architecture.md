@@ -143,7 +143,7 @@ winner's residual. Its path through the system:
    A shard that passes becomes the miner's starting point.
 
 **Where a miner starts when nothing is published** (the first round of a task,
-or a round where nobody beat the base): it keeps its own last trained
+or a round where no miner scored above 0): it keeps its own last trained
 checkpoint, or, with none, its own freshly drawn residual. A miner never
 starts from an untrained residual (all-zero `down_proj`, or gate and up both
 zero), because such a residual gets no gradient; the miner refuses one as a

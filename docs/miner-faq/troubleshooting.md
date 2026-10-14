@@ -73,8 +73,8 @@ and the miner never trains from a published round winner.
 1. **Nothing was published.** Validators publish a round winner only if some
    miner's round score is above 0: better than the pretrained base after the
    c4 and gate-usage penalties (which also means it passed the c4 cutoff). On
-   the first round of a task, or a round where nobody qualified, they commit a hash with **no HF coordinates**, and there is
-   nothing to download. This is normal. With nothing published, the miner
+   the first round of a task, or a round where nobody qualified, they commit
+   a hash with **no HF coordinates**, and there is nothing to download. This is normal. With nothing published, the miner
    resumes its own last trained checkpoint, or keeps its fresh draw if it
    has none.
 2. **The published shard was refused.** The miner checks a downloaded
@@ -284,7 +284,7 @@ Code: `connito/shared/checkpoints.py:build_chain_checkpoints_from_previous_phase
 **Symptom:** status 15, `replay_loss_increase`, with `val_loss = inf` and a
 round score of `−Inf` on `validator_miner_round_delta`, often right after your
 miner restarted from a published round winner. Your task loss may still have
-beaten the baseline. You are not ranked, not published and not on the podium.
+beaten the baseline. You are not ranked and not published.
 
 **Cause:** your residual raised the loss on general English text (c4) by more
 than the locked tolerance, `evaluation.max_replay_loss_increase` (default

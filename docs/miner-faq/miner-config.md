@@ -234,7 +234,7 @@ Code: `connito/shared/config.py:CycleCfg`.
    clear the local checkpoint dir between runs if you reset training.
 3. **HF private repo.** If `hf.checkpoint_repo` is private, validators cannot
    download your shard, and you are never scored. If the repo or revision is
-   gone for good, the round scores 0 (`repo_unavailable`). Make the repo
+   gone for good, you get rank score 0 for the round (`repo_unavailable`). Make the repo
    public.
 4. **Run name reuse.** `run_name` is part of the local checkpoint path. If
    you rename the run between cycles, miner restart will not find the
