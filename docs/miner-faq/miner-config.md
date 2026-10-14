@@ -265,8 +265,8 @@ Code: `connito/shared/telemetry.py` (the `MINER_*` gauges),
 
 ## Vary your training data every round
 
-**The stock miner trains on the same data every round, and that gets you
-zeroed.** It builds its training loader with no seed, so the stream starts at
+**The stock miner trains on the same data every round, and that trips the c4
+cutoff.** It builds its training loader with no seed, so the stream starts at
 the same rows in the same order every time. It rebuilds the loader at every
 `setup_training`, including the restart from each round's published winner,
 so each round replays the same data. And every one-GPU miner reads the same
@@ -274,16 +274,23 @@ slice of it (rank 0 of the task's 10 data shards), so every miner on the stock
 code sees identical batches.
 
 **What that does, measured** (two miners, both starting from round 1's
-published winner, scored on the same eval set):
+published winner, scored on the same eval set, under the scoring of that run:
+task gain plus the c4 cutoff, before the gate-usage penalties):
 
 | training data | task loss vs start | c4 loss vs base | result |
 |---|---|---|---|
-| stock (same stream again) | worse | +0.064 / +0.066 | both zeroed by the c4 check, nothing published |
-| each source shuffled per (hotkey, round) | −0.0014 / −0.0047 | −0.024 / −0.025 | winner published |
+| stock (same stream again) | worse | +0.064 / +0.066 | both stopped by the c4 cutoff (status 15), nothing published |
+| each source shuffled per (hotkey, round) | −0.0014 / −0.0047 | −0.024 / −0.025 | cutoff passed, winner published |
 
 In a full two-round rehearsal on the stock code, round 2 went the same way:
-c4 loss +0.061 / +0.059, both miners zeroed (status 15, `replay_loss_increase`),
-nothing published. With repeated data, 13–28% of micro-batches were also
+c4 loss +0.061 / +0.059, both miners stopped (status 15, `replay_loss_increase`),
+nothing published.
+
+The cutoff is what varied data protects you from. Under the current score,
+passing it is necessary but not enough: the score also subtracts gate-usage
+penalties, and reference-miner shards have measured below 0 even with fresh
+data (see `scoring.md`, "Gate usage: why a better loss can still score below
+0"). With repeated data, 13–28% of micro-batches were also
 skipped as non-finite; the shuffled run skipped none.
 
 **What to do.** Give each round, and each hotkey, its own data order. The
@@ -303,9 +310,9 @@ and the miners ran out of data within about 20 minutes.
 
 **Two reference miners score 0 together.** Two miners running the stock code
 from the same published winner read identical batches. If they also run the
-same number of steps, they produce the same shard and exactly equal
-`val_loss`, and `finalize_round_scores` scores an exact tie 0 for both, as a
-duplicate submission.
+same number of steps, they produce the same shard and exactly equal scores,
+and `finalize_round_scores` gives an exact tie 0 for both, as a duplicate
+submission.
 
 Code: `connito/miner/train.py:setup_training`,
 `connito/shared/dataloader.py:get_dataloader`,
