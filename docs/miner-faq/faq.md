@@ -422,9 +422,9 @@ Code: `connito/miner/train.py:setup_training`,
 **No. Load the base model onto one GPU.** On a 6× RTX A6000 host, Qwen loaded
 with transformers `device_map="auto"` over three GPUs returned wrong logits
 with no error or warning: loss 12.42 on a test sentence instead of 2.04, every
-run. Two GPUs happened to give the right answer, but the cause (cross-device
-races in the fla kernels and the final logits copy) means no split is
-trusted.
+run. Two GPUs happened to give the right answer, but the suspected cause
+(unsynchronised cross-device kernel launches and logits copy) would affect any
+split, so no split is trusted.
 
 So the loader refuses a model spread over more than one device, with
 `the base model is split over devices [...]. Load it onto one GPU`. A single
