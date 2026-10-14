@@ -9,15 +9,16 @@ through each step.
 
 When a validator scores a miner submission, it loads the miner's residual onto
 the frozen base, evaluates it on the round's task batches and on the c4 replay
-batches, and computes one number:
+batches, and computes a raw score, then subtracts the base's own raw score:
 
 ```python
 # connito/validator/evaluator.py:evaluate_one_miner_sync (simplified)
 task_gain = baseline_loss - val_loss               # > 0: better than pretrained on the task
-score = (task_gain
-         - a * max(0, c4_loss - baseline_c4_loss)  # replay_penalty
-         - b * abs(task_usage - target)            # usage_penalty
-         - c * c4_usage)                           # replay_usage_penalty
+raw = (task_gain
+       - a * max(0, c4_loss - baseline_c4_loss)    # replay_penalty
+       - b * abs(task_usage - target)              # usage_penalty
+       - c * c4_usage)                             # replay_usage_penalty
+score = raw - base_raw                             # base_raw: the base's own raw this round
 # defaults (locked validator config): a = b = c = 1.0, target = 0.2
 ```
 
@@ -32,8 +33,11 @@ score = (task_gain
   It is measured during the same task and c4 evals; batches whose loss is
   dropped as non-finite don't count. The score asks the gate to fire on about
   `target` (0.2) of task tokens and to stay quiet on c4.
-- **The baseline scores 0 by definition.** Only a score above 0 is ranked or
-  published.
+- **`base_raw`** is the same formula applied to the base on its own baseline
+  evals. Its task gain and c4 rise are 0, so only its gate-usage terms count,
+  using the base's measured usage. A miner identical to the base therefore
+  scores exactly 0, and **a score above 0 means a raw score above the
+  base's**. Only a score above 0 is ranked or published.
 - **The c4 cutoff.** If `c4_loss − baseline_c4_loss` exceeds the locked
   `evaluation.max_replay_loss_increase` (default 0.02), or any c4 batch is
   non-finite, or the rise is NaN, the score is `−inf`, `val_loss` is reported
@@ -44,19 +48,22 @@ score = (task_gain
   excluded).
 - **Any other non-finite score** (for example every task batch NaN) is `−inf`
   with status 1, `non_finite_loss`.
-- **A task with no c4 replay source** has no c4 terms: score = task gain −
-  b·|task_usage − target|.
+- **A task with no c4 replay source** has no c4 terms, for the miner or the
+  base: raw = task gain − b·|task_usage − target|.
+- **On a fallback round** (the base could not be measured) `base_raw` is 0.
 
 The weights are locked `EvalCfg` fields: `replay_loss_weight` (a),
 `task_usage_weight` (b), `task_usage_target` (target) and
 `replay_usage_weight` (c). There is no exponent on the gain.
 
-The raw score is stored on the `MinerEvalJob` but is **not** what ends up on
+The score is stored on the `MinerEvalJob` but is **not** what ends up on
 chain — see "Rank-based finalization" below.
 
 Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
+`connito/validator/evaluator.py:usage_penalties`,
+`connito/validator/background_eval_worker.py:BackgroundEvalWorker._load_round_base`,
 `connito/shared/modeling/residual.py:record_gate_usage`,
-`connito/shared/evaluate.py:evaluate_model`, `connito/shared/config.py:EvalCfg`.
+`connito/shared/config.py:EvalCfg`.
 
 ## When `val_loss` and `delta_loss` are null
 
@@ -246,12 +253,12 @@ duplicate-score penalty. Current dashboards expose `score_latest` and
 
 The most common cases, in order of frequency:
 
-1. **The penalties outweigh the task gain.** A low `val_loss` only buys the
-   task gain; the gate-usage and c4 penalties are subtracted from it. A gate
-   that fires equally on task and c4 tokens pays 0.2 for any usage up to 0.2,
-   more than the task gains measured (at most 0.06). A round score of 0 or
-   below gets rank score 0. See "Gate usage: why a better loss can still score
-   below 0".
+1. **Its raw score did not beat the base's.** A low `val_loss` only buys the
+   task gain; the gate-usage and c4 penalties are subtracted from it, and the
+   result is compared with the base's own raw score. If the residual's gate
+   fires more on c4, or further from the 0.2 target on the task, than the
+   base's does, the extra penalty can cancel the gain. A round score of 0 or
+   below gets rank score 0. See "Gate usage and the base's raw score".
 2. **Not in the round's top 3 by score.** The rank-based mapping is geometric
    and cuts off after rank 3. Rank 4 is 0.0.
 3. **The c4 cutoff stopped it** (status 15): its c4 loss rose more than 0.02
@@ -284,8 +291,7 @@ is happening on that validator:
    every round score was 0 or below), so every `score_avg` is 0 and
    `select_top_n_by_local_score` skips them all. G1 is empty and its share
    goes to UID 0; G2 is empty too, so after normalization UID 0 receives the
-   whole emission. Under the current score this is what happens while no miner's
-   residual scores above the pretrained base.
+   whole emission.
 3. **Stale-weights fallback** — the validator did not submit weights in
    `cycle_length` blocks (e.g., it was down). `_submit_fallback_weights`
    aggregates peer consensus and emits to top-3 peer-favored miners, with the
@@ -313,10 +319,10 @@ subnet builds on.
 
 The rule, applied when the round is finalized:
 
-1. **Only miners with a score above 0 this round qualify.** The pretrained
-   base scores 0 by definition, so that means better than the base after the
-   c4 and gate-usage penalties; a miner stopped by the c4 cutoff scores `−inf`
-   and never qualifies.
+1. **Only miners with a score above 0 this round qualify.** The score is
+   measured from the base's own raw score, so the pretrained base scores 0
+   and a score above 0 means a raw score above the base's; a miner stopped by
+   the c4 cutoff scores `−inf` and never qualifies.
 2. Among those, the best-ranked **proven** miner wins: one of the top 3 by
    track record (`score_avg`) that submitted this round.
 3. If none of the proven miners qualifies, the qualifying miner with the
@@ -331,10 +337,11 @@ The rule, applied when the round is finalized:
    that has a replay source), it scores the round against a fixed 100.0, logs
    "round on the fallback baseline; no winner will be published", and
    publishes no winner. There is no c4 eval on such a round, so no c4 terms
-   and no c4 cutoff. Rank rewards for that round still apply.
+   and no c4 cutoff, and `base_raw` is 0. Rank rewards for that round still
+   apply.
 
-So the published residual is always one that scored above the pretrained
-base on that round's data, penalties included, and passed the c4 cutoff. The
+So the published residual is always one whose raw score beat the pretrained
+base's on that round's data, penalties included, and passed the c4 cutoff. The
 publishing validator logs `publish_baseline: published` with the winner's
 `score`, or `publish_baseline: no miner beat the baseline`.
 
@@ -342,40 +349,47 @@ Code: `connito/validator/round.py:select_baseline_uid`,
 `connito/validator/round.py:Round.baseline_winner_uid`,
 `connito/validator/distribute.py:publish_round_baseline`.
 
-## Gate usage: why a better loss can still score below 0
+## Gate usage and the base's raw score
 
-The score charges the residual for where its gate fires, not only for the
-loss it wins: `− |task_usage − 0.2| − c4_usage` (default weights). The
-pretrained base, with the validator's fresh residual, has a gate usage of
-about 0.05 on both task and c4 tokens (it varies a little with the fresh
-draw).
+The raw score charges the residual for where its gate fires, not only for the
+loss it wins: `− |task_usage − 0.2| − c4_usage` (default weights). The base is
+charged the same way, so the score only rewards a residual that does better
+than the base on these terms as well as on the task.
+
+**The base sits at about −0.2.** Its gate usage, with the validator's fresh
+residual, is about 0.04–0.05 on task and c4 tokens alike. A gate with no
+preference between task and c4 tokens, at any usage u up to 0.2, pays
+`|u − 0.2| + u = 0.2` exactly, so `base_raw` is about −0.2 (measured −0.200 to
+−0.208).
 
 **What was measured** (production scoring code, real shards, two eval seeds):
 
-- Shards trained with the reference training code (two full-Train rehearsal
-  shards and a 3-step test shard) beat the base on the task by 0.03 to 0.06
-  nats and scored **−0.14 to −0.17**: they would publish nothing and earn no
-  rank reward. The full-Train shards raised gate usage on **both** splits, to
-  about 0.08 on task tokens and 0.09 on c4; the 3-step shard stayed near the
-  base's usage and scored about −0.17.
+- A 3-step test shard from the reference training code scored **+0.028 and
+  +0.039**.
+- Two full-Train rehearsal shards scored **+0.043 to +0.064**. They beat the
+  base on the task by 0.05 to 0.06 nats; their gate usage rose on both splits
+  (to about 0.08 task and 0.09 c4), which costs about as much as it saves.
 - A deliberately leaky shard (its residual scaled ×32) failed the c4 cutoff:
   `−inf`, status 15.
 
-**Why.** A gate that fires equally on task and c4 tokens, at any usage u up to
-0.2, pays `|u − 0.2| + u = 0.2` exactly. Raising usage on both splits trades
-one penalty for the other. To score above 0 a miner has to make its gate
-**fire on task tokens** (toward 0.2) **and stay quiet on c4**, and gain more
-on the task loss than the penalty that is left.
+**How to score higher.** Once the task gain is in, the usage terms are where
+the room is: a gate that fires on task tokens (toward 0.2) and stays quiet on
+c4 lowers both penalties below the base's. The reference miner trains on
+cross-entropy only, with no term that separates the gate's behaviour on task
+and c4 tokens, so it leaves that room unused. How to use it is up to you;
+there is no tested recipe.
 
-**The reference miner does not do this.** It trains on cross-entropy only,
-with no term that separates the gate's behaviour on task and c4 tokens, so
-nothing pushes its gate toward the task. How to get there is up to you;
-there is no tested recipe. The weights and target are locked validator
-config and can change between releases, so read the current values in
-`connito/shared/config.py:EvalCfg` and watch your own terms on the
-`validator_miner_score_term` and `validator_miner_gate_usage` gauges.
+**Validators differ a little.** Each validator draws its own fresh residual,
+so its base usage varies by about ±0.005 and `base_raw` with it. The same
+shard can score up to about 0.008 differently on two validators.
+
+The weights and target are locked validator config and can change between
+releases, so read the current values in `connito/shared/config.py:EvalCfg`
+and watch your own terms on the `validator_miner_score_term` and
+`validator_miner_gate_usage` gauges.
 
 Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
+`connito/validator/evaluator.py:usage_penalties`,
 `connito/shared/modeling/residual.py:record_gate_usage`.
 
 ## Where to see your score terms
@@ -388,20 +402,25 @@ Each validator publishes every term of your round score per miner:
   terms are present only when the c4 eval ran.
 - `validator_miner_gate_usage{miner_uid, split}`, with `split` `task` or
   `replay`.
-- `validator_miner_round_delta{miner_uid}`: the round score itself. It can be
-  negative, and is `−Inf` when the c4 cutoff stopped you.
+- `validator_miner_round_delta{miner_uid}`: the round score itself (raw minus
+  the base's raw). It can be negative, and is `−Inf` when the c4 cutoff
+  stopped you.
+- `validator_round_base_raw_score` (the last measured round's `base_raw`) and
+  `validator_round_base_raw_score_by_round{round_id}`. Neither is set on a
+  fallback round.
 - `validator_miner_replay_loss_increase{miner_uid}`: your c4 rise over the
   base.
 
 In the validator's log, `evaluate_one_miner: complete` carries `val_loss`,
 `baseline_loss`, `replay_loss_increase`, `task_usage`, `replay_usage`,
-`task_gain`, `replay_penalty`, `usage_penalty`, `replay_usage_penalty` and
-`score`. A miner stopped by the c4 cutoff gets
+`task_gain`, `replay_penalty`, `usage_penalty`, `replay_usage_penalty`,
+`raw`, `base_raw` and `score`. A miner stopped by the c4 cutoff gets
 `evaluate_one_miner: c4 isolation gate failed; not ranked` with `reason`,
 `replay_loss_increase` and the `tolerance=` in force. The round's base usage
-appears on the `bg-eval: round snapshot loaded` line as `baseline_task_usage`
-and `baseline_replay_usage`.
+and raw score appear on the `bg-eval: round snapshot loaded` line as
+`baseline_task_usage`, `baseline_replay_usage` and `base_raw_score`.
 
 Code: `connito/shared/telemetry.py` (`VALIDATOR_MINER_SCORE_TERM`,
-`VALIDATOR_MINER_GATE_USAGE`, `VALIDATOR_MINER_ROUND_DELTA`),
+`VALIDATOR_MINER_GATE_USAGE`, `VALIDATOR_MINER_ROUND_DELTA`,
+`VALIDATOR_ROUND_BASE_RAW_SCORE`),
 `connito/validator/evaluator.py:evaluate_one_miner_sync`.
