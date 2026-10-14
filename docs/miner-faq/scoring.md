@@ -11,19 +11,32 @@ When a validator picks up a miner submission, it runs:
 
 ```python
 # connito/validator/evaluator.py:evaluate_one_miner_sync
-val_loss = float(metrics.get("val_loss", 100))   # measured on the held-out slice
-delta    = max(0.0, baseline_loss - val_loss)    # baseline is THIS validator's pre-merge model loss
+val_loss = float(metrics.get("val_loss", 100))   # base + this miner's residual, task eval split
+if c4_gate_failed:                               # c4 loss rose above the tolerance
+    val_loss = float("inf")
+delta    = max(0.0, baseline_loss - val_loss)    # baseline = the pretrained base model
 score    = delta ** 1.2                          # per-round raw signal
 ```
 
-- **`baseline_loss`** is computed once per round against the round's *input*
-  global model (before any merging this cycle). Every miner in the same round
-  is compared against this same baseline. Code:
-  `connito/validator/evaluator.py:evaluate_foreground_round` (`baseline_loss`
-  assignment, ~line 964).
-- **`val_loss`** is the miner's loss on the same eval batches. If the eval
-  blew up to NaN/Inf, `evaluate_model` returns `+inf` so `delta` clamps to
-  0. Code: `connito/shared/evaluate.py:evaluate_model`.
+- **`baseline_loss`** is the loss of the **pretrained base model** on the
+  round's task eval batches. The validator measures it once per round with its
+  own freshly drawn residual loaded; that residual's `down_proj` is 0, so the
+  model equals the pretrained base exactly. Every miner in the round is
+  compared with this same baseline, so a positive delta means "better than
+  pretrained Qwen on this round's data". Code:
+  `connito/validator/background_eval_worker.py:BackgroundEvalWorker._load_round_base`,
+  `connito/validator/run.py:setup_training`.
+- **`val_loss`** is the loss of the base plus the miner's residual on the same
+  batches. The task eval uses the task's non-replay sources only (pmc for
+  `exp_pmc_residual`). If the eval blew up to NaN/Inf, `evaluate_model`
+  returns `+inf` so `delta` clamps to 0. Code:
+  `connito/shared/evaluate.py:evaluate_model`.
+- **The c4 isolation check** scores the same model on a c4 replay split. If
+  the miner's c4 loss minus the base's c4 loss exceeds the locked
+  `evaluation.max_replay_loss_increase` (default 0.02), or any c4 batch is
+  non-finite, `val_loss` is set to `inf` and the round score is 0 (eval
+  status 15, `replay_loss_increase`). The validator's log line
+  `c4 isolation gate failed` prints the `tolerance=` in force.
 - **`delta_loss`** is the gap. The `** 1.2` exponent makes top miners
   separate more sharply than a linear delta would, but is monotonic — a
   better `val_loss` always produces a higher `score`.
@@ -43,19 +56,22 @@ bugs; they each map to a specific validator state.
    `connito/validator/round.py:Round.freeze` (step 3, `freeze_zero_uids`),
    `connito/validator/evaluator.py:validate_miner_submission` (returns
    `"no_chain_commit"` if `chain_checkpoint is None`).
-2. **Signature / hash / expert-group / NaN-Inf failed at the checkpoint
-   verifier** — the on-disk shard's hash doesn't match the chain commit, the
-   miner's hotkey didn't sign the model hash, the shard contains experts from
-   a group the miner is not assigned to, or the shard contains a NaN/Inf
-   tensor. `evaluate_one_miner` is **not called** in any of these cases, so
-   no `val_loss` is produced. Code:
+2. **Signature / hash / residual spec failed at the checkpoint verifier** —
+   the on-disk shard's hash doesn't match the chain commit, the miner's
+   hotkey didn't sign the model hash, or the shard is not exactly the
+   residual spec (wrong keys, shapes or dtypes, a NaN/Inf tensor, or an
+   untrained expert; status 14, `bad_residual_shard`). `evaluate_one_miner`
+   is **not called** in any of these cases, so no `val_loss` is produced.
+   Code:
    `connito/shared/checkpoints.py:ChainCheckpoint.validate`,
    `connito/validator/evaluator.py:validate_miner_submission`.
 3. **Non-finite `val_loss`** — the eval ran but returned `+inf` (e.g.,
    every batch produced a NaN loss). `val_loss` is logged as `inf` and the
    miner's `eval_status_label` is `non_finite_loss`. The aggregator still
-   records a `score = 0` for the round. Code:
-   `connito/validator/evaluator.py` line 802-805.
+   records a `score = 0` for the round. A miner zeroed by the c4 isolation
+   check also shows `val_loss = inf`, with `eval_status_label =
+   replay_loss_increase`. Code:
+   `connito/validator/evaluator.py:evaluate_one_miner_sync`.
 4. **Operational failure** — download timeout, GPU OOM, eval timeout, or
    unexpected exception. The miner is marked `failed_uids` (not
    `validation_failed_uids`), and `finalize_round_scores` writes **nothing**
@@ -90,8 +106,8 @@ miners get non-zero score points; everyone else gets 0.
 - Two miners with exactly the same `val_loss` → **both get score = 0.0** (a
   duplicated submission is the much more likely cause than two miners
   legitimately producing bit-identical losses).
-- Miners with `delta == 0` (didn't beat baseline) → **score = 0.0** regardless
-  of rank.
+- Miners with `delta == 0` (didn't beat the pretrained baseline, or were
+  zeroed by the c4 isolation check) → **score = 0.0** regardless of rank.
 
 Tied scores between unique miners do not break this rule — only literal
 exact-equal `val_loss` values trigger the duplication penalty.
@@ -208,8 +224,9 @@ The most common cases, in order of frequency:
 1. **Not in the round's top 3 by `val_loss`.** The rank-based mapping is
    geometric and cuts off after rank 3. Rank 4 is 0.0.
 2. **`delta == 0`** — the miner did not beat the baseline. Even if their
-   `val_loss` is lower than other submissions, if it is above the validator's
-   own pre-merge baseline the delta clamps to 0 and the round score is 0.
+   `val_loss` is lower than other submissions, if it is above the pretrained
+   base model's loss the delta clamps to 0 and the round score is 0. A miner
+   zeroed by the c4 isolation check (status 15) lands here too.
 3. **Tied `val_loss` with another miner** — both sides get 0 regardless of
    rank (duplicate-submission heuristic).
 4. **Recency gate failure** — the miner has plenty of history but missed the
@@ -229,7 +246,7 @@ these things is happening on that validator:
 1. **No miner cleared the G1 recency gate** — `build_submission_uid_weights`
    redirects the 98 % G1 share to UID 0. 2 % G2 is still split among
    evaluated miners. This is the most common cause on a freshly-restarted
-   validator with no rolling history, and on a quiet expert group where
+   validator with no rolling history, and on a quiet task where
    miners are not consistently submitting.
 2. **Stale-weights fallback** — the validator did not submit weights in
    `cycle_length` blocks (e.g., it was down). `_submit_fallback_weights`
@@ -247,3 +264,38 @@ these things is happening on that validator:
 Code: `connito/shared/chain.py` (lines 568-586 for the no-differentiated-peer
 case, line 590 for the 5 % owner share applied to the fallback path),
 `connito/validator/run.py` (G1 redirection log line, ~line 1064).
+
+## Which miner becomes next round's starting point
+
+Besides scoring, each validator picks one miner per round whose residual it
+publishes as the **round baseline**: the shard every miner restarts from in
+the next Distribute. This is separate from rewards; it decides what the
+subnet builds on.
+
+The rule, applied when the round is finalized:
+
+1. **Only miners with a positive score this round qualify.** That means their
+   `val_loss` is below this round's baseline (the pretrained base), and the c4
+   isolation check did not zero them.
+2. Among those, the best-ranked **proven** miner wins: one of the top 3 by
+   track record (`score_avg`) that submitted this round.
+3. If none of the proven miners qualifies, the qualifying miner with the
+   lowest `val_loss` this round wins. UID breaks an exact tie, so two
+   validators never disagree.
+4. **If no miner qualifies, nothing is published.** The validator commits a
+   hash with no HF coordinates, and miners keep training from what they
+   have.
+5. **A round on the fallback baseline publishes nothing.** If the validator
+   could not measure the base model's loss (its base shard failed to load,
+   the baseline came back non-finite, or the c4 check could not run on a task
+   that has a replay source), it scores the round against a fixed 100.0, logs
+   "round on the fallback baseline; no winner will be published", and
+   publishes no winner. Rank rewards for that round still apply.
+
+So the published residual is always one that beat pretrained Qwen on that
+round's data and stayed quiet on general text. If you train from it and make
+it worse, you score 0 and it is not published again.
+
+Code: `connito/validator/round.py:select_baseline_uid`,
+`connito/validator/round.py:Round.baseline_winner_uid`,
+`connito/validator/distribute.py:publish_round_baseline`.
