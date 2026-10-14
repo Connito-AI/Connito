@@ -16,7 +16,6 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import math
 import threading
 import time
@@ -35,7 +34,6 @@ from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
-    VALIDATOR_ROUND_BASE_RAW_SCORE,
     inc_error,
     note_round_series,
     set_baseline_loss,
@@ -435,9 +433,7 @@ class BackgroundEvalWorker(threading.Thread):
             # Feeds the dashboard's baseline trend. Only the measured path
             # publishes: both fallbacks park the value at 100.0, and a
             # sentinel in the series reads as a real regression.
-            set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss)
-            with contextlib.suppress(Exception):
-                VALIDATOR_ROUND_BASE_RAW_SCORE.set(self._loaded_base_raw_score)
+            set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss, self._loaded_base_raw_score)
         except Exception as e:
             self._fall_back(round_obj, "baseline failed", e)
 

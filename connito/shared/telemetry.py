@@ -148,12 +148,6 @@ VALIDATOR_BASELINE_LOSS = Gauge(
     "validator_baseline_loss",
     "Round baseline loss against this validator's eval set",
 )
-# The base's own raw score on the round's baseline evals (its gate-usage terms), which every miner's
-# score is measured from. Set only when the baselines are measured, like `validator_baseline_loss`.
-VALIDATOR_ROUND_BASE_RAW_SCORE = Gauge(
-    "validator_round_base_raw_score",
-    "Raw score of the round base on its own baseline evals; each miner's score is its raw score minus this",
-)
 # Per-round baseline loss, labeled by the round it belongs to. The unlabeled
 # gauge above is overwritten every round, so a scraper can only sample it and
 # a cycle's baseline ends up timing-dependent; this labeled family lets the
@@ -167,6 +161,19 @@ VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
     "Round baseline loss (this validator's eval set), labeled by the "
     "round it belongs to. Stable per round; the unlabeled validator_baseline_loss "
     "is retained for backward compat.",
+    ["round_id"],
+)
+# The base's own raw score on the round's baseline evals (its gate-usage terms), which every miner's
+# score is measured from. Set with the baseline loss, so never on a fallback round; per round, and
+# the last measured round's value unlabeled.
+VALIDATOR_ROUND_BASE_RAW_SCORE = Gauge(
+    "validator_round_base_raw_score",
+    "Raw score of the last measured round's base on its own baseline evals; not set on a fallback round",
+)
+VALIDATOR_ROUND_BASE_RAW_SCORE_BY_ROUND = Gauge(
+    "validator_round_base_raw_score_by_round",
+    "Raw score of the round base on its own baseline evals, labeled by the round it belongs to; "
+    "each miner's score is its raw score minus this",
     ["round_id"],
 )
 # Numeric ID of the current round, set when `Round.freeze` returns and
@@ -612,9 +619,10 @@ def set_round_progress(
         pass
 
 
-def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
-    """Publish a round's eval baseline loss to BOTH the unlabeled
-    gauge (backward compat) and the per-round labeled family.
+def set_baseline_loss(round_id: int, baseline_loss: float, base_raw: float) -> None:
+    """Publish a round's eval baseline loss, and the base's raw score, to
+    BOTH the unlabeled gauges (backward compat) and the per-round labeled
+    families.
 
     Registers the round_id for eviction so the labeled series is pruned on
     the same cutoff as the other per-round families. Round creation already
@@ -628,6 +636,8 @@ def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
         VALIDATOR_BASELINE_LOSS.set(value)
         note_round_series(int(round_id))
         VALIDATOR_BASELINE_LOSS_BY_ROUND.labels(round_id=str(int(round_id))).set(value)
+        VALIDATOR_ROUND_BASE_RAW_SCORE.set(float(base_raw))
+        VALIDATOR_ROUND_BASE_RAW_SCORE_BY_ROUND.labels(round_id=str(int(round_id))).set(float(base_raw))
     except Exception:
         pass
 
@@ -657,6 +667,7 @@ def evict_round_series_before(min_round_id: int) -> int:
                     VALIDATOR_ROUND_MINERS_FAILED,
                     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
                     VALIDATOR_BASELINE_LOSS_BY_ROUND,
+                    VALIDATOR_ROUND_BASE_RAW_SCORE_BY_ROUND,
                 ):
                     try:
                         family.remove(rid)
