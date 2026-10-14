@@ -6,15 +6,18 @@ entry ends with a `Code:` pointer; longer answers link to a dedicated doc.
 ## Why is the subnet "burning" 97 % of emission?
 
 **Short answer:** It's not a burn. It's the empty-G1 fallback — when no
-miner clears the recency gate (a score recorded in *both* of the last 2
-rounds), the validator redirects the 98 % Weight Group 1 share to UID 0
-(the subnet owner). UID 0 receives the TAO; nothing is destroyed. There is
+miner qualifies for Weight Group 1 (at least 3 scores, in at least 3 distinct
+rounds of the last 5 cycles, with a positive `score_avg`), the validator
+redirects the 98 % Weight Group 1 share to UID 0 (the subnet owner). UID 0 receives the TAO; nothing is destroyed. There is
 also a separate 5 % owner share applied to peer-consensus fallback paths
 (`reserve_subnet_owner_share`). See `scoring.md` for the long version.
 
 **When the redirect fires:** validator just restarted (no rolling history),
-a quiet task, or a cycle where every assigned miner submitted invalid
-or missed entirely.
+a quiet task, a cycle where every assigned miner submitted invalid or missed
+entirely, or **no miner has a positive score average** — no top-3 placing
+with a round score above 0 in its window, for example because every round
+score was 0 or below. In that last case Weight Group 2 is empty too, so UID 0
+receives all of the validator's emission.
 
 Code: `connito/validator/evaluator.py:build_submission_uid_weights` (the g1
 redirect), `connito/validator/run.py` (the "g1 empty — redirecting" log line).
@@ -42,20 +45,21 @@ Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
 
 ## Why is my score 0 even with a low `val_loss`?
 
-**Short answer:** `finalize_round_scores` keeps only the top 3 miners per
-round and assigns them 2.25 / 1.5 / 1.0; everyone else is 0. If your
-`val_loss` is low but not in the top 3 *for this validator's round*, you
-get 0 for the round.
+**Short answer:** `finalize_round_scores` keeps only the top 3 miners **with
+a round score above 0** and assigns them 2.25 / 1.5 / 1.0; everyone else is
+0. A low `val_loss` is not enough, because the round score subtracts
+penalties from your task gain.
 
-Other ways to land at 0 with a finite task loss:
+The ways to land at 0 with a finite task loss:
 
 - **Your round score is 0 or below.** The score is your task gain over the
   **pretrained base model** minus penalties for a c4 loss rise and for where
   your residual's gate fires (`− |task_usage − 0.2| − c4_usage` by default).
-  The base scores 0, and only a score above 0 is ranked. Shards from the
-  reference miner have measured −0.14 to −0.17: they beat the base on the
-  task, but their gate fires on c4 as much as on the task. See "Why is my
+  The base scores 0, and only a score above 0 is ranked. Shards trained with
+  the reference training code measured −0.14 to −0.17: they beat the base on
+  the task, but their gate fires on c4 as much as on the task. See "Why is my
   round score negative?".
+- Your score is above 0 but not in the top 3 *for this validator's round*.
 - The **c4 cutoff** stopped you: your residual raised the loss on general web
   text by more than the tolerance (status 15, `replay_loss_increase`). Your
   score is `−inf` and your `val_loss` shows `inf`.
@@ -187,8 +191,8 @@ where `v` ranges over all weight-setting validators. The dashboard then
 normalizes across miners.
 
 The old top-level `score` field was removed because it conflated the
-per-round raw score (task gain minus penalties) with the rolling rank-based aggregator
-value. Use `score_latest`, `score_avg`, `score_samples` instead. See
+per-round raw score (task gain minus penalties) with the rolling rank-based
+aggregator value. Use `score_latest`, `score_avg`, `score_samples` instead. See
 `scoring.md`.
 
 Code: `connito/shared/chain.py:submit_weights`,
@@ -316,10 +320,11 @@ Code: `connito/shared/checkpoint_helper.py:verify_residual_shard`,
 
 ## How long does it take a new miner to earn rewards?
 
-Hard floor: 2 cycles. The Weight Group 1 ballot requires a score in both
-the current round AND the round `cycle_length` blocks ago — a miner that
-just started has at most 1 round of history and cannot clear the
-recency gate.
+Hard floor: 3 rounds. The Weight Group 1 ballot requires at least 3 scores,
+in at least 3 distinct rounds within the last 5 cycles, and a positive
+`score_avg` — so a miner needs 3 scored rounds, at least one of them a top-3
+placing with a round score above 0, before it can enter Weight Group 1.
+Weight Group 2 (2 %) needs only 1 score and a positive average.
 
 Soft floor: ~3-8 cycles before the rolling `score_avg` starts to
 stabilize. The aggregator window is 8 samples; until you fill it, your
@@ -330,7 +335,7 @@ cycle), background eval picks you up via the staleness queue — but
 foreground is faster.
 
 Code: `connito/validator/evaluator.py:build_submission_uid_weights`
-(recency gate at line 442-444),
+(the recency gate),
 `connito/validator/aggregator.py:MinerScoreAggregator` (score_window=8),
 `connito/validator/round.py:Round.freeze` (background staleness ordering).
 
@@ -415,8 +420,8 @@ Measured, two miners starting from the same published winner:
   the scoring of that run (task gain plus the c4 cutoff, before the
   gate-usage penalties) a winner was published.
 
-Varying your data keeps you clear of the c4 cutoff; it does not on its own
-lift the score above 0. That also needs the gate to prefer task tokens (see
+Varying your data kept both shards clear of the c4 cutoff in the measured
+run; it does not on its own lift the score above 0. That also needs the gate to prefer task tokens (see
 "Why is my round score negative?").
 
 **Fix:** vary or shuffle your data every round, for example by shuffling each
@@ -452,7 +457,7 @@ Code: `connito/shared/modeling/mycelia.py:get_base_model` (the split check),
 ## Known issues in the reference miner
 
 The stock miner is a reference implementation. These are known; items 1 and
-4 cost you score, the others only time:
+4 cost you score directly, the others don't on their own:
 
 1. **The same training data every round.** The train stream restarts at every
    `setup_training`, and all one-GPU miners read rank 0's slice. This one
@@ -469,9 +474,9 @@ The stock miner is a reference implementation. These are known; items 1 and
    training loop reloads whenever that is None. Starting from a published
    winner took 77–107 s with no reload.
 4. **Its gate does not prefer task tokens.** It trains on cross-entropy only,
-   so its gate fires about as much on c4 as on the task, and its shards have
-   measured round scores of −0.14 to −0.17 (below the base's 0). This one
-   *does* cost score; see "Why is my round score negative?".
+   so its gate fires about as much on c4 as on the task, and its shards
+   score below the base's 0. This one *does* cost score; see "Why is my round
+   score negative?".
 5. **A `TypeError` on Ctrl-C.** On shutdown, a failure inside the cleanup path
    is logged through a standard-library logger with a keyword argument it
    doesn't accept (`connito/miner/train_helper.py:76`), so a `TypeError`
@@ -492,7 +497,7 @@ papers but damages ordinary text should not win.
   `evaluation.max_replay_loss_increase` (default 0.02 nats), or any c4 batch
   is non-finite, or the rise is NaN, your score is `−inf`, your `val_loss`
   shows `inf`, and your status is 15, `replay_loss_increase`. You are never
-  ranked, never published, and kept off the podium.
+  ranked and never published.
 - **The penalties.** Below the cutoff, the c4 eval still costs you: the score
   subtracts any c4 rise (`replay_penalty`) and your gate's usage on c4 tokens
   (`replay_usage_penalty`), each with weight 1 by default.
@@ -522,11 +527,13 @@ residual gate's mean firing (Σ_j q_j) on task tokens and on c4 tokens. The
 pretrained base scores 0, and only a score above 0 earns a rank reward or can
 be published as the round winner.
 
-**Measured:** the base's gate usage is 0.045 on task and 0.053 on c4. Shards
-trained by the reference miner beat the base on the task by 0.03 to 0.06 and
-scored **−0.14 to −0.17**; a full Train phase raised gate usage on both
-splits, to about 0.08 task and 0.09 c4. A gate that fires equally on task and c4 tokens pays
-exactly 0.2 for any usage up to 0.2, more than those task gains.
+**Measured:** the base's gate usage is about 0.05 on both task and c4.
+Shards trained with the reference training code (two full-Train rehearsal
+shards and a 3-step test shard) beat the base on the task by 0.03 to 0.06 and
+scored **−0.14 to −0.17**; the full-Train shards raised gate usage on both
+splits, to about 0.08 task and 0.09 c4. A gate that fires equally on task and
+c4 tokens pays exactly 0.2 for any usage up to 0.2, more than those task
+gains.
 
 **What it takes to score above 0:** a gate that fires on task tokens (toward
 0.2) and stays quiet on c4, plus more task gain than the penalty that is
