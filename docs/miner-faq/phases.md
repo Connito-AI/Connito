@@ -167,9 +167,10 @@ at a time on the GPU:
    hash), loads it onto the base, and measures the task loss, the c4 loss and
    the residual gate's usage on both, on the same batches.
 3. A miner whose c4 loss rises more than the tolerance above the base's
-   scores `−inf` (status 15). Otherwise its score is the task gain
-   (`baseline_loss − val_loss`) minus the c4-rise and gate-usage penalties;
-   the base scores 0.
+   scores `−inf` (status 15). Otherwise its raw score is the task gain
+   (`baseline_loss − val_loss`) minus the c4-rise and gate-usage penalties,
+   and its score is that minus the base's own raw score, so the base scores
+   0.
 
 **Miner:** idle — the miner's work for the round is already done. The training
 loop may keep running, but its output won't be used until the next cycle's

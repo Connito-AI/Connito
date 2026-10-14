@@ -60,7 +60,8 @@ Code: `connito/miner/train.py:train_worker`,
    residual onto the frozen base, measure `val_loss` on the round's task eval
    split and the loss on a c4 replay split, and compute the round score: the
    task gain over the pretrained base minus penalties for a c4 rise and for
-   where the residual's gate fires. A c4 rise above a cutoff scores `−inf`.
+   where the residual's gate fires, less the base's own penalties, so the
+   base scores 0. A c4 rise above a cutoff scores `−inf`.
 2. **Validate** — persist the score history. The round's scores are finalized
    (rank-based, top-3 only) 5 blocks before the next cycle's MinerCommit1,
    just before weights are submitted.
@@ -129,8 +130,9 @@ Each round, validators pick a winner, and every miner restarts from the
 winner's residual. Its path through the system:
 
 1. **The validator picks a winner** when it finalizes the round. Only a miner
-   with a round score above 0 can win: better than the pretrained base after
-   the c4 and gate-usage penalties, which also means it passed the c4 cutoff.
+   with a round score above 0 can win: a raw score (task gain minus the c4
+   and gate-usage penalties) above the pretrained base's own, which also
+   means it passed the c4 cutoff.
    Among those, a miner with a top-3 track record is preferred; otherwise the
    highest score wins. If no miner qualifies, nothing is published.
 2. **The validator publishes it** to its own HF repo, then commits the shard's

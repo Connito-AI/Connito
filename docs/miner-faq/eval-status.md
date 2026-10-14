@@ -55,18 +55,17 @@ The miner's shard was downloaded, validated, evaluated on the task data and
 on c4, passed the c4 cutoff, and produced a finite round score. The miner is
 in the round's score map. This is the only "good" code.
 
-**`ok` does not mean a positive score.** The round score is the task gain
-over the pretrained base minus the c4-rise and gate-usage penalties, and it
-can be negative. Only a score above 0 earns a rank reward or can be
-published; shards trained with the reference training code have measured
-−0.14 to −0.17.
+**`ok` does not mean a positive score.** The round score is the miner's raw
+score (task gain over the pretrained base minus the c4-rise and gate-usage
+penalties) minus the base's own raw score, and it can be negative. Only a
+score above 0 earns a rank reward or can be published.
 
 **Set by:** `connito/validator/evaluator.py:evaluate_one_miner_sync`, after the
 c4 cutoff passes and the score is finite.
 
 **Miner action:** none for the status itself. If `score_avg` is still 0, see
 `scoring.md` ("Why a miner with low `val_loss` can still have `score = 0`"
-and "Gate usage: why a better loss can still score below 0"), and read your
+and "Gate usage and the base's raw score"), and read your
 terms on the `validator_miner_score_term` gauge.
 
 ## `non_finite_loss` (code 1)

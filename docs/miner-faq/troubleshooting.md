@@ -11,7 +11,7 @@ relevant section.
 | Miner submitted but never evaluated | Not on the active task's group, or `no_chain_commit` | [Submitted but never evaluated](#submitted-but-never-evaluated) |
 | `score_avg` flat for 5+ hours | Stuck on a single rank, or operationally failing every round | [Score didn't change for 5+ hours](#score_avg-didnt-change-for-5-hours) |
 | Status 15, `replay_loss_increase`, `val_loss = inf` | Residual raised the c4 loss above the cutoff; usually the same data trained again | [Zeroed by the c4 check](#score-zeroed-by-the-c4-check-status-15) |
-| Status `ok`, task loss below the base, but rank score 0 and nothing published | Round score ≤ 0: the gate-usage and c4 penalties outweigh the task gain | See `scoring.md`, "Gate usage: why a better loss can still score below 0" |
+| Status `ok`, task loss below the base, but rank score 0 and nothing published | Round score ≤ 0: your raw score (task gain minus the c4 and gate-usage penalties) did not beat the base's | See `scoring.md`, "Gate usage and the base's raw score" |
 | Status 14, `bad_residual_shard` | Shard is not exactly the task's residual | See `eval-status.md` |
 | `eval_status_label` shows `hash_mismatch` | Re-uploaded the same revision after committing | See `eval-status.md` |
 | `the base model is split over devices` at startup | Model spread over several GPUs | [Split over GPUs](#loader-refuses-a-model-split-over-several-gpus) |
@@ -242,8 +242,8 @@ phase; it does not touch scores. If your score didn't update for the round:
    EMA is preserved (operational failure path: download trouble, timeout,
    OOM).
 2. If you are in `written_uids` but the value is 0.0, you ranked outside
-   the top 3, your round score was 0 or below (not better than the
-   pretrained base after the penalties), the c4 cutoff gave you `−inf`, or
+   the top 3, your round score was 0 or below (a raw score no better than
+   the base's), the c4 cutoff gave you `−inf`, or
    you hit the duplicate-score penalty.
 
 Code: `connito/validator/evaluator.py:finalize_round_scores`.
@@ -296,9 +296,9 @@ fixed stream every round, and every stock miner reads the same slice. Measured
 from the same published winner, the stock stream raised c4 loss by
 +0.064 / +0.066 and both miners were stopped; shuffling each source per
 (hotkey, round) lowered it by 0.024 / 0.025 and passed the cutoff. Passing the
-cutoff is not the same as scoring above 0: the score still subtracts the
-gate-usage penalties (see `scoring.md`, "Gate usage: why a better loss can
-still score below 0").
+cutoff is not the same as scoring above 0: your raw score, gate-usage
+penalties included, still has to beat the base's (see `scoring.md`, "Gate
+usage and the base's raw score").
 
 **Fix:**
 1. Vary or shuffle your training data every round, e.g. shuffle each

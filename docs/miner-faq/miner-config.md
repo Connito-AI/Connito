@@ -287,11 +287,10 @@ c4 loss +0.061 / +0.059, both miners stopped (status 15, `replay_loss_increase`)
 nothing published.
 
 The cutoff is what varied data protects you from. Under the current score,
-passing it is necessary but not enough: the score also subtracts gate-usage
-penalties, and reference-miner shards have measured below 0 even with fresh
-data (see `scoring.md`, "Gate usage: why a better loss can still score below
-0"). With repeated data, 13–28% of micro-batches were also
-skipped as non-finite; the shuffled run skipped none.
+passing it is necessary; how far above 0 you then score depends on your task
+gain and on where your gate fires compared with the base's (see `scoring.md`,
+"Gate usage and the base's raw score"). With repeated data, 13–28% of
+micro-batches were also skipped as non-finite; the shuffled run skipped none.
 
 **What to do.** Give each round, and each hotkey, its own data order. The
 measured fix shuffles every streaming source with a seed derived from the
