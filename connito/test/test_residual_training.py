@@ -165,7 +165,7 @@ def _run_loop(model, batches, config: MinerConfig, monkeypatch, **stubs) -> Simp
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
     seen.scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
-    setup = (model, optimizer, seen.scheduler, None, batches, None)
+    setup = (model, optimizer, seen.scheduler, batches, None)
     for name, stub in {
         "setup_training": lambda *a, **k: setup,
         "chunked_lm_loss": loss,
@@ -249,8 +249,8 @@ def test_the_train_loader_takes_the_miners_micro_batch_and_the_eval_loader_the_t
 
 
 def test_setup_training_loads_at_the_miners_micro_batch(family_name, tmp_path, monkeypatch):
+    """Also the miner's boot without `expert_assignment.json`: the task folder holds only its config.yaml."""
     config, seen = _miner_config(tmp_path), []
-    monkeypatch.setattr(train, "ExpertManager", lambda config: None)
     monkeypatch.setattr(train, "load_model", lambda *a: (_model(family_name, draw_down=False), None))
     monkeypatch.setattr(train, "get_dataloader", lambda config, **kw: seen.append(kw["batch_size"]) or [])
 
@@ -267,3 +267,11 @@ def test_tokens_per_step_count_every_accumulated_micro_batch(tmp_path):
     status = train_helper.get_status(config=config, step=0, training_time=0, total_training_time=0, inner_opt_step=2)
 
     assert status["total_tokens"] == 2 * 3 * 5 * config.task.exp.data.sequence_length
+
+
+def test_the_param_sum_gauge_reads_the_residual_alone(family_name):
+    """The base is frozen and, unquantized here, would swamp the gauge with a constant."""
+    model = _model(family_name)
+    residual = sum(float(p.float().sum()) for n, p in model.named_parameters() if ".residual_" in n)
+
+    assert train_helper.model_health(model)["param_sum"] == pytest.approx(residual)

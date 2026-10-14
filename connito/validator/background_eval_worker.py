@@ -2,9 +2,9 @@
 
 Active only inside the (3) window: from end of Validate(K) to end of
 Train(K+1). Pulls UIDs from `Round.downloaded_pool` and runs
-`evaluate_one_miner` against `eval_base_model`, whose expert weights are
-reloaded once per round from `round.base_shard`. The backbone never
-trains, so the shard plus a pretrained backbone is the whole base —
+`evaluate_one_miner` against `eval_base_model`, whose residual is
+reloaded once per round from `round.base_shard`. The base never
+trains, so the shard plus the pretrained base is the whole model —
 nothing else has to be carried between rounds.
 
 GPU-lock yielding invariant: `gpu_eval_lock` is acquired only for the
@@ -131,7 +131,7 @@ class BackgroundEvalWorker(threading.Thread):
         """Hand the worker a model to use as its eval base.
 
         Called by the main loop at round freeze, so the worker doesn't need
-        to re-fetch and re-construct the model from chain. Expert weights are
+        to re-fetch and re-construct the model from chain. The residual is
         reloaded per round from `round.base_shard`, so what matters here is
         the architecture, not the current weights.
         """
@@ -280,10 +280,11 @@ class BackgroundEvalWorker(threading.Thread):
         """Load the round's baseline shard into our GPU eval_base_model,
         materialize the round's eval batches once, and compute baseline.
 
-        The shard is the active group's pretrained experts, written at boot.
-        Every other parameter is frozen for the life of the subnet, so
-        `strict=False` with the backbone left alone rebuilds the base exactly,
-        whatever the previous round left in the model.
+        The shard is the validator's own residual (`down_proj` = 0), written
+        at boot and at each task switch. It replaces whatever residual the
+        previous round's last miner left, so the baseline is the base exactly.
+        It is loaded directly, never verified: the untrained-expert rule
+        would refuse it by design.
 
         Holds `gpu_eval_lock` only for the duration of `load_state_dict`
         and the baseline forward pass. The dataloader is *materialized*
@@ -303,11 +304,12 @@ class BackgroundEvalWorker(threading.Thread):
         # for a full 50-batch window — leaking it across rounds compounds
         # under restart-replay scenarios.
         self._cached_batches = None
+        self._expected = None
 
         def _load() -> None:
+            self._expected = residual_shapes(self.config)
             shard = round_obj.base_shard
             sd = load_state_dict_from_path(str(shard))
-            self._expected = residual_shapes(self.config)
             with self.gpu_eval_lock:
                 incompatible = self._eval_base_model.load_state_dict(sd, strict=False)
                 if torch.cuda.is_available():
@@ -321,7 +323,17 @@ class BackgroundEvalWorker(threading.Thread):
                     round_id=round_obj.round_id, path=str(shard),
                 )
 
-        await asyncio.to_thread(_load)
+        try:
+            await asyncio.to_thread(_load)
+        except Exception as e:
+            # Not restored, so no baseline can be measured; the eval thread must outlive it.
+            logger.error(
+                "bg-eval: round base shard failed to load; using fallback baseline",
+                round_id=round_obj.round_id, path=str(round_obj.base_shard), error=str(e), exc_info=True,
+            )
+            self._loaded_baseline_loss = 100.0
+            self._loaded_round_id = round_obj.round_id
+            return
 
         # Build the dataloader and pull all batches into RAM up-front.
         # Both steps are wrapped in to_thread so the event loop stays
@@ -428,6 +440,14 @@ class BackgroundEvalWorker(threading.Thread):
         path = round_obj.pop_downloaded(uid)
         if path is None:
             round_obj.release_claim(uid)
+            return
+
+        if self._expected is None:
+            # No spec this round is the validator's fault: an operational failure, never `bad_residual_shard`.
+            logger.warning("bg-eval: no residual spec this round; not scoring", uid=uid, round_id=round_obj.round_id)
+            round_obj.mark_failed(uid)
+            round_obj.publish_progress()
+            self._prune_non_top(round_obj)
             return
 
         timeout = float(self.config.evaluation.per_miner_eval_timeout_sec)

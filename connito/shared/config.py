@@ -12,7 +12,16 @@ import bittensor
 import fsspec
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    ValidationError,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
@@ -634,9 +643,8 @@ class ResidualCfg(BaseConfig):
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    # -1 signals "not assigned to a functioning slot". Default -1 avoids silent
-    # clashes with an already-in-use slot when the field is forgotten.
-    group_id: int = -1
+    # Required: it is the expert group every chain commit names, so a forgotten one must not default into a slot.
+    group_id: NonNegativeInt
     residual: ResidualCfg
 
 
@@ -650,7 +658,6 @@ class TaskCfg(BaseConfig):
     # new task no longer needs a release. The value here is the fallback used
     # when the API is unreachable.
     expert_group_name: str = "exp_pmc_residual"
-    load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg | None = None  # set from the task's config.yaml by model_post_init
@@ -812,11 +819,15 @@ class WorkerConfig(BaseConfig):
         try:
             self._update_by_task(expert_group_name=expert_group_name)
         except Exception:
-            self.task.expert_group_name = previous_name
-            self.task.exp = previous_exp
-            self._refresh_paths()
+            self.restore_task(previous_name, previous_exp)
             raise
         self._ensure_runtime_dirs()
+
+    def restore_task(self, expert_group_name: str, exp: ExpertCfg) -> None:
+        """Put back a task this config was on, from memory: no file is read, so it cannot fail."""
+        self.task.expert_group_name = expert_group_name
+        self.task.exp = exp
+        self._refresh_paths()
 
     def _fill_wallet_data(self) -> None:
         if self.chain.hotkey_ss58 and self.chain.coldkey_ss58:

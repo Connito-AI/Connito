@@ -6,7 +6,6 @@ Both follow from where the file lives relative to the group-scoped path.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -26,7 +25,6 @@ def _task_dir(root: Path, name: str, group_id: int) -> None:
     d = root / "expert_groups" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.yaml").write_text(yaml.safe_dump(body))
-    (d / "expert_assignment.json").write_text(json.dumps({"0": [[0, group_id * 10]]}))
 
 
 @pytest.fixture

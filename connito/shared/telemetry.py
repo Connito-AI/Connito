@@ -361,7 +361,7 @@ MINER_TOTAL_TOKENS = Gauge("miner_total_tokens", "Cumulative tokens processed si
 MINER_TOTAL_SAMPLES = Gauge("miner_total_samples", "Cumulative samples processed since run start")
 MINER_STEP_TIME_HOURS = Gauge("miner_step_time_hours", "Wall-clock time of the last inner step (hours)")
 MINER_TOTAL_TRAINING_TIME_HOURS = Gauge("miner_total_training_time_hours", "Total accumulated training time (hours)")
-MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of expert parameter values (health check)")
+MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of residual parameter values (health check)")
 
 # Histograms (Latency & Sizes)
 EVAL_LATENCY_SECONDS = Histogram("validator_eval_latency_seconds", "Latency of run_evaluation()")

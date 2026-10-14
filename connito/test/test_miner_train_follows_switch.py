@@ -10,7 +10,6 @@ Run with `python -m pytest connito/test/test_miner_train_follows_switch.py`.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,19 +24,18 @@ SHIPPED = "exp_pmc_residual"
 TARGET = "exp_switch_target"
 
 
-def _task_dir(root: Path, name: str, group_id: int, org_base: int) -> None:
+def _task_dir(root: Path, name: str, group_id: int) -> None:
     body = yaml.safe_load(Path(f"expert_groups/{SHIPPED}/config.yaml").read_text())
     body["group_id"] = group_id
     d = root / "expert_groups" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.yaml").write_text(yaml.safe_dump(body))
-    (d / "expert_assignment.json").write_text(json.dumps({"0": [[0, org_base], [1, org_base + 1]]}))
 
 
 @pytest.fixture
 def config(tmp_path: Path) -> MinerConfig:
-    _task_dir(tmp_path, SHIPPED, group_id=4, org_base=10)
-    _task_dir(tmp_path, TARGET, group_id=7, org_base=20)
+    _task_dir(tmp_path, SHIPPED, group_id=4)
+    _task_dir(tmp_path, TARGET, group_id=7)
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({
         "run": {"root_path": str(tmp_path)},
@@ -79,7 +77,7 @@ def harness(monkeypatch):
         seen.setups.append((config.task.expert_group_name, config.task.exp.group_id))
         model = _Tiny()
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
-        return model, opt, SimpleNamespace(step=lambda: None), None, _batches(2), None
+        return model, opt, SimpleNamespace(step=lambda: None), _batches(2), None
 
     class _Poller:
         def __init__(self, **kw): pass

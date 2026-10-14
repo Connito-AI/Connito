@@ -6,7 +6,6 @@ from typing import Any
 import torch
 
 from connito.shared.config import MinerConfig, ValidatorConfig
-from connito.shared.expert_manager import get_weight_sum
 
 # Configure the basic logging setup
 logger = logging.getLogger(__name__)
@@ -118,14 +117,15 @@ def free_cuda_models(
 
 def model_health(model: torch.nn.Module, step: int | None = None) -> dict[str, float]:
     """The miner's cheap checks that its weights are moving and finite:
-    the expert parameter sum (non-finite reads as 0.0 so the gauge keeps
+    the residual parameter sum (non-finite reads as 0.0 so the gauge keeps
     updating through a NaN incident) and the gradient norm when grads exist.
     Miner-only — the validator's model belongs to its eval worker."""
-    _, expert_sum = get_weight_sum(model, shared=False)
-    if torch.isfinite(expert_sum):
-        health = {"param_sum": float(expert_sum.detach().cpu().item())}
+    residual = (p.detach().float().sum().cpu() for n, p in model.named_parameters() if ".residual_" in n)
+    residual_sum = sum(residual, torch.tensor(0.0))
+    if torch.isfinite(residual_sum):
+        health = {"param_sum": float(residual_sum.item())}
     else:
-        logger.warning("Non-finite expert parameter sum detected; substituting 0.0", step=step)
+        logger.warning("Non-finite residual parameter sum detected; substituting 0.0", step=step)
         health = {"param_sum": 0.0}
     try:
         total = sum(float(p.grad.detach().norm(2)) ** 2 for p in model.parameters() if p.grad is not None)
