@@ -340,9 +340,10 @@ environment built for transformers 4.x cannot load it.
   hf download Qwen/Qwen3.6-35B-A3B --revision 995ad96eacd98c81ed38be0c5b274b04031597b0
   ```
   Set `HF_HOME` to the cache the miner uses. To remove a model, run
-  `hf cache rm model/<org>/<name>` against the same cache, for example
-  `hf cache rm model/deepseek-ai/DeepSeek-V2-Lite` for the previous base
-  model, or delete the whole cache directory. Deleting only the model's
+  `hf cache rm model/<org>/<name>` against the same cache (`hf cache ls`
+  lists the ids; this one is `model/Qwen/Qwen3.6-35B-A3B`), or delete the
+  whole cache directory. Remove the previous release's base model the same
+  way once you have upgraded. Deleting only the model's
   folder does not free the disk: its files stay in the shared `blobs/`
   directory.
 
