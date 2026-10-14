@@ -380,8 +380,9 @@ and c4 tokens, so it leaves that room unused. How to use it is up to you;
 there is no tested recipe.
 
 **Validators differ a little.** Each validator draws its own fresh residual,
-so its base usage varies by about ±0.005 and `base_raw` with it. The same
-shard can score up to about 0.008 differently on two validators.
+so its base usage varies by about ±0.005 on task tokens (a little more on
+c4), and `base_raw` with it (measured −0.200 to −0.208). The same shard can
+score up to about 0.008 differently on two validators.
 
 The weights and target are locked validator config and can change between
 releases, so read the current values in `connito/shared/config.py:EvalCfg`
