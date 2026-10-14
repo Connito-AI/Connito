@@ -468,7 +468,11 @@ lose you score on their own:
    recorded (`current_model_meta` is None), and the resync check in the
    training loop reloads whenever that is None. Starting from a published
    winner took 77–107 s with no reload.
-4. **A `TypeError` on Ctrl-C.** On shutdown, a failure inside the cleanup path
+4. **Its gate does not prefer task tokens.** It trains on cross-entropy only,
+   so its gate fires about as much on c4 as on the task, and its shards have
+   measured round scores of −0.14 to −0.17 (below the base's 0). This one
+   *does* cost score; see "Why is my round score negative?".
+5. **A `TypeError` on Ctrl-C.** On shutdown, a failure inside the cleanup path
    is logged through a standard-library logger with a keyword argument it
    doesn't accept (`connito/miner/train_helper.py:76`), so a `TypeError`
    traceback can follow the real error. The process still stops.
