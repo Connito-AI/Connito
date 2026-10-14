@@ -274,7 +274,9 @@ that changes the base model or the CUDA image needs three things done
    stay in the shared `blobs/` directory.
 
 **Locked config fields.** Some fields (for example `model.family`,
-`model.quantization_validator`, `evaluation.max_replay_loss_increase`,
+`model.quantization_validator`, `evaluation.max_replay_loss_increase`, the
+score weights `evaluation.replay_loss_weight`, `evaluation.task_usage_weight`,
+`evaluation.task_usage_target` and `evaluation.replay_usage_weight`,
 `cycle.cycle_length`, the `cycle.*_period` fields and `cycle.owner_url`) must
 match the fleet. On boot the validator compares them with
 the release's defaults. With the default `--auto_update_config` it resets

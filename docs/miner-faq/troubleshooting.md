@@ -10,7 +10,8 @@ relevant section.
 | Training stops at setup, or the loss doesn't move | No residual installed, diverged residual, or flat training | [Training refuses to start](#training-refuses-to-start-or-the-loss-doesnt-move) |
 | Miner submitted but never evaluated | Not on the active task's group, or `no_chain_commit` | [Submitted but never evaluated](#submitted-but-never-evaluated) |
 | `score_avg` flat for 5+ hours | Stuck on a single rank, or operationally failing every round | [Score didn't change for 5+ hours](#score_avg-didnt-change-for-5-hours) |
-| Status 15, `replay_loss_increase`, `val_loss = inf` | Residual raised the c4 loss; usually the same data trained again | [Zeroed by the c4 check](#score-zeroed-by-the-c4-check-status-15) |
+| Status 15, `replay_loss_increase`, `val_loss = inf` | Residual raised the c4 loss above the cutoff; usually the same data trained again | [Zeroed by the c4 check](#score-zeroed-by-the-c4-check-status-15) |
+| Status `ok`, task loss below the base, but rank score 0 and nothing published | Round score ≤ 0: the gate-usage and c4 penalties outweigh the task gain | See `scoring.md`, "Gate usage: why a better loss can still score below 0" |
 | Status 14, `bad_residual_shard` | Shard is not exactly the task's residual | See `eval-status.md` |
 | `eval_status_label` shows `hash_mismatch` | Re-uploaded the same revision after committing | See `eval-status.md` |
 | `the base model is split over devices` at startup | Model spread over several GPUs | [Split over GPUs](#loader-refuses-a-model-split-over-several-gpus) |
@@ -70,9 +71,9 @@ and the miner never trains from a published round winner.
 **Causes, in order of likelihood:**
 
 1. **Nothing was published.** Validators publish a round winner only if some
-   miner beat the pretrained base on that round's data and passed the c4
-   isolation check; on the first round of a task, or a round where nobody
-   qualified, they commit a hash with **no HF coordinates**, and there is
+   miner's round score is above 0: better than the pretrained base after the
+   c4 and gate-usage penalties (which also means it passed the c4 cutoff). On
+   the first round of a task, or a round where nobody qualified, they commit a hash with **no HF coordinates**, and there is
    nothing to download. This is normal. With nothing published, the miner
    resumes its own last trained checkpoint, or keeps its fresh draw if it
    has none.
@@ -239,8 +240,9 @@ phase; it does not touch scores. If your score didn't update for the round:
    EMA is preserved (operational failure path: download trouble, timeout,
    OOM).
 2. If you are in `written_uids` but the value is 0.0, you ranked outside
-   the top 3, didn't beat the pretrained baseline, were zeroed by the c4
-   check, or hit the duplicate-`val_loss` penalty.
+   the top 3, your round score was 0 or below (not better than the
+   pretrained base after the penalties), the c4 cutoff gave you `−inf`, or
+   you hit the duplicate-score penalty.
 
 Code: `connito/validator/evaluator.py:finalize_round_scores`.
 
@@ -279,9 +281,10 @@ Code: `connito/shared/checkpoints.py:build_chain_checkpoints_from_previous_phase
 
 ## Score zeroed by the c4 check (status 15)
 
-**Symptom:** status 15, `replay_loss_increase`, with `val_loss = inf`, often
-right after your miner restarted from a published round winner. Your task loss
-may still have beaten the baseline.
+**Symptom:** status 15, `replay_loss_increase`, with `val_loss = inf` and a
+round score of `−Inf` on `validator_miner_round_delta`, often right after your
+miner restarted from a published round winner. Your task loss may still have
+beaten the baseline. You are not ranked, not published and not on the podium.
 
 **Cause:** your residual raised the loss on general English text (c4) by more
 than the locked tolerance, `evaluation.max_replay_loss_increase` (default
@@ -289,8 +292,11 @@ than the locked tolerance, `evaluation.max_replay_loss_increase` (default
 reason is **training on the same data again**: the stock miner replays one
 fixed stream every round, and every stock miner reads the same slice. Measured
 from the same published winner, the stock stream raised c4 loss by
-+0.064 / +0.066 and both miners were zeroed; shuffling each source per
-(hotkey, round) lowered it by 0.024 / 0.025 and the winner was published.
++0.064 / +0.066 and both miners were stopped; shuffling each source per
+(hotkey, round) lowered it by 0.024 / 0.025 and passed the cutoff. Passing the
+cutoff is not the same as scoring above 0: the score still subtracts the
+gate-usage penalties (see `scoring.md`, "Gate usage: why a better loss can
+still score below 0").
 
 **Fix:**
 1. Vary or shuffle your training data every round, e.g. shuffle each
@@ -298,8 +304,8 @@ from the same published winner, the stock stream raised c4 loss by
    `seed=` to `get_dataloader` for training. See `miner-config.md`, "Vary
    your training data every round".
 2. Keep the task's c4 replay rows in your mix, with their labels.
-3. Read the validator log line `c4 isolation gate failed` (`reason`,
-   `replay_loss_increase`, `tolerance=`) or the
+3. Read the validator log line `evaluate_one_miner: c4 isolation gate failed;
+   not ranked` (`reason`, `replay_loss_increase`, `tolerance=`) or the
    `validator_miner_replay_loss_increase` gauge to see your margin.
 
 Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,

@@ -164,10 +164,12 @@ at a time on the GPU:
    base) and measures the **baseline losses**: the task eval split and the c4
    replay split.
 2. For each miner, it verifies the shard (signature, exact residual spec,
-   hash), loads it onto the base, and measures the task loss and the c4 loss
-   on the same batches.
+   hash), loads it onto the base, and measures the task loss, the c4 loss and
+   the residual gate's usage on both, on the same batches.
 3. A miner whose c4 loss rises more than the tolerance above the base's
-   scores 0 (status 15). Otherwise its delta is `baseline_loss − val_loss`.
+   scores `−inf` (status 15). Otherwise its score is the task gain
+   (`baseline_loss − val_loss`) minus the c4-rise and gate-usage penalties;
+   the base scores 0.
 
 **Miner:** idle — the miner's work for the round is already done. The training
 loop may keep running, but its output won't be used until the next cycle's

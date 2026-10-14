@@ -58,8 +58,9 @@ Code: `connito/miner/train.py:train_worker`,
 1. **Submission** — freeze the round (build the eval roster), download each
    assigned miner's HF shard, verify it, and score it: load the miner's
    residual onto the frozen base, measure `val_loss` on the round's task eval
-   split, and compare it with the round's baseline loss. The same miner is
-   also scored on a c4 replay split (the isolation check).
+   split and the loss on a c4 replay split, and compute the round score: the
+   task gain over the pretrained base minus penalties for a c4 rise and for
+   where the residual's gate fires. A c4 rise above a cutoff scores `−inf`.
 2. **Validate** — persist the score history. The round's scores are finalized
    (rank-based, top-3 only) 5 blocks before the next cycle's MinerCommit1,
    just before weights are submitted.
@@ -128,10 +129,10 @@ Each round, validators pick a winner, and every miner restarts from the
 winner's residual. Its path through the system:
 
 1. **The validator picks a winner** when it finalizes the round. Only a miner
-   that beat this round's baseline loss (a positive score) and passed the c4
-   isolation check can win. Among those, a miner with a top-3 track record is
-   preferred; otherwise the lowest `val_loss` wins. If no miner qualifies,
-   nothing is published.
+   with a round score above 0 can win: better than the pretrained base after
+   the c4 and gate-usage penalties, which also means it passed the c4 cutoff.
+   Among those, a miner with a top-3 track record is preferred; otherwise the
+   highest score wins. If no miner qualifies, nothing is published.
 2. **The validator publishes it** to its own HF repo, then commits the shard's
    hash and the HF `(repo_id, revision)` to chain in ValidatorCommit1/2. The
    revision is truncated to 7 characters to fit the 128-byte chain commit.
@@ -171,11 +172,14 @@ The task `exp_pmc_residual` trains on two streaming datasets:
 
 Validators score each miner twice per round, on the same loaded model:
 
-- **The task eval** uses the non-replay sources only (pmc). This is the
-  `val_loss` your score comes from.
-- **The c4 isolation check** uses the replay source, sized by real tokens
-  (65,536 per round). A miner whose c4 loss rises more than the tolerance
-  above the base's scores 0.
+- **The task eval** uses the non-replay sources only (pmc). Its `val_loss`
+  against the base's gives your task gain.
+- **The c4 eval** uses the replay source, sized by real tokens (65,536 per
+  round). A c4 rise is subtracted from your score, and a rise above the
+  cutoff (0.02 by default) scores `−inf`.
+- Both evals also measure how much your residual's gate fires; the score
+  asks for about 0.2 on task tokens and as little as possible on c4. See
+  `scoring.md`.
 
 Both datasets are pinned to a commit SHA (`eval_source_revision_pin`), so every
 validator reads identical rows. The eval slice is chosen by **seeded
@@ -206,9 +210,10 @@ destination, and training settings such as the learning rate,
 Miners do **not** control: the task, its K / A / τ and its `group_id` (served by
 the owner API), the base model, the cycle phase boundaries (chain-driven), the
 eval data slice (seeded from chain state validators cannot forge), which
-validator scores them in a given cycle (seeded partition), the c4 isolation
-tolerance, or the rank → score mapping that converts a `val_loss` into a chain
-weight (hard-coded; see `scoring.md`).
+validator scores them in a given cycle (seeded partition), the score's
+weights, gate-usage target and c4 cutoff (locked validator config), or the
+rank → score mapping that converts a round score into a chain weight
+(hard-coded; see `scoring.md`).
 
 Code: `connito/shared/cycle.py:assign_miners_to_validators`,
 `connito/validator/evaluator.py:_RANK_TO_SCORE`.
