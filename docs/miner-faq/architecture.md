@@ -61,7 +61,7 @@ Code: `connito/miner/train.py:train_worker`,
    split, and compare it with the round's baseline loss. The same miner is
    also scored on a c4 replay split (the isolation check).
 2. **Validate** — persist the score history. The round's scores are finalized
-   (rank-based, top-3 only) at the start of the next cycle's MinerCommit1,
+   (rank-based, top-3 only) 5 blocks before the next cycle's MinerCommit1,
    just before weights are submitted.
 3. **Merge** — nothing is merged. The phase stays in the schedule because the
    phase API owns its boundaries; validators do no work in it.
@@ -69,9 +69,9 @@ Code: `connito/miner/train.py:train_worker`,
    coordinates of the round winner this validator published, so the next
    cycle's miners know where to download from. With no winner, the commit
    carries a hash and no HF coordinates.
-5. **Next MinerCommit1** — finalize the round's scores, publish the winner's
-   shard to HF, and submit chain weights derived from the rolling-average
-   score history.
+5. **5 blocks before the next MinerCommit1** — finalize the round's scores,
+   publish the winner's shard to HF, and submit chain weights derived from the
+   rolling-average score history.
 
 Code: `connito/validator/run.py` (the single-loop main function),
 `connito/validator/evaluator.py:evaluate_one_miner_sync`,

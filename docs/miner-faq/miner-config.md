@@ -131,8 +131,10 @@ settings (sequence length 4096, micro-batch 2 × accumulation 2):
 - **Host RAM:** a dedicated 62 GB box works. Loading peaked at about 33 GiB of
   anonymous memory. Resident memory (RSS) read 62–63 GB, but most of that is
   the memory-mapped checkpoint, which the kernel can drop under pressure.
-- **Disk:** the checkpoint is 67 GiB (72 GB) in your Hugging Face cache; keep
-  about 100 GB free for it.
+- **Disk:** the checkpoint is 67 GiB (72 GB) in your Hugging Face cache.
+
+Plan for about 100 GB of free disk for the model: a margin over the 67 GiB
+checkpoint, not a measurement.
 
 The settings that move GPU memory:
 
@@ -147,7 +149,8 @@ model:
 - **On OOM, lower `local_par.micro_batch_size`**, and raise
   `gradient_accumulation_steps` to keep 4 rows per step. Do not change
   `sequence_length`: it is locked at the task's 4096.
-- `model.quantization_miner: experts` keeps the attention weights in bf16; it
+- `model.quantization_miner: experts` stores only the routed experts in fp8
+  and keeps every other base weight in bf16; it
   uses about 1.3 GiB more GPU memory than `all` (34.68 vs 33.37 GiB after
   load) and fits micro-batch 2 on the L40S. It is not locked: it only affects
   your own box.

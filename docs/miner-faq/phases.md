@@ -121,11 +121,11 @@ The signing message is the model hash; the signing key is the miner's
 hotkey. This is what validators later verify against
 `ChainCheckpoint._verify_signature`.
 
-**Validator:** a few blocks before this phase it finalizes the previous
-round: rank-based scores, the round winner published to HF (in a background
-thread), and chain weights. At the phase start it commits a fresh
-`ValidatorChainCommit` heartbeat with a new miner seed, prunes old
-submissions, and submits stale-weights fallback weights if needed.
+**Validator:** 5 blocks before this phase it finalizes the previous round:
+rank-based scores, the round winner published to HF (in a background
+thread), and chain weights (or stale-weights fallback weights if its weights
+are too old). At the phase start it commits a fresh `ValidatorChainCommit`
+heartbeat with a new miner seed and prunes old submissions.
 
 Code: `connito/miner/model_io.py:_commit_signed_model_hash`,
 `connito/validator/run.py` (the MinerCommit1 block of the main loop),

@@ -100,8 +100,12 @@ range are expected. Over a 300-step run the pmc eval loss fell by about 0.07,
 most of it in the first 50 steps.
 
 **Training stops at setup** with
-`the model has no residual experts (.residual_ parameters) to train`: the
-residual was not installed, which means the model was built outside
+
+```
+ValueError: the model has no residual experts (`.residual_` parameters) to train
+```
+
+The residual was not installed, which means the model was built outside
 `get_model_from_checkpoint` (a custom loader). Use the stock path.
 
 **Training stops mid-round** with `FloatingPointError: Non-finite loss
@@ -223,8 +227,8 @@ Code: `connito/shared/chain.py:submit_weights`,
 **Symptom:** a validator's log shows the round finalized, but
 `score_aggregator.json` was not updated for your UID.
 
-**Cause:** scores are written once per round, by `finalize_round_scores`, at
-the start of the next cycle's MinerCommit1. Nothing is merged in the Merge
+**Cause:** scores are written once per round, by `finalize_round_scores`, 5
+blocks before the next cycle's MinerCommit1. Nothing is merged in the Merge
 phase; it does not touch scores. If your score didn't update for the round:
 
 1. Check your UID is in `validator-1 | … round_id=… written_uids=…`. If
