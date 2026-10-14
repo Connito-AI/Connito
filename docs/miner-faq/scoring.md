@@ -127,8 +127,8 @@ score above 0** get non-zero score points; everyone else gets 0.
 - Two miners with exactly the same score → **both get score = 0.0** (a
   duplicated submission is the much more likely cause than two miners
   legitimately producing bit-identical results).
-- Miners with a score of 0 or below (not better than the pretrained base
-  after the penalties), or `−inf` (stopped by the c4 cutoff) → **score = 0.0**
+- Miners with a score of 0 or below (a raw score no better than the base's),
+  or `−inf` (stopped by the c4 cutoff) → **score = 0.0**
   regardless of rank.
 
 Close scores between different miners do not trigger this rule — only

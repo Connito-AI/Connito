@@ -54,13 +54,15 @@ penalties from your task gain.
 
 The ways to land at 0 with a finite task loss:
 
-- **Your round score is 0 or below.** The score is your task gain over the
-  **pretrained base model** minus penalties for a c4 loss rise and for where
-  your residual's gate fires (`− |task_usage − 0.2| − c4_usage` by default).
-  The base scores 0, and only a score above 0 is ranked. Shards trained with
-  the reference training code measured −0.14 to −0.17: they beat the base on
-  the task, but their gate fires on c4 as much as on the task. See "Why is my
-  round score negative?".
+- **Your round score is 0 or below.** Your raw score is your task gain over
+  the **pretrained base model** minus penalties for a c4 loss rise and for
+  where your residual's gate fires (`− |task_usage − 0.2| − c4_usage` by
+  default); the round score is that minus the base's own raw score, so the
+  base scores 0 and only a score above 0 is ranked. Shards trained with the
+  reference training code measured +0.03 to +0.06, so a score at or below 0
+  usually means the residual gained little on the task or fires more on c4
+  than the base does. See "How is my round score measured against the
+  base?".
 - Your score is above 0 but not in the top 3 *for this validator's round*.
 - The **c4 cutoff** stopped you: your residual raised the loss on general web
   text by more than the tolerance (status 15, `replay_loss_increase`). Your
@@ -423,9 +425,9 @@ Measured, two miners starting from the same published winner:
   the scoring of that run (task gain plus the c4 cutoff, before the
   gate-usage penalties) a winner was published.
 
-Varying your data kept both shards clear of the c4 cutoff in the measured run;
-it does not on its own lift the score above 0. That also needs the gate to
-prefer task tokens (see "Why is my round score negative?").
+Varying your data kept both shards clear of the c4 cutoff in the measured run.
+How far above 0 you then score depends on your task gain and on where your
+gate fires (see "How is my round score measured against the base?").
 
 **Fix:** vary or shuffle your data every round, for example by shuffling each
 streaming source with a seed built from your hotkey and the round. Do not just
@@ -459,8 +461,8 @@ Code: `connito/shared/modeling/mycelia.py:get_base_model` (the split check),
 
 ## Known issues in the reference miner
 
-The stock miner is a reference implementation. These are known; items 1 and
-4 cost you score directly, the others don't on their own:
+The stock miner is a reference implementation. These are known; item 1 costs
+you score directly, the others don't on their own:
 
 1. **The same training data every round.** The train stream restarts at every
    `setup_training`, and all one-GPU miners read rank 0's slice. This one
@@ -476,11 +478,7 @@ The stock miner is a reference implementation. These are known; items 1 and
    recorded (`current_model_meta` is None), and the resync check in the
    training loop reloads whenever that is None. Starting from a published
    winner took 77–107 s with no reload.
-4. **Its gate does not prefer task tokens.** It trains on cross-entropy only,
-   so its gate fires about as much on c4 as on the task, and its shards
-   score below the base's 0. This one *does* cost score; see "Why is my round
-   score negative?".
-5. **A `TypeError` on Ctrl-C.** On shutdown, a failure inside the cleanup path
+4. **A `TypeError` on Ctrl-C.** On shutdown, a failure inside the cleanup path
    is logged through a standard-library logger with a keyword argument it
    doesn't accept (`connito/miner/train_helper.py:76`), so a `TypeError`
    traceback can follow the real error. The process still stops.
@@ -518,34 +516,40 @@ Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
 `connito/shared/config.py:EvalCfg`,
 `expert_groups/exp_pmc_residual/config.yaml` (the `replay: true` source).
 
-## Why is my round score negative?
+## How is my round score measured against the base?
 
-Because the score is not just the task gain. Each validator computes
+The score is not just the task gain. Each validator computes a raw score
 
-    score = task_gain − c4_rise_penalty − |task_usage − 0.2| − c4_usage
+    raw = task_gain − c4_rise_penalty − |task_usage − 0.2| − c4_usage
 
-with the default (locked) weights of 1. `task_gain` is how much your residual
-lowers the task loss below the pretrained base; the usage terms are the
-residual gate's mean firing (Σ_j q_j) on task tokens and on c4 tokens. The
-pretrained base scores 0, and only a score above 0 earns a rank reward or can
-be published as the round winner.
+with the default (locked) weights of 1, and your round score is
+`raw − base_raw`, where `base_raw` is the same formula for the pretrained base
+on its own baseline evals (task gain and c4 rise 0, only its gate usage
+counts). `task_gain` is how much your residual lowers the task loss below the
+base; the usage terms are the residual gate's mean firing (Σ_j q_j) on task
+tokens and on c4 tokens. A miner identical to the base scores exactly 0, and
+only a score above 0 earns a rank reward or can be published as the round
+winner.
 
-**Measured:** the base's gate usage is about 0.05 on both task and c4.
-Shards trained with the reference training code (two full-Train rehearsal
-shards and a 3-step test shard) beat the base on the task by 0.03 to 0.06 and
-scored **−0.14 to −0.17**; the full-Train shards raised gate usage on both
-splits, to about 0.08 task and 0.09 c4. A gate that fires equally on task and
-c4 tokens pays exactly 0.2 for any usage up to 0.2, more than those task
-gains.
+**Measured:** the base's gate usage is about 0.04–0.05 on task and c4 alike,
+so `base_raw` is about −0.2 (−0.200 to −0.208): a gate with no preference
+between task and c4 tokens pays exactly 0.2. Shards trained with the
+reference training code scored **+0.028 and +0.039** (a 3-step test shard)
+and **+0.043 to +0.064** (two full-Train rehearsal shards).
 
-**What it takes to score above 0:** a gate that fires on task tokens (toward
-0.2) and stays quiet on c4, plus more task gain than the penalty that is
-left. The reference miner trains on cross-entropy only and does not push its
-gate that way; how to do it is up to you, and there is no tested recipe. The
-weights and target are validator config and may change between releases, so
-check `connito/shared/config.py:EvalCfg` and your own terms on the
+**How to score higher:** gain more on the task, and make your gate fire on
+task tokens (toward 0.2) while staying quiet on c4, which lowers your usage
+penalties below the base's. The reference miner trains on cross-entropy only
+and does not push its gate that way; how to do it is up to you, and there is
+no tested recipe.
+
+**Validators differ a little.** Each draws its own fresh residual, so
+`base_raw` varies by a few thousandths; the same shard can score up to about
+0.008 differently on two validators. The weights and target are validator
+config and may change between releases, so check
+`connito/shared/config.py:EvalCfg` and your own terms on the
 `validator_miner_score_term` and `validator_miner_gate_usage` gauges.
 
 Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
 `connito/shared/modeling/residual.py:record_gate_usage`. More in `scoring.md`,
-"Gate usage: why a better loss can still score below 0".
+"Gate usage and the base's raw score".
