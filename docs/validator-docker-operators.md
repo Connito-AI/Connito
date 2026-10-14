@@ -264,8 +264,10 @@ that changes the base model or the CUDA image needs three things done
    ```
    `DATA_DIR` is the host directory mounted at `/data` (the repo root by
    default; see `.env`); the container reads the cache at `/data/hf`.
-3. **Disk.** Keep about 100 GB free for the model. To remove the old model,
-   point `HF_HOME` at the same cache and run
+3. **Disk.** Keep about 100 GB free for the model. Once the upgrade has
+   landed (the release before it still runs the old model), remove the old
+   model with the host `hf` from step 2 (the pre-tag image's `hf` has no
+   `rm`): point `HF_HOME` at the same cache and run
    `hf cache rm model/deepseek-ai/DeepSeek-V2-Lite`; the same form removes any
    model (`hf cache rm model/Qwen/Qwen3.6-35B-A3B`). Deleting the whole cache
    directory also works. Deleting only a model's folder does not: its files
