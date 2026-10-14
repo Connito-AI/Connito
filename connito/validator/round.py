@@ -109,7 +109,7 @@ class Round:
     # Per-uid average score over the aggregator's rolling window, snapshotted
     # at freeze. Already fetched to order the eval queue; kept because it is
     # the only stable ranking available all round — the live aggregator holds
-    # this round's *raw deltas* until finalize replaces them with rank scores,
+    # this round's *raw scores* until finalize replaces them with rank scores,
     # so a mid-round average mixes incompatible units.
     prior_avg_scores: dict[int, float] = field(default_factory=dict)
     # The cycle this round belongs to, as the cycle API numbers them. Carried

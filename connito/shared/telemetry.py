@@ -113,8 +113,8 @@ VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
 # Per-miner validation loss measured against this validator's eval set. High-cardinality (one series per miner UID) but bounded by
 # subnet size (~100s); same shape as `validator_miner_score`. Set inside
 # `evaluate_one_miner` immediately after the val_loss is computed.
-# Aggregators compute `delta_loss = max(0, validator_baseline_loss -
-# validator_miner_val_loss)` as needed.
+# Aggregators compute `delta_loss = validator_baseline_loss -
+# validator_miner_val_loss` as needed; the round score is `validator_miner_round_delta`.
 VALIDATOR_MINER_VAL_LOSS = Gauge(
     "validator_miner_val_loss",
     "Per-miner validation loss measured against this validator's eval set",
@@ -127,7 +127,8 @@ VALIDATOR_MINER_REPLAY_LOSS_INCREASE = Gauge(
     "Per-miner c4 replay loss minus the round base's replay loss",
     ["miner_uid"],
 )
-# Per-miner terms of the round score, each as it enters the sum; replay terms only when the c4 eval ran.
+# Per-miner terms of the round score: the task gain, and each penalty as the positive magnitude the score
+# subtracts. The replay terms are set only when the c4 eval ran.
 VALIDATOR_MINER_SCORE_TERM = Gauge(
     "validator_miner_score_term",
     "Per-miner term of the round score: task_gain, replay_penalty, usage_penalty or replay_usage_penalty",
@@ -519,13 +520,13 @@ def set_miner_last_scored_round(miner_uid: int | str, round_id: int) -> None:
         pass
 
 
-def set_miner_round_delta(miner_uid: int | str, delta: float) -> None:
-    """Record the raw per-round improvement signal for an evaluated miner.
+def set_miner_round_delta(miner_uid: int | str, score: float) -> None:
+    """Record the raw per-round score for an evaluated miner.
 
     Best-effort — never raises.
     """
     try:
-        VALIDATOR_MINER_ROUND_DELTA.labels(miner_uid=str(miner_uid)).set(float(delta))
+        VALIDATOR_MINER_ROUND_DELTA.labels(miner_uid=str(miner_uid)).set(float(score))
     except Exception:
         pass
 

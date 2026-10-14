@@ -34,8 +34,7 @@ from pathlib import Path
 # column blanks for a full cycle after every restart. v3 also adds
 # `uid_to_val_loss`, the only per-miner field with no recovery path at all:
 # `validator_miner_val_loss` is emitted at eval time and cannot be derived
-# from `scores`, because `delta = max(0.0, baseline - val_loss)` clamps at
-# zero, so every miner scoring 0 would be underivable.
+# from `scores`, which also carries the c4 and gate-usage terms.
 # `from_json` accepts v1/v2 files (missing fields default) so leftover
 # journals written by an older build still recover.
 SCHEMA_VERSION = 3
@@ -243,7 +242,7 @@ def republish_telemetry_from_journal(
                 samples=samples,
             )
 
-        # Raw per-round delta, for every uid actually evaluated.
+        # Raw per-round score, for every uid actually evaluated.
         for uid in journal.scored_uids:
             set_miner_round_delta(int(uid), float(journal.scores.get(uid, 0.0)))
 

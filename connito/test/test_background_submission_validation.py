@@ -1003,8 +1003,8 @@ class TestFinalizeRoundScores:
         assert self._scores_for_uid(agg, rnd.roster[3].uid, rnd.round_id) == [2.25]
 
     def test_zero_delta_excluded_from_top_three(self) -> None:
-        # If only one miner has delta > 0, only that miner gets the
-        # rank-1 reward (2.25). The other "scored but delta==0" miners
+        # If only one miner has score > 0, only that miner gets the
+        # rank-1 reward (2.25). The other "scored but score==0" miners
         # receive 0.0 — they did not actually improve over baseline so
         # they should not collect reward weight just for showing up.
         from connito.validator.evaluator import finalize_round_scores

@@ -54,9 +54,8 @@ def test_evaluator_skips_nan_batches_from_divisor(monkeypatch):
 
 
 def test_evaluator_returns_inf_when_every_batch_nans(monkeypatch):
-    """100% NaN miner must NOT score val_loss=0 (which would be max
-    delta after `max(0, baseline - val_loss)`). Return +inf so delta
-    clamps to 0."""
+    """100% NaN miner must NOT score val_loss=0 (which would be the
+    maximum task gain). Return +inf so its score is -inf."""
     import math
     _scripted(monkeypatch, [float("nan")] * 5)
 

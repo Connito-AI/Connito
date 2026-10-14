@@ -185,7 +185,7 @@ def finalize_round_scores(
       - Other scored UIDs (incl. score <= 0, and -inf for a c4 gate
         failure): score 0.
       - Any UIDs whose `round.scores` value exactly equals another
-        scored miner's: score 0 — a tied val_loss is evidence of a
+        scored miner's: score 0 — a tied score is evidence of a
         duplicated submission, so both sides are penalized regardless
         of where they would have ranked.
       - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf, or a
@@ -719,7 +719,7 @@ def _evaluate_on_fresh_loader_sync(
     cached) eval batch source.
 
     Every caller in a round shares the same `combinded_seed`, so the
-    baseline and all miner evals see the same batches — the deltas are
+    baseline and all miner evals see the same batches — the scores are
     comparable.
 
     If `cached_batches` is provided, iterates the cached list (CPU

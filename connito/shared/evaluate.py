@@ -147,9 +147,8 @@ def evaluate_model(
         )
 
     # Every batch was NaN/Inf — the miner's checkpoint is malicious or
-    # broken. Return `+inf` so the caller's `delta = max(0, baseline -
-    # val_loss)` clamps to 0 (score=0). Returning 0.0 would have given
-    # them maximum delta.
+    # broken. Return `+inf` so the caller's task gain, and so its score,
+    # is -inf. Returning 0.0 would have given them the maximum gain.
     if scored_batches == 0:
         if nan_batches > 0:
             logger.warning(

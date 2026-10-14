@@ -7,7 +7,7 @@ fix: `Round.freeze` persisting the base parameters it snapshots, and
 
 The base is the load-bearing part. A resumed miner must be scored against
 the same base as one scored before the restart, because
-`delta = max(0, baseline - val_loss)` is only comparable within a single base.
+the task gain `baseline - val_loss` is only comparable within a single base.
 Every round's base is the pretrained shard the boot wrote, so a journal that
 names anything else must refuse the resume rather than degrade it.
 
