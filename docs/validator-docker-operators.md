@@ -59,11 +59,11 @@ experts stored in fp8 (`model.quantization_validator: experts`, locked), plus
 one miner's residual experts at a time.
 
 - **GPU: one 48 GB card** (the validator process measured on an RTX A6000
-  and an L40S; a miner's full task + c4 eval only on the A6000). A 40 GB card is too
-  small. The base model must sit on **one** GPU: split over three GPUs
-  with transformers `device_map="auto"`, Qwen returned wrong logits with no
-  error (loss 12.42 instead of 2.04), so the loader refuses any model spread
-  over more than one device.
+  and an L40S; a miner's full task + c4 eval only on the A6000). A 40 GB
+  card is too small. The base model must sit on **one** GPU: split over
+  three GPUs with transformers `device_map="auto"`, Qwen returned wrong
+  logits with no error (loss 12.42 instead of 2.04), so the loader refuses
+  any model spread over more than one device.
 - **NVIDIA driver ≥ 570** (the image is CUDA 12.8).
 - **Host RAM:** a 62 GiB host ran the validator. Resident memory (RSS) counts
   the memory-mapped checkpoint pages, which the kernel can drop under
@@ -423,9 +423,9 @@ writable before starting the stack.
 - **Stopping auto-updates entirely.** `docker compose stop watchtower`,
   or remove the `com.centurylinklabs.watchtower.enable` label from the
   validator service.
-- **Multi-GPU hosts.** Set `VALIDATOR_GPU_ID` in `.env` to pick the one
-  GPU the validator uses (default `0`); the model never spans GPUs. Run separate compose
-  projects (`COMPOSE_PROJECT_NAME=val2 docker compose ...`) per
+- **Multi-GPU hosts.** Set `VALIDATOR_GPU_ID` in `.env` to pick the one GPU
+  the validator uses (default `0`); the model never spans GPUs. Run separate
+  compose projects (`COMPOSE_PROJECT_NAME=val2 docker compose ...`) per
   validator if you want multiple validators on one box.
 
 ## Things you have to do manually (not automated)

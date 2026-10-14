@@ -172,8 +172,8 @@ weight_group_1_size  = 3      # G1 holds at most 3 miners
 weight_group_2_size  = 5      # G2 holds at most 5 miners
 ```
 
-**Weight Group 1 (98 % of the miners' share, 73.5 % on the wire)** — top-3 of validation groups A ∪ B by `score_avg`,
-subject to:
+**Weight Group 1 (98 % of the miners' share, 73.5 % on the wire)** — top-3 of
+validation groups A ∪ B by `score_avg`, subject to:
 
 1. `record_count >= 3` (the miner has at least 3 samples in the aggregator).
 2. The miner has scores recorded in **at least 3 distinct rounds** within the
@@ -204,10 +204,10 @@ applied to every regular submission in
 `connito/validator/chain_submitter.py:ChainSubmitter._submit_weight_one` and
 to both fallback paths in `connito/shared/chain.py`).
 
-**Weight Group 2 (2 % of the miners' share, 1.5 % on the wire)** — top-5 of A ∪ B ∪ C \ G1 by `score_avg`, subject
-to `record_count >= 1` and a `score_avg` above 0. No recency gate. If G2 is
-empty too, the chain submitter normalizes the weights, so UID 0 receives all
-of this validator's emission.
+**Weight Group 2 (2 % of the miners' share, 1.5 % on the wire)** — top-5 of A
+∪ B ∪ C \ G1 by `score_avg`, subject to `record_count >= 1` and a `score_avg`
+above 0. No recency gate. If G2 is empty too, the chain submitter normalizes
+the weights, so UID 0 receives all of this validator's emission.
 
 Within each group, the share is split **proportional to `score_avg`** (not
 equal).
@@ -249,8 +249,9 @@ The most common cases, in order of frequency:
 1. **The penalties outweigh the task gain.** A low `val_loss` only buys the
    task gain; the gate-usage and c4 penalties are subtracted from it. A gate
    that fires equally on task and c4 tokens pays 0.2 for any usage up to 0.2,
-   more than the task gains measured (at most 0.06). A round score of 0 or below gets
-   rank score 0. See "Gate usage: why a better loss can still score below 0".
+   more than the task gains measured (at most 0.06). A round score of 0 or
+   below gets rank score 0. See "Gate usage: why a better loss can still score
+   below 0".
 2. **Not in the round's top 3 by score.** The rank-based mapping is geometric
    and cuts off after rank 3. Rank 4 is 0.0.
 3. **The c4 cutoff stopped it** (status 15): its c4 loss rose more than 0.02
@@ -275,9 +276,9 @@ is happening on that validator:
 
 1. **No miner cleared the G1 recency gate** — `build_submission_uid_weights`
    redirects the G1 share to UID 0, which then holds 98.5 % with the owner
-   reserve. The 1.5 % G2 share is still split among evaluated miners. This is the most common cause on a freshly-restarted
-   validator with no rolling history, and on a quiet task where
-   miners are not consistently submitting.
+   reserve. The 1.5 % G2 share is still split among evaluated miners. This is
+   the most common cause on a freshly-restarted validator with no rolling
+   history, and on a quiet task where miners are not consistently submitting.
 2. **No miner has a positive score average** — no miner placed in a round's
    top 3 with a round score above 0 within its last 8 samples (for example,
    every round score was 0 or below), so every `score_avg` is 0 and

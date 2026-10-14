@@ -261,9 +261,10 @@ See `eval-status.md` for the full table. Quick reference:
   time budget. No miner action.
 - `repo_unavailable` (12) — your committed repo or revision is gone or not
   public. Keep it public and in place.
-- `bad_residual_shard` (14) — the shard is not exactly the task's residual
-  (a corrupt, truncated or empty file, extra/missing keys, wrong shape or
-  dtype, `.pt`, NaN, or an untrained expert). Upload the stock `save_residual_shard` output.
+- `bad_residual_shard` (14) — the shard is not exactly the task's residual (a
+  corrupt, truncated or empty file, extra/missing keys, wrong shape or dtype,
+  `.pt`, NaN, or an untrained expert). Upload the stock `save_residual_shard`
+  output.
 - `replay_loss_increase` (15) — the c4 cutoff stopped you (score `−inf`, not
   ranked or published). Vary your training data every round.
 - Codes 5 and 13 are retired (they belonged to the old expert-group shards)
@@ -415,16 +416,16 @@ Measured, two miners starting from the same published winner:
 
 - **same stream again** (stock): task loss worse than the starting shard, c4
   loss +0.064 / +0.066 above the base: both stopped by the c4 cutoff (status
-  15), nothing published. A full two-round rehearsal on the stock code gave the same
-  result in round 2 (c4 +0.061 / +0.059).
+  15), nothing published. A full two-round rehearsal on the stock code gave
+  the same result in round 2 (c4 +0.061 / +0.059).
 - **each source shuffled per (hotkey, round)**: task loss −0.0014 / −0.0047
   below the starting shard, c4 −0.024 / −0.025: the cutoff passed, and under
   the scoring of that run (task gain plus the c4 cutoff, before the
   gate-usage penalties) a winner was published.
 
-Varying your data kept both shards clear of the c4 cutoff in the measured
-run; it does not on its own lift the score above 0. That also needs the gate to prefer task tokens (see
-"Why is my round score negative?").
+Varying your data kept both shards clear of the c4 cutoff in the measured run;
+it does not on its own lift the score above 0. That also needs the gate to
+prefer task tokens (see "Why is my round score negative?").
 
 **Fix:** vary or shuffle your data every round, for example by shuffling each
 streaming source with a seed built from your hotkey and the round. Do not just

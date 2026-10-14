@@ -71,10 +71,10 @@ export HF_TOKEN="hf_..."                  # must have WRITE access to checkpoint
 - The HF repo must be **public** (or accessible to every validator's HF
   token — in practice that means public). Validators only have read access
   with the stock `HF_TOKEN`.
-- `checkpoint_repo` is capped at **32 characters** (`CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS`)
-  because the full repo string has to fit in the 128-byte chain commit
-  alongside other fields. A longer repo id will raise `ValueError` at
-  commit time.
+- `checkpoint_repo` is capped at **32 characters**
+  (`CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS`) because the full repo string has to
+  fit in the 128-byte chain commit alongside other fields. A longer repo id
+  will raise `ValueError` at commit time.
 
 Code: `connito/shared/config.py:HfCfg`,
 `connito/shared/chain.py:CHAIN_COMMIT_MAX_HF_REPO_ID_CHARS`,
@@ -234,8 +234,8 @@ Code: `connito/shared/config.py:CycleCfg`.
    clear the local checkpoint dir between runs if you reset training.
 3. **HF private repo.** If `hf.checkpoint_repo` is private, validators cannot
    download your shard, and you are never scored. If the repo or revision is
-   gone for good, you get rank score 0 for the round (`repo_unavailable`). Make the repo
-   public.
+   gone for good, you get rank score 0 for the round (`repo_unavailable`).
+   Make the repo public.
 4. **Run name reuse.** `run_name` is part of the local checkpoint path. If
    you rename the run between cycles, miner restart will not find the
    previous checkpoint and will start from the published winner or a fresh
