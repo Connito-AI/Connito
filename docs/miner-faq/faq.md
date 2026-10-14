@@ -451,8 +451,8 @@ Code: `connito/shared/modeling/mycelia.py:get_base_model` (the split check),
 
 ## Known issues in the reference miner
 
-The stock miner is a reference implementation. These are known and do not
-lose you score on their own:
+The stock miner is a reference implementation. These are known; items 1 and
+4 cost you score, the others only time:
 
 1. **The same training data every round.** The train stream restarts at every
    `setup_training`, and all one-GPU miners read rank 0's slice. This one
