@@ -332,9 +332,12 @@ environment built for transformers 4.x cannot load it.
   ```bash
   hf download Qwen/Qwen3.6-35B-A3B --revision 995ad96eacd98c81ed38be0c5b274b04031597b0
   ```
-  Set `HF_HOME` to the cache the miner uses. To remove a model, use
-  `hf cache delete` (or delete the whole cache directory): deleting only the
-  model's folder leaves its files in the shared `blobs/` directory.
+  Set `HF_HOME` to the cache the miner uses. To remove a model, run
+  `hf cache rm model/<org>/<name>` against the same cache, for example
+  `hf cache rm model/deepseek-ai/DeepSeek-V2-Lite` for the previous base
+  model, or delete the whole cache directory. Deleting only the model's
+  folder does not free the disk: its files stay in the shared `blobs/`
+  directory.
 
 Code: `requirements.txt`, `connito/shared/modeling/families.py` (model id and
 revision).

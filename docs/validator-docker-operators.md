@@ -255,16 +255,20 @@ that changes the base model or the CUDA image needs three things done
    docker compose run --rm --no-deps --entrypoint hf validator \
      download Qwen/Qwen3.6-35B-A3B --revision 995ad96eacd98c81ed38be0c5b274b04031597b0
    ```
-   or from the host, with the `hf` CLI (`pip install "huggingface_hub>=1.31"`):
+   or from the host, with the `hf` CLI
+   (`uv tool install "huggingface_hub>=1.31"`):
    ```bash
-   HF_HOME=$DATA_DIR/hf hf download Qwen/Qwen3.6-35B-A3B \
+   HF_HOME=${DATA_DIR:?set to DATA_DIR from .env}/hf hf download Qwen/Qwen3.6-35B-A3B \
      --revision 995ad96eacd98c81ed38be0c5b274b04031597b0
    ```
-   `$DATA_DIR` is the host directory mounted at `/data` (the repo root by
-   default); the container reads the cache at `/data/hf`.
-3. **Disk.** Keep about 100 GB free for the model. To remove an old model,
-   use `hf cache delete` (or delete the whole cache directory). Deleting only
-   a model's folder leaves its files in the shared `blobs/` directory.
+   `DATA_DIR` is the host directory mounted at `/data` (the repo root by
+   default; see `.env`); the container reads the cache at `/data/hf`.
+3. **Disk.** Keep about 100 GB free for the model. To remove the old model,
+   point `HF_HOME` at the same cache and run
+   `hf cache rm model/deepseek-ai/DeepSeek-V2-Lite`; the same form removes any
+   model (`hf cache rm model/Qwen/Qwen3.6-35B-A3B`). Deleting the whole cache
+   directory also works. Deleting only a model's folder does not: its files
+   stay in the shared `blobs/` directory.
 
 **Locked config fields.** Some fields (for example `model.family`,
 `model.quantization_validator`, `evaluation.max_replay_loss_increase`,
@@ -443,8 +447,11 @@ writable before starting the stack.
    lands. Highly recommended — silent upgrades are great until they
    aren't.
 8. **HuggingFace cache hygiene.** The compose file sets `HF_HOME=/data/hf`
-   so model weights survive restarts. To reclaim disk:
-   `rm -rf /opt/connito/data/hf` and let the next run re-download.
+   so model weights survive restarts. To reclaim disk, remove models you no
+   longer run with `hf cache rm model/<org>/<name>` (see
+   [Upgrading to a release that changes the base model](#upgrading-to-a-release-that-changes-the-base-model)).
+   Deleting the whole `${DATA_DIR}/hf` directory also works, but the next start
+   then re-downloads the 72 GB base model, so pre-download it again first.
 
 ## Troubleshooting
 
