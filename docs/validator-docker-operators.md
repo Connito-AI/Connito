@@ -58,17 +58,17 @@ The validator runs `Qwen/Qwen3.6-35B-A3B` at the pinned revision
 experts stored in fp8 (`model.quantization_validator: experts`, locked), plus
 one miner's residual experts at a time.
 
-- **GPU: one 48 GB card** (measured on an RTX A6000; on an L40S, the task
-  eval). A 40 GB card is
-  too small. The base model must sit on **one** GPU: split over three GPUs
+- **GPU: one 48 GB card** (the validator process measured on an RTX A6000
+  and an L40S; a miner's eval measured on the A6000). A 40 GB card is too
+  small. The base model must sit on **one** GPU: split over three GPUs
   with transformers `device_map="auto"`, Qwen returned wrong logits with no
   error (loss 12.42 instead of 2.04), so the loader refuses any model spread
   over more than one device.
 - **NVIDIA driver ≥ 570** (the image is CUDA 12.8).
 - **Host RAM:** a 62 GB host ran the validator. Resident memory (RSS) counts
   the memory-mapped checkpoint pages, which the kernel can drop under
-  pressure, so RSS grows with whatever RAM is free: 59 GiB on a 62 GB host,
-  91.7 GiB at boot on a 1 TB host.
+  pressure, so RSS grows with whatever RAM is free: 60.2 GiB at boot on a
+  62 GiB host (L40S), 91.7 GiB at boot on a 1 TB host.
 - **Disk:** the checkpoint is 67 GiB (72 GB) in the Hugging Face cache
   (`${DATA_DIR}/hf`); keep about 100 GB free for it. Miner submissions are
   pruned after each round.
@@ -80,7 +80,7 @@ Measured peaks (real model, real eval data, seq 4096):
 | RTX A6000 (47.4 GiB) | the validator process, 6 rounds on live chain data: its own task and c4 baseline evals each round (no submission passed verification in those rounds) | 42,316 MiB used (41.3 GiB) on `nvidia-smi`, CUDA context included |
 | RTX A6000 | task eval + c4 eval of one miner | 39.25 GiB allocated / 39.45 GiB reserved (the c4 eval sets the peak; the task eval peaks at 37.16) |
 | L40S (44.4 GiB) | task eval of one miner | 37.16 GiB allocated / 37.56 GiB reserved |
-<!-- L40S observer cycle: add its row here (nvidia-smi peak, host RSS, per-miner eval time). -->
+| L40S (46,068 MiB on `nvidia-smi`) | the validator process in observer mode on a live round, fp8 `experts`: both baseline evals. Every live shard was refused (code 14), so no miner eval ran; the miner-eval peak is the A6000 row above (39.25 GiB allocated) | 41,693 MiB used (40.7 GiB) on `nvidia-smi` at the c4 replay baseline, 60 s samples, the only process on the GPU; host RSS 60.2 GiB (VmHWM, at boot, mmapped weights included) on a 62 GiB host |
 
 Timing on an A6000: boot takes about 70 s with the model already in the
 cache; scoring one miner (task eval plus c4 eval) takes about 98 s of the
