@@ -1,9 +1,8 @@
 # Cycle phases reference
 
 The cycle is a state machine. Every block of every cycle is in exactly one
-phase. Phase order is fixed and lengths are configured in
-`config.cycle.*_period` (the same fields are used by miners, validators, and
-the owner phase service, so they must agree).
+phase. The phase order is fixed; the phase lengths come from the owner phase
+service, which every miner and validator consults.
 
 ## Source of truth for "current phase"
 
@@ -30,192 +29,200 @@ backoff (`api_retries = 5`, `api_backoff_sec = 2`).
 
 The `/get_phase` endpoint is served by the subnet owner's cycle-api service,
 which is not part of this repository. `PhaseManager` mirrors the same block
-arithmetic locally, so you can read the phase schedule here.
+arithmetic locally, so you can read the phase logic here.
 
 Code: `connito/shared/cycle.py:PhaseManager`,
 `connito/shared/cycle.py:get_phase_from_api`.
 
-## Phase order and default lengths
+## Phase order and lengths
 
 ```
-Distribute (20)  → Train (300)  → MinerCommit1 (10)  → MinerCommit2 (10)
-   → Submission (80)  → Validate (10)  → Merge (50)
-   → ValidatorCommit1 (10)  → ValidatorCommit2 (10)
-
-Total = 500 blocks ≈ 100 minutes at 12 s/block
+Distribute → Train → MinerCommit1 → MinerCommit2 → Submission
+   → Validate → Merge → ValidatorCommit1 → ValidatorCommit2
 ```
 
-(`cycle.cycle_length: 448` in the locked defaults; the per-phase periods in
-the latest code sum to 500. The validator's `PhaseManager` recomputes
-`cycle_length` from the sum of `phase["length"]` at startup, so the actual
-cycle is 500 blocks. The locked `cycle_length: 448` value is a historical
-default that is no longer authoritative.)
+**The lengths are served, not configured.** The owner's phase service decides
+how many blocks each phase lasts, and it can change them. To see the live
+lengths, call `GET https://cycle-api.connito.ai/get_phase`: the response
+carries `phase_start_block`, `phase_end_block` and
+`blocks_remaining_in_phase` for the current phase. A block is about 12 s.
 
-> If the owner's deployed lengths differ from what the miner's config has,
-> the deployed values win. Phase boundaries are computed against the
-> deployed `PhaseManager`; the miner's local `config.cycle.*_period` only
-> affects `wait_till`'s sleep math, not the chain-block timing.
+The `config.cycle.*_period` and `cycle.cycle_length` values in your local
+YAML are fallback defaults for local tooling. They are locked (reset on load)
+and do not move the real phase boundaries, which are computed by the
+deployed service from chain block height. Do not tune your miner against
+them.
+
+Train is by far the longest phase: it is the miner's whole training budget
+for the round.
 
 Code: `connito/shared/config.py:CycleCfg`,
-`connito/shared/cycle.py:PhaseManager.init_phases`.
+`connito/shared/cycle.py:PhaseManager.init_phases`,
+`connito/shared/cycle.py:wait_till`.
 
 ## Per-phase: what miners and validators do
 
-### Distribute (20 blocks ≈ 4 min)
+### Distribute
 
-**Miner:** download the latest global checkpoint.
+**Miner:** fetch the round's published winner, if there is one.
 
-- Pull every recent `ValidatorChainCommit` from chain, filter to
-  `expert_group == config.task.exp.group_id`, and pick one with a valid
-  `signed_model_hash`.
-- Download `model_expgroup_{N}.safetensors` from
-  `validator_hf_repo_id @ validator_hf_revision` (revision is the 7-char
-  short SHA the validator committed).
-- Reconstruct the backbone from `deepseek-ai/DeepSeek-V2-Lite`
-  (`from_pretrained`); only the expert shard came from chain.
+- Read every recent `ValidatorChainCommit` from chain, keep those whose
+  `expert_group` equals the active task's `group_id` and that are newer than
+  what the miner already has, and pick one with a valid `signed_model_hash`.
+- Download `model_expgroup_{group_id}.safetensors` from
+  `validator_hf_repo_id @ validator_hf_revision` (the 7-char short SHA the
+  validator committed). That file is a residual shard: the winner's residual
+  experts and routers, nothing else.
+- Verify it: hash against the chain commit, then the exact residual spec
+  (keys, shapes, dtypes), finite values, and trained experts. A shard that
+  passes becomes the miner's next starting point. A validator that published
+  no winner commits no HF coordinates, and the miner keeps what it has.
+- The miner also checks the owner API for the active task here; a task switch
+  takes effect from this phase.
 
-**Validator:** mostly idle. May be finishing the previous cycle's tail
-(weight submission, archive prune) or doing a peer-resync if
-`_participated_in_merge` was False last cycle.
+The frozen base model (`Qwen/Qwen3.6-35B-A3B` at its pinned revision) is
+loaded from the local Hugging Face cache at miner startup; only the residual
+shard comes from chain.
+
+**Validator:** mostly idle. Its background eval worker may still be scoring
+the previous round's miners.
 
 Code: `connito/miner/model_io.py:download_worker`,
 `connito/shared/model.py:fetch_model_from_chain_validator`.
 
-### Train (300 blocks ≈ 60 min)
+### Train
 
-**Miner:** run AdamW inner-optimizer steps on the miner's expert-group
-parameters. The training loop is in `connito/miner/train.py:train_worker`.
-Each `inner_opt_step` runs `gradient_accumulation_steps` forward+backward
-passes, then one optimizer step.
+**Miner:** run AdamW steps on the residual experts and their routers only;
+every base weight is frozen. The loss is next-token cross-entropy over every
+labelled token (task rows and c4 replay rows alike), computed in chunks over
+the LM head. Each `inner_opt_step` runs `local_par.gradient_accumulation_steps`
+micro-batches of `local_par.micro_batch_size` rows (defaults 2 × 2), then one
+optimizer step.
 
-The miner does **not** receive validator feedback during Train; it trains on
-the most recent global checkpoint from Distribute against its expert-group
-dataset (`expert_groups/{name}/dataset.py`).
+The miner does **not** receive validator feedback during Train. It trains from
+its starting point (the published winner, its own last checkpoint, or its own
+fresh draw) on the task's data sources, as listed in the task's `config.yaml`.
+Vary the data you train on every round; see `miner-config.md`, "Vary your
+training data every round".
 
-**Validator:** blocked in `wait_till(PhaseNames.miner_commit_1)`. Idle from
-the validator's perspective.
+**Validator:** the background eval worker keeps scoring the previous round's
+miners. At the start of Train the validator checks the owner API for a new
+active task and switches in place if there is one.
 
-Code: `connito/miner/train.py:train_worker`, the main `for step, batch in
-enumerate(train_dataloader)` loop (~line 321).
+Code: `connito/miner/train.py:train_worker`,
+`connito/shared/evaluate.py:chunked_lm_loss`.
 
-### MinerCommit1 (10 blocks ≈ 2 min)
+### MinerCommit1
 
-**Miner:** sign the freshly-trained checkpoint and commit
-`signed_model_hash` to chain. No HF upload yet — only the signature.
+**Miner:** sign the freshly trained shard and commit `signed_model_hash` to
+chain. No HF upload yet — only the signature.
 
 The signing message is the model hash; the signing key is the miner's
 hotkey. This is what validators later verify against
 `ChainCheckpoint._verify_signature`.
 
-**Validator:** top-of-loop housekeeping. Stale-weights fallback if needed,
-re-publish `ValidatorChainCommit(model_hash, global_ver, expert_group)`
-with last cycle's model hash as a chain heartbeat.
+**Validator:** a few blocks before this phase it finalizes the previous
+round: rank-based scores, the round winner published to HF (in a background
+thread), and chain weights. At the phase start it commits a fresh
+`ValidatorChainCommit` heartbeat with a new miner seed, prunes old
+submissions, and submits stale-weights fallback weights if needed.
 
 Code: `connito/miner/model_io.py:_commit_signed_model_hash`,
-`connito/validator/run.py` (~line 686).
+`connito/validator/run.py` (the MinerCommit1 block of the main loop),
+`connito/validator/evaluator.py:finalize_round_scores`,
+`connito/validator/distribute.py:publish_round_baseline`.
 
-### MinerCommit2 (10 blocks ≈ 2 min)
+### MinerCommit2
 
 **Miner:** HF upload happens *first*, then chain commit. Specifically:
 
 1. Resolve `hf_upload_repo_id` from `config.hf.checkpoint_repo`.
-2. Call `upload_checkpoint_to_hf` to push the expert-group shard. Returns a
-   short SHA (`hf_revision`).
+2. Upload `model_expgroup_{group_id}.safetensors` (the residual shard, about
+   252 MB at K = 1). Returns a short SHA (`hf_revision`).
 3. Commit `MinerChainCommit(model_hash, global_ver, expert_group,
    hf_repo_id, hf_revision)` to chain.
 
 If the HF upload fails, the chain commit goes out **without** HF coords and
-the miner is missing for the round (validators cannot find the checkpoint).
+the miner is missing for the round (validators cannot find the shard).
 
 **Validator:** still idle. Blocked in `wait_till(PhaseNames.submission)`.
 
 Code: `connito/miner/model_io.py:_upload_checkpoint_to_hf_safe`,
 `connito/miner/model_io.py:_commit_model_hash`.
 
-### Submission (80 blocks ≈ 16 min)
+### Submission
 
-**Validator:** the busy phase. `Round.freeze` runs at the start (builds the
-eval roster — validation groups, foreground/background split, model
-snapshot to CPU). `stream_gather_and_evaluate` then evaluates the assigned
-top-N miners one at a time, computing `val_loss` against the round's
-baseline.
+**Validator:** the busy phase. `Round.freeze` runs at the start and builds the
+eval roster (validation groups, foreground/background split). The download
+worker pulls each assigned miner's shard, and the eval worker scores them one
+at a time on the GPU:
 
-The miner→validator assignment is computed once at the start of Submission
-and reused for the missed-submission penalty pass in Validate.
+1. Once per round, it loads its own fresh residual (equal to the pretrained
+   base) and measures the **baseline losses**: the task eval split and the c4
+   replay split.
+2. For each miner, it verifies the shard (signature, exact residual spec,
+   hash), loads it onto the base, and measures the task loss and the c4 loss
+   on the same batches.
+3. A miner whose c4 loss rises more than the tolerance above the base's
+   scores 0 (status 15). Otherwise its delta is `baseline_loss − val_loss`.
 
-**Miner:** idle — the miner's work for the cycle is already done. The
-miner's training loop continues, but its outputs won't be used until the
-next cycle's MinerCommit2.
+**Miner:** idle — the miner's work for the round is already done. The training
+loop may keep running, but its output won't be used until the next cycle's
+MinerCommit2.
 
-Code: `connito/validator/run.py` (~line 719),
-`connito/validator/round.py:Round.freeze`,
-`connito/validator/evaluator.py:evaluate_foreground_round`.
+Code: `connito/validator/round.py:Round.freeze`,
+`connito/validator/background_eval_worker.py:BackgroundEvalWorker`,
+`connito/validator/evaluator.py:evaluate_one_miner_sync`.
 
-### Validate (10 blocks ≈ 2 min)
+### Validate
 
-**Validator:**
-1. **Missed-submission penalty pass.** Every hotkey in this validator's
-   assignment that did not submit gets `score = 0` for the round.
-2. **Finalize scores.** `finalize_round_scores` overwrites the per-round
-   raw `delta ** 1.2` values with the rank-based mapping (top-3 only).
-3. **Persist `score_aggregator.json`.**
-4. **Aggregate miner gradients.** Stream the top-K miners' checkpoints
-   into a single combined gradient on `global_model.grad`. NaN/Inf-guarded.
-
-**Miner:** idle.
-
-Code: `connito/validator/run.py` (~line 750-848),
-`connito/validator/evaluator.py:finalize_round_scores`.
-
-### Merge (50 blocks ≈ 10 min)
-
-**Validator:** the DHT-coordinated cross-validator step. Hivemind
-`DecentralizedAverager.step()` averages each validator's `global_model.grad`
-buffer for the active expert group and the `shared` group. Then the outer
-SGD step runs (`outer_lr = 0.7`, `outer_momentum = 0.9`, Nesterov).
-
-If `grad_is_valid` was False after Validate (no usable miner contributions
-or NaN/Inf in the merged grad), Merge is **skipped** and the validator
-flags itself for peer-resync next cycle.
-
-A new checkpoint is saved to disk at
-`config.ckpt.checkpoint_path / globalver_{global_opt_step}`.
+**Validator:** frees GPU memory held by the main loop and persists the score
+history (`score_aggregator.json`). Scoring of the round's miners continues in
+the background worker, which deletes the submissions it no longer needs; the
+round is finalized at the next MinerCommit1.
 
 **Miner:** idle.
 
-Code: `connito/validator/run.py` (~line 849-918).
+Code: `connito/validator/run.py` (the Validate block),
+`connito/validator/background_eval_worker.py:BackgroundEvalWorker`.
 
-### ValidatorCommit1 (10 blocks ≈ 2 min)
+### Merge
+
+**Validator:** nothing is merged. Each round's winner is published as a whole
+residual shard, and every validator scores every round against the pretrained
+base. The phase stays because the owner's phase service owns its boundaries
+and miners read the same schedule; validators do no work in it, which frees
+the window for the background workers.
+
+**Miner:** idle.
+
+Code: `connito/validator/run.py` (the Merge block and its comment).
+
+### ValidatorCommit1
 
 **Validator:**
-1. Build a `ModelCheckpoint`, sign its hash with the validator's hotkey.
+1. Build a `ModelCheckpoint` for the round winner this validator published
+   (or, with no winner, for a hash that every validator of the task computes
+   the same way) and sign its hash with the validator's hotkey.
 2. Commit `SignedModelHashChainCommit(signed_model_hash)` to chain.
-3. **Upload to HF.** `upload_checkpoint_to_hf` pushes the global checkpoint
-   to the validator's HF repo and captures the revision SHA. This is the
-   bytes miners pull during the next cycle's Distribute.
 
 **Miner:** idle.
 
-Code: `connito/validator/run.py` (~line 929-992).
+Code: `connito/validator/run.py` (the ValidatorCommit1 block),
+`connito/validator/distribute.py:unadvertised_model_hash`.
 
-### ValidatorCommit2 (10 blocks ≈ 2 min)
+### ValidatorCommit2
 
 **Validator:** reveal the model hash on chain and pin the HF coords.
 
 `commit_status(ValidatorChainCommit(model_hash, global_ver, expert_group,
-hf_repo_id, hf_revision))` — `global_ver` is `0` if `_participated_in_merge`
-is False, signaling to peers that this validator's checkpoint should not be
-authoritative.
-
-After this phase, the cycle's *visible* work is complete. The validator's
-post-cycle tail (`submit_weights` to chain, archive/prune submissions,
-metric log) runs immediately after ValidatorCommit2 but is not gated by a
-separate phase — it has to finish before the next cycle's MinerCommit1.
+hf_repo_id, hf_revision))`. With a published winner, `hf_repo_id` and
+`hf_revision` point at it and miners fetch it in the next Distribute. With
+no winner, both are empty and miners have nothing to fetch.
 
 **Miner:** idle.
 
-Code: `connito/validator/run.py` (~line 994-1057),
-`connito/validator/run.py:submit_weights` call site (~line 1014-1028).
+Code: `connito/validator/run.py` (the ValidatorCommit2 block).
 
 ## How a miner knows what phase they're in
 
@@ -237,12 +244,17 @@ authoritative computation lives in the deployed `PhaseManager`.
 
 ## Cross-cycle state
 
-Between cycles, only one piece of state survives the validator main loop:
-`_participated_in_merge`. It tracks whether the validator successfully
-contributed to last cycle's Hivemind allreduce. If False, next cycle's
-MinerCommit1 phase will pull a fresh model from a peer instead of using the
-local one.
+**Validator.** The round in progress is journaled to disk (scores, the
+roster, and whether the round is on the fallback baseline), so a validator
+that restarts mid-round resumes it instead of starting over. A round resumed
+on the fallback baseline still publishes no winner. The score history lives in
+`score_aggregator.json`.
 
-Miners have no equivalent cross-cycle state — each cycle is independent.
+**Miner.** The miner's state across cycles is its local checkpoints and the
+last published winner it downloaded. On restart it resumes from the newest
+local checkpoint that passes the residual spec, or keeps a fresh draw if none
+does.
 
-Code: `connito/validator/run.py` (search `_participated_in_merge`).
+Code: `connito/validator/round_journal.py`,
+`connito/validator/aggregator.py:MinerScoreAggregator`,
+`connito/shared/model.py:get_model_from_checkpoint`.
