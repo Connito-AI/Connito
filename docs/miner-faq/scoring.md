@@ -160,17 +160,19 @@ called from the finalize step in `connito/validator/run.py`).
 ## From `score_avg` to chain weights: `chain_weight_stake_weighted`
 
 After Validate, the validator builds a `{uid: weight}` payload that goes onto
-chain via `set_weights`. The payload is split into two groups:
+chain via `set_weights`. Every submission first reserves **25 %** for UID 0,
+the subnet owner (`SUBNET_OWNER_WEIGHT_SHARE = 0.25`); the miners' payload is
+split into two groups that share the remaining 75 %:
 
 ```python
 # connito/shared/config.py:EvalCfg
-weight_group_1_share = 0.98   # 98% of this validator's emission
-weight_group_2_share = 0.02   # 2% of this validator's emission
+weight_group_1_share = 0.98   # 98% of the miners' 75% = 73.5% on the wire
+weight_group_2_share = 0.02   # 2% of the miners' 75%  = 1.5% on the wire
 weight_group_1_size  = 3      # G1 holds at most 3 miners
 weight_group_2_size  = 5      # G2 holds at most 5 miners
 ```
 
-**Weight Group 1 (98 %)** — top-3 of validation groups A ∪ B by `score_avg`,
+**Weight Group 1 (98 % of the miners' share, 73.5 % on the wire)** — top-3 of validation groups A ∪ B by `score_avg`,
 subject to:
 
 1. `record_count >= 3` (the miner has at least 3 samples in the aggregator).
@@ -181,13 +183,14 @@ subject to:
    an average of 0 means no top-3 placing with a positive round score in the
    window.
 
-If no UID qualifies, the entire 98 % share is **redirected to UID 0**
-(subnet owner). This is the **no-winner-in-group fallback**, not a "burn":
+If no UID qualifies, the whole G1 share is **redirected to UID 0** (subnet
+owner). With the 25 % owner reserve on top, UID 0 then receives 98.5 % of the
+submission. This is the **no-winner-in-group fallback**, not a "burn":
 
 > The chain emission is not destroyed. It is paid to the subnet owner because
 > the validator could not pick a top-3 from miners that have been scoring
 > consistently and positively. From the chain's perspective UID 0 receiving
-> 98 % looks identical to a burn, but the operational meaning is "no
+> 98.5 % looks identical to a burn, but the operational meaning is "no
 > qualified winner this round."
 
 Code:
@@ -196,17 +199,18 @@ and redirect),
 `connito/validator/round_groups.py:select_top_n_by_local_score` (skips a
 `score_avg` of 0 or below),
 `connito/validator/run.py:1064-1070` (the "g1 empty — redirecting" log line),
-`connito/shared/chain.py:reserve_subnet_owner_share` (a separate 5 % owner
-share applied to fallback-weight paths, distinct from G1 redirection).
+`connito/shared/chain.py:reserve_subnet_owner_share` (the 25 % owner reserve,
+applied to every regular submission in
+`connito/validator/chain_submitter.py:ChainSubmitter._submit_weight_one` and
+to both fallback paths in `connito/shared/chain.py`).
 
-**Weight Group 2 (2 %)** — top-5 of A ∪ B ∪ C \ G1 by `score_avg`, subject
+**Weight Group 2 (2 % of the miners' share, 1.5 % on the wire)** — top-5 of A ∪ B ∪ C \ G1 by `score_avg`, subject
 to `record_count >= 1` and a `score_avg` above 0. No recency gate. If G2 is
 empty too, the chain submitter normalizes the weights, so UID 0 receives all
 of this validator's emission.
 
 Within each group, the share is split **proportional to `score_avg`** (not
-equal). If every member of a group scored 0, the share is split equally
-across members.
+equal).
 
 Code: `connito/validator/round_groups.py:compute_uid_weights`,
 `connito/validator/round_groups.py:select_top_n_by_local_score`.
@@ -265,26 +269,27 @@ Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
 
 ## The "97 % burn" question, end-to-end
 
-The chain shows ~97 % of a validator's emission going to UID 0 when one of
-these things is happening on that validator:
+UID 0 always receives the 25 % owner reserve. The chain shows nearly all of a
+validator's emission going to UID 0 (98.5 % or more) when one of these things
+is happening on that validator:
 
 1. **No miner cleared the G1 recency gate** — `build_submission_uid_weights`
-   redirects the 98 % G1 share to UID 0. 2 % G2 is still split among
-   evaluated miners. This is the most common cause on a freshly-restarted
+   redirects the G1 share to UID 0, which then holds 98.5 % with the owner
+   reserve. The 1.5 % G2 share is still split among evaluated miners. This is the most common cause on a freshly-restarted
    validator with no rolling history, and on a quiet task where
    miners are not consistently submitting.
 2. **No miner has a positive score average** — no miner placed in a round's
    top 3 with a round score above 0 within its last 8 samples (for example,
    every round score was 0 or below), so every `score_avg` is 0 and
-   `select_top_n_by_local_score` skips them all. G1 is empty and the 98 % goes
-   to UID 0; G2 is empty too, so after normalization UID 0 receives the whole
-   emission. Under the current score this is what happens while no miner's
+   `select_top_n_by_local_score` skips them all. G1 is empty and its share
+   goes to UID 0; G2 is empty too, so after normalization UID 0 receives the
+   whole emission. Under the current score this is what happens while no miner's
    residual scores above the pretrained base.
 3. **Stale-weights fallback** — the validator did not submit weights in
    `cycle_length` blocks (e.g., it was down). `_submit_fallback_weights`
-   aggregates peer consensus and emits to top-3 peer-favored miners, plus
-   reserving a separate **5 % to UID 0** (`SUBNET_OWNER_WEIGHT_SHARE`). This
-   is distinct from G1 redirection.
+   aggregates peer consensus and emits to top-3 peer-favored miners, with the
+   same **25 % reserved for UID 0** (`SUBNET_OWNER_WEIGHT_SHARE`). This is
+   distinct from G1 redirection.
 4. **All peers are themselves in even-weight fallback state** — emit 100 %
    to UID 0 to avoid amplifying a subnet-wide cascade. Code:
    `connito/shared/chain.py:_submit_fallback_weights`.
@@ -293,9 +298,10 @@ these things is happening on that validator:
 > dashboard convention of calling this "burn" is loose; the on-chain effect
 > is owner emission.
 
-Code: `connito/shared/chain.py` (lines 568-586 for the no-differentiated-peer
-case, line 590 for the 5 % owner share applied to the fallback path),
-`connito/validator/run.py` (G1 redirection log line, ~line 1064).
+Code: `connito/shared/chain.py:_submit_fallback_weights` and
+`_asubmit_fallback_weights` (the no-differentiated-peer case and the owner
+reserve on the fallback paths), `connito/shared/chain.py:reserve_subnet_owner_share`,
+`connito/validator/run.py` (the G1 redirection log line).
 
 ## Which miner becomes next round's starting point
 

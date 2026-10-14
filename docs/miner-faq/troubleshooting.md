@@ -194,7 +194,9 @@ Diagnostics:
 
 4. **Is the validator on the empty-G1 fallback?** If `score_avg` is
    non-zero but you see `validator_miner_weight_submitted` showing UID 0
-   at 98 %, the validator could not pick a top-3 by recency — your
+   at 98 % (the gauge records the weights before the 25 % owner reserve is
+   added; on chain UID 0 then holds 98.5 %), the validator could not pick a
+   top-3 by recency — your
    `score_avg` is fine but the weight share is going to the owner anyway.
    See `scoring.md` "97 % burn" section.
 

@@ -5,12 +5,14 @@ entry ends with a `Code:` pointer; longer answers link to a dedicated doc.
 
 ## Why is the subnet "burning" 97 % of emission?
 
-**Short answer:** It's not a burn. It's the empty-G1 fallback — when no
+**Short answer:** It's not a burn. Every weight submission reserves **25 %**
+for UID 0 (the subnet owner, `SUBNET_OWNER_WEIGHT_SHARE`); Weight Group 1 and
+Weight Group 2 split the other 75 % (73.5 % and 1.5 % on the wire). When no
 miner qualifies for Weight Group 1 (at least 3 scores, in at least 3 distinct
 rounds of the last 5 cycles, with a positive `score_avg`), the validator
-redirects the 98 % Weight Group 1 share to UID 0 (the subnet owner). UID 0 receives the TAO; nothing is destroyed. There is
-also a separate 5 % owner share applied to peer-consensus fallback paths
-(`reserve_subnet_owner_share`). See `scoring.md` for the long version.
+redirects the Weight Group 1 share to UID 0 too, so UID 0 receives 98.5 %.
+UID 0 receives the TAO; nothing is destroyed. See `scoring.md` for the long
+version.
 
 **When the redirect fires:** validator just restarted (no rolling history),
 a quiet task, a cycle where every assigned miner submitted invalid or missed
@@ -324,7 +326,7 @@ Hard floor: 3 rounds. The Weight Group 1 ballot requires at least 3 scores,
 in at least 3 distinct rounds within the last 5 cycles, and a positive
 `score_avg` — so a miner needs 3 scored rounds, at least one of them a top-3
 placing with a round score above 0, before it can enter Weight Group 1.
-Weight Group 2 (2 %) needs only 1 score and a positive average.
+Weight Group 2 (1.5 % on the wire) needs only 1 score and a positive average.
 
 Soft floor: ~3-8 cycles before the rolling `score_avg` starts to
 stabilize. The aggregator window is 8 samples; until you fill it, your
