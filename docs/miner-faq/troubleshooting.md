@@ -381,11 +381,13 @@ AttributeError: 'NoneType' object has no attribute 'phase_name'
 
 The process shuts its workers down and exits with code 0. Under the operator
 compose file (`restart: unless-stopped`) Docker restarts the container; it
-boots in about 70 s and resumes the open round from its journal. While the
-API is still down, the restarted validator reaches the same wait and exits
-again, so expect a restart loop that ends once the API answers. Two test
-validators went through exactly this during a cycle-api outage. Nothing is
-lost beyond the time the API was down.
+boots in about 70 s and finalizes the interrupted round from its journal:
+scores already recorded are kept, but it publishes no winner for that round
+(its next ValidatorCommit carries the no-winner hash) and skips that round's
+weight submission. While the API is still down, the restarted validator
+reaches the same wait and exits again, so expect a restart loop that ends once
+the API answers. Two test validators crashed this way during a cycle-api
+outage.
 
 **Miner: waits, then carries on.** Every phase wait in the miner (Distribute,
 MinerCommit1, MinerCommit2) waits for a phase to start, so it keeps polling
