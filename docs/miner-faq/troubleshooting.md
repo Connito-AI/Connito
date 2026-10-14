@@ -34,8 +34,8 @@ request as automated. Common triggers:
 - Default `python-requests` User-Agent.
 - Too many sequential identical-shape requests in a short window.
 
-**What the code does:** `_get_with_retry` treats 403 as **non-retryable**
-(line 88 of `connito/shared/cycle.py`) and returns `None`. `wait_till` then
+**What the code does:** `get_with_retry` treats 403 as **non-retryable**
+and returns `None`, so `get_phase_from_api` returns `None`. `wait_till` then
 cannot make progress until the API responds — both miner and validator
 will idle on `get_phase_from_api`.
 
@@ -50,7 +50,7 @@ will idle on `get_phase_from_api`.
 3. Contact the subnet owner if persistent — they can whitelist your IP
    range against the WAF rule.
 
-Code: `connito/shared/cycle.py:_get_with_retry` (non-retryable status list
+Code: `connito/shared/helper.py:get_with_retry` (non-retryable status list
 includes 403), `connito/shared/cycle.py:get_phase_from_api`.
 
 ## Miner keeps starting from its own fresh residual
@@ -237,26 +237,36 @@ phase; it does not touch scores. If your score didn't update for the round:
 
 Code: `connito/validator/evaluator.py:finalize_round_scores`.
 
-## My miner uploaded but the validator log says `outdated_submissions`
+## My miner committed, but the validator used an older commit or none
 
-**Symptom:** Validator log:
+**Symptom:** your miner logged its MinerCommit1 and MinerCommit2 commits, but
+the round shows `signature_invalid` (3), `no_chain_commit` (6), or a score for
+an older shard.
 
-```
-Skipping submission file: outdated
-file_name=hotkey_…_block_8120000.pt
-```
+**Cause:** validators do not read your commits whenever they arrive. At round
+freeze they read the chain **as of two blocks**: the end of MinerCommit1 (your
+signed hash) and the end of MinerCommit2 (your model hash and HF
+coordinates). Whatever your commitments were at those blocks is what gets
+scored:
 
-**Cause:** Your submission's `block` is outside the previous Submission
-phase's block range. This usually means you uploaded too early (during the
-cycle that just ended) or your local clock is drifting badly.
+- **Signed hash committed after MinerCommit1 ended:** the validator pairs the
+  previous signed hash with the new model hash, and the signature check fails
+  (`signature_invalid`).
+- **Model hash committed after MinerCommit2 ended:** the validator sees your
+  previous MinerCommit2 commit, or none (`no_chain_commit`).
+- **HF upload failed:** the MinerCommit2 commit went out without HF
+  coordinates (`no_chain_commit`).
 
-**Fix:** Make sure MinerCommit2 fires inside the chain phase boundary, not
-on a wall-clock timer. The stock miner uses `wait_till(config,
-PhaseNames.miner_commit_2)` which is chain-block driven — only a custom
-miner would deviate.
+**Fix:** let each commit land inside its phase. The stock miner waits on the
+chain-driven phases (`wait_till(config, PhaseNames.miner_commit_1)` and
+`…miner_commit_2`); a custom miner on a wall-clock timer, or one whose HF
+upload runs past MinerCommit2, misses the window. Look for `<MinerCommit2>
+committing` in your log and check its block against the phase's end block
+from `GET /get_phase`.
 
-Code: `connito/shared/cycle.py:gather_validation_job` (the
-`in_previous_phase` filter, line 1045-1059).
+Code: `connito/shared/checkpoints.py:build_chain_checkpoints_from_previous_phase`,
+`connito/shared/cycle.py:get_validator_miner_assignment`,
+`connito/miner/model_io.py:commit_worker`.
 
 ## Score zeroed by the c4 check (status 15)
 

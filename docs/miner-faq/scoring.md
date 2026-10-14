@@ -138,8 +138,9 @@ Code: `connito/validator/aggregator.py:MinerScoreAggregator.add_score`
 (line 199, hotkey-change reset is at line 234-237),
 `connito/shared/telemetry.py:set_miner_score_snapshot`.
 
-History older than `8 × cycle_length` blocks is pruned at the end of every
-cycle (`connito/validator/run.py:prune_before_round`).
+History older than `8 × cycle_length` blocks is pruned each time a round is
+finalized (`connito/validator/aggregator.py:MinerScoreAggregator.prune_before_round`,
+called from the finalize step in `connito/validator/run.py`).
 
 ## From `score_avg` to chain weights: `chain_weight_stake_weighted`
 

@@ -45,7 +45,7 @@ The tax is: a bittensor sync `Subtensor` will happily route a historical `block=
 |---|---|---|
 | `subtensor.get_all_commitments(netuid, block=<int>)` | `chain.py:212` | `get_chain_commits()` whenever a historical block is passed |
 | `subtensor.metagraph(netuid, block=<int>)` | `chain.py:215` | `get_chain_commits()` |
-| `build_chain_checkpoints_from_previous_phase` | `checkpoints.py:743-747` | `Round.freeze`, `setup_training`/`load_model` (resume), `evaluate_foreground_round` (`resolve_miner_hf_target`) |
+| `build_chain_checkpoints_from_previous_phase` | `checkpoints.py:build_chain_checkpoints_from_previous_phase` | `Round.freeze` (via `cycle.get_validator_miner_assignment`); on miners, `fetch_model_from_chain_validator` (from `load_model` and `download_worker`) |
 
 In `run.py` the archive `subtensor` is therefore reserved for exactly these callers (`run.py:592, 728, 826, 845`). Everything else uses `lite_subtensor`.
 

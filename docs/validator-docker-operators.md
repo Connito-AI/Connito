@@ -419,8 +419,8 @@ writable before starting the stack.
 - **Stopping auto-updates entirely.** `docker compose stop watchtower`,
   or remove the `com.centurylinklabs.watchtower.enable` label from the
   validator service.
-- **Multi-GPU hosts.** Replace `count: all` in `docker-compose.yml` with
-  `device_ids: ["0"]` to pin a specific GPU. Run separate compose
+- **Multi-GPU hosts.** Set `VALIDATOR_GPU_ID` in `.env` to pick the one
+  GPU the validator uses (default `0`); the model never spans GPUs. Run separate compose
   projects (`COMPOSE_PROJECT_NAME=val2 docker compose ...`) per
   validator if you want multiple validators on one box.
 
