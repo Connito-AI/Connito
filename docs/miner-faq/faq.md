@@ -239,7 +239,8 @@ See `eval-status.md` for the full table. Quick reference:
 - `ok` (0) — evaluated cleanly. No action.
 - `non_finite_loss` (1) — eval produced NaN/Inf. Your residual diverged;
   lower the learning rate.
-- `statedict_parse_failed` (2) — file corrupt/truncated. Re-upload.
+- `statedict_parse_failed` (2) — the shard verified but would not load onto
+  the model. Rare; re-upload the stock file.
 - `signature_invalid` (3) — signed with the wrong key or hash drift. Re-commit.
 - `hash_mismatch` (4) — disk file ≠ chain hash. Don't push twice to the same
   revision.
@@ -249,8 +250,8 @@ See `eval-status.md` for the full table. Quick reference:
 - `repo_unavailable` (12) — your committed repo or revision is gone or not
   public. Keep it public and in place.
 - `bad_residual_shard` (14) — the shard is not exactly the task's residual
-  (extra/missing keys, wrong shape or dtype, `.pt`, NaN, or an untrained
-  expert). Upload the stock `save_residual_shard` output.
+  (a corrupt, truncated or empty file, extra/missing keys, wrong shape or
+  dtype, `.pt`, NaN, or an untrained expert). Upload the stock `save_residual_shard` output.
 - `replay_loss_increase` (15) — the c4 isolation check zeroed you. Vary your
   training data every round.
 - Codes 5 and 13 are retired (they belonged to the old expert-group shards)

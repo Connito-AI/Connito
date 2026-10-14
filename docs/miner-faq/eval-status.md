@@ -93,17 +93,22 @@ run the model in bf16).
 
 ## `statedict_parse_failed` (code 2)
 
-The shard file on disk could not be parsed into a tensor dict: truncated,
-malformed, or an unsupported format.
+The shard passed validation but could not be loaded onto the model for
+scoring. This is rare now.
+
+**A truncated, malformed or 0-byte file is not code 2.** Every submission is
+validated before it is scored, and validation reads the file with
+`safe_open`: a file that cannot be read fails there ("residual shard refused:
+unreadable") and reports **code 14, `bad_residual_shard`**. Code 2 is left for
+a file that verified and then failed to load.
 
 **Condition in code:** `evaluate_one_miner_sync` catches `ValueError`,
-`RuntimeError` or `EOFError` while loading the file and records
-`statedict_parse_failed`.
+`RuntimeError` or `EOFError` while loading the verified file onto the model
+and records `statedict_parse_failed`.
 
 **Miner action:**
-- Verify your HF repo actually contains `model_expgroup_{group_id}.safetensors`
-  at the revision you committed. A 0-byte file passes the HF download but
-  fails parse.
+- Re-upload the stock `model_expgroup_{group_id}.safetensors` and commit the
+  new revision.
 - If you're using a custom upload script, run `safetensors.torch.load_file`
   locally on the file before uploading. Only `.safetensors` is accepted.
 
@@ -154,7 +159,9 @@ shapes and dtypes, all finite, and actually trained. The validator refuses it
 before scoring; the miner's round score is 0.
 
 **Condition in code:** `verify_residual_shard` returns `None`, checking in
-this order:
+this order. A file it cannot read at all (truncated, malformed, 0 bytes, not
+safetensors) is refused first, logged as "residual shard refused:
+unreadable".
 
 1. **The file header must equal the spec exactly**, read before any tensor:
    the same keys, shapes and dtypes. For K residual experts per layer on all
