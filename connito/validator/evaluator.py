@@ -773,6 +773,7 @@ def evaluate_one_miner_sync(
     combined_seed: str,
     device: torch.device,
     baseline_loss: float,
+    base_raw_score: float,
     step: int,
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
@@ -781,7 +782,6 @@ def evaluate_one_miner_sync(
     cached_batches: list | None = None,
     replay_batches: list | None = None,
     baseline_replay_loss: float | None = None,
-    base_raw_score: float = 0.0,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
 

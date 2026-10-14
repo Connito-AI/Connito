@@ -60,9 +60,8 @@ def _score(monkeypatch, *, task_loss: float, replay_loss: float, replay_batches=
     job = evaluate_one_miner_sync(
         config=_config(**evaluation),
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
-        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
+        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, base_raw_score=base_raw, step=1,
         cached_batches=TASK, replay_batches=replay_batches, baseline_replay_loss=baseline_replay,
-        base_raw_score=base_raw,
     )
     return job, calls
 
@@ -266,7 +265,7 @@ def test_the_replay_eval_honours_the_miners_deadline(monkeypatch, statuses):
     job = evaluate_one_miner_sync(
         config=_config(),
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
-        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
+        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, base_raw_score=0.0, step=1,
         deadline_monotonic=0.0, cached_batches=TASK, replay_batches=REPLAY, baseline_replay_loss=BASELINE_REPLAY,
     )
 
@@ -282,7 +281,7 @@ def test_without_cached_batches_the_task_loader_leaves_out_replay(monkeypatch):
     job = evaluate_one_miner_sync(
         config=_config(),
         model_path="m.safetensors", uid=7, hotkey="hotkey", base_model=MagicMock(), tokenizer=None,
-        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, step=1,
+        combined_seed="s", device=torch.device("cpu"), baseline_loss=BASELINE, base_raw_score=0.0, step=1,
     )
 
     assert seen == [False]
