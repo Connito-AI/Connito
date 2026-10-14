@@ -1,19 +1,18 @@
 import errno
-import gc
 import os
 import shutil
-from copy import deepcopy
 from pathlib import Path
+from typing import NamedTuple
 
 import fsspec
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from connito.shared.app_logging import structlog
-from connito.shared.config import MinerConfig
 from connito.shared.expert_manager import (
     ExpertAssignments,
-    ExpertManager,
     get_layer_expert_id,
 )
 from connito.shared.helper import (
@@ -24,6 +23,14 @@ from connito.shared.helper import (
 )
 
 logger = structlog.getLogger(__name__)
+
+
+class TensorSpec(NamedTuple):
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+_SAFETENSORS_DTYPES = {"BF16": torch.bfloat16, "F32": torch.float32}
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -329,7 +336,6 @@ def save_state_dict_by_expert_group(
     # validator host. The on-chain `model_hash` is computed from the
     # in-memory state_dict (see `get_model_hash` / `serialize_torch_model_path`),
     # so it's identical regardless of file format — no chain commit changes.
-    from safetensors.torch import save_file
     paths = {}
     for gid, sd in grouped_state.items():
         fname = expert_group_shard_name(gid)
@@ -375,9 +381,61 @@ def save_state_dict_by_expert_group(
     return paths
 
 
+def save_residual_shard(model: torch.nn.Module, dest_dir: str | Path, group_id: int) -> Path:
+    """Write the model's residual experts and routers, each in its own dtype, as the group's shard."""
+    path = Path(dest_dir) / expert_group_shard_name(group_id)
+    # Parameters, not state_dict(): that would dequantize every fp8 expert to a CPU copy first.
+    residual = {n: p.detach().cpu().contiguous() for n, p in model.named_parameters() if ".residual_" in n}
+    save_file(residual, str(path))
+    return path
+
+
+def group_shard(path: str | Path, group_id: int | None) -> Path:
+    """`path` itself if it is a file (a submission), else the group's shard in that folder."""
+    path = Path(path)
+    return path if path.is_file() else path / expert_group_shard_name(group_id)
+
+
+def verify_residual_shard(path: str | Path, expected: dict[str, TensorSpec]) -> dict[str, torch.Tensor] | None:
+    """The shard's tensors if its header is exactly `expected` and every tensor is finite and trained; else None."""
+    path = Path(path)
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            slices = {k: f.get_slice(k) for k in f.keys()}
+            header = {k: TensorSpec(tuple(t.get_shape()), _SAFETENSORS_DTYPES.get(t.get_dtype()))
+                      for k, t in slices.items()}
+            if path.suffix != ".safetensors" or header != expected:
+                logger.warning(
+                    "residual shard refused: off spec", path=str(path),
+                    missing=sorted(expected.keys() - header.keys())[:5],
+                    extra=sorted(header.keys() - expected.keys())[:5],
+                    mismatched=sorted(k for k in expected.keys() & header.keys() if header[k] != expected[k])[:5],
+                )
+                return None
+            # From the same open, so these are the tensors whose header passed.
+            state_dict = {k: f.get_tensor(k) for k in header}
+    except Exception as e:
+        logger.warning("residual shard refused: unreadable", path=str(path), error=str(e))
+        return None
+    non_finite = sorted(k for k, t in state_dict.items() if not torch.isfinite(t).all())
+
+    def zero(expert: str, proj: str) -> bool:
+        return not state_dict[f"{expert}.{proj}.weight"].any()
+
+    experts = {k.rsplit(".", 2)[0] for k in state_dict if ".residual_experts." in k}
+    # Honest training never leaves one: ResidualCfg keeps A/τ below 80, so q > 0 on every token and every
+    # down_proj moves at the first step.
+    untrained = sorted(e for e in experts if zero(e, "down_proj") or (zero(e, "gate_proj") and zero(e, "up_proj")))
+    if non_finite or untrained:
+        logger.warning("residual shard refused", path=str(path), non_finite=non_finite[:5], untrained=untrained[:5])
+        return None
+    return state_dict
+
+
 def save_checkpoint(
     checkpoint_path: str | Path,
     model: torch.nn.Module,
+    group_id: int,
     rank: int,
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     inner_optimizer: torch.optim.Optimizer | None = None,
@@ -385,10 +443,6 @@ def save_checkpoint(
     loss: float | None = None,
     data_loader: StatefulDataLoader | None = None,
     save_global_state: bool = True,
-    save_model_by_expert_group: bool = False,
-    expert_manager: ExpertManager | None = None,
-    strict_sharding: bool = False,
-    active_expert_group_id: int | None = None,
 ) -> None:
     """
     Saves the current model checkpoint.
@@ -408,39 +462,7 @@ def save_checkpoint(
     write_path = tmp_checkpoint_path
 
     try:
-        # === save model, optimizer ===
-        model_dtype = next(model.parameters()).dtype if len(list(model.parameters())) > 0 else torch.float16
-
-        if save_model_by_expert_group and expert_manager is not None:
-            # With one active group, every tensor the shard keeps is a trainable
-            # expert, so parameters are enough. `model.state_dict()` would
-            # dequantize every fp8 module to a CPU copy first — the whole model
-            # under full topology — only for the filter to throw it away.
-            state_dict = (
-                {name: p.detach() for name, p in model.named_parameters()}
-                if active_expert_group_id is not None
-                else model.state_dict()
-            )
-            save_state_dict_by_expert_group(
-                state_dict,
-                expert_manager.expert_group_assignment,
-                write_path,
-                strict_sharding=strict_sharding,
-                active_expert_group_id=active_expert_group_id,
-                save_dtype=model_dtype,
-            )
-            del state_dict
-            gc.collect()
-
-        else:
-            checkpoint = {
-                "model_state_dict": {k: v.detach().to(dtype=model_dtype, device="cpu", non_blocking=True) for k, v in model.state_dict().items()},
-                "loss": loss,
-            }
-            target = write_path / "model.pt"
-            if not target.exists():
-                with fsspec.open(str(target), "wb") as f:
-                    torch.save(checkpoint, f)
+        save_residual_shard(model, write_path, group_id)
 
         # === save optimizer ===
         if inner_optimizer is not None:
@@ -499,55 +521,6 @@ def save_checkpoint(
         raise
 
     logger.info(f"Checkpoint saved to {checkpoint_path}")
-
-
-def load_optimizer(checkpoint_path, optimizer):
-    def _get_name_to_id(optimizer_state_dict):
-        param_name = [pid for g in optimizer_state_dict["param_groups"] for pid in g["param_names"]]
-        param_id = [pid for g in optimizer_state_dict["param_groups"] for pid in g["params"]]
-        param_name_to_id = {name: pid for name, pid in zip(param_name, param_id, strict=False)}
-        return param_name_to_id
-
-    def _get_name_to_param(optimizer_state_dict):
-        """
-        Build a mapping: parameter_name -> optimizer_state (for that param).
-        Works regardless of the optimizer’s internal param IDs.
-        """
-        state = optimizer_state_dict["state"]
-        name_to_id = _get_name_to_id(optimizer_state_dict)
-        name_to_state = {param_name: state[pid] for param_name, pid in name_to_id.items()}
-        return name_to_state
-
-    def _update_state_dict(optimizer_state_dict, name_to_param):
-        """
-        Build a *loadable* optimizer.state_dict() for `target_optimizer` such that:
-        - Params that belong to the requested experts get their merged state.
-        - All other params are left without state (the optimizer will re-init them).
-        """
-
-        optimizer_state_dict["state"] = {}
-
-        target_name_to_id = _get_name_to_id(optimizer_state_dict)
-
-        for pid, name in target_name_to_id.items():
-            st = name_to_param.get(name, None)
-            if st is not None:
-                optimizer_state_dict["state"][pid] = deepcopy(st)  # avoid aliasing
-
-        return optimizer_state_dict
-
-    full_name_to_param = {}
-    model_files = fsspec.open_files(checkpoint_path, mode="rb")
-
-    if len(model_files) == 0:
-        return
-
-    for f in model_files:
-        with f as fh:
-            state_dict = torch.load(fh, map_location=torch.device("cpu"))
-            full_name_to_param = full_name_to_param | _get_name_to_param(state_dict["optimizer_state_dict"])
-
-    optimizer.load_state_dict(_update_state_dict(optimizer.state_dict(), full_name_to_param))
 
 
 def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int | str] | None = None):
@@ -615,66 +588,6 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
                     logger.debug("loaded checkpoint file", path=f, loss=round(loss, 5))
 
     return full_state_dict
-
-
-def load_checkpoint(
-    checkpoint_path: str,
-    config: MinerConfig,
-    rank: int | None,
-    device: torch.device,
-    model: torch.nn.Module | None = None,
-    inner_optimizer: torch.optim.Optimizer | None = None,
-    scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
-    outer_optimizer: torch.optim.Optimizer | None = None,
-    data_loader: StatefulDataLoader | None = None,
-) -> float:
-    """Load the model and optimizer state from a checkpoint folder
-
-    Args:
-        checkpoint_path: the path to the checkpoint folder
-        model: the model to load
-        optimizer: the optimizer to load
-        scheduler: the scheduler to load
-        outer_optimizer: the outer optimizer to load
-        data_loader: the data loader to load
-
-    Returns:
-        loss: the loss from the checkpoint
-    """
-
-    if model is not None:
-        # Each tensor is copied into its parameter's own dtype; casting the model would round the fp32 router.
-        model.load_state_dict(compile_full_state_dict_from_path(checkpoint_path), strict=False)
-        model.to(device=device)
-
-    if inner_optimizer is not None:
-        load_optimizer(os.path.join(checkpoint_path, "inner_optimizer*.pt"), inner_optimizer)
-
-    if outer_optimizer is not None:
-        load_optimizer(os.path.join(checkpoint_path, "outer_optimizer*.pt"), outer_optimizer)
-
-    if data_loader is not None:
-        with fsspec.open(os.path.join(checkpoint_path, f"dataloader_rank{rank}.pt"), "rb") as f:
-            rank_state_dict = torch.load(f, map_location=torch.device("cpu"))
-        data_loader.load_state_dict(rank_state_dict["data_loader"])
-
-    if scheduler is not None:
-        with fsspec.open(os.path.join(checkpoint_path, "global_state.pt"), "rb") as f:
-            global_state_dict = torch.load(f, map_location=torch.device("cpu"))
-    else:
-        return -1
-
-    if scheduler is not None:
-        scheduler.load_state_dict(global_state_dict["scheduler"])
-        inner_optimizer.param_groups[0]["lr"] = scheduler.get_last_lr()[0]
-
-        # Push optimizer tensors to the same device as the model
-        for st in outer_optimizer.state.values():
-            for k, v in st.items():
-                if torch.is_tensor(v):
-                    st[k] = v.to(device)
-
-    return global_state_dict["loss"]
 
 
 # ====================

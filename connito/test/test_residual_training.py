@@ -36,7 +36,7 @@ def _config(name: str) -> SimpleNamespace:
 
 def _model(name: str, dtype: torch.dtype = torch.bfloat16, draw_down: bool = True) -> torch.nn.Module:
     """The miner's model; `draw_down` makes down_proj non-zero so every residual tensor gets a gradient at once."""
-    model, _ = shared_model.get_model_from_checkpoint(rank=0, config=_config(name), load_global_checkpoint=False)
+    model, _ = shared_model.get_model_from_checkpoint(config=_config(name), load_global_checkpoint=False)
     freeze_all_but_residual(model)
     if dtype is torch.float32:
         model.float()

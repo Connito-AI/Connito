@@ -10,8 +10,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from connito.shared.checkpoint_helper import TensorSpec
 from connito.shared.config import MinerConfig, ValidatorConfig
-from connito.shared.modeling.families import family
+from connito.shared.modeling.families import ModelFamily, family
 
 
 def _residual_hook(block: nn.Module, args, out: torch.Tensor, *, threshold: float, temperature: float):
@@ -22,6 +23,14 @@ def _residual_hook(block: nn.Module, args, out: torch.Tensor, *, threshold: floa
         q = torch.sigmoid((r - threshold) / temperature)
     h = sum(q[:, j, None].to(flat.dtype) * expert(flat) for j, expert in enumerate(block.residual_experts))
     return out + h.view_as(out)
+
+
+def _attach(block: nn.Module, fam: ModelFamily, text, k: int) -> None:
+    """Hang K residual experts, in the block's dtype, and their fp32 router on the block, weights as built."""
+    ref = block.gate.weight
+    experts = nn.ModuleList(fam.mlp(text, intermediate_size=text.moe_intermediate_size) for _ in range(k))
+    block.residual_experts = experts.to(ref.device, ref.dtype)
+    block.residual_router = nn.Linear(text.hidden_size, k, bias=False, dtype=torch.float32, device=ref.device)
 
 
 def install_residual_experts(model: nn.Module, config: MinerConfig | ValidatorConfig) -> None:
@@ -40,19 +49,29 @@ def install_residual_experts(model: nn.Module, config: MinerConfig | ValidatorCo
             w = gate_up[e].float() if scale is None else gate_up[e].float() * scale[e]
             stds += torch.stack([w[: text.moe_intermediate_size].std(), w[text.moe_intermediate_size :].std()]).cpu()
         gate_std, up_std = (stds / gate_up.shape[0]).tolist()
-        experts = nn.ModuleList(fam.mlp(text, intermediate_size=text.moe_intermediate_size) for _ in range(cfg.k))
-        router = nn.Linear(text.hidden_size, cfg.k, bias=False, dtype=torch.float32)
+        _attach(block, fam, text, cfg.k)
         with torch.no_grad():
-            for expert in experts:
+            for expert in block.residual_experts:
                 nn.init.normal_(expert.gate_proj.weight, std=gate_std)
                 nn.init.normal_(expert.up_proj.weight, std=up_std)
                 nn.init.zeros_(expert.down_proj.weight)
-            nn.init.normal_(router.weight, std=ref.float().std().item())
-        block.residual_experts = experts.to(ref.device, ref.dtype)
-        block.residual_router = router.to(ref.device)
+            nn.init.normal_(block.residual_router.weight, std=ref.float().std().item())
         block.residual_hook = block.register_forward_hook(functools.partial(
             _residual_hook, threshold=cfg.threshold, temperature=cfg.temperature,
         ))
+
+
+def residual_shapes(config: MinerConfig | ValidatorConfig) -> dict[str, TensorSpec]:
+    """Every residual key of the family and task K, with its shape and dtype, read from config.json alone."""
+    fam = family(config)
+    text = fam.causal_lm.config_class.from_pretrained(fam.model_path, revision=fam.revision)
+    # A meta-device skeleton holds no weights, and walking it skips dense layers as the install does.
+    with torch.device("meta"):
+        skeleton = fam.causal_lm(text).to(torch.bfloat16)
+        for decoder in skeleton.model.layers:
+            if isinstance(decoder.mlp, fam.moe_block):
+                _attach(decoder.mlp, fam, text, config.task.exp.residual.k)
+    return {n: TensorSpec(tuple(p.shape), p.dtype) for n, p in skeleton.named_parameters() if ".residual_" in n}
 
 
 def freeze_all_but_residual(model: nn.Module) -> None:

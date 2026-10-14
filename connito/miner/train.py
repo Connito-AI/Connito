@@ -23,10 +23,7 @@ from connito.miner.train_helper import free_cuda_models, get_status, model_healt
 from connito.shared.app_logging import configure_logging, structlog
 from connito.shared.chain import setup_chain_worker
 from connito.shared.cycle import wait_till, PhaseNames, PhaseManager
-from connito.shared.checkpoint_helper import (
-    load_checkpoint,
-    save_checkpoint,
-)
+from connito.shared.checkpoint_helper import save_checkpoint
 from connito.shared.checkpoints import (
     ModelCheckpoint,
     delete_old_checkpoints,
@@ -160,7 +157,7 @@ def setup_training(
     # === model & Experts manager ===
     logger.debug("init - model and expert manager")
     expert_manager = ExpertManager(config)
-    model, model_checkpoint = load_model(rank, config, expert_manager, subtensor, wallet)
+    model, model_checkpoint = load_model(config, subtensor, wallet)
     model = model.to(device)
     freeze_all_but_residual(model)
 
@@ -227,24 +224,6 @@ def setup_training(
         config, rank=rank, world_size=config.task.exp.data.world_size, tokenizer=tokenizer,
         batch_size=config.local_par.micro_batch_size,
     )
-
-    # === load checkpoint (if any) ===
-    logger.debug("init - load checkpoint")
-    resume = False
-
-    if get_nested_attr(config, "ckpt.resume_from_ckpt", False):
-        latest_checkpoint = select_best_checkpoint(config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt)
-
-    if get_nested_attr(config, "resume_from_ckpt", False) and resume and latest_checkpoint.path is not None:
-        _ = load_checkpoint(
-            config=config,
-            checkpoint_path=latest_checkpoint.path,
-            inner_optimizer=inner_optimizer,
-            scheduler=scheduler,
-            rank=rank,
-            device=device,
-            data_loader=train_dataloader,
-        )
 
     logger.info("setup_training: success!")
     return (
@@ -610,10 +589,7 @@ def train_worker(rank: int, world_size: int, config: MinerConfig) -> None:
                     data_loader=train_dataloader,
                     save_global_state=rank == 0,
                     rank=rank,
-                    save_model_by_expert_group=True,
-                    expert_manager=expert_manager,
-                    strict_sharding=get_nested_attr(config, "ckpt.strict_sharding", False),
-                    active_expert_group_id=config.task.exp.group_id,
+                    group_id=config.task.exp.group_id,
                 )
 
                 if config.ckpt.checkpoint_topk is not None:

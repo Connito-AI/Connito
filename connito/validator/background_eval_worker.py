@@ -24,7 +24,9 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.checkpoint_helper import TensorSpec
 from connito.shared.helper import load_state_dict_from_path
+from connito.shared.modeling.residual import residual_shapes
 from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
@@ -81,7 +83,6 @@ class BackgroundEvalWorker(threading.Thread):
         merge_phase_active: threading.Event,
         eval_window_active: threading.Event,
         gpu_eval_lock: threading.Lock,
-        expert_group_assignment,
         stop_event: threading.Event | None = None,
         poll_interval_sec: float = 2.0,
         stuck_lock_recycle_threshold: int = DEFAULT_STUCK_LOCK_RECYCLE_THRESHOLD,
@@ -94,10 +95,6 @@ class BackgroundEvalWorker(threading.Thread):
         self.merge_phase_active = merge_phase_active
         self.eval_window_active = eval_window_active
         self.gpu_eval_lock = gpu_eval_lock
-        # Private so the only way in is `set_expert_group_assignment`. No
-        # lock, unlike `_eval_base_model` below: a bare rebind, and the
-        # window guard keeps the swap out of an in-flight eval.
-        self._expert_group_assignment = expert_group_assignment
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
         self.stuck_lock_recycle_threshold = stuck_lock_recycle_threshold
@@ -108,10 +105,10 @@ class BackgroundEvalWorker(threading.Thread):
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
-        # The round's base shard key set — what every submission must equal,
-        # since miners are loaded into the one model in place. None until a
-        # base shard has been loaded (cold start), when the check is skipped.
-        self._expected_expert_keys: set[str] | None = None
+        # The residual spec every submission must equal, since miners are
+        # loaded into the one model in place. Read from config at each round
+        # load, so it follows a task switch.
+        self._expected: dict[str, TensorSpec] | None = None
         # Round-scoped cache of materialized eval batches. Built once in
         # `_load_round_base` from the streaming dataloader, then
         # iterated by every miner's eval this round. Same combined seed
@@ -146,20 +143,6 @@ class BackgroundEvalWorker(threading.Thread):
     def has_eval_base_model(self) -> bool:
         with self._eval_base_model_lock:
             return self._eval_base_model is not None
-
-    def set_expert_group_assignment(self, assignment) -> None:
-        """Point the worker at a different expert group's assignment.
-
-        Refuses while the eval window is open: `validate_miner_submission`
-        checks expert-group ownership, so a swap mid-round rejects every
-        submission and writes score=0 for the whole roster.
-        """
-        if self.eval_window_active.is_set():
-            raise RuntimeError(
-                "refusing to swap expert_group_assignment while the eval window "
-                "is open; clear eval_window_active and finalize the round first"
-            )
-        self._expert_group_assignment = assignment
 
     # ---------------- Thread body ----------------
     def run(self) -> None:
@@ -324,7 +307,7 @@ class BackgroundEvalWorker(threading.Thread):
         def _load() -> None:
             shard = round_obj.base_shard
             sd = load_state_dict_from_path(str(shard))
-            self._expected_expert_keys = set(sd)
+            self._expected = residual_shapes(self.config)
             with self.gpu_eval_lock:
                 incompatible = self._eval_base_model.load_state_dict(sd, strict=False)
                 if torch.cuda.is_available():
@@ -451,18 +434,21 @@ class BackgroundEvalWorker(threading.Thread):
         baseline = self._loaded_baseline_loss if self._loaded_baseline_loss is not None else 100.0
 
         # Verify the on-disk submission against the chain commit (signed
-        # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
-        # GPU eval. Off-spec submissions are dropped.
+        # hash, residual spec, NaN/Inf scan, hash) BEFORE the GPU eval.
+        # Off-spec submissions are dropped.
         from connito.shared.telemetry import inc_error
-        from connito.validator.evaluator import validate_miner_submission
+        from connito.validator.evaluator import (
+            _VALIDATION_FAIL_TO_REASON,
+            _record_eval_failure,
+            validate_miner_submission,
+        )
 
         fail_reason = await asyncio.to_thread(
             validate_miner_submission,
             round_obj=round_obj,
             uid=uid,
             model_path=path,
-            expert_group_assignment=self._expert_group_assignment,
-            expected_keys=self._expected_expert_keys,
+            expected=self._expected,
         )
         if fail_reason is not None:
             logger.warning(
@@ -472,6 +458,7 @@ class BackgroundEvalWorker(threading.Thread):
                 reason=fail_reason,
             )
             inc_error(component="bg_eval", kind="validation")
+            _record_eval_failure(uid, _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
             # `mark_validation_failed` puts this UID into both
             # `failed_uids` (claim-blocking) and `validation_failed_uids`
             # so finalize writes score=0 for it. Operational failures

@@ -41,7 +41,6 @@ def _worker(model: nn.Module) -> BackgroundEvalWorker:
         merge_phase_active=threading.Event(),
         eval_window_active=threading.Event(),
         gpu_eval_lock=threading.Lock(),
-        expert_group_assignment={},
     )
     worker.set_eval_base_model(model)
     return worker
@@ -49,7 +48,8 @@ def _worker(model: nn.Module) -> BackgroundEvalWorker:
 
 @pytest.fixture
 def stub_eval(monkeypatch):
-    """Past the load: the dataloader and the baseline forward pass."""
+    """Past the load: the residual spec, the dataloader and the baseline forward pass."""
+    monkeypatch.setattr("connito.validator.background_eval_worker.residual_shapes", lambda config: {})
     monkeypatch.setattr("connito.shared.dataloader.get_dataloader", lambda **kw: [])
     monkeypatch.setattr("connito.shared.dataloader.materialize_batches", lambda *a, **kw: [1])
     monkeypatch.setattr(

@@ -68,7 +68,6 @@ def eval_worker(gates) -> BackgroundEvalWorker:
         merge_phase_active=merge,
         eval_window_active=eval_window,
         gpu_eval_lock=threading.Lock(),
-        expert_group_assignment={4: {0: [(0, 10), (1, 11)]}},
     )
 
 
@@ -112,7 +111,6 @@ def _switch(config, eval_worker, gates, to: str, *, model, write_shard=_stub_wri
         return _switch_task(
             config, to,
             eval_model=model, base_shard=OLD_SHARD,
-            eval_worker=eval_worker,
             eval_window_active=eval_window,
             merge_phase_active=merge,
         )
@@ -125,12 +123,6 @@ def test_config_and_routing_table_move_together(config, eval_worker, gates, mode
     assert config.task.exp.group_id == 7
     assert set(manager.expert_group_assignment) == {7}
     assert manager.expert_group_assignment[7][0] == [(0, 20), (1, 21)]
-
-
-def test_the_eval_worker_is_handed_the_new_table(config, eval_worker, gates, model) -> None:
-    manager = _switch(config, eval_worker, gates, TARGET, model=model).expert_manager
-
-    assert eval_worker._expert_group_assignment is manager.expert_group_assignment
 
 
 @pytest.mark.parametrize("gate", ["eval_window", "merge"])
@@ -152,7 +144,6 @@ def test_a_refused_switch_moves_nothing(config, eval_worker, gates, model) -> No
         _switch(config, eval_worker, gates, TARGET, model=model)
 
     assert (config.task.expert_group_name, config.task.exp.group_id) == before
-    assert 4 in eval_worker._expert_group_assignment
     assert torch.equal(model.w, torch.ones(2))
 
 
@@ -172,8 +163,6 @@ def test_an_unloadable_task_rolls_config_back(config, eval_worker, gates, model,
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
     assert config.task.path.name == SHIPPED
-    # And the worker was never handed a half-built table.
-    assert 4 in eval_worker._expert_group_assignment
 
 
 def test_the_switch_hands_back_a_fresh_baseline_ref(config, eval_worker, gates, model) -> None:
@@ -199,7 +188,6 @@ def test_the_model_is_the_same_object_after_the_switch(config, eval_worker, gate
     assert state.eval_model is model
     assert eval_worker._eval_base_model is model
     assert state.base_shard.name == "model_expgroup_7.safetensors"
-    assert 7 in eval_worker._expert_group_assignment
 
 
 def test_the_old_groups_experts_go_back_to_pretrained(config, eval_worker, gates, model) -> None:
@@ -241,7 +229,6 @@ def test_a_failed_shard_write_rolls_config_back(config, eval_worker, gates, mode
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
     assert eval_worker._eval_base_model is model
-    assert 4 in eval_worker._expert_group_assignment
 
 
 # --- tier 3: the trigger ------------------------------------------------------
@@ -263,7 +250,7 @@ def _poll(config, eval_worker, gates, monkeypatch, *, model, active, bundle=None
     monkeypatch.setattr(run, "load_pretrained_expert_tensors", lambda config, layer_map: {})
     monkeypatch.setattr(run, "_write_pretrained_shard", write_shard)
     state = run._maybe_switch_task(
-        config, eval_model=model, base_shard=OLD_SHARD, eval_worker=eval_worker,
+        config, eval_model=model, base_shard=OLD_SHARD,
         eval_window_active=eval_window, merge_phase_active=merge,
         round_ref=round_ref, gpu_eval_lock=threading.Lock(),
     )

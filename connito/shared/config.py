@@ -510,7 +510,6 @@ class CheckpointCfg(BaseConfig):
     # checkpoint_path rather than disabling resume, which is no longer honored.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
     resume_from_ckpt: bool = True
-    strict_sharding: bool = False
     base_checkpoint_path: Path = Path("checkpoints/miner")
     checkpoint_path: Path | None = None
     checkpoint_interval: PositiveInt | None = None
@@ -623,6 +622,14 @@ class ResidualCfg(BaseConfig):
     k: PositiveInt
     threshold: float = Field(gt=0, lt=1)  # compared with a sigmoid output
     temperature: PositiveFloat
+
+    @model_validator(mode="after")
+    def _gate_can_open(self) -> ResidualCfg:
+        # q ≥ sigmoid(−A/τ), which is exactly 0 in fp32 from about 88; a token with q = 0 gives its expert no gradient.
+        ratio = self.threshold / self.temperature
+        if ratio >= 80:
+            raise ValueError(f"residual threshold / temperature must be below 80, got {ratio:g}")
+        return self
 
 
 class ExpertCfg(BaseConfig):

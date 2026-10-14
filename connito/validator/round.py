@@ -98,8 +98,8 @@ class Round:
     # would silently reject it because its block falls outside the window.
     submission_block_range: tuple[int, int] | None = None
     # Per-uid `ChainCheckpoint` snapshot captured at freeze time so the eval
-    # path can run `validate(expert_group_assignment=...)` (signature, hash,
-    # expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
+    # path can run `validate(expected)` (signature, residual spec, NaN/Inf
+    # scan, hash) without re-issuing chain RPCs.
     uid_to_chain_checkpoint: dict[int, "ChainCheckpoint"] = field(default_factory=dict)
     # Per-uid average score over the aggregator's rolling window, snapshotted
     # at freeze. Already fetched to order the eval queue; kept because it is
@@ -727,7 +727,7 @@ class Round:
 
     def mark_validation_failed(self, uid: int) -> None:
         """Mark a UID as failed through the miner's own fault: an off-spec
-        on-disk submission (hash/signature/expert_group/NaN-Inf mismatch
+        on-disk submission (hash/signature/residual-spec/NaN-Inf mismatch
         detected by `validate_miner_submission`) or a committed HF
         checkpoint that is confirmed not publicly retrievable (repo
         deleted/private/gated). Lands in both `failed_uids` and
