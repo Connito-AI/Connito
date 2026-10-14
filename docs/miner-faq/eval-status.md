@@ -51,28 +51,38 @@ Code: `connito/shared/telemetry.py:EVAL_STATUS_CODES`,
 
 ## `ok` (code 0)
 
-The miner's shard was downloaded, validated, evaluated on the task data,
-passed the c4 isolation check, and produced a finite `val_loss`. The miner is
+The miner's shard was downloaded, validated, evaluated on the task data and
+on c4, passed the c4 cutoff, and produced a finite round score. The miner is
 in the round's score map. This is the only "good" code.
 
-**Set by:** `connito/validator/evaluator.py:evaluate_one_miner_sync`, after the
-c4 check passes and the `math.isfinite(val_loss)` check passes.
+**`ok` does not mean a positive score.** The round score is the task gain
+over the pretrained base minus the c4-rise and gate-usage penalties, and it
+can be negative. Only a score above 0 earns a rank reward or can be
+published; shards from the reference miner have measured −0.14 to −0.17.
 
-**Miner action:** none. If `score_avg` is still 0, see `scoring.md` for why
-a successfully-evaluated miner can still rank outside the top 3 or fail to
-beat the pretrained baseline.
+**Set by:** `connito/validator/evaluator.py:evaluate_one_miner_sync`, after the
+c4 cutoff passes and the score is finite.
+
+**Miner action:** none for the status itself. If `score_avg` is still 0, see
+`scoring.md` ("Why a miner with low `val_loss` can still have `score = 0`"
+and "Gate usage: why a better loss can still score below 0"), and read your
+terms on the `validator_miner_score_term` gauge.
 
 ## `non_finite_loss` (code 1)
 
-The miner was downloaded, validated, and the task eval ran — but `val_loss`
-came back as NaN or Inf. The miner's round score is 0.
+The miner was downloaded, validated, and the eval ran — but the round score
+came out NaN or Inf (for example every task batch gave a NaN loss, so
+`val_loss` is `inf`). The score is set to `−inf`: the miner is not ranked
+and gets rank score 0.
 
-**Condition in code:** in `evaluate_one_miner_sync`, after the c4 isolation
-check:
+**Condition in code:** in `evaluate_one_miner_sync`, after the c4 cutoff:
 ```python
-if gated:                         # c4 isolation check failed
+if gated or not math.isfinite(score):
+    score = float("-inf")
+...
+if gated:                         # c4 cutoff failed
     set_miner_eval_status(int(uid), "replay_loss_increase")
-elif math.isfinite(val_loss):
+elif math.isfinite(score):
     set_miner_eval_status(int(uid), None)
 else:
     set_miner_eval_status(int(uid), "non_finite_loss")
@@ -354,21 +364,26 @@ Code: `connito/validator/background_download_worker.py` (search for
 
 ## `replay_loss_increase` (code 15)
 
-The c4 isolation check zeroed the miner. Besides the task eval, every
-validator scores each miner on a c4 replay split (general web text, about
-65,000 real tokens per round) and compares the miner's c4 loss with the
-pretrained base's on the same batches. A residual that improves the task but
-damages general text fails here. The miner's `val_loss` is reported as `inf`,
-and its round score is 0.
+The c4 cutoff stopped the miner. Besides the task eval, every validator
+scores each miner on a c4 replay split (general web text, about 65,000 real
+tokens per round) and compares the miner's c4 loss with the pretrained base's
+on the same batches. A residual that improves the task but damages general
+text fails here. The miner's score is `−inf` and its `val_loss` is reported
+as `inf`: it is never ranked (rank score 0), never published as the round
+winner, and kept off the podium.
+
+A c4 rise below the cutoff is not free: it is subtracted from the score as
+`replay_penalty`, along with the gate's usage on c4 tokens.
 
 **Condition in code:** in `evaluate_one_miner_sync`, the miner fails the
-check if
+cutoff if
 
 - `c4_loss − base_c4_loss` exceeds the locked
-  `evaluation.max_replay_loss_increase` (default 0.02 nats), or
+  `evaluation.max_replay_loss_increase` (default 0.02 nats), or the rise is
+  NaN, or
 - any c4 batch came back non-finite.
 
-The validator logs `evaluate_one_miner: c4 isolation gate failed; scoring 0`
+The validator logs `evaluate_one_miner: c4 isolation gate failed; not ranked`
 with `reason` (`increase` or `non_finite_batches`), `replay_loss_increase`
 and `tolerance=` (the value in force). The per-miner increase is also on the
 `validator_miner_replay_loss_increase{miner_uid}` gauge.
@@ -379,7 +394,7 @@ Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
 **Miner action:**
 - **Do not train on the same data every round.** Restarting from the
   published winner and training on the same stream again overfits: in a
-  measured run, the c4 loss rose by +0.06 and both miners were zeroed. With
+  measured run, the c4 loss rose by +0.06 and both miners were stopped. With
   each source shuffled per (hotkey, round), the c4 loss fell instead. See
   `miner-config.md`, "Vary your training data every round".
 - Keep the c4 replay rows in your training mix with their labels; they are
