@@ -12,7 +12,7 @@
 #
 # Miners do NOT use this image — only validators are containerized.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_IMAGE} AS base
 
 # Build-time provenance, baked into the image so `run.py` can report which
@@ -65,10 +65,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Install dependencies first so the layer caches across code changes.
-# Torch is pinned in requirements.txt; we add the CUDA 12.4 wheel index
+# Torch is pinned in requirements.txt; we add the CUDA 12.8 wheel index
 # so the right binary wheel is selected.
 COPY requirements.txt ./
-RUN pip install --extra-index-url https://download.pytorch.org/whl/cu124 \
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
         -r requirements.txt
 
 # Now copy the source. .dockerignore at the repo root keeps venvs, wandb
@@ -78,8 +78,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY connito ./connito
 # expert_groups/ ships with the code (per-task config.yaml + expert_assignment.json).
 # Baking them into the image guarantees the validator has the exact same
-# assignments as the connito/ package version it's paired with, so
-# `task.helper_group_id` lookups by group_id always resolve without
+# assignments as the connito/ package version it's paired with, without
 # depending on a host-side checkout. Compose can still bind-mount over
 # /app/expert_groups if a developer wants to iterate locally.
 COPY expert_groups ./expert_groups

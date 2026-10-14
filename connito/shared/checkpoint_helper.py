@@ -110,7 +110,7 @@ def save_state_dict_by_expert_group(
 
     Only expert-group shards are written. Non-expert (backbone) params are
     deliberately dropped — every participant reconstructs them deterministically
-    from ``config.model.model_path`` at startup via ``from_pretrained``, so
+    from the model family's pinned checkpoint at startup via ``from_pretrained``, so
     persisting and shipping them is wasted bandwidth and risks divergence
     between hosts that started from different bootstrap snapshots.
 
@@ -199,7 +199,7 @@ def save_state_dict_by_expert_group(
     for name, tensor in state_dict.items():
         layer_id, expert_id = get_layer_expert_id(name)
         # CASE 1: Not an expert parameter — drop. Every participant reconstructs
-        # the backbone deterministically from `config.model.model_path` at boot,
+        # the backbone deterministically from the model family's pinned checkpoint at boot,
         # so persisting these would be wasted bytes (and historically caused
         # divergence between validators when locally-trained shared weights
         # were retained in old globalver_* directories).
@@ -564,7 +564,7 @@ def compile_full_state_dict_from_path(checkpoint_path, expert_groups: list[int |
             # No filter: still skip any legacy `model_shared.*` file so that
             # backbone state from old globalver_* directories is never loaded
             # — the backbone is reproduced deterministically from
-            # `config.model.model_path` at instantiation time, see the
+            # the model family's pinned checkpoint at instantiation time, see the
             # rationale in `save_state_dict_by_expert_group`.
             filename = Path(file_path).name
             return filename not in ("model_shared.safetensors", "model_shared.pt")
@@ -637,7 +637,6 @@ def load_checkpoint(
     inner_scaler: torch.amp.GradScaler | None = None,
     outer_scaler: torch.amp.GradScaler | None = None,
     data_loader: StatefulDataLoader | None = None,
-    expert_groups: list[int | str] | None = None,
 ) -> float:
     """Load the model and optimizer state from a checkpoint folder
 
@@ -659,7 +658,7 @@ def load_checkpoint(
             precision = "fp16-mixed"
         model_dtype = torch.bfloat16 if precision == "bf16-mixed" else torch.float16
 
-        full_state_dict = compile_full_state_dict_from_path(checkpoint_path, expert_groups=expert_groups)
+        full_state_dict = compile_full_state_dict_from_path(checkpoint_path)
         for key, value in full_state_dict.items():
             if torch.is_tensor(value) and torch.is_floating_point(value) and value.dtype != model_dtype:
                 full_state_dict[key] = value.to(dtype=model_dtype)

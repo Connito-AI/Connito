@@ -20,7 +20,6 @@ from connito.shared.config import MinerConfig
 
 SHIPPED = "exp_nemotron_c4"
 TARGET = "exp_switch_target"
-HELPER = "exp_helper"
 
 
 def _task_dir(root: Path, name: str, group_id: int, org_base: int) -> None:
@@ -36,7 +35,6 @@ def _task_dir(root: Path, name: str, group_id: int, org_base: int) -> None:
 def config(tmp_path: Path) -> MinerConfig:
     _task_dir(tmp_path, SHIPPED, group_id=4, org_base=10)
     _task_dir(tmp_path, TARGET, group_id=7, org_base=20)
-    _task_dir(tmp_path, HELPER, group_id=2, org_base=30)
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({
         "run": {"root_path": str(tmp_path)},

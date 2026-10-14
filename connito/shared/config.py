@@ -192,16 +192,16 @@ class ModelCfg(BaseConfig):
     # `quantization` and `quantization_validator` are locked so the fleet cannot
     # drift into validators scoring under different scopes, which breaks
     # cross-validator val_loss comparability. `quantization_miner` is not locked
-    # — it only affects that miner's own VRAM.
+    # — it only affects that miner's own VRAM. `family` is locked because every
+    # node must load the same checkpoint.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "model_path", "base_arch_model", "quantization", "quantization_validator",
+        "family", "precision", "quantization", "quantization_validator",
     })
-    model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
-    base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
+    # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
+    family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
     foundation: bool = True
     torch_compile: bool = False
-    attn_implementation: str = "sdpa"
-    precision: str = "fp16-mixed"
+    precision: str = "bf16-mixed"  # locked: both families are published in bf16
     device: str = "cuda"
     # fp8 weight-only storage for modules a role never trains. `quantization`
     # picks the format, the per-role fields pick the scope. See
@@ -484,37 +484,12 @@ class DataloaderCfg(BaseConfig):
     world_size: int = 10  # number of distinct data shards (typically = number of validators)
 
 
-class MoECfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
-    })
-    interleave: bool = True
-    num_experts: PositiveInt = 8
-    num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 6
-    # DeepSeek-V2-Lite's own `num_experts_per_tok`, matching `partial_topk`.
-    # Read by `mycelia.get_base_model` whenever `partial=False`, where it is the
-    # only thing that sets routing width — a wrong value routes at the wrong
-    # width and raises nothing.
-    full_topk: PositiveInt = 6
-    aux_load_balance: bool = True
-    router_aux_loss_coef: float = 1.0
-    # The model the miner trains. "full" holds every routed expert and routes
-    # natively at `full_topk` — the model validators score. "partial" holds
-    # only the active and helper groups and fits smaller GPUs. Only the active
-    # group trains either way. Replaces `partial_moe`, which nothing read: a
-    # new name, so configs written with that field still get this default.
-    miner_topology: Literal["full", "partial"] = "full"
-    num_worker_groups: PositiveInt = 2
-
-
 class OptimizerCfg(BaseConfig):
     lr: float = 1e-4
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
     # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
-    #   32 -> torch.optim.AdamW, fp32 state (default). Fits DeepSeek-V2-Lite
-    #         2Fnat on a 47GB A6000 at sequence_length 1024.
+    #   32 -> torch.optim.AdamW, fp32 state (default), 8 bytes per trainable param.
     #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
     #         an alternative when running fp32 at a larger sequence_length.
     # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
@@ -562,9 +537,8 @@ class CheckpointCfg(BaseConfig):
     download_concurrency: PositiveInt = 1
     # When True, skip the chain-fetch of the validator's latest checkpoint
     # AND the on-disk overlay in get_model_from_checkpoint. The model returns
-    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
-    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
-    # backbone). Overrides resume_from_ckpt.
+    # with pretrained base weights only — useful for cold-start experiments
+    # (LR sweeps starting from the base backbone). Overrides resume_from_ckpt.
     use_pretrained_only: bool = False
     # When True (default) the miner's inner-opt-step loop calls the
     # "(5) Reload Model" branch that re-runs setup_training if it finds a
@@ -676,30 +650,11 @@ class TaskCfg(BaseConfig):
     # unchanged, its authority just moved from a code constant to the API, so a
     # new task no longer needs a release. The value here is the fallback used
     # when the API is unreachable.
-    #
-    # `helper_group_id` and `routing_mode` stay locked for the natural-routing
-    # (2Fnat) consensus contract and are independent of the dataset.
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "helper_group_id", "routing_mode",
-    })
     expert_group_name: str = "exp_nemotron_c4"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
-    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
-    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
-    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
-    # frozen-helper slot). Set to None to disable the pairing — the routing
-    # branch self-gates and falls through to masked-topk.
-    helper_group_id: int | None = 2
-    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
-    # is the default: base gate runs unmasked, natural picks landing in the
-    # trainable set are kept as-is, non-trainable picks get replaced by the
-    # token's top-scoring helper. Falls back to masked-topk automatically when
-    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
-    # to force the pre-2Fnat behavior.
-    routing_mode: str = "natural_with_fallback"
 
 
 # ---------------------------
@@ -718,7 +673,6 @@ class WorkerConfig(BaseConfig):
     run: RunCfg = Field(default_factory=RunCfg)
     chain: ChainCfg = Field(default_factory=ChainCfg)
     model: ModelCfg = Field(default_factory=ModelCfg)
-    moe: MoECfg = Field(default_factory=MoECfg)
     ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
     hf: HfCfg = Field(default_factory=HfCfg)
     sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
@@ -896,7 +850,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
     def from_path(
