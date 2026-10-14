@@ -113,12 +113,31 @@ VALIDATOR_MINER_WEIGHT_SUBMITTED = Gauge(
 # Per-miner validation loss measured against this validator's eval set. High-cardinality (one series per miner UID) but bounded by
 # subnet size (~100s); same shape as `validator_miner_score`. Set inside
 # `evaluate_one_miner` immediately after the val_loss is computed.
-# Aggregators compute `delta_loss = max(0, validator_baseline_loss -
-# validator_miner_val_loss)` as needed.
+# Aggregators compute `delta_loss = validator_baseline_loss -
+# validator_miner_val_loss` as needed; the round score is `validator_miner_round_delta`.
 VALIDATOR_MINER_VAL_LOSS = Gauge(
     "validator_miner_val_loss",
     "Per-miner validation loss measured against this validator's eval set",
     ["miner_uid"],
+)
+# Per-miner c4 replay loss minus the round base's: the value the isolation gate
+# compares with `max_replay_loss_increase`.
+VALIDATOR_MINER_REPLAY_LOSS_INCREASE = Gauge(
+    "validator_miner_replay_loss_increase",
+    "Per-miner c4 replay loss minus the round base's replay loss",
+    ["miner_uid"],
+)
+# Per-miner terms of the round score: the task gain, and each penalty as the positive magnitude the score
+# subtracts. The replay terms are set only when the c4 eval ran.
+VALIDATOR_MINER_SCORE_TERM = Gauge(
+    "validator_miner_score_term",
+    "Per-miner term of the round score: task_gain, replay_penalty, usage_penalty or replay_usage_penalty",
+    ["miner_uid", "term"],
+)
+VALIDATOR_MINER_GATE_USAGE = Gauge(
+    "validator_miner_gate_usage",
+    "Per-miner mean residual gate usage (sum of q over the K experts) on real tokens, on the task or replay split",
+    ["miner_uid", "split"],
 )
 # Round-level baseline loss: this validator's eval loss against the
 # round's global model, computed once per round at freeze. Single value
@@ -142,6 +161,19 @@ VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
     "Round baseline loss (this validator's eval set), labeled by the "
     "round it belongs to. Stable per round; the unlabeled validator_baseline_loss "
     "is retained for backward compat.",
+    ["round_id"],
+)
+# The base's own raw score on the round's baseline evals (its gate-usage terms), which every miner's
+# score is measured from. Set with the baseline loss, so never on a fallback round; per round, and
+# the last measured round's value unlabeled.
+VALIDATOR_ROUND_BASE_RAW_SCORE = Gauge(
+    "validator_round_base_raw_score",
+    "Raw score of the last measured round's base on its own baseline evals; not set on a fallback round",
+)
+VALIDATOR_ROUND_BASE_RAW_SCORE_BY_ROUND = Gauge(
+    "validator_round_base_raw_score_by_round",
+    "Raw score of the round base on its own baseline evals, labeled by the round it belongs to; "
+    "each miner's score is its raw score minus this",
     ["round_id"],
 )
 # Numeric ID of the current round, set when `Round.freeze` returns and
@@ -274,8 +306,9 @@ VALIDATOR_MINER_LAST_SCORED_ROUND_ID = Gauge(
 )
 VALIDATOR_MINER_ROUND_DELTA = Gauge(
     "validator_miner_round_delta",
-    "Raw per-round improvement signal ((baseline - val_loss) ** 1.2, >= 0) "
-    "from the miner's most recent evaluated round. Distinct from "
+    "Per-round score from the miner's most recent evaluated round: task gain minus the c4 and "
+    "gate-usage penalties, less the base's own; negative below the base, -Inf when the c4 isolation "
+    "gate failed. Distinct from "
     "validator_miner_score_latest, which is the finalized podium rank score.",
     ["miner_uid"],
 )
@@ -352,7 +385,6 @@ MINER_GRAD_ACCUM_STEPS = Gauge("miner_grad_accum_steps", "Gradient accumulation 
 
 # MoE / Expert Routing (Gauges)
 MOE_EXPERT_LOAD = Gauge("moe_expert_load", "Tokens routed to each expert", ["layer_idx", "expert_idx"])
-MOE_AUX_LOSS = Gauge("moe_aux_loss", "Router load-balance loss")
 MOE_EXPERTS_ACTIVE = Gauge("moe_experts_active_count", "Number of experts that received tokens in batch")
 MOE_ROUTING_ENTROPY = Gauge("moe_topk_routing_entropy", "Diversity of routing decisions")
 MOE_EXPERT_UTILIZATION = Gauge("moe_expert_utilization_ratio", "Utilization proportion per group/layer", ["group_idx", "layer_idx"])
@@ -361,7 +393,7 @@ MINER_TOTAL_TOKENS = Gauge("miner_total_tokens", "Cumulative tokens processed si
 MINER_TOTAL_SAMPLES = Gauge("miner_total_samples", "Cumulative samples processed since run start")
 MINER_STEP_TIME_HOURS = Gauge("miner_step_time_hours", "Wall-clock time of the last inner step (hours)")
 MINER_TOTAL_TRAINING_TIME_HOURS = Gauge("miner_total_training_time_hours", "Total accumulated training time (hours)")
-MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of expert parameter values (health check)")
+MINER_PARAM_SUM = Gauge("miner_param_sum", "Sum of residual parameter values (health check)")
 
 # Histograms (Latency & Sizes)
 EVAL_LATENCY_SECONDS = Histogram("validator_eval_latency_seconds", "Latency of run_evaluation()")
@@ -400,20 +432,20 @@ EvalFailureReason = Literal[
     "no_chain_commit",
     "signature_invalid",
     "hash_mismatch",
-    "expert_group_or_nan",
-    "incomplete_expert_set",
+    "bad_residual_shard",
     "non_finite_loss",
     "download_failed",
     "statedict_parse_failed",
     "repo_unavailable",
+    "replay_loss_increase",
 ]
 _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
     "deadline",
     "no_chain_commit", "signature_invalid", "hash_mismatch",
-    "expert_group_or_nan", "non_finite_loss",
+    "bad_residual_shard", "non_finite_loss",
     "download_failed", "statedict_parse_failed",
-    "repo_unavailable",
+    "repo_unavailable", "replay_loss_increase",
 })
 
 # Stable integer codes surfaced by VALIDATOR_MINER_EVAL_STATUS. Treat as a
@@ -426,7 +458,7 @@ EVAL_STATUS_CODES: dict[int, str] = {
     2: "statedict_parse_failed",
     3: "signature_invalid",
     4: "hash_mismatch",
-    5: "expert_group_or_nan",
+    5: "expert_group_or_nan",  # retired with expert groups; never reused
     6: "no_chain_commit",
     7: "download_failed",
     8: "oom",
@@ -434,7 +466,9 @@ EVAL_STATUS_CODES: dict[int, str] = {
     10: "deadline_exceeded",
     11: "rpc_error",
     12: "repo_unavailable",
-    13: "incomplete_expert_set",
+    13: "incomplete_expert_set",  # retired with expert groups; never reused
+    14: "bad_residual_shard",
+    15: "replay_loss_increase",
     99: "unknown",
 }
 _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
@@ -442,7 +476,6 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "statedict_parse_failed": 2,
     "signature_invalid": 3,
     "hash_mismatch": 4,
-    "expert_group_or_nan": 5,
     "no_chain_commit": 6,
     "download_failed": 7,
     "oom": 8,
@@ -450,7 +483,8 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "deadline": 10,
     "rpc": 11,
     "repo_unavailable": 12,
-    "incomplete_expert_set": 13,
+    "bad_residual_shard": 14,
+    "replay_loss_increase": 15,
     # Legacy aliases — fold into the closest miner-facing code so old
     # call sites continue producing meaningful status values.
     "corrupt": 2,
@@ -499,13 +533,13 @@ def set_miner_last_scored_round(miner_uid: int | str, round_id: int) -> None:
         pass
 
 
-def set_miner_round_delta(miner_uid: int | str, delta: float) -> None:
-    """Record the raw per-round improvement signal for an evaluated miner.
+def set_miner_round_delta(miner_uid: int | str, score: float) -> None:
+    """Record the raw per-round score for an evaluated miner.
 
     Best-effort — never raises.
     """
     try:
-        VALIDATOR_MINER_ROUND_DELTA.labels(miner_uid=str(miner_uid)).set(float(delta))
+        VALIDATOR_MINER_ROUND_DELTA.labels(miner_uid=str(miner_uid)).set(float(score))
     except Exception:
         pass
 
@@ -584,9 +618,10 @@ def set_round_progress(
         pass
 
 
-def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
-    """Publish a round's eval baseline loss to BOTH the unlabeled
-    gauge (backward compat) and the per-round labeled family.
+def set_baseline_loss(round_id: int, baseline_loss: float, base_raw: float) -> None:
+    """Publish a round's eval baseline loss, and the base's raw score, to
+    BOTH the unlabeled gauges (backward compat) and the per-round labeled
+    families.
 
     Registers the round_id for eviction so the labeled series is pruned on
     the same cutoff as the other per-round families. Round creation already
@@ -600,6 +635,8 @@ def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
         VALIDATOR_BASELINE_LOSS.set(value)
         note_round_series(int(round_id))
         VALIDATOR_BASELINE_LOSS_BY_ROUND.labels(round_id=str(int(round_id))).set(value)
+        VALIDATOR_ROUND_BASE_RAW_SCORE.set(float(base_raw))
+        VALIDATOR_ROUND_BASE_RAW_SCORE_BY_ROUND.labels(round_id=str(int(round_id))).set(float(base_raw))
     except Exception:
         pass
 
@@ -629,6 +666,7 @@ def evict_round_series_before(min_round_id: int) -> int:
                     VALIDATOR_ROUND_MINERS_FAILED,
                     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
                     VALIDATOR_BASELINE_LOSS_BY_ROUND,
+                    VALIDATOR_ROUND_BASE_RAW_SCORE_BY_ROUND,
                 ):
                     try:
                         family.remove(rid)

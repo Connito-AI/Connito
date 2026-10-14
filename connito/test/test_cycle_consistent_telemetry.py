@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from prometheus_client import REGISTRY
+
 from connito.shared import telemetry as T
 from connito.validator import round_journal as RJ
 from connito.validator.evaluator import finalize_round_scores
@@ -346,7 +348,7 @@ def test_finalize_recovery_path_reemits_commits(tmp_path):
 
 def test_set_baseline_loss_sets_both_gauges():
     rid = 920_100
-    T.set_baseline_loss(rid, 1.8342)
+    T.set_baseline_loss(rid, 1.8342, -0.25)
     # Unlabeled gauge carries the latest value (backward compat).
     unlabeled = _samples_for(T.VALIDATOR_BASELINE_LOSS, "validator_baseline_loss")
     assert unlabeled and unlabeled[0].value == 1.8342
@@ -360,6 +362,9 @@ def test_set_baseline_loss_sets_both_gauges():
     ]
     assert len(labeled) == 1
     assert labeled[0].value == 1.8342
+    # The base's raw score, the same way.
+    assert REGISTRY.get_sample_value("validator_round_base_raw_score") == -0.25
+    assert REGISTRY.get_sample_value("validator_round_base_raw_score_by_round", {"round_id": str(rid)}) == -0.25
     # round_id registered for eviction.
     assert rid in T._EMITTED_ROUND_IDS
 
@@ -368,8 +373,8 @@ def test_set_baseline_loss_labeled_is_stable_per_round():
     # A second round's baseline does not disturb the first round's labeled
     # value — the whole point of the per-round label vs the overwritten
     # unlabeled gauge.
-    T.set_baseline_loss(920_200, 2.0)
-    T.set_baseline_loss(920_724, 3.0)
+    T.set_baseline_loss(920_200, 2.0, -0.2)
+    T.set_baseline_loss(920_724, 3.0, -0.3)
     by_round = {
         s.labels["round_id"]: s.value
         for s in _samples_for(
@@ -389,7 +394,7 @@ def test_evict_round_series_before():
     for rid in (old_rid, new_rid):
         T.note_round_series(rid)
         T.VALIDATOR_ROUND_MINERS_SCORED.labels(round_id=str(rid)).set(5)
-        T.VALIDATOR_BASELINE_LOSS_BY_ROUND.labels(round_id=str(rid)).set(1.8)
+        T.set_baseline_loss(rid, 1.8, -0.2)
     removed = T.evict_round_series_before(new_rid)
     assert removed >= 1
     rids = {
@@ -409,5 +414,8 @@ def test_evict_round_series_before():
     }
     assert str(old_rid) not in baseline_rids
     assert str(new_rid) in baseline_rids
+    base_raw = {rid: REGISTRY.get_sample_value("validator_round_base_raw_score_by_round", {"round_id": str(rid)})
+                for rid in (old_rid, new_rid)}
+    assert base_raw == {old_rid: None, new_rid: -0.2}
     # Idempotent / KeyError-safe on repeat.
     assert T.evict_round_series_before(new_rid) == 0

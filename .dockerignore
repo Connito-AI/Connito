@@ -35,10 +35,8 @@ wandb
 metrics
 bittensor_subnetinfo_daily
 # NOTE: expert_groups/ is intentionally NOT excluded here — it's the
-# static per-task config + expert_assignment.json set that ships with the
-# code. The Dockerfile COPYs it in so validators/miners always have the
-# same versioned assignments as the connito/ package they're paired with.
-# ~120 KB total; negligible image bloat.
+# shipped default task's config.yaml. The Dockerfile COPYs it in so a
+# validator that cannot reach the owner API still has a task to boot on.
 
 # Big binary blobs that must not bloat the build context
 *.pt

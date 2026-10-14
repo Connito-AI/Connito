@@ -18,7 +18,6 @@ from connito.shared.telemetry import (
     MINER_GRAD_NORM,
     MINER_TOKENS_PER_SEC,
     MINER_GRAD_ACCUM_STEPS,
-    MOE_AUX_LOSS,
     VALIDATOR_EVAL_LOSS,
     MINER_PERPLEXITY,
     MINER_TOTAL_TOKENS,
@@ -135,8 +134,6 @@ class MetricLogger:
                 MINER_GRAD_NORM.set(flat["grad_norm"])
             if "gradient_accumulation_steps" in flat and isinstance(flat["gradient_accumulation_steps"], (int, float)):
                 MINER_GRAD_ACCUM_STEPS.set(flat["gradient_accumulation_steps"])
-            if "aux_loss" in flat and isinstance(flat["aux_loss"], (int, float)):
-                MOE_AUX_LOSS.set(flat["aux_loss"])
             if "perplexity" in flat and isinstance(flat["perplexity"], (int, float)):
                 MINER_PERPLEXITY.set(flat["perplexity"])
             if "total_tokens" in flat and isinstance(flat["total_tokens"], (int, float)):

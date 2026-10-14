@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
 
+import torch
 from datasets import load_dataset, interleave_datasets, Features, Value
 from datasets.distributed import split_dataset_by_node
 from torch.utils.data import IterableDataset as TorchIterableDataset
@@ -182,13 +183,13 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         train: bool = True,
         seed: str | int | None = None,
         fraction: float | None = None,
+        replay: bool | None = None,
     ):
         split_name = "train" if train else "validation"
 
         def _load_streaming_split(
             ds_name: str,
             ds_config: str | None = None,
-            trust_remote_code: bool = False,
             split_override: str | None = None,
         ):
             """Load one source's streaming split, falling back to 'train' when the wanted split is absent.
@@ -202,13 +203,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 load_kwargs: dict[str, Any] = {"streaming": True, "revision": "main"}
                 if ds_config is not None:
                     load_kwargs["name"] = ds_config
-                if trust_remote_code:
-                    # Authorize HF to execute the dataset repo's custom
-                    # builder script. Opt-in per source via
-                    # DatasetSourceCfg.trust_remote_code; never on by
-                    # default. See config.DatasetSourceCfg for the
-                    # rationale.
-                    load_kwargs["trust_remote_code"] = True
 
                 ds = load_dataset(ds_name, **load_kwargs)
                 if wanted_split in ds:
@@ -292,6 +286,9 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 return source.get(key, default)
             return getattr(source, key, default)
 
+        if replay is not None:
+            source_specs = [s for s in source_specs if bool(_source_value(s, "replay", False)) == replay]
+
         # Force all source text columns to be a standard 'string' under the common key 'text'
         common_features = Features({"text": Value("string")})
 
@@ -354,7 +351,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             text_template = _source_value(source, "text_template")
             source_split_name = _source_value(source, "split")
             weight = float(_source_value(source, "weight", 1.0))
-            trust_remote_code = bool(_source_value(source, "trust_remote_code", False))
 
             if not ds_name:
                 raise ValueError("Each dataset source must define a non-empty 'path'.")
@@ -395,7 +391,6 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
                 source_split = _load_streaming_split(
                     ds_name,
                     ds_config=ds_config,
-                    trust_remote_code=trust_remote_code,
                     split_override=source_split_name,
                 )
 
@@ -568,6 +563,8 @@ def get_dataloader(
     train: bool = True,
     format_fn: Callable | None = None,
     data_collator: DataCollator | None = None,
+    batch_size: int | None = None,
+    replay: bool | None = None,
 ) -> StatefulDataLoader:
     """
     Build a `StatefulDataLoader` over a streaming HF dataset, tokenized on the fly.
@@ -591,6 +588,10 @@ def get_dataloader(
     train : bool
         If True, returns a loader over the training split; else returns a loader for validation
         (or None if the dataset has no validation split).
+    batch_size : Optional[int]
+        Rows per batch; defaults to the task's `per_device_train_batch_size`, the validator's eval batch.
+    replay : Optional[bool]
+        Keep only the sources whose `replay` flag equals it; None keeps them all.
 
     Returns
     -------
@@ -616,6 +617,7 @@ def get_dataloader(
         train=train,
         seed=seed,  # e.g. combined validator seed
         fraction=config.task.exp.data.vali_fraction,  # use ~20% of the dataset
+        replay=replay,
     )
 
     # Collator for causal LM (no MLM)
@@ -630,7 +632,7 @@ def get_dataloader(
     loader = StatefulDataLoader(
         tokenised_dataset,  # split
         collate_fn=data_collator,
-        batch_size=config.task.exp.data.per_device_train_batch_size,
+        batch_size=batch_size or config.task.exp.data.per_device_train_batch_size,
         num_workers=num_workers,
     )
     return loader
@@ -661,3 +663,28 @@ def materialize_batches(
     GPU per-batch as before.
     """
     return list(itertools.islice(dataloader, max_batches + 1))
+
+
+def materialize_by_tokens(dataloader: Iterable, min_tokens: int, max_positions: int) -> list[dict]:
+    """Pull rows up to `min_tokens` real tokens; batch them by length, padding cut, within `max_positions`."""
+    rows, tokens = [], 0
+    for row in ({k: v[i] for k, v in batch.items()} for batch in dataloader for i in range(len(batch["input_ids"]))):
+        length = int(row["attention_mask"].sum())
+        if length < 2:
+            continue  # no labelled token after the shift; a batch of only such rows is NaN for every model
+        rows.append(row)
+        tokens += length
+        if tokens >= min_tokens:
+            break
+    rows.sort(key=lambda r: int(r["attention_mask"].sum()))
+    groups: list[list[dict]] = []
+    for row in rows:
+        length = int(row["attention_mask"].sum())
+        if not groups or (len(groups[-1]) + 1) * length > max_positions:
+            groups.append([])
+        groups[-1].append(row)
+    # Sorted ascending, so a group's last row is its longest.
+    return [
+        {k: torch.stack([r[k][: int(g[-1]["attention_mask"].sum())] for r in g]) for k in g[0]}
+        for g in groups
+    ]

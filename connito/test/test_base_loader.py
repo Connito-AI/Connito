@@ -42,7 +42,7 @@ FIXTURE = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_
 def _config(monkeypatch, name: str, path: Path) -> SimpleNamespace:
     """A config naming `name`, whose family record points at the tiny checkpoint in `path`."""
     monkeypatch.setitem(FAMILIES, name, replace(FAMILIES[name], model_path=str(path)))
-    return SimpleNamespace(model=SimpleNamespace(family=name, torch_compile=False))
+    return SimpleNamespace(model=SimpleNamespace(family=name))
 
 
 @pytest.fixture(params=sorted(FAMILIES))
@@ -175,27 +175,6 @@ def test_deepseek_v2_moe_block_computes_from_the_per_expert_tensors(tiny_deepsee
         torch.testing.assert_close(block(h[None])[0], expected)
 
 
-def test_expert_tensors_are_read_at_the_familys_revision(tiny_deepseek_v2_checkpoint, monkeypatch):
-    config = _config(monkeypatch, "deepseek_v2", tiny_deepseek_v2_checkpoint)
-    weights = load_file(str(tiny_deepseek_v2_checkpoint / "model.safetensors"))
-    index = {"weight_map": dict.fromkeys(weights, "model.safetensors")}
-    (tiny_deepseek_v2_checkpoint / "model.safetensors.index.json").write_text(json.dumps(index))
-    revisions: list[str] = []
-
-    def _cached_file(path, filename, revision):
-        revisions.append(revision)
-        return str(Path(path) / filename)
-
-    monkeypatch.setattr(mycelia, "cached_file", _cached_file)
-
-    tensors = mycelia.load_pretrained_expert_tensors(config, {1: [(0, 3), (1, 5)]})
-
-    assert revisions == [family(config).revision] * 2
-    assert set(tensors) == {
-        f"model.layers.1.mlp.experts.{i}.{p}_proj.weight" for i in (3, 5) for p in ("gate", "up", "down")
-    }
-
-
 def test_deepseek_v2_attention_keeps_the_yarn_mscale(tiny_deepseek_v2_checkpoint, monkeypatch):
     """YaRN scales V2's attention by mscale(factor, mscale_all_dim)²; staging_v3's transformers 4 build left it out."""
     model = mycelia.get_base_model(_config(monkeypatch, "deepseek_v2", tiny_deepseek_v2_checkpoint))
@@ -203,3 +182,35 @@ def test_deepseek_v2_attention_keeps_the_yarn_mscale(tiny_deepseek_v2_checkpoint
     # The fixture's qk_nope_head_dim + qk_rope_head_dim, mscale_all_dim and factor.
     expected = (16 + 8) ** -0.5 * (0.1 * 0.707 * math.log(40) + 1) ** 2
     assert [layer.self_attn.scaling for layer in model.model.layers] == pytest.approx([expected] * 3)
+
+
+def test_the_two_tiny_checkpoints_do_not_share_a_directory(tiny_qwen_checkpoint, tiny_deepseek_v2_checkpoint):
+    model_types = {json.loads((p / "config.json").read_text())["model_type"]
+                   for p in (tiny_qwen_checkpoint, tiny_deepseek_v2_checkpoint)}
+
+    assert model_types == {"qwen3_5_moe", "deepseek_v2"}
+
+
+def _splitting(causal_lm: type, how: str) -> type:
+    """`causal_lm`, but `from_pretrained` returns the model split over two devices, as device_map would."""
+    class Split(causal_lm):
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            model, info = causal_lm.from_pretrained(*args, **kwargs)
+            if how == "device_map":
+                model.hf_device_map = {"model": 0, "lm_head": 1}
+            else:
+                model.lm_head.to("meta")
+            return model, info
+
+    return Split
+
+
+@pytest.mark.parametrize("how", ["device_map", "parameters"])
+def test_a_model_split_over_two_devices_is_refused(checkpoint, monkeypatch, how):
+    config, _ = checkpoint
+    name = config.model.family
+    monkeypatch.setitem(FAMILIES, name, replace(FAMILIES[name], causal_lm=_splitting(FAMILIES[name].causal_lm, how)))
+
+    with pytest.raises(RuntimeError, match="Load it onto one GPU"):
+        mycelia.get_base_model(config)

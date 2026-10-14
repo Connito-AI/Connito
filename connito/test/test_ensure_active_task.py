@@ -17,7 +17,7 @@ import yaml
 from connito.shared import task_sync
 from connito.shared.config import MinerConfig
 
-SHIPPED = "exp_nemotron_c4"
+SHIPPED = "exp_pmc_residual"
 TARGET = "exp_owner_named"
 
 
@@ -27,7 +27,6 @@ def _task_dir(root: Path, name: str, group_id: int) -> None:
     d = root / "expert_groups" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.yaml").write_text(yaml.safe_dump(body))
-    (d / "expert_assignment.json").write_text(json.dumps({"0": [[0, 10], [1, 11]]}))
 
 
 @pytest.fixture
@@ -101,6 +100,21 @@ def test_a_failed_write_keeps_the_fallback_without_raising(config, monkeypatch) 
 
     task_sync.ensure_active_task(config, TARGET)
 
+    assert config.task.expert_group_name == SHIPPED
+    assert config.task.exp.group_id == 4
+
+
+def test_a_bundle_without_residual_settings_is_refused(config, monkeypatch) -> None:
+    """It passes its hash and lands on disk, but the switch onto it is refused."""
+    served = json.loads((Path(__file__).parent / "fixtures" / "active_task_bundle.json").read_text())
+    bundle = task_sync.TaskBundle(**served | {"name": TARGET})
+    del bundle.config["residual"]
+    bundle.bundle_sha256 = bundle.canonical_sha256()
+    monkeypatch.setattr(task_sync, "get_active_task_bundle", lambda cycle: bundle)
+
+    task_sync.ensure_active_task(config, TARGET)
+
+    assert (config.task.base_path / TARGET / "config.yaml").is_file()
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
 

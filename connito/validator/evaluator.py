@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import math
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.checkpoint_helper import TensorSpec
 from connito.shared.dataloader import get_dataloader
 from connito.shared.evaluate import EvalDeadlineExceeded, evaluate_model
 from connito.shared.helper import (
@@ -18,6 +20,9 @@ from connito.shared.helper import (
 )
 from connito.shared.telemetry import (
     EvalFailureReason,
+    VALIDATOR_MINER_GATE_USAGE,
+    VALIDATOR_MINER_REPLAY_LOSS_INCREASE,
+    VALIDATOR_MINER_SCORE_TERM,
     VALIDATOR_MINER_VAL_LOSS,
     inc_eval_failure,
     set_miner_eval_status,
@@ -33,13 +38,12 @@ logger = structlog.get_logger(__name__)
 # `validator_miner_eval_failures_total` Counter and the
 # `validator_miner_eval_status` Gauge. Each row gets its own miner-facing
 # bucket so a miner reading the gateway can tell a bad signature apart from
-# a hash mismatch or an expert-group / NaN-Inf violation.
+# a hash mismatch or a shard off the residual spec.
 _VALIDATION_FAIL_TO_REASON: dict[str, EvalFailureReason] = {
     "no_chain_commit": "no_chain_commit",
     "signature": "signature_invalid",
     "hash": "hash_mismatch",
-    "expert_group_or_nan": "expert_group_or_nan",
-    "incomplete_expert_set": "incomplete_expert_set",
+    "bad_residual_shard": "bad_residual_shard",
     "unknown": "unknown",
 }
 
@@ -148,7 +152,7 @@ def cleanup_non_top_submissions(
 
 
 # Rank → score mapping used by `finalize_round_scores`. Geometric
-# progression with ratio 1.5: top-1 in the round's delta ranking gets
+# progression with ratio 1.5: top-1 in the round's score ranking gets
 # 2.25, runner-up 1.5, third 1.0; everyone else (and every failed /
 # missing miner) gets 0.0. The geometric spacing concentrates more
 # reward weight at the top — `top1 / top3 = 2.25` vs. the previous
@@ -168,19 +172,20 @@ def finalize_round_scores(
     score_path=None,
 ) -> dict[int, float]:
     """Write this round's per-miner aggregator entries as rank-based scores
-    derived from `round.scores` (the delta-based per-round signal recorded
-    by `mark_scored`). Sole writer to the aggregator for this round_id.
+    derived from `round.scores` (the per-round score recorded by
+    `mark_scored`). Sole writer to the aggregator for this round_id.
 
     Drops every point tagged with `round.round_id` first — a no-op on the
     live path, but the startup replay of an unfinalized journal re-derives
     a round the previous process may have partly written — then adds:
 
-      - Top-1 by `round.scores` (delta desc): score 2.25.
+      - Top-1 by `round.scores` (score desc): score 2.25.
       - Top-2: score 1.5.
       - Top-3: score 1.0.
-      - Other scored UIDs (incl. delta=0): score 0.
+      - Other scored UIDs (incl. score <= 0, and -inf for a c4 gate
+        failure): score 0.
       - Any UIDs whose `round.scores` value exactly equals another
-        scored miner's: score 0 — a tied val_loss is evidence of a
+        scored miner's: score 0 — a tied score is evidence of a
         duplicated submission, so both sides are penalized regardless
         of where they would have ranked.
       - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf, or a
@@ -199,9 +204,10 @@ def finalize_round_scores(
     and receive no entry. They keep their prior EMA and the next
     round's stalest-first prioritization gives them another shot.
 
-    Miners whose `round.scores` value is 0.0 are explicitly excluded
-    from the top-3 ranking so a "best of a bad bunch" miner cannot
-    collect reward weight without actually improving over baseline.
+    Miners whose `round.scores` value is not above 0.0, the baseline's
+    score, are explicitly excluded from the top-3 ranking so a "best of a
+    bad bunch" miner cannot collect reward weight without actually
+    improving over baseline.
 
     Returns ``{uid: rank_score}`` for the UIDs the function wrote, for
     logging.
@@ -220,15 +226,15 @@ def finalize_round_scores(
 
     score_aggregator.drop_round(round_obj.round_id)
 
-    # Rank only positive-delta miners — see the docstring's "best of a
+    # Rank only positive-score miners — see the docstring's "best of a
     # bad bunch" clause.
     positive = [
         (uid, score) for uid, score in round_scores.items()
         if uid in scored and score > 0.0
     ]
-    # Group by exact score value: any miner whose val_loss matches
+    # Group by exact score value: any miner whose score matches
     # another miner's gets 0 regardless of where they would have ranked.
-    # `score = (baseline_loss - val_loss) ** 1.2` with float64 math —
+    # The score is float64 math over the miner's losses and gate usage —
     # exact equality between two miners is overwhelmingly evidence of a
     # duplicated submission, not legitimate parallel improvement, so
     # penalize both sides. Unique-score miners are then ranked normally
@@ -253,7 +259,7 @@ def finalize_round_scores(
         written[uid] = rank_score
         top_uids.add(uid)
 
-    # Tied positive-delta miners — explicit 0 entry per uid.
+    # Tied positive-score miners — explicit 0 entry per uid.
     for uid in tied_uids:
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
@@ -264,7 +270,7 @@ def finalize_round_scores(
         written[uid] = 0.0
         top_uids.add(uid)
 
-    # Remaining scored UIDs (delta == 0 or beyond top-3): score 0.
+    # Remaining scored UIDs (score <= 0 or beyond top-3): score 0.
     for uid in scored - top_uids:
         hotkey = round_obj.uid_to_hotkey.get(uid)
         if hotkey is None:
@@ -303,7 +309,7 @@ def finalize_round_scores(
     # never reach that point, so without this loop the gateway has no signal
     # for "we knew at freeze you had no/invalid commit." validation_failed
     # statuses are already set at the validate_miner_submission call site
-    # with the specific sub-reason (signature/hash/expert_group_or_nan), so
+    # with the specific sub-reason (signature/hash/bad_residual_shard), so
     # do not overwrite them here. Wrapped broadly — telemetry must never
     # block finalize.
     try:
@@ -548,57 +554,44 @@ def build_submission_uid_weights(
     )
 
 
-def _submission_keys(path: str | Path) -> set[str]:
-    """Key set without materialising tensors where the format allows."""
-    p = Path(path)
-    if p.suffix == ".safetensors":
-        from safetensors import safe_open
-
-        with safe_open(str(p), framework="pt") as f:
-            return set(f.keys())
-    return set(load_state_dict_from_path(str(p)))
-
-
 def validate_miner_submission(
     *,
     round_obj,  # connito.validator.round.Round
     uid: int,
     model_path: str | Path,
-    expert_group_assignment,
-    expected_keys: set[str] | None = None,
+    expected: dict[str, TensorSpec],
 ) -> str | None:
     """Run the existing `ChainCheckpoint.validate(...)` against a miner's
     on-disk submission before it is fed to `evaluate_one_miner`.
 
-    `expected_keys` is the round's base shard key set. A submission that is
-    not exactly that set is `incomplete_expert_set`: miners are loaded into
-    one shared model in place, so a subset would leave the previous miner's
-    experts in it. Skipped (None) only on a cold start with no base shard.
+    `expected` is the residual spec. A submission must be exactly it: miners
+    are loaded into one shared model in place, so a subset would leave the
+    previous miner's residual in it.
 
     Returns ``None`` on success. On failure returns a short reason string —
-    one of ``no_chain_commit | signature | hash | expert_group | nan_inf``,
-    or a generic ``"unknown"`` if the helper raised. The reason is intended
-    to be plumbed into telemetry labels and log lines.
+    one of ``no_chain_commit | signature | bad_residual_shard | hash``, or a
+    generic ``"unknown"`` if the helper raised. The reason is intended to be
+    plumbed into telemetry labels and log lines.
 
     The chain checkpoint is read from `round_obj.uid_to_chain_checkpoint`
     so this never re-fetches anything from the chain. The check itself is
-    `ChainCheckpoint.validate(expert_group_assignment=…)`, which runs:
+    `ChainCheckpoint.validate(expected)`, which runs:
 
     - `_verify_signature` — the chain hotkey signed `model_hash`.
-    - `_verify_hash` — the on-disk shard's hash matches the chain commit.
-    - `_verify_expert_group` — every routed-expert key in the state dict
-      belongs to the miner's assigned group, and no tensor contains NaN/Inf.
+    - `verify_residual_shard` — the header is exactly the spec, read before
+      any tensor; then every tensor is finite and every expert trained.
+    - `_verify_hash` — the shard's hash matches the chain commit.
     """
     chain_checkpoint = round_obj.uid_to_chain_checkpoint.get(int(uid))
     if chain_checkpoint is None:
         return "no_chain_commit"
 
-    # `validate()` reads the state dict from `chain_checkpoint.path`; point
-    # it at the on-disk submission for this round.
+    # `validate()` reads the shard from `chain_checkpoint.path`; point it at
+    # the on-disk submission for this round.
     chain_checkpoint.path = Path(model_path)
 
     try:
-        ok = chain_checkpoint.validate(expert_group_assignment=expert_group_assignment)
+        ok = chain_checkpoint.validate(expected)
     except Exception as e:
         logger.warning(
             "validate_miner_submission: validate() raised",
@@ -607,25 +600,17 @@ def validate_miner_submission(
         return "unknown"
 
     if ok:
-        if expected_keys is not None and _submission_keys(model_path) != expected_keys:
-            logger.warning(
-                "validate_miner_submission: incomplete expert set",
-                uid=int(uid), expected=len(expected_keys),
-            )
-            return "incomplete_expert_set"
         return None
 
     # `validate()` already logged a structured warning per failed sub-check.
-    # Map the per-check booleans to a single short reason for telemetry.
+    # Map the per-check booleans to a single short reason for telemetry. An
+    # off-spec shard is never hashed, so it is named before the hash.
     if not getattr(chain_checkpoint, "signature_verified", False):
         return "signature"
+    if not getattr(chain_checkpoint, "shard_verified", False):
+        return "bad_residual_shard"
     if not getattr(chain_checkpoint, "hash_verified", False):
         return "hash"
-    if not getattr(chain_checkpoint, "expert_group_verified", False):
-        # _verify_expert_group folds the NaN/Inf scan in with the routing
-        # check, so we cannot tell them apart from the booleans alone. The
-        # underlying logger.warning at the failure site distinguishes them.
-        return "expert_group_or_nan"
     return "unknown"
 
 
@@ -638,12 +623,10 @@ class MinerEvalJob:
     step: int
     score: float = 0.0
     # Raw evaluation loss for this miner this round. Carried alongside the
-    # delta-based `score` so the caller can journal it: `val_loss` is
-    # published to Prometheus at eval time and is NOT recoverable from
-    # `score` alone, because `delta = max(0.0, baseline - val_loss)` clamps
-    # at zero — every miner scoring 0 (the majority in many rounds) would
-    # be underivable. Without journaling it, a mid-round restart loses the
-    # cycle's losses permanently.
+    # `score` so the caller can journal it: `val_loss` is published to
+    # Prometheus at eval time and is NOT recoverable from `score` alone,
+    # which also carries the c4 and gate-usage terms. Without journaling it,
+    # a mid-round restart loses the cycle's losses permanently.
     val_loss: float | None = None
 
 
@@ -652,6 +635,8 @@ MAX_CONCURRENT_DOWNLOADS = 4
 EVAL_WORKERS = 1
 DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
+# Real (unpadded) tokens in the c4 replay split.
+REPLAY_EVAL_TOKENS = 65_536
 # ------------------------------------------------------------------------------
 
 # def load_model_from_path(path: str, base_model, device: torch.device) -> nn.Module:
@@ -734,7 +719,7 @@ def _evaluate_on_fresh_loader_sync(
     cached) eval batch source.
 
     Every caller in a round shares the same `combinded_seed`, so the
-    baseline and all miner evals see the same batches — the deltas are
+    baseline and all miner evals see the same batches — the scores are
     comparable.
 
     If `cached_batches` is provided, iterates the cached list (CPU
@@ -754,6 +739,7 @@ def _evaluate_on_fresh_loader_sync(
             seed=combinded_seed,
             rank=0,
             world_size=config.dataloader.world_size,
+            replay=False,
         )
     try:
         @track_eval_latency()
@@ -768,6 +754,14 @@ def _evaluate_on_fresh_loader_sync(
             del dataloader
 
 
+def usage_penalties(evaluation, usage: dict[str, float]) -> dict[str, float]:
+    """The score's gate-usage terms, each the positive magnitude it subtracts; the replay one only when measured."""
+    penalties = {"usage_penalty": evaluation.task_usage_weight * abs(usage["task"] - evaluation.task_usage_target)}
+    if "replay" in usage:
+        penalties["replay_usage_penalty"] = evaluation.replay_usage_weight * usage["replay"]
+    return penalties
+
+
 def evaluate_one_miner_sync(
     *,
     config,
@@ -779,12 +773,15 @@ def evaluate_one_miner_sync(
     combined_seed: str,
     device: torch.device,
     baseline_loss: float,
+    base_raw_score: float,
     step: int,
     round_id: int | None = None,
     max_eval_batches: int = EVAL_MAX_BATCHES,
     rank: int | None = None,
     deadline_monotonic: float | None = None,
     cached_batches: list | None = None,
+    replay_batches: list | None = None,
+    baseline_replay_loss: float | None = None,
 ) -> "MinerEvalJob | None":
     """Synchronous variant of `evaluate_one_miner`.
 
@@ -809,6 +806,14 @@ def evaluate_one_miner_sync(
     caller's `with` block then unwinds and releases the lock — covers
     the case where the eval genuinely stalls on GPU and `wait_for`
     cancellation alone wouldn't recover.
+
+    The raw score is the task gain minus the c4 and gate-usage penalties
+    weighted in `config.evaluation`; the score is it minus `base_raw_score`,
+    the base's own raw score on the round's baseline evals. With
+    `replay_batches` and `baseline_replay_loss`, the same model is also
+    scored on c4 replay; a rise above `max_replay_loss_increase` sets
+    `val_loss` to inf and the score to -inf, so the miner is never ranked
+    or published.
     """
     try:
         gc.collect()
@@ -836,13 +841,59 @@ def evaluate_one_miner_sync(
                 torch.cuda.empty_cache()
 
         val_loss = float(metrics.get("val_loss", 100))
-        delta = max(0.0, baseline_loss - val_loss)
-        # `score` is the per-round delta-based signal stored on
+        ev = config.evaluation
+        usage = {"task": float(metrics.get("gate_usage", 0.0))}
+        penalties = {}
+        replay_increase, replay_nan_batches = None, 0
+        if replay_batches and baseline_replay_loss is not None:
+            replay = evaluate_model(step, miner_model, replay_batches, device, None, rank,
+                                    deadline_monotonic=deadline_monotonic)
+            replay_increase = float(replay["val_loss"]) - baseline_replay_loss
+            replay_nan_batches = int(replay.get("nan_batches", 0))
+            usage["replay"] = float(replay.get("gate_usage", 0.0))
+            penalties["replay_penalty"] = ev.replay_loss_weight * max(0.0, replay_increase)
+        penalties |= usage_penalties(ev, usage)
+        terms = {"task_gain": baseline_loss - val_loss, **penalties}
+        # `score` is the per-round signal stored on
         # `MinerEvalJob` and recorded in `round.scores` by the caller via
         # `mark_scored`. The aggregator is intentionally NOT updated here
         # — `finalize_round_scores` is the sole writer for this round's
         # aggregator entries (see PR #93 introducing rank-based scoring).
-        score = delta ** 1.2
+        # Measured from the base's own raw score, so the base scores 0: only a miner above it is ranked or published.
+        raw = terms["task_gain"] - sum(penalties.values())
+        score = raw - base_raw_score
+        try:
+            for term, value in terms.items():
+                VALIDATOR_MINER_SCORE_TERM.labels(miner_uid=str(int(uid)), term=term).set(value)
+            for split, value in usage.items():
+                VALIDATOR_MINER_GATE_USAGE.labels(miner_uid=str(int(uid)), split=split).set(value)
+            if replay_increase is not None:
+                VALIDATOR_MINER_REPLAY_LOSS_INCREASE.labels(miner_uid=str(int(uid))).set(replay_increase)
+            else:  # no c4 eval this time: drop the replay series an earlier round left for this miner
+                for gauge, label in ((VALIDATOR_MINER_SCORE_TERM, "replay_penalty"),
+                                     (VALIDATOR_MINER_SCORE_TERM, "replay_usage_penalty"),
+                                     (VALIDATOR_MINER_GATE_USAGE, "replay")):
+                    with contextlib.suppress(KeyError):
+                        gauge.remove(str(int(uid)), label)
+        except Exception:
+            pass
+        # `evaluate_model` drops non-finite batches from its mean, so a residual that blows up on the
+        # c4 rows where it fires would pass on the rest; any such batch fails the gate.
+        gated = replay_increase is not None and (
+            not replay_increase <= ev.max_replay_loss_increase or replay_nan_batches > 0  # a NaN rise fails too
+        )
+        if gated:
+            logger.info(
+                "evaluate_one_miner: c4 isolation gate failed; not ranked",
+                reason="non_finite_batches" if replay_nan_batches > 0 else "increase",
+                uid=int(uid), task_loss=round(val_loss, 4), replay_loss_increase=round(replay_increase, 4),
+                replay_nan_batches=replay_nan_batches, tolerance=ev.max_replay_loss_increase,
+                round_id=round_id,
+            )
+            val_loss = float("inf")
+        # -inf sorts below every passing miner; a NaN (non-finite activations reaching the gate) would not sort.
+        if gated or not math.isfinite(score):
+            score = float("-inf")
         # Publish per-miner val_loss to Prometheus so external aggregators
         # can render the leaderboard without a per-validator HTTP scrape.
         # Best-effort — Prometheus exposition is purely an observability
@@ -857,7 +908,9 @@ def evaluate_one_miner_sync(
         # naturally produce a 0 ranking score — but the gauge lets the
         # gateway distinguish "evaluated and clean" from "evaluated and the
         # eval blew up numerically", which the failure Counter doesn't.
-        if math.isfinite(val_loss):
+        if gated:
+            set_miner_eval_status(int(uid), "replay_loss_increase")
+        elif math.isfinite(score):
             set_miner_eval_status(int(uid), None)
         else:
             set_miner_eval_status(int(uid), "non_finite_loss")
@@ -867,7 +920,11 @@ def evaluate_one_miner_sync(
             hotkey=hotkey[:6],
             val_loss=round(val_loss, 4),
             baseline_loss=round(baseline_loss, 4),
-            delta=round(delta, 4),
+            replay_loss_increase=None if replay_increase is None else round(replay_increase, 4),
+            **{f"{split}_usage": round(value, 4) for split, value in usage.items()},
+            **{term: round(value, 4) for term, value in terms.items()},
+            raw=round(raw, 6),
+            base_raw=round(base_raw_score, 6),
             score=round(score, 6),
             round_id=round_id,
         )

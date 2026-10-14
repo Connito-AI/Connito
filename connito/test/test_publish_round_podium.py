@@ -143,6 +143,18 @@ def test_a_miner_unscored_this_round_is_never_selected(tmp_path, uploads):
     assert [f["uid"] for f in uploads[0]["manifest"]["files"]] == [2, 1]
 
 
+def test_a_miner_the_c4_gate_failed_is_left_off_the_podium(tmp_path, uploads):
+    """Its score is -inf, which the manifest could not carry as JSON."""
+    sub = tmp_path / "sub"
+    for hk in ("aaa", "bbb", "ccc"):
+        _submission(sub, hk)
+    rnd = _round({1: -0.2, 2: 0.90, 3: float("-inf")}, {1: "aaa", 2: "bbb", 3: "ccc"})
+
+    distribute.publish_round_podium(round_obj=rnd, config=_config(sub))
+
+    assert [(f["uid"], f["score"]) for f in uploads[0]["manifest"]["files"]] == [(2, 0.9), (1, -0.2)]
+
+
 def test_top_k_bounds_the_podium(tmp_path, uploads):
     sub = tmp_path / "sub"
     for hk in ("aaa", "bbb", "ccc", "ddd"):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ from safetensors.torch import save_file
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers.models.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM
 from transformers.models.qwen3_5_moe import Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration
+
+from connito.shared.modeling.families import FAMILIES
 
 TINY_TEXT_CONFIG = dict(
     vocab_size=128,
@@ -89,13 +92,14 @@ def tiny_qwen_vlm() -> Qwen3_5MoeForConditionalGeneration:
 @pytest.fixture()
 def tiny_qwen_checkpoint(tmp_path: Path, tiny_qwen_vlm) -> Path:
     """The VLM saved with fused expert tensors and an `mtp.*` tensor, as the published checkpoint is."""
-    tiny_qwen_vlm.save_pretrained(tmp_path)
+    path = tmp_path / "qwen3_5_moe"
+    tiny_qwen_vlm.save_pretrained(path)
     # `save_pretrained` splits fused experts into per-expert keys; the real checkpoint keeps them fused.
     state = {name: tensor.contiguous() for name, tensor in tiny_qwen_vlm.state_dict().items()}
     state["mtp.fc.weight"] = torch.zeros(4, 4, dtype=torch.bfloat16)
-    save_file(state, str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
-    _write_tokenizer(tmp_path, {"tokenizer_class": "Qwen2Tokenizer", "bos_token": None, "eos_token": "<eos>"})
-    return tmp_path
+    save_file(state, str(path / "model.safetensors"), metadata={"format": "pt"})
+    _write_tokenizer(path, {"tokenizer_class": "Qwen2Tokenizer", "bos_token": None, "eos_token": "<eos>"})
+    return path
 
 
 @pytest.fixture()
@@ -103,11 +107,21 @@ def tiny_deepseek_v2_checkpoint(tmp_path: Path) -> Path:
     """Per-expert `mlp.experts.{i}.*_proj` tensors and the original config.json, as the published checkpoint is."""
     torch.manual_seed(0)
     model = DeepseekV2ForCausalLM(DeepseekV2Config(**TINY_DEEPSEEK_V2_CONFIG)).to(torch.bfloat16)
+    path = tmp_path / "deepseek_v2"
     # transformers 5 splits its fused experts back into per-expert keys on save.
-    model.save_pretrained(tmp_path)
-    (tmp_path / "config.json").write_text(json.dumps(TINY_DEEPSEEK_V2_CONFIG))
+    model.save_pretrained(path)
+    (path / "config.json").write_text(json.dumps(TINY_DEEPSEEK_V2_CONFIG))
     # The published tokenizer_config asks for BOS, but its tokenizer.json has no template that adds one.
-    _write_tokenizer(tmp_path, {
+    _write_tokenizer(path, {
         "tokenizer_class": "LlamaTokenizerFast", "add_bos_token": True, "bos_token": "<bos>", "eos_token": "<eos>",
     })
-    return tmp_path
+    return path
+
+
+@pytest.fixture(params=sorted(FAMILIES))
+def family_name(request, monkeypatch) -> str:
+    """A family whose record points at its tiny checkpoint."""
+    fixture = {"qwen3_5_moe": "tiny_qwen_checkpoint", "deepseek_v2": "tiny_deepseek_v2_checkpoint"}[request.param]
+    path = request.getfixturevalue(fixture)
+    monkeypatch.setitem(FAMILIES, request.param, replace(FAMILIES[request.param], model_path=str(path)))
+    return request.param

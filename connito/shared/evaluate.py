@@ -4,14 +4,38 @@ import gc
 import time
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 from connito.shared.app_logging import structlog
+from connito.shared.modeling.residual import record_gate_usage
 
 logger = structlog.getLogger(__name__)
 
 tqdm(disable=True, total=0)
+
+# Positions per lm_head chunk: about 1 GiB of fp32 logits at Qwen's 248,320 vocab, as measured on the L40S floor.
+_CE_CHUNK_TOKENS = 1024
+
+
+def _chunk_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(lm_head(hidden).float(), labels, reduction="sum")
+
+
+def chunked_lm_loss(model: nn.Module, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Next-token cross-entropy averaged over labelled tokens, as `model(**batch).loss`, without full logits."""
+    hidden = model.model(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask")).last_hidden_state
+    hidden = hidden[:, :-1].reshape(-1, hidden.shape[-1])
+    labels = batch["labels"][:, 1:].reshape(-1)
+    # Checkpointed, so backward keeps one chunk's logits at a time instead of the whole batch's.
+    total = sum(
+        checkpoint(_chunk_ce, model.lm_head, hidden[i : i + _CE_CHUNK_TOKENS], labels[i : i + _CE_CHUNK_TOKENS],
+                   use_reentrant=False)
+        for i in range(0, labels.numel(), _CE_CHUNK_TOKENS)
+    )
+    return total / labels.ne(-100).sum()
 
 
 class EvalDeadlineExceeded(RuntimeError):
@@ -53,12 +77,11 @@ def evaluate_model(
     Returns
     -------
     Dict[str, float]
-        e.g., {"val_loss": 2.345}
+        e.g., {"val_loss": 2.345, "gate_usage": 0.07}; `gate_usage` is the residual gate's mean Σq over real tokens.
     """
     model.to(device)
     model.eval()
     loss_sum: float = 0.0
-    aux_loss_sum: float = 0.0
     # Count of batches that produced a finite loss. The previous
     # implementation skipped NaN-loss batches from `loss_sum` but still
     # included them in the divisor, so a miner that crafts weights to
@@ -66,13 +89,11 @@ def evaluate_model(
     # batches would report `(1 - p) * honest_loss` instead of
     # `honest_loss` — gaming the val_loss downward and inflating their
     # reward. Divide by `scored_batches` instead so a NaN/Inf batch
-    # contributes nothing to either side of the ratio. Also skip
-    # `aux_loss_sum` on NaN/Inf batches so a related variant (subtract
-    # aux_loss but skip loss) cannot replicate the same exploit.
+    # contributes nothing to either side of the ratio.
     scored_batches: int = 0
     nan_batches: int = 0
     batch_step = -1
-    with torch.no_grad():
+    with torch.no_grad(), record_gate_usage(model) as usage:
         for batch_step, batch in enumerate(iterable=eval_dataloader):
             # Per-batch deadline check. Raised before we start GPU work
             # for this batch so the caller's `with lock:` unwinds without
@@ -90,28 +111,23 @@ def evaluate_model(
 
             if device_batch.get("attention_mask") is None and "input_ids" in device_batch:
                 device_batch["attention_mask"] = torch.ones_like(device_batch["input_ids"])
+            usage.mask = device_batch["attention_mask"]
+            kept_usage = usage.total, usage.tokens
 
             autocast_device = "cuda" if device.type == "cuda" else "cpu"
-            eval_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.amp.autocast(autocast_device, dtype=eval_dtype):
-                outputs = model(**device_batch)
+            with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
+                loss = chunked_lm_loss(model, device_batch)
 
-                if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
-                    # NaN/Inf batches contribute 0 to both sums and do
-                    # NOT increment `scored_batches`, so they drop out
-                    # of the divisor as well. Explicit no-op `+= 0`
-                    # keeps the parallel structure with the else-branch.
-                    nan_batches += 1
-                else:
-                    loss_sum += float(outputs.loss.item())
-                    aux_loss_sum += (
-                        float(outputs.aux_loss.item())
-                        if hasattr(outputs, "aux_loss") and outputs.aux_loss is not None
-                        else 0.0
-                    )
-                    scored_batches += 1
+            if torch.isnan(loss) or torch.isinf(loss):
+                # NaN/Inf batches add nothing to the sum and do NOT increment
+                # `scored_batches`, so they drop out of the divisor as well.
+                nan_batches += 1
+                usage.total, usage.tokens = kept_usage  # nor to the gate usage
+            else:
+                loss_sum += float(loss.item())
+                scored_batches += 1
 
-            del device_batch, outputs
+            del device_batch, loss
             gc.collect()
 
             if max_eval_batches is not None and batch_step >= max_eval_batches:
@@ -125,16 +141,14 @@ def evaluate_model(
         logger.info(
             "eval loss",
             loss_sum=round(loss_sum, 4),
-            aux_loss_sum=round(aux_loss_sum, 4),
             scored_batches=scored_batches,
             nan_batches=nan_batches,
             step=step,
         )
 
     # Every batch was NaN/Inf — the miner's checkpoint is malicious or
-    # broken. Return `+inf` so the caller's `delta = max(0, baseline -
-    # val_loss)` clamps to 0 (score=0). Returning 0.0 would have given
-    # them maximum delta.
+    # broken. Return `+inf` so the caller's task gain, and so its score,
+    # is -inf. Returning 0.0 would have given them the maximum gain.
     if scored_batches == 0:
         if nan_batches > 0:
             logger.warning(
@@ -143,16 +157,14 @@ def evaluate_model(
             )
         return {
             "val_loss": float("inf"),
-            "val_aux_loss": 0.0,
             "nan_batches": nan_batches,
             "scored_batches": 0,
+            "gate_usage": usage.mean(),
         }
 
-    val_loss = (loss_sum - aux_loss_sum) / scored_batches
-    val_aux_loss = aux_loss_sum / scored_batches
     return {
-        "val_loss": val_loss,
-        "val_aux_loss": val_aux_loss,
+        "val_loss": loss_sum / scored_batches,
         "nan_batches": nan_batches,
         "scored_batches": scored_batches,
+        "gate_usage": usage.mean(),
     }

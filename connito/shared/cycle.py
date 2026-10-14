@@ -25,7 +25,7 @@ class ValidatorMinerAssignment(NamedTuple):
         chain_checkpoints_by_hotkey: hotkey -> the miner's `ChainCheckpoint`
             (carrying signed_model_hash, model_hash, expert_group, etc.).
             The eval path uses this to verify each submission via
-            `ChainCheckpoint.validate(expert_group_assignment=...)` without
+            `ChainCheckpoint.validate(expected)` without
             re-fetching anything from chain at eval time.
     """
     assignment: dict[str, list[str]]

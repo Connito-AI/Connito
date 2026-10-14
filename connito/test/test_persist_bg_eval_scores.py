@@ -58,7 +58,7 @@ def test_mark_scored_writes_the_journal_and_nothing_else(tmp_path: Path) -> None
     assert journal.scores == {1: 0.018}
     assert journal.finalized is False
 
-    # The raw `delta ** 1.2` never reaches the aggregator: only
+    # The raw round score never reaches the aggregator: only
     # `finalize_round_scores` writes it, and only rank values.
     assert not score_path.exists()
 
@@ -205,7 +205,7 @@ def test_late_result_after_finalize_is_dropped(tmp_path: Path) -> None:
     """The bg worker consults the eval-window flag only when claiming a new
     miner, so the one already on the GPU calls `mark_*` after finalize has
     read the scores and written the ranks. Recording it then would leave a
-    raw `delta ** 1.2` in the aggregator that no `drop_round` ever removes,
+    raw round score in the aggregator that no `drop_round` ever removes,
     and would rewrite the journal with `finalized=False` — making startup
     recovery replay an already-finalized round.
     """

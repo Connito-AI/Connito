@@ -101,6 +101,7 @@ WINNER_HASH = "cd" * 32
 def _round_with_winner(uid: int = 2) -> SimpleNamespace:
     return SimpleNamespace(
         round_id=9000, val_losses={1: 3.9, uid: 3.1},
+        scores={1: 0.1, uid: 0.9},  # both beat the round's baseline
         uid_to_hotkey={1: "hkA", uid: "hkB"},
         uid_to_chain_checkpoint={uid: _ckpt(uid, WINNER_HASH, stake=1.0)},
         submission_block_range=(500, 600),
@@ -223,12 +224,14 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
         def to(self, **kw):
             return self
 
-        def gradient_checkpointing_enable(self):
+        def gradient_checkpointing_enable(self, **kw):
             pass
 
     monkeypatch.setattr(shared_model, "get_base_model", lambda *a, **k: _Model())
-    monkeypatch.setattr(shared_model, "select_best_checkpoint",
-                        lambda **kw: consulted.append(True))
+    monkeypatch.setattr(shared_model, "install_residual_experts", lambda *a: None)
+    monkeypatch.setattr(shared_model, "residual_shapes", lambda config: {})
+    monkeypatch.setattr(shared_model, "local_checkpoints_best_first",
+                        lambda *a, **kw: consulted.append(True) or [])
 
     cfg = SimpleNamespace(
         ckpt=SimpleNamespace(
@@ -236,7 +239,7 @@ def test_boot_consults_on_disk_state_only_when_asked(monkeypatch, tmp_path, load
             validator_checkpoint_path=tmp_path, checkpoint_path=tmp_path,
         ),
         task=SimpleNamespace(exp=SimpleNamespace(group_id=GROUP_ID)),
-        model=SimpleNamespace(device="cpu", precision="fp16-mixed"),
+        model=SimpleNamespace(device="cpu"),
     )
-    shared_model.get_model_from_checkpoint(rank=0, config=cfg, load_global_checkpoint=load_global)
+    shared_model.get_model_from_checkpoint(config=cfg, load_global_checkpoint=load_global)
     assert bool(consulted) is expect_consulted

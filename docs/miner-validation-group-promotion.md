@@ -393,8 +393,8 @@ path open even when the seeded Group C partition does not pick them.
   `MinerScoreAggregator.add_score` resets that UID's history. The
   miner must re-accumulate the ≥ 3 / ≥ 1 record thresholds before it
   can re-appear in weight Group 1 / 2.
-- **Validation failure.** Hash, signature, expert-group, or NaN/Inf
-  failures during eval flag the UID in `validation_failed_uids`;
+- **Validation failure.** Hash, signature, or residual-spec (eval status
+  code 14) failures during eval flag the UID in `validation_failed_uids`;
   `finalize_round_scores` writes `score = 0` for that round.
   Repeated failures pull the avg down and eventually push the miner
   out of the upper tiers via the chain-set tally.
