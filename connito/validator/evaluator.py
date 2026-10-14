@@ -637,14 +637,6 @@ DOWNLOAD_TIMEOUT_SEC = 60
 EVAL_MAX_BATCHES = 50
 # Real (unpadded) tokens in the c4 replay split.
 REPLAY_EVAL_TOKENS = 65_536
-
-
-def usage_penalties(evaluation, usage: dict[str, float]) -> dict[str, float]:
-    """The score's gate-usage terms, each the positive magnitude it subtracts; the replay one only when measured."""
-    penalties = {"usage_penalty": evaluation.task_usage_weight * abs(usage["task"] - evaluation.task_usage_target)}
-    if "replay" in usage:
-        penalties["replay_usage_penalty"] = evaluation.replay_usage_weight * usage["replay"]
-    return penalties
 # ------------------------------------------------------------------------------
 
 # def load_model_from_path(path: str, base_model, device: torch.device) -> nn.Module:
@@ -762,6 +754,14 @@ def _evaluate_on_fresh_loader_sync(
             del dataloader
 
 
+def usage_penalties(evaluation, usage: dict[str, float]) -> dict[str, float]:
+    """The score's gate-usage terms, each the positive magnitude it subtracts; the replay one only when measured."""
+    penalties = {"usage_penalty": evaluation.task_usage_weight * abs(usage["task"] - evaluation.task_usage_target)}
+    if "replay" in usage:
+        penalties["replay_usage_penalty"] = evaluation.replay_usage_weight * usage["replay"]
+    return penalties
+
+
 def evaluate_one_miner_sync(
     *,
     config,
@@ -809,10 +809,11 @@ def evaluate_one_miner_sync(
 
     The raw score is the task gain minus the c4 and gate-usage penalties
     weighted in `config.evaluation`; the score is it minus `base_raw_score`,
-    the base's own raw score on the round's baseline evals. With `replay_batches` and `baseline_replay_loss`,
-    the same model is also scored on c4 replay; a rise above
-    `max_replay_loss_increase` sets `val_loss` to inf and the score to -inf,
-    so the miner is never ranked or published.
+    the base's own raw score on the round's baseline evals. With
+    `replay_batches` and `baseline_replay_loss`, the same model is also
+    scored on c4 replay; a rise above `max_replay_loss_increase` sets
+    `val_loss` to inf and the score to -inf, so the miner is never ranked
+    or published.
     """
     try:
         gc.collect()

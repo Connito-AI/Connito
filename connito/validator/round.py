@@ -35,8 +35,8 @@ def select_baseline_uid(
     beat this round's baseline.
 
     Only a miner with a positive score this round qualifies: the baseline
-    scores 0 by definition, and a miner the c4 isolation gate failed scores
-    -inf.
+    scores 0 by construction (its raw score minus itself), and a miner the
+    c4 isolation gate failed scores -inf.
 
     Preferred: the best-ranked *proven* miner that submitted this round.
     Proven means the top-`top_n` by track record, matching the count that
