@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 from connito.shared.app_logging import structlog
+from connito.shared.modeling.residual import record_gate_usage
 
 logger = structlog.getLogger(__name__)
 
@@ -76,7 +77,7 @@ def evaluate_model(
     Returns
     -------
     Dict[str, float]
-        e.g., {"val_loss": 2.345}
+        e.g., {"val_loss": 2.345, "gate_usage": 0.07}; `gate_usage` is the residual gate's mean Σq over real tokens.
     """
     model.to(device)
     model.eval()
@@ -92,7 +93,7 @@ def evaluate_model(
     scored_batches: int = 0
     nan_batches: int = 0
     batch_step = -1
-    with torch.no_grad():
+    with torch.no_grad(), record_gate_usage(model) as usage:
         for batch_step, batch in enumerate(iterable=eval_dataloader):
             # Per-batch deadline check. Raised before we start GPU work
             # for this batch so the caller's `with lock:` unwinds without
@@ -110,6 +111,7 @@ def evaluate_model(
 
             if device_batch.get("attention_mask") is None and "input_ids" in device_batch:
                 device_batch["attention_mask"] = torch.ones_like(device_batch["input_ids"])
+            usage.mask = device_batch["attention_mask"]
 
             autocast_device = "cuda" if device.type == "cuda" else "cpu"
             with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
@@ -156,10 +158,12 @@ def evaluate_model(
             "val_loss": float("inf"),
             "nan_batches": nan_batches,
             "scored_batches": 0,
+            "gate_usage": usage.mean(),
         }
 
     return {
         "val_loss": loss_sum / scored_batches,
         "nan_batches": nan_batches,
         "scored_batches": scored_batches,
+        "gate_usage": usage.mean(),
     }

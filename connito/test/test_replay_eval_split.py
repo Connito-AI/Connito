@@ -16,6 +16,7 @@ from connito.shared import model as shared_model
 from connito.shared.config import DatasetSourceCfg, ResidualCfg
 from connito.shared.dataloader import materialize_by_tokens
 from connito.shared.evaluate import chunked_lm_loss
+from connito.shared.modeling.residual import record_gate_usage
 
 TEXTS = {"task/pmc": ["pmc one", "pmc two", "pmc three"], "allenai/c4": ["c4 one", "c4 two", "c4 three"]}
 
@@ -114,7 +115,7 @@ def _summed_ce(model, batches) -> float:
     return sum(float(chunked_lm_loss(model, b)) * int(b["labels"][:, 1:].ne(-100).sum()) for b in batches)
 
 
-def test_batched_trimmed_rows_score_as_one_row_per_pass(family_name):
+def _trained_model(family_name: str) -> torch.nn.Module:
     config = SimpleNamespace(
         role="validator",
         model=SimpleNamespace(family=family_name, device="cpu", quantization="off", quantization_validator="off"),
@@ -127,6 +128,26 @@ def test_batched_trimmed_rows_score_as_one_row_per_pass(family_name):
         for name, param in model.named_parameters():
             if ".residual_experts." in name and "down_proj" in name:
                 param.normal_(std=0.02)  # a trained residual, so its gate and experts are in the loss
+    return model
+
+
+def test_batched_trimmed_rows_score_as_one_row_per_pass(family_name):
+    model = _trained_model(family_name)
+    with torch.no_grad():
         batched = _summed_ce(model, materialize_by_tokens(_loader(), 10_000, 24))
         one_per_pass = _summed_ce(model, _loader())
     assert batched == pytest.approx(one_per_pass, rel=1e-5)
+
+
+def _gate_usage(model, batches) -> float:
+    with torch.no_grad(), record_gate_usage(model) as usage:
+        for batch in batches:
+            usage.mask = batch["attention_mask"]
+            model.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+    return usage.mean()
+
+
+def test_batched_trimmed_rows_give_the_same_gate_usage_as_one_row_per_pass(family_name):
+    model = _trained_model(family_name)
+    batched = _gate_usage(model, materialize_by_tokens(_loader(), 10_000, 24))
+    assert batched == pytest.approx(_gate_usage(model, _loader()), rel=1e-5)
