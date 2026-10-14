@@ -27,7 +27,6 @@ logger = structlog.get_logger(__name__)
 
 
 def select_baseline_uid(
-    val_losses: dict[int, float],
     scores: dict[int, float],
     prior_avg_scores: dict[int, float],
     top_n: int = 3,
@@ -35,15 +34,16 @@ def select_baseline_uid(
     """The UID the round's baseline is published from, or None if no miner
     beat this round's baseline.
 
-    Only a miner with a positive score this round qualifies: its val_loss is
-    below the round's baseline, and the c4 isolation gate did not zero it.
+    Only a miner with a positive score this round qualifies: the baseline
+    scores 0 by definition, and a miner the c4 isolation gate failed scores
+    -inf.
 
     Preferred: the best-ranked *proven* miner that submitted this round.
     Proven means the top-`top_n` by track record, matching the count that
     scores points each round (`_RANK_TO_SCORE`).
 
     Fallback: if none of them submitted, this round's best submission by
-    val_loss. A miner whose single top-3 placing has nearly aged out should
+    score. A miner whose single top-3 placing has nearly aged out should
     not outrank a fresh measurement on the validator's own held-out data —
     the baseline is a starting model, not a reward.
 
@@ -53,17 +53,17 @@ def select_baseline_uid(
     `publish_round_baseline` must rank identically — the file has to survive
     until finalize, and only the scored miners are candidates.
     """
-    val_losses = {uid: loss for uid, loss in val_losses.items() if scores.get(uid, 0.0) > 0.0}
-    if not val_losses:
+    scores = {uid: score for uid, score in scores.items() if score > 0.0}
+    if not scores:
         return None
     proven = {
         uid for uid, _ in
         sorted(prior_avg_scores.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]
     }
-    submitted = {uid: loss for uid, loss in val_losses.items() if uid in proven}
+    submitted = {uid: score for uid, score in scores.items() if uid in proven}
     if submitted:
-        return min(submitted, key=lambda uid: (-prior_avg_scores[uid], val_losses[uid], uid))
-    return min(val_losses, key=lambda uid: (val_losses[uid], uid))
+        return min(submitted, key=lambda uid: (-prior_avg_scores[uid], -scores[uid], uid))
+    return min(scores, key=lambda uid: (-scores[uid], uid))
 
 
 
@@ -722,7 +722,7 @@ class Round:
         with self._lock:
             if self.baseline_fallback:
                 return None
-            return select_baseline_uid(self.val_losses, self.scores, self.prior_avg_scores)
+            return select_baseline_uid(self.scores, self.prior_avg_scores)
 
     def mark_failed(self, uid: int) -> None:
         """Mark a UID as failed for operational reasons (download timeout,

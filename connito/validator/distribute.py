@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -55,15 +56,14 @@ def publish_round_baseline(*, round_obj, config, group_id: int, out: dict | None
         if getattr(round_obj, "baseline_fallback", False):
             logger.info("publish_baseline: round baseline is the fallback; nothing published", round_id=rid)
             return
-        val_losses = dict(getattr(round_obj, "val_losses", None) or {})
+        scores = dict(getattr(round_obj, "scores", None) or {})
         avg = dict(getattr(round_obj, "prior_avg_scores", None) or {})
         # Same call cleanup retains against, so the winner's file is still on
         # disk by construction.
-        uid = select_baseline_uid(val_losses, dict(getattr(round_obj, "scores", None) or {}), avg)
+        uid = select_baseline_uid(scores, avg)
         if uid is None:
             logger.info("publish_baseline: no miner beat the baseline", round_id=rid)
             return
-        val_loss = val_losses[uid]
         hotkey = round_obj.uid_to_hotkey.get(uid)
         submission_dir = Path(config.ckpt.miner_submission_path)
         src = find_submission_for_hotkey(
@@ -110,7 +110,8 @@ def publish_round_baseline(*, round_obj, config, group_id: int, out: dict | None
         if out is not None:
             out.update(revision=revision, model_hash=model_hash)
         logger.info(
-            "publish_baseline: published", round_id=rid, uid=uid, val_loss=val_loss,
+            "publish_baseline: published", round_id=rid, uid=uid, score=round(scores[uid], 6),
+            val_loss=(getattr(round_obj, "val_losses", None) or {}).get(uid),
             avg_score=round(avg.get(uid, 0.0), 4),
             repo_id=repo_id, revision=revision, size_bytes=size_bytes,
             model_hash=model_hash[:6] if model_hash else None, hash_source=hash_source,
@@ -208,7 +209,8 @@ def publish_round_podium(*, round_obj, config) -> None:
             logger.warning("publish_podium: no cycle_index on the round", round_id=rid)
             return
 
-        podium = round_obj.top_scored_ranked_this_round(int(config.evaluation.top_k_miners_to_reward))
+        podium = [(uid, score) for uid, score in round_obj.top_scored_ranked_this_round(
+            int(config.evaluation.top_k_miners_to_reward)) if math.isfinite(score)]
         if not podium:
             logger.info("publish_podium: nothing scored this round", round_id=rid)
             return

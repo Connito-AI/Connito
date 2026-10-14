@@ -108,7 +108,7 @@ def test_a_miner_that_matches_the_baseline_scores_exactly_zero_like_the_baseline
     job, _ = _score(monkeypatch, task_loss=BASELINE, replay_loss=BASELINE_REPLAY)
 
     assert job.score == 0.0
-    assert select_baseline_uid({7: BASELINE}, {7: job.score}, {}) is None
+    assert select_baseline_uid({7: job.score}, {}) is None
 
 
 def test_each_term_is_logged_and_published(monkeypatch, statuses):

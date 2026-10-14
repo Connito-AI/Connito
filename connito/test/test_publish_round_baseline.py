@@ -2,7 +2,7 @@
 
 It runs on a daemon thread off the main validator loop, so the properties worth
 pinning are the ones a thread cannot report: that the winner is picked by
-`val_loss` (not by rank score), that the staged file carries the exact name
+this round's score (not by rank score), that the staged file carries the exact name
 miners fetch, that staging never copies the ~3 GB shard, and that no input —
 missing file, deprecated suffix, HF outage — can escape as an exception.
 
@@ -38,12 +38,12 @@ def _round(val_losses: dict[int, float], uid_to_hotkey: dict[int, str],
            scores: dict[int, float] | None = None, baseline_fallback: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         round_id=9000, val_losses=val_losses, uid_to_hotkey=uid_to_hotkey,
-        # Every miner beat the baseline unless a test says otherwise.
-        scores={uid: 0.5 for uid in val_losses} if scores is None else scores,
+        # Every miner beat the baseline unless a test says otherwise; a lower val_loss scores higher.
+        scores={uid: 4.0 - loss for uid, loss in val_losses.items()} if scores is None else scores,
         baseline_fallback=baseline_fallback,
         submission_block_range=BLOCK_RANGE,
         # Freeze-time snapshot. Flat by default so tests that are not about
-        # selection fall through to the val_loss tie-break.
+        # selection fall through to the score tie-break.
         prior_avg_scores=prior_avg_scores or {uid: 0.0 for uid in val_losses},
     )
 
@@ -109,7 +109,7 @@ def test_the_shard_is_named_by_the_group_it_was_given(tmp_path, uploads):
     assert uploads[0]["staged"] == ["model_expgroup_7.safetensors"]
 
 
-def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
+def test_the_round_score_breaks_an_average_tie(tmp_path, uploads):
     """Averaged rank scores collide constantly — every miner never in a top-3
     sits at exactly 0.0 — so the round's own result has to settle it."""
     sub = tmp_path / "miner_submission"
@@ -125,7 +125,7 @@ def test_val_loss_breaks_an_average_tie(tmp_path, uploads):
 
 
 def test_uid_breaks_a_total_tie(tmp_path, uploads):
-    """Same average and same val_loss: fall to uid so two validators seeing
+    """Same average and same score: fall to uid so two validators seeing
     identical numbers never publish different baselines."""
     sub = tmp_path / "miner_submission"
     _submission(sub, "hkA", 550)
@@ -269,7 +269,7 @@ def test_cleanup_keeps_the_winner_when_averages_tie(tmp_path):
 
     Rank scores are 2.25/1.5/1.0/0.0, so averages over the window collide
     often. Retention once broke ties on UID alone while selection broke them
-    on val_loss first — so a tie handed the keep slot to one miner and the
+    on score first — so a tie handed the keep slot to one miner and the
     publish to another.
     """
     from connito.validator.evaluator import cleanup_non_top_submissions
@@ -284,12 +284,12 @@ def test_cleanup_keeps_the_winner_when_averages_tie(tmp_path):
         round_id=9000, seed="s", validator_miner_assignment={},
         background_uids=tuple(uid_to_hotkey),
         uid_to_hotkey=dict(uid_to_hotkey), base_shard=Path("pretrained/model_expgroup_1.safetensors"),
-        # uids 4 and 5 tie on average; 5 has the better val_loss, so publish
+        # uids 4 and 5 tie on average; 5 has the better round score, so publish
         # picks 5, while a uid-only tie-break would keep 4.
         prior_avg_scores={1: 0.5, 2: 0.5, 3: 0.5, 4: 1.5, 5: 1.5},
     )
-    for uid, score in {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.2, 5: 0.1}.items():
-        round_obj.mark_scored(uid, score=score, val_loss=(2.0 if uid == 4 else 1.0))
+    for uid, score in {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.1, 5: 0.2}.items():
+        round_obj.mark_scored(uid, score=score, val_loss=1.0)
 
     cleanup_non_top_submissions(round_obj=round_obj, submission_dir=sub, top_k=3)
 
@@ -326,7 +326,7 @@ def test_round_best_wins_when_no_proven_miner_submitted(tmp_path, uploads):
     A miner whose single top-3 placing has nearly aged out (uid 7, avg 0.3)
     should not outrank this round's actual best on the strength of stale
     reputation. Only the top-3 averages count as proven, so uid 7 ranks 0.0
-    like everyone else and the val_loss tie-break picks uid 8.
+    like everyone else and the score tie-break picks uid 8.
     """
     sub = tmp_path / "miner_submission"
     _submission(sub, "hkStale", 550)
@@ -355,7 +355,7 @@ def test_proven_miner_still_wins_when_it_submits(tmp_path, uploads):
 
     distribute.publish_round_baseline(
         round_obj=_round(
-            {7: 2.0, 8: 1.0},                       # uid 8 still has the better val_loss
+            {7: 2.0, 8: 1.0},                       # uid 8 still has the better score
             {7: "hkProven", 8: "hkBest"},
             prior_avg_scores={7: 1.5, 10: 2.0, 11: 1.0, 8: 0.0},
         ),
@@ -375,7 +375,7 @@ def test_a_proven_miner_that_did_not_beat_the_baseline_this_round_is_not_publish
         round_obj=_round(
             {7: 2.0, 8: 1.0}, {7: "hkProven", 8: "hkBest"},
             prior_avg_scores={7: 2.0, 8: 0.0},
-            scores={7: 0.0, 8: 0.3},  # uid 7's val_loss is at or above the baseline
+            scores={7: 0.0, 8: 0.3},  # uid 7 scored the baseline's 0
         ),
         config=_config(sub), group_id=GROUP_ID,
     )
@@ -383,7 +383,7 @@ def test_a_proven_miner_that_did_not_beat_the_baseline_this_round_is_not_publish
     assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
 
 
-def test_a_miner_the_c4_gate_zeroed_is_never_published(tmp_path, uploads):
+def test_a_miner_the_c4_gate_failed_is_never_published(tmp_path, uploads):
     sub = tmp_path / "miner_submission"
     _submission(sub, "hkGated", 550)
     _submission(sub, "hkClean", 550)
@@ -391,12 +391,39 @@ def test_a_miner_the_c4_gate_zeroed_is_never_published(tmp_path, uploads):
     distribute.publish_round_baseline(
         round_obj=_round(
             {7: float("inf"), 8: 1.0}, {7: "hkGated", 8: "hkClean"},
-            prior_avg_scores={7: 2.0, 8: 0.0}, scores={7: 0.0, 8: 0.3},
+            prior_avg_scores={7: 2.0, 8: 0.0}, scores={7: float("-inf"), 8: 0.3},
         ),
         config=_config(sub), group_id=GROUP_ID,
     )
 
     assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
+
+
+def test_the_highest_score_wins_over_the_lowest_val_loss(tmp_path, uploads):
+    """The gate-usage penalties can rank a miner with a worse task loss first; publishing follows the score."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+    _submission(sub, "hkB", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round({7: 1.0, 8: 2.0}, {7: "hkA", 8: "hkB"}, scores={7: 0.1, 8: 0.3}),
+        config=_config(sub), group_id=GROUP_ID,
+    )
+
+    assert uploads[0]["commit_message"].endswith("uid=8"), uploads[0]["commit_message"]
+
+
+def test_a_proven_miner_with_a_negative_score_is_not_published(tmp_path, uploads):
+    """It passed the c4 gate, but its score is below the baseline's 0."""
+    sub = tmp_path / "miner_submission"
+    _submission(sub, "hkA", 550)
+
+    distribute.publish_round_baseline(
+        round_obj=_round({7: 1.0}, {7: "hkA"}, prior_avg_scores={7: 2.0}, scores={7: -0.2}),
+        config=_config(sub), group_id=GROUP_ID,
+    )
+
+    assert uploads == []
 
 
 def test_nothing_is_published_when_no_miner_beat_the_baseline(tmp_path, uploads):
