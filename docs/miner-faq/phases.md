@@ -23,9 +23,12 @@ The dashboard API mirrors what the phase service returns. The chain itself
 does not store a "current phase" field; it stores block heights only.
 
 If `cycle-api.connito.ai` is unreachable, `get_phase_from_api` returns
-`None` and `wait_till` cannot make progress — both miners and validators
-will idle until the API comes back. Both workers will keep retrying with
-backoff (`api_retries = 5`, `api_backoff_sec = 2`).
+`None` after retrying with backoff (`api_retries = 5`, `api_backoff_sec = 2`).
+A miner's phase waits keep polling and resume when the API answers. A
+validator waiting for the run-up to MinerCommit1 exits instead (log
+`Quit training`, exit code 0) and recovers when it is restarted after the API
+is back; see `troubleshooting.md`, "cycle-api unreachable: the validator
+exits, the miner waits".
 
 The `/get_phase` endpoint is served by the subnet owner's cycle-api service,
 which is not part of this repository. `PhaseManager` mirrors the same block

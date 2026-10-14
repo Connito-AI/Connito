@@ -15,6 +15,7 @@ relevant section.
 | `eval_status_label` shows `hash_mismatch` | Re-uploaded the same revision after committing | See `eval-status.md` |
 | `the base model is split over devices` at startup | Model spread over several GPUs | [Split over GPUs](#loader-refuses-a-model-split-over-several-gpus) |
 | fla warns "Triton is not supported on current platform" | Python without `Python.h` | [fla Triton warning](#fla-warns-that-triton-is-not-supported) |
+| Validator logs `Quit training` and exits after cycle-api errors; miner stalls on phase waits | cycle-api unreachable | [cycle-api unreachable](#cycle-api-unreachable-the-validator-exits-the-miner-waits) |
 | Validator dashboards show different `chain_weight_stake_weighted` per validator | Expected — each validator has independent `score_avg` history | [Validators show different weights](#validators-show-different-chain_weight_stake_weighted) |
 
 ---
@@ -35,9 +36,11 @@ request as automated. Common triggers:
 - Too many sequential identical-shape requests in a short window.
 
 **What the code does:** `get_with_retry` treats 403 as **non-retryable**
-and returns `None`, so `get_phase_from_api` returns `None`. `wait_till` then
-cannot make progress until the API responds — both miner and validator
-will idle on `get_phase_from_api`.
+and returns `None`, so `get_phase_from_api` returns `None`. From there the
+node behaves as with any cycle-api outage: a miner keeps polling and resumes
+when the API answers, while a validator waiting for the run-up to
+MinerCommit1 exits with `Quit training` and only recovers on restart. See
+"cycle-api unreachable: the validator exits, the miner waits".
 
 **Fix:**
 
@@ -353,3 +356,51 @@ On a distribution Python, install its development package (for example
 `python3.10-dev`) instead. Also check the NVIDIA driver is 570 or newer.
 
 Code: `requirements.txt` (`flash-linear-attention`).
+
+## cycle-api unreachable: the validator exits, the miner waits
+
+Both roles ask the owner's phase service (`cycle-api.connito.ai`) where the
+cycle is. When it stops answering (timeouts, or a 403 from its firewall),
+each request is retried with backoff (`cycle.api_retries` 5,
+`cycle.api_timeout_sec` 10, `cycle.api_backoff_sec` 2, so up to about two
+minutes per request on timeouts), then given up. What happens next differs.
+
+**Validator: exits, and recovers on restart.** Most of `wait_till`'s callers
+wait for a phase to *start*, and those keep polling. But the validator's two
+waits that end a few blocks *before* MinerCommit1 (15 and 5 blocks before;
+the first one covers most of Train) stop after a failed poll with no phase
+to report, and the validator then crashes on it. The log reads:
+
+```
+Network error calling https://cycle-api.connito.ai:443/..., will retry
+wait_till: loop exited but phase_response is None for phase 'MinerCommit1' (block_offset=-15)
+Quit training
+AttributeError: 'NoneType' object has no attribute 'phase_name'
+```
+
+The process shuts its workers down and exits with code 0. Under the operator
+compose file (`restart: unless-stopped`) Docker restarts the container; it
+boots in about 70 s and resumes the open round from its journal. While the
+API is still down, the restarted validator reaches the same wait and exits
+again, so expect a restart loop that ends once the API answers. Two test
+validators went through exactly this during a cycle-api outage. Nothing is
+lost beyond the time the API was down.
+
+**Miner: waits, then carries on.** Every phase wait in the miner (Distribute,
+MinerCommit1, MinerCommit2) waits for a phase to start, so it keeps polling
+every few blocks and logging the network errors, and continues when the API
+answers. Training already under way keeps running, but each optimizer step
+also polls for the active task, logs `Owner API unreachable — staying on the
+current task`, and can wait up to about two minutes for that poll while the
+API times out. A miner whose commit phases fall inside the outage misses that
+round's commits.
+
+**What to do:** nothing on your side if the API is down for everyone (check
+`curl -i https://cycle-api.connito.ai/get_phase` from another network). If
+only your host gets a 403, see "HTTP 403 from `cycle-api.connito.ai`". Run the
+validator under the compose file, or another supervisor that restarts it on
+any exit, including exit code 0.
+
+Code: `connito/shared/cycle.py:wait_till`, `connito/shared/cycle.py:should_act`,
+`connito/shared/helper.py:get_with_retry`, `connito/validator/run.py` (the
+"Quit training" handler), `connito/shared/task_sync.py:sync_active_task`.
