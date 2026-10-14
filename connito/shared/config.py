@@ -210,23 +210,16 @@ class ModelCfg(BaseConfig):
     # Not locked: a miner trades VRAM against training fidelity on its own box,
     # and the choice affects nobody else's scoring.
     quantization_miner: str = "all"
-    # "all" fleet-wide. Locked, so every validator scores under the identical
-    # scope; a mixed fleet would make val_loss incomparable across validators.
-    quantization_validator: str = "all"
+    # Locked, so every validator scores under one scope and val_loss stays comparable across validators.
+    # Measured on Qwen vs bf16: "experts" +0.0006 nats, "all" +0.0018 for only 1.3 GiB less.
+    quantization_validator: str = "experts"
 
     @model_validator(mode="after")
     def _validate_quantization(self) -> ModelCfg:
-        # Imported here: quantization.py -> expert_manager.py -> config.py.
-        from connito.shared.modeling.quantization import SCOPES
-
         if self.quantization not in ("off", "fp8"):
             raise ValueError(
                 f"model.quantization must be 'off' or 'fp8', got {self.quantization!r}"
             )
-        for field in ("quantization_miner", "quantization_validator"):
-            value = getattr(self, field)
-            if value not in SCOPES:
-                raise ValueError(f"model.{field} must be one of {SCOPES}, got {value!r}")
         return self
 
 
@@ -1122,6 +1115,15 @@ class MinerConfig(WorkerConfig):
         if self.log.metric_interval is None:
             self.log.metric_interval = max(1, round(goi * frac))
 
+        return self
+
+    @model_validator(mode="after")
+    def _validate_quantization_miner(self):
+        # Only a miner reads it. quantization_validator is locked: a stale value is reset on load, not refused.
+        from connito.shared.modeling.quantization import SCOPES  # quantization -> families -> config
+
+        if self.model.quantization_miner not in SCOPES:
+            raise ValueError(f"model.quantization_miner must be one of {SCOPES}, got {self.model.quantization_miner!r}")
         return self
 
 

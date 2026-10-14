@@ -20,6 +20,7 @@ from connito.shared.config import MinerConfig, ValidatorConfig
 from connito.shared.expert_manager import get_layer_expert_id
 from connito.shared.helper import get_nested_attr
 from connito.shared.modeling.families import family
+from connito.shared.modeling.quantization import fp8_load_config
 
 logger = structlog.get_logger(__name__)
 
@@ -52,6 +53,7 @@ def get_base_model(config: MinerConfig | ValidatorConfig) -> PreTrainedModel:
     # transformers drops Qwen's language_model. prefix and visual.*/mtp.*, and fuses V2's per-expert tensors.
     model, info = fam.causal_lm.from_pretrained(
         fam.model_path, revision=fam.revision, dtype=torch.bfloat16, output_loading_info=True,
+        quantization_config=fp8_load_config(config),
     )
     # transformers only warns, and leaves a missing tensor randomly initialised.
     if info["missing_keys"]:

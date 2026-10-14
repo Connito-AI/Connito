@@ -203,3 +203,10 @@ def test_deepseek_v2_attention_keeps_the_yarn_mscale(tiny_deepseek_v2_checkpoint
     # The fixture's qk_nope_head_dim + qk_rope_head_dim, mscale_all_dim and factor.
     expected = (16 + 8) ** -0.5 * (0.1 * 0.707 * math.log(40) + 1) ** 2
     assert [layer.self_attn.scaling for layer in model.model.layers] == pytest.approx([expected] * 3)
+
+
+def test_the_two_tiny_checkpoints_do_not_share_a_directory(tiny_qwen_checkpoint, tiny_deepseek_v2_checkpoint):
+    model_types = {json.loads((p / "config.json").read_text())["model_type"]
+                   for p in (tiny_qwen_checkpoint, tiny_deepseek_v2_checkpoint)}
+
+    assert model_types == {"qwen3_5_moe", "deepseek_v2"}
