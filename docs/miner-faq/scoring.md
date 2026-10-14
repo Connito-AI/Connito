@@ -12,7 +12,7 @@ the frozen base, evaluates it on the round's task batches and on the c4 replay
 batches, and computes one number:
 
 ```python
-# connito/validator/evaluator.py:evaluate_one_miner_sync
+# connito/validator/evaluator.py:evaluate_one_miner_sync (simplified)
 task_gain = baseline_loss - val_loss               # > 0: better than pretrained on the task
 score = (task_gain
          - a * max(0, c4_loss - baseline_c4_loss)  # replay_penalty
@@ -38,7 +38,10 @@ score = (task_gain
   `evaluation.max_replay_loss_increase` (default 0.02), or any c4 batch is
   non-finite, or the rise is NaN, the score is `−inf`, `val_loss` is reported
   as `inf`, and the status is 15 (`replay_loss_increase`). Such a miner is
-  never ranked, never published, and kept off the podium.
+  never ranked, never published, and kept off the podium (the round's top-3
+  shards that a validator archives to its HF archive repo, when one is
+  configured; finite scores are archived even when negative, only `−inf` is
+  excluded).
 - **Any other non-finite score** (for example every task batch NaN) is `−inf`
   with status 1, `non_finite_loss`.
 - **A task with no c4 replay source** has no c4 terms: score = task gain −
@@ -170,31 +173,36 @@ weight_group_2_size  = 5      # G2 holds at most 5 miners
 **Weight Group 1 (98 %)** — top-3 of validation groups A ∪ B by `score_avg`,
 subject to:
 
-1. `record_count >= 2` (the miner has at least 2 samples in the aggregator).
-2. The miner has a score recorded for **both** of the last 2 rounds
-   (`round_id == current_round_id` and `round_id == current_round_id - cycle_length`).
-   This is the "recency gate" — a miner that missed either round drops off G1
-   for this cycle.
+1. `record_count >= 3` (the miner has at least 3 samples in the aggregator).
+2. The miner has scores recorded in **at least 3 distinct rounds** within the
+   last 5 cycles (round ids from `current_round_id − 5 × cycle_length` to
+   `current_round_id`). This is the "recency gate".
+3. Its `score_avg` is **above 0**. Rank scores are 2.25 / 1.5 / 1.0 / 0, so
+   an average of 0 means no top-3 placing with a positive round score in the
+   window.
 
-If no UID clears the recency gate, the entire 98 % share is **redirected to
-UID 0** (subnet owner). This is the **no-winner-in-group fallback**, not a
-"burn":
+If no UID qualifies, the entire 98 % share is **redirected to UID 0**
+(subnet owner). This is the **no-winner-in-group fallback**, not a "burn":
 
 > The chain emission is not destroyed. It is paid to the subnet owner because
-> the validator could not confidently pick a top-3 from miners that have been
-> scoring consistently in the last 2 rounds. From the chain's perspective UID
-> 0 receiving 98 % looks identical to a burn, but the operational meaning is
-> "no qualified winner this round."
+> the validator could not pick a top-3 from miners that have been scoring
+> consistently and positively. From the chain's perspective UID 0 receiving
+> 98 % looks identical to a burn, but the operational meaning is "no
+> qualified winner this round."
 
 Code:
 `connito/validator/evaluator.py:build_submission_uid_weights` (g1 selection
-and redirect at lines 440-453),
+and redirect),
+`connito/validator/round_groups.py:select_top_n_by_local_score` (skips a
+`score_avg` of 0 or below),
 `connito/validator/run.py:1064-1070` (the "g1 empty — redirecting" log line),
 `connito/shared/chain.py:reserve_subnet_owner_share` (a separate 5 % owner
 share applied to fallback-weight paths, distinct from G1 redirection).
 
 **Weight Group 2 (2 %)** — top-5 of A ∪ B ∪ C \ G1 by `score_avg`, subject
-to `record_count >= 1`. No recency gate.
+to `record_count >= 1` and a `score_avg` above 0. No recency gate. If G2 is
+empty too, the chain submitter normalizes the weights, so UID 0 receives all
+of this validator's emission.
 
 Within each group, the share is split **proportional to `score_avg`** (not
 equal). If every member of a group scored 0, the share is split equally
@@ -237,7 +245,7 @@ The most common cases, in order of frequency:
 1. **The penalties outweigh the task gain.** A low `val_loss` only buys the
    task gain; the gate-usage and c4 penalties are subtracted from it. A gate
    that fires equally on task and c4 tokens pays 0.2 for any usage up to 0.2,
-   more than the task gains measured so far. A round score of 0 or below gets
+   more than the task gains measured (at most 0.06). A round score of 0 or below gets
    rank score 0. See "Gate usage: why a better loss can still score below 0".
 2. **Not in the round's top 3 by score.** The rank-based mapping is geometric
    and cuts off after rank 3. Rank 4 is 0.0.
@@ -265,12 +273,19 @@ these things is happening on that validator:
    evaluated miners. This is the most common cause on a freshly-restarted
    validator with no rolling history, and on a quiet task where
    miners are not consistently submitting.
-2. **Stale-weights fallback** — the validator did not submit weights in
+2. **No miner has a positive score average** — no miner placed in a round's
+   top 3 with a round score above 0 within its last 8 samples (for example,
+   every round score was 0 or below), so every `score_avg` is 0 and
+   `select_top_n_by_local_score` skips them all. G1 is empty and the 98 % goes
+   to UID 0; G2 is empty too, so after normalization UID 0 receives the whole
+   emission. Under the current score this is what happens while no miner's
+   residual scores above the pretrained base.
+3. **Stale-weights fallback** — the validator did not submit weights in
    `cycle_length` blocks (e.g., it was down). `_submit_fallback_weights`
    aggregates peer consensus and emits to top-3 peer-favored miners, plus
    reserving a separate **5 % to UID 0** (`SUBNET_OWNER_WEIGHT_SHARE`). This
    is distinct from G1 redirection.
-3. **All peers are themselves in even-weight fallback state** — emit 100 %
+4. **All peers are themselves in even-weight fallback state** — emit 100 %
    to UID 0 to avoid amplifying a subnet-wide cascade. Code:
    `connito/shared/chain.py:_submit_fallback_weights`.
 
@@ -308,7 +323,8 @@ The rule, applied when the round is finalized:
    the baseline came back non-finite, or the c4 check could not run on a task
    that has a replay source), it scores the round against a fixed 100.0, logs
    "round on the fallback baseline; no winner will be published", and
-   publishes no winner. Rank rewards for that round still apply.
+   publishes no winner. There is no c4 eval on such a round, so no c4 terms
+   and no c4 cutoff. Rank rewards for that round still apply.
 
 So the published residual is always one that scored above the pretrained
 base on that round's data, penalties included, and passed the c4 cutoff. The
@@ -324,23 +340,25 @@ Code: `connito/validator/round.py:select_baseline_uid`,
 The score charges the residual for where its gate fires, not only for the
 loss it wins: `− |task_usage − 0.2| − c4_usage` (default weights). The
 pretrained base, with the validator's fresh residual, has a gate usage of
-0.045 on task tokens and 0.053 on c4 tokens.
+about 0.05 on both task and c4 tokens (it varies a little with the fresh
+draw).
 
 **What was measured** (production scoring code, real shards, two eval seeds):
 
-- Shards trained by the reference miner beat the base on the task by 0.03 to
-  0.06 nats and scored **−0.14 to −0.17**: nothing published, no rank
-  rewards. A full Train phase raised gate usage on **both** splits, to about
-  0.08 on task tokens and 0.09 on c4; a shard trained for a few steps stayed
-  near the base's usage and scored about the same.
+- Shards trained with the reference training code (two full-Train rehearsal
+  shards and a 3-step test shard) beat the base on the task by 0.03 to 0.06
+  nats and scored **−0.14 to −0.17**: they would publish nothing and earn no
+  rank reward. The full-Train shards raised gate usage on **both** splits, to
+  about 0.08 on task tokens and 0.09 on c4; the 3-step shard stayed near the
+  base's usage and scored about −0.17.
 - A deliberately leaky shard (its residual scaled ×32) failed the c4 cutoff:
   `−inf`, status 15.
 
 **Why.** A gate that fires equally on task and c4 tokens, at any usage u up to
 0.2, pays `|u − 0.2| + u = 0.2` exactly. Raising usage on both splits trades
 one penalty for the other. To score above 0 a miner has to make its gate
-**fire on task tokens** (toward 0.2) **and stay quiet on c4**, and win more
-task loss than the penalty that is left.
+**fire on task tokens** (toward 0.2) **and stay quiet on c4**, and gain more
+on the task loss than the penalty that is left.
 
 **The reference miner does not do this.** It trains on cross-entropy only,
 with no term that separates the gate's behaviour on task and c4 tokens, so
