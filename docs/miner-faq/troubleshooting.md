@@ -6,12 +6,17 @@ relevant section.
 | Symptom | Likely cause | Section below |
 |---------|--------------|---------------|
 | HTTP 403 from `cycle-api.connito.ai` when polling phase | Cloudflare WAF flagging the request | [HTTP 403 from phase API](#http-403-from-cycle-apiconnitoai-cloudflare-waf) |
-| Miner trains from base every cycle | Distribute download 404 / wrong file extension | [Miner trains from base every cycle](#miner-trains-from-base-every-cycle-download-404-on-pt) |
-| Training batch loss starts at ~20 instead of <1 | Base model loaded; previous training discarded | [Batch loss starts at 20](#training-batch-loss-starts-at-20-instead-of--1) |
-| Miner submitted but never evaluated | No validator covers your expert group, or `no_chain_commit` | [Submitted but never evaluated](#submitted-but-never-evaluated) |
+| Miner never starts from a published winner | Nothing published yet, or the published shard was refused | [Fresh residual every round](#miner-keeps-starting-from-its-own-fresh-residual) |
+| Training stops at setup, or the loss doesn't move | No residual installed, diverged residual, or flat training | [Training refuses to start](#training-refuses-to-start-or-the-loss-doesnt-move) |
+| Miner submitted but never evaluated | Not on the active task's group, or `no_chain_commit` | [Submitted but never evaluated](#submitted-but-never-evaluated) |
 | `score_avg` flat for 5+ hours | Stuck on a single rank, or operationally failing every round | [Score didn't change for 5+ hours](#score_avg-didnt-change-for-5-hours) |
-| `eval_status_label` shows `download_failed` | HF repo private, file missing at committed revision, or timeout | See `eval-status.md` |
+| Status 15, `replay_loss_increase`, `val_loss = inf` | Residual raised the c4 loss above the cutoff; usually the same data trained again | [Zeroed by the c4 check](#score-zeroed-by-the-c4-check-status-15) |
+| Status `ok`, task loss below the base, but rank score 0 and nothing published | Round score ≤ 0: your raw score (task gain minus the c4 and gate-usage penalties) did not beat the base's | See `scoring.md`, "Gate usage and the base's raw score" |
+| Status 14, `bad_residual_shard` | Shard is not exactly the task's residual | See `eval-status.md` |
 | `eval_status_label` shows `hash_mismatch` | Re-uploaded the same revision after committing | See `eval-status.md` |
+| `the base model is split over devices` at startup | Model spread over several GPUs | [Split over GPUs](#loader-refuses-a-model-split-over-several-gpus) |
+| fla warns "Triton is not supported on current platform" | Python without `Python.h` | [fla Triton warning](#fla-warns-that-triton-is-not-supported) |
+| Validator logs `Quit training` and exits after cycle-api errors; miner stalls on phase waits | cycle-api unreachable | [cycle-api unreachable](#cycle-api-unreachable-the-validator-exits-the-miner-waits) |
 | Validator dashboards show different `chain_weight_stake_weighted` per validator | Expected — each validator has independent `score_avg` history | [Validators show different weights](#validators-show-different-chain_weight_stake_weighted) |
 
 ---
@@ -31,10 +36,12 @@ request as automated. Common triggers:
 - Default `python-requests` User-Agent.
 - Too many sequential identical-shape requests in a short window.
 
-**What the code does:** `_get_with_retry` treats 403 as **non-retryable**
-(line 88 of `connito/shared/cycle.py`) and returns `None`. `wait_till` then
-cannot make progress until the API responds — both miner and validator
-will idle on `get_phase_from_api`.
+**What the code does:** `get_with_retry` treats 403 as **non-retryable**
+and returns `None`, so `get_phase_from_api` returns `None`. From there the
+node behaves as with any cycle-api outage: a miner keeps polling and resumes
+when the API answers, while a validator waiting for the run-up to
+MinerCommit1 exits with `Quit training` and only recovers on restart. See
+"cycle-api unreachable: the validator exits, the miner waits".
 
 **Fix:**
 
@@ -47,87 +54,80 @@ will idle on `get_phase_from_api`.
 3. Contact the subnet owner if persistent — they can whitelist your IP
    range against the WAF rule.
 
-Code: `connito/shared/cycle.py:_get_with_retry` (non-retryable status list
+Code: `connito/shared/helper.py:get_with_retry` (non-retryable status list
 includes 403), `connito/shared/cycle.py:get_phase_from_api`.
 
-## Miner trains from base every cycle (download 404 on `.pt`)
+## Miner keeps starting from its own fresh residual
 
-**Symptom:**
-
-```
-<Distribute> downloaded model metadata from chain: None
-FileNotReadyError: No required download job
-```
-
-Followed by `(0) Setup training` re-loading `deepseek-ai/DeepSeek-V2-Lite`
-from scratch, and Train logs showing initial batch loss in the high teens.
-
-**Cause:** `_build_download_targets` hard-codes
-`f"model_expgroup_{expert_group_id}.pt"` (line 51 of
-`connito/shared/model.py`). If the validator's HF upload only contains the
-`.safetensors` version of the shard at that revision, the `.pt` download
-404s and the miner has no checkpoint to load.
-
-**Fix (one of):**
-
-1. **Upgrade to the latest miner code.** Confirm `_build_download_targets`
-   in your fork includes `.safetensors` as a fallback. Stock validator
-   upload paths in the current code upload **both** `.safetensors` and `.pt`
-   (`allow_patterns=["model_expgroup_*.pt", "model_expgroup_*.safetensors"]`
-   — see `connito/shared/hf_distribute.py:139-147`); a 404 indicates either
-   a stale validator on the old `.safetensors`-only upload path or a
-   miner-side downloader pinned to the wrong extension.
-2. **Verify the HF source.** Open the validator's HF repo at the chain-committed
-   revision and confirm `model_expgroup_{N}.safetensors` exists there. If
-   it doesn't, the validator's upload also failed and the miner can wait
-   for the next cycle's commit.
-
-> **TODO: code in `connito/shared/model.py:_build_download_targets` only
-> requests `.pt`. The validator path uploads both; the miner downloader
-> should be updated to request `.safetensors` first and fall back to
-> `.pt`. Until that change ships, the symptom recurs on any cycle where the
-> validator drops the `.pt` upload.**
-
-Code: `connito/shared/model.py:_build_download_targets`,
-`connito/shared/hf_distribute.py:download_checkpoint_from_hf`.
-
-## Training batch loss starts at ~20 instead of <1
-
-**Symptom:** Miner logs show:
+**Symptom:** every round, the miner logs
 
 ```
-batch loss loss=21.43 inner_opt_step=0
+Keeping the fresh residual: no local checkpoint is a start
 ```
 
-at the start of Train.
+or Distribute logs `Fetching model from chain` with `should_download=False`,
+and the miner never trains from a published round winner.
 
-**Cause:** The model was loaded fresh from `deepseek-ai/DeepSeek-V2-Lite`
-instead of from a recent checkpoint. The base model has not seen the
-subnet's training data and produces high initial loss.
+**Causes, in order of likelihood:**
+1. **Nothing was published.** Validators publish a round winner only if some
+   miner's round score is above 0: a raw score, c4 and gate-usage penalties
+   included, above the pretrained base's own (which also means it passed the
+   c4 cutoff). On the first round of a task, or a round where nobody
+   qualified, they commit a hash with **no HF coordinates**, and there is
+   nothing to download. This is normal. With nothing published, the miner
+   resumes its own last trained checkpoint, or keeps its fresh draw if it has
+   none.
+2. **The published shard was refused.** The miner checks a downloaded
+   winner exactly as validators check submissions (keys, shapes, dtypes,
+   finite, trained). A shard for another K, for example right after a task
+   switch, fails and is deleted. Look for `residual shard refused` in the
+   miner log. A refused winner is downloaded again on each later fetch (about
+   252 MB) until a newer one is published.
+3. **Your local checkpoints are gone.** A wiped `checkpoints/` dir or a
+   renamed `run_name` means there is nothing of your own to resume from.
 
-**Why this happens:**
+**Fix:** for (1) nothing; train from your own residual and vary your data.
+For (2), make sure the miner is on the active task (it follows the owner API
+at Distribute). For (3), keep `run_name` and the checkpoint dir stable.
 
-1. The Distribute phase failed to find a chain-committed checkpoint (no
-   recent validator commit with valid signature).
-2. The Distribute phase succeeded but the HF download 404'd (see
-   `.pt` 404 trap above).
-3. Local `config.ckpt.checkpoint_path` was wiped and `resume_from_ckpt =
-   true` could not find a local fallback either.
+Code: `connito/shared/model.py:fetch_model_from_chain_validator`,
+`connito/shared/model.py:get_model_from_checkpoint`,
+`connito/shared/checkpoint_helper.py:verify_residual_shard`.
 
-**Fix:**
+## Training refuses to start, or the loss doesn't move
 
-- Check the previous cycle's `<Distribute> downloaded model metadata from
-  chain: ...` log line. If it says `None`, no chain commit was found — was
-  the validator down last cycle? Wait one cycle and retry.
-- If the download 404'd, see the previous section.
-- If neither — check `expert_groups/<group_name>/config.yaml` and your
-  miner config agree on `group_id`. A mismatch means
-  `freeze_parameters` produces zero trainable params and the model never
-  actually trains; you see a finite but high loss because base DeepSeek
-  is being evaluated, not your trained version.
+**What normal looks like.** At step 0 the residual adds nothing (its
+`down_proj` is 0), so the first losses are the pretrained base's. On this
+task's eval data the base scored about 1.5–1.7 on pmc and 2.3–2.5 on c4 across
+measured rounds; training batches mix both, so early batch losses in that
+range are expected. Over a 300-step run the pmc eval loss fell by about 0.07,
+most of it in the first 50 steps.
 
-Code: `connito/miner/train.py:setup_training` (the `freeze_parameters` →
-"No trainable parameters found" warning around line 177-184).
+**Training stops at setup** with
+
+```
+ValueError: the model has no residual experts (`.residual_` parameters) to train
+```
+
+The residual was not installed, which means the model was built outside
+`get_model_from_checkpoint` (a custom loader). Use the stock path.
+
+**Training stops mid-round** with `FloatingPointError: Non-finite loss
+persisted for 50 consecutive batches`: the residual diverged, or the data
+stream is producing only near-empty rows. Lower the learning rate, restart
+from your last good checkpoint, and vary your data (see "Score zeroed by the
+c4 check"). A few `Non-finite loss detected, skipping batch` warnings are
+tolerated.
+
+**The loss doesn't move.** Check the miner's `miner_param_sum` gauge: it sums
+the residual parameters and moves on every optimizer step while training
+works. If it is flat, confirm the miner is in the Train phase and is not
+reloading every step (`Should reload model` in the log on every step means it
+keeps finding a newer checkpoint on disk and rebuilds from it).
+
+Code: `connito/shared/modeling/residual.py:freeze_all_but_residual`,
+`connito/miner/train.py:train_worker`,
+`connito/shared/model.py:get_model_from_checkpoint`.
 
 ## Submitted but never evaluated
 
@@ -137,16 +137,16 @@ dashboard you have no `val_loss` for the round and your
 
 **Cause (in order of frequency):**
 
-1. **No validator is running your expert group.** Validators filter their
-   roster by `expert_group == config.task.exp.group_id`. If you committed
-   to `group_id = 5` and every validator is running `group_id = 0` or `1`,
-   no one evaluates you.
+1. **You are not on the active task.** Validators filter their roster by
+   `expert_group == config.task.exp.group_id`, the `group_id` of the task the
+   owner API serves (9 for `exp_pmc_residual`). A miner still committing
+   under an older task's group is never evaluated.
 
-   Check: dashboard's per-validator panel will show which `expert_group`
-   each validator runs.
+   Check: the `expert_group` in your miner's MinerCommit2 log line, against
+   the active task's `config.yaml`.
 
-   Fix: switch `task.expert_group_name` to a group at least one validator
-   covers.
+   Fix: run a current miner release; it follows the owner API's active task
+   at startup and at each Distribute. Do not pin `task.expert_group_name`.
 
 2. **Your hotkey is not in the validator's assignment slice.** Each
    validator only evaluates `foreground_top_n = 5` miners per cycle
@@ -194,7 +194,9 @@ Diagnostics:
 
 4. **Is the validator on the empty-G1 fallback?** If `score_avg` is
    non-zero but you see `validator_miner_weight_submitted` showing UID 0
-   at 98 %, the validator could not pick a top-3 by recency — your
+   at 98 % (the gauge records the weights before the 25 % owner reserve is
+   added; on chain UID 0 then holds 98.5 %), the validator could not pick a
+   top-3 by recency — your
    `score_avg` is fine but the weight share is going to the owner anyway.
    See `scoring.md` "97 % burn" section.
 
@@ -226,40 +228,190 @@ calculation (or your stake-weighting interpretation), not the validators.
 Code: `connito/shared/chain.py:submit_weights`,
 `connito/validator/aggregator.py:MinerScoreAggregator.uid_score_pairs`.
 
-## Validator status `merge` ran but my score didn't update
+## My score didn't update for a round
 
-**Symptom:** Validator log shows `(5) Run global optimization` completing,
-but `score_aggregator.json` was not updated for your UID.
+**Symptom:** a validator's log shows the round finalized, but
+`score_aggregator.json` was not updated for your UID.
 
-**Cause:** The Merge phase aggregates *gradients*, not *scores*. Scores
-were finalized earlier (Validate phase). If your score didn't update for
-the round:
+**Cause:** scores are written once per round, by `finalize_round_scores`, 5
+blocks before the next cycle's MinerCommit1. Nothing is merged in the Merge
+phase; it does not touch scores. If your score didn't update for the round:
 
 1. Check your UID is in `validator-1 | … round_id=… written_uids=…`. If
    it's not in `written_uids`, you weren't in scored_uids and your prior
-   EMA is preserved (operational failure path).
+   EMA is preserved (operational failure path: download trouble, timeout,
+   OOM).
 2. If you are in `written_uids` but the value is 0.0, you ranked outside
-   the top 3 or hit the duplicate-`val_loss` penalty.
+   the top 3, your round score was 0 or below (a raw score no better than
+   the base's), the c4 cutoff gave you `−inf`, or
+   you hit the duplicate-score penalty.
 
 Code: `connito/validator/evaluator.py:finalize_round_scores`.
 
-## My miner uploaded but the validator log says `outdated_submissions`
+## My miner committed, but the validator used an older commit or none
 
-**Symptom:** Validator log:
+**Symptom:** your miner logged its MinerCommit1 and MinerCommit2 commits, but
+the round shows `signature_invalid` (3) or `no_chain_commit` (6).
+
+**Cause:** validators do not read your commits whenever they arrive. At round
+freeze they read the chain **as of two blocks**: the end of MinerCommit1 (your
+signed hash) and the end of MinerCommit2 (your model hash and HF
+coordinates). A hotkey has one commitment slot, which each commit
+overwrites, so whatever the slot held at those blocks is what gets scored:
+
+- **Signed hash committed after MinerCommit1 ended:** at that block the slot
+  still held your previous commit, which carries no signed hash, so the
+  validator drops you as having no complete commit (`no_chain_commit`). If
+  that previous commit was itself an older signed hash, the signature check
+  fails instead (`signature_invalid`).
+- **Model hash committed after MinerCommit2 ended:** at that block the slot
+  still held your signed hash, so the validator finds no model-hash commit
+  (`no_chain_commit`).
+- **HF upload failed:** the MinerCommit2 commit went out without HF
+  coordinates (`no_chain_commit`).
+
+**Fix:** let each commit land inside its phase. The stock miner waits on the
+chain-driven phases (`wait_till(config, PhaseNames.miner_commit_1)` and
+`…miner_commit_2`); a custom miner on a wall-clock timer, or one whose HF
+upload runs past MinerCommit2, misses the window. Look for `<MinerCommit2>
+committing` in your log and check its block against the phase's end block
+from `GET /get_phase`.
+
+Code: `connito/shared/checkpoints.py:build_chain_checkpoints_from_previous_phase`,
+`connito/shared/cycle.py:get_validator_miner_assignment`,
+`connito/miner/model_io.py:commit_worker`.
+
+## Score zeroed by the c4 check (status 15)
+
+**Symptom:** status 15, `replay_loss_increase`, with `val_loss = inf` and a
+round score of `−Inf` on `validator_miner_round_delta`, often right after your
+miner restarted from a published round winner. Your task loss may still have
+beaten the baseline. You are not ranked and not published.
+
+**Cause:** your residual raised the loss on general English text (c4) by more
+than the locked tolerance, `evaluation.max_replay_loss_increase` (default
+0.02 nats), compared with the pretrained base on the same batches. The usual
+reason is **training on the same data again**: the stock miner replays one
+fixed stream every round, and every stock miner reads the same slice. Measured
+from the same published winner, the stock stream raised c4 loss by
++0.064 / +0.066 and both miners were stopped; shuffling each source per
+(hotkey, round) lowered it by 0.024 / 0.025 and passed the cutoff. Passing the
+cutoff is not the same as scoring above 0: your raw score, gate-usage
+penalties included, still has to beat the base's (see `scoring.md`, "Gate
+usage and the base's raw score").
+
+**Fix:**
+1. Vary or shuffle your training data every round, e.g. shuffle each
+   streaming source with a seed from your hotkey and the round. Do not pass
+   `seed=` to `get_dataloader` for training. See `miner-config.md`, "Vary
+   your training data every round".
+2. Keep the task's c4 replay rows in your mix, with their labels.
+3. Read the validator log line `evaluate_one_miner: c4 isolation gate failed;
+   not ranked` (`reason`, `replay_loss_increase`, `tolerance=`) or the
+   `validator_miner_replay_loss_increase` gauge to see your margin.
+
+Code: `connito/validator/evaluator.py:evaluate_one_miner_sync`,
+`connito/miner/train.py:setup_training`.
+
+## Loader refuses a model split over several GPUs
+
+**Symptom:** the miner or validator stops at startup with
 
 ```
-Skipping submission file: outdated
-file_name=hotkey_…_block_8120000.pt
+the base model is split over devices [...]. Load it onto one GPU: split over several GPUs (transformers device_map), Qwen gives wrong outputs.
 ```
 
-**Cause:** Your submission's `block` is outside the previous Submission
-phase's block range. This usually means you uploaded too early (during the
-cycle that just ended) or your local clock is drifting badly.
+**Cause:** the base model ended up on more than one device, for example
+because something loaded it with transformers `device_map="auto"` on a
+multi-GPU host. That is refused on purpose: split over three GPUs, Qwen
+returned wrong logits with no error (loss 12.42 instead of 2.04 on a test
+sentence), and two GPUs only happened to be right.
 
-**Fix:** Make sure MinerCommit2 fires inside the chain phase boundary, not
-on a wall-clock timer. The stock miner uses `wait_till(config,
-PhaseNames.miner_commit_2)` which is chain-block driven — only a custom
-miner would deviate.
+**Fix:** run on one 48 GB GPU. On a multi-GPU host, pin the process to one
+GPU with `CUDA_VISIBLE_DEVICES=<n>`, and run one miner per GPU, each with its
+own hotkey.
 
-Code: `connito/shared/cycle.py:gather_validation_job` (the
-`in_previous_phase` filter, line 1045-1059).
+Code: `connito/shared/modeling/mycelia.py:get_base_model`.
+
+## fla warns that Triton is not supported
+
+**Symptom:** at startup or at the first training step:
+
+```
+Triton is not supported on current platform, roll back to CPU
+```
+
+Training then runs, but falls back to a slower path.
+
+**Cause:** the model's Gated DeltaNet layers run on flash-linear-attention
+(fla) Triton kernels, which compile a small C launcher at first use. Without
+the Python headers (`Python.h`), the compile fails, and fla only warns and
+falls back. A system Python without its `-dev` package is the usual cause.
+
+**Fix:** build the environment on a Python that ships its headers. A
+uv-managed Python does; `--managed-python` makes uv use it even when a system
+Python 3.10 exists (on Ubuntu 22.04, `uv venv -p 3.10` alone can pick the
+system one, which has no headers):
+
+```bash
+uv venv --seed --managed-python -p 3.10 .venv && source .venv/bin/activate
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+On a uv release without `--managed-python`, run `uv python install 3.10`
+first and pass `--python-preference only-managed` instead.
+
+On a distribution Python, install its development package (for example
+`python3.10-dev`) instead. Also check the NVIDIA driver is 570 or newer.
+
+Code: `requirements.txt` (`flash-linear-attention`).
+
+## cycle-api unreachable: the validator exits, the miner waits
+
+Both roles ask the owner's phase service (`cycle-api.connito.ai`) where the
+cycle is. When it stops answering (timeouts, or a 403 from its firewall),
+each request is retried with backoff (`cycle.api_retries` 5,
+`cycle.api_timeout_sec` 10, `cycle.api_backoff_sec` 2, so up to about two
+minutes per request on timeouts), then given up. What happens next differs.
+
+**Validator: exits, and recovers on restart.** Most of `wait_till`'s callers
+wait for a phase to *start*, and those keep polling. But the validator's two
+waits that end a few blocks *before* MinerCommit1 (15 and 5 blocks before;
+the first one covers most of Train) stop after a failed poll with no phase
+to report, and the validator then crashes on it. The log reads:
+
+```
+Network error calling https://cycle-api.connito.ai:443/..., will retry
+wait_till: loop exited but phase_response is None for phase 'MinerCommit1' (block_offset=-15)
+Quit training
+AttributeError: 'NoneType' object has no attribute 'phase_name'
+```
+
+The process shuts its workers down and exits with code 0. Under the operator
+compose file (`restart: unless-stopped`) Docker restarts the container; it
+boots in about 70 s and finalizes the interrupted round from its journal:
+scores already recorded are kept, but it publishes no winner for that round
+(its next ValidatorCommit carries the no-winner hash) and skips that round's
+weight submission. While the API is still down, the restarted validator
+reaches the same wait and exits again, so expect a restart loop that ends once
+the API answers. Two test validators crashed this way during a cycle-api
+outage.
+
+**Miner: waits, then carries on.** Every phase wait in the miner (Distribute,
+MinerCommit1, MinerCommit2) waits for a phase to start, so it keeps polling
+every few blocks and logging the network errors, and continues when the API
+answers. Training already under way keeps running, but each optimizer step
+also polls for the active task, logs `Owner API unreachable — staying on the
+current task`, and can wait up to about two minutes for that poll while the
+API times out. A miner whose commit phases fall inside the outage misses that
+round's commits.
+
+**What to do:** nothing on your side if the API is down for everyone (check
+`curl -i https://cycle-api.connito.ai/get_phase` from another network). If
+only your host gets a 403, see "HTTP 403 from `cycle-api.connito.ai`". Run the
+validator under the compose file, or another supervisor that restarts it on
+any exit, including exit code 0.
+
+Code: `connito/shared/cycle.py:wait_till`, `connito/shared/cycle.py:should_act`,
+`connito/shared/helper.py:get_with_retry`, `connito/validator/run.py` (the
+"Quit training" handler), `connito/shared/task_sync.py:sync_active_task`.
