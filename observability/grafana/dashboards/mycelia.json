@@ -241,19 +241,6 @@
         "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 5, "lineWidth": 2, "showPoints": "never", "spanNulls": true }, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 39 },
-      "id": 15,
-      "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "miner_aux_loss", "legendFormat": "aux loss" }],
-      "title": "MoE Aux Loss",
-      "type": "timeseries"
-    },
-
-    {
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 5, "lineWidth": 2, "showPoints": "never", "spanNulls": true }, "unit": "short" },
-        "overrides": []
-      },
       "gridPos": { "h": 7, "w": 8, "x": 0, "y": 46 },
       "id": 16,
       "targets": [{ "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "miner_learning_rate", "legendFormat": "lr" }],
