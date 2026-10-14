@@ -58,7 +58,8 @@ The validator runs `Qwen/Qwen3.6-35B-A3B` at the pinned revision
 experts stored in fp8 (`model.quantization_validator: experts`, locked), plus
 one miner's residual experts at a time.
 
-- **GPU: one 48 GB card** (measured on RTX A6000 and L40S). A 40 GB card is
+- **GPU: one 48 GB card** (measured on an RTX A6000; on an L40S, the task
+  eval). A 40 GB card is
   too small. The base model must sit on **one** GPU: split over three GPUs
   with transformers `device_map="auto"`, Qwen returned wrong logits with no
   error (loss 12.42 instead of 2.04), so the loader refuses any model spread
@@ -76,7 +77,7 @@ Measured peaks (real model, real eval data, seq 4096):
 
 | GPU | what ran | GPU memory |
 |---|---|---|
-| RTX A6000 (47.4 GiB) | the validator process, 6 rounds on live chain data | 42,316 MiB used (41.3 GiB) on `nvidia-smi`, CUDA context included |
+| RTX A6000 (47.4 GiB) | the validator process, 6 rounds on live chain data: its own task and c4 baseline evals each round (no submission passed verification in those rounds) | 42,316 MiB used (41.3 GiB) on `nvidia-smi`, CUDA context included |
 | RTX A6000 | task eval + c4 eval of one miner | 39.25 GiB allocated / 39.45 GiB reserved (the c4 eval sets the peak; the task eval peaks at 37.16) |
 | L40S (44.4 GiB) | task eval of one miner | 37.16 GiB allocated / 37.56 GiB reserved |
 <!-- L40S observer cycle: add its row here (nvidia-smi peak, host RSS, per-miner eval time). -->
@@ -272,7 +273,8 @@ that changes the base model or the CUDA image needs three things done
 
 **Locked config fields.** Some fields (for example `model.family`,
 `model.quantization_validator`, `evaluation.max_replay_loss_increase`,
-`cycle.*`) must match the fleet. On boot the validator compares them with
+`cycle.cycle_length`, the `cycle.*_period` fields and `cycle.owner_url`) must
+match the fleet. On boot the validator compares them with
 the release's defaults. With the default `--auto_update_config` it resets
 any stale value, logs `auto_update_config: resetting locked field to
 default`, and rewrites your YAML. With `--no-auto_update_config` it asks on a
@@ -427,7 +429,7 @@ writable before starting the stack.
 1. **GHCR access.** If the image is private, run `docker login ghcr.io`
    on the host. The compose file bind-mounts `~/.docker/config.json`
    into Watchtower so it inherits the same auth — no extra config.
-2. **`validator.yaml` is host-specific** (wallet names, expert group,
+2. **`validator.yaml` is host-specific** (wallet names, task,
    ports). Source-control it in a private repo or your secret store, not
    in the public one.
 3. **Wallet bind mount is read-only.** The compose file does this for
