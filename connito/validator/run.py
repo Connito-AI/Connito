@@ -1474,7 +1474,9 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 except Exception:
                     pass
 
-            phase_response = wait_till(config, PhaseNames.validate)
+            # A skipped round can already be past Validate/Merge; waiting for them would sleep a whole cycle.
+            if frozen is not None:
+                phase_response = wait_till(config, PhaseNames.validate)
 
             cleanup()
 
@@ -1491,18 +1493,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # central phase API owns its boundaries and miners read the same
             # schedule — we do no work in it, which frees the window for the
             # background workers.
-            check_phase_expired(lite_subtensor, phase_response)
-            phase_response = wait_till(config, PhaseNames.merge)
-
             if frozen is not None:
+                check_phase_expired(lite_subtensor, phase_response)
+                phase_response = wait_till(config, PhaseNames.merge)
                 try:
                     note_round_series(new_round.round_id)
                     new_round.lifecycle_step = 3
                     VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
                 except Exception:
                     pass
-
-            check_phase_expired(lite_subtensor, phase_response)
+                check_phase_expired(lite_subtensor, phase_response)
 
             # === Commit to chain for next validation ===
             # Advertise the baseline published at finalize. It uploaded ~142
