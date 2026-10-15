@@ -673,6 +673,7 @@ def get_validator_miner_assignment(
     *,
     commits: list[tuple[WorkerChainCommit, bittensor.Neuron]] | None = None,
     metagraph: bittensor.Metagraph | None = None,
+    deadline: float | None = None,
 ) -> ValidatorMinerAssignment:
     """Resolve the validator → miner assignment for the current phase.
 
@@ -685,13 +686,13 @@ def get_validator_miner_assignment(
     from connito.shared.checkpoints import build_chain_checkpoints_from_previous_phase
 
     if commits is None:
-        commits = get_chain_commits(config, subtensor)
+        commits = get_chain_commits(config, subtensor, deadline=deadline)
     validator_seeds = get_validator_seed_from_commit(config, commits)
     miners = get_miners_from_commit(config, commits)
 
     # Filter miners to only those with a chain checkpoint from the previous commit phase
     chain_checkpoints = build_chain_checkpoints_from_previous_phase(
-        config=config, subtensor=subtensor, for_role="miner",
+        config=config, subtensor=subtensor, for_role="miner", deadline=deadline,
     )
     # Index by hotkey so the eval path can look up signed_model_hash /
     # model_hash / expert_group for `_verify_*` without re-touching the chain.

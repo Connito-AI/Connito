@@ -647,6 +647,7 @@ def build_chain_checkpoints_from_previous_phase(
     subtensor: bittensor.Subtensor,
     for_role: str = "validator",
     owner_hotkey: str | None = None,
+    deadline: float | None = None,
 ) -> ChainCheckpoints:
     logger.debug("Building chain checkpoints from previous phase", for_role=for_role)
     
@@ -688,10 +689,10 @@ def build_chain_checkpoints_from_previous_phase(
 
         # --- Get commits from chain at the right blocks ---
         signed_hash_chain_commits: tuple[SignedModelHashChainCommit, bittensor.Neuron] = get_chain_commits(
-            config, subtensor, block=commit_1_end_block, signature_commit=True
+            config, subtensor, block=commit_1_end_block, signature_commit=True, deadline=deadline,
         )
         hash_chain_commits: tuple[WorkerChainCommit, bittensor.Neuron] = get_chain_commits(
-            config, subtensor, block=commit_2_end_block
+            config, subtensor, block=commit_2_end_block, deadline=deadline,
         )
         # Log the source blocks at info: when two validators disagree on which
         # miner revision to download (the chain-read divergence we saw in SN102

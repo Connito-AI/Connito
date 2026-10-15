@@ -291,6 +291,7 @@ def get_chain_commits(
     wait_to_decrypt: bool = False,
     block: int | None = None,
     signature_commit: bool = False,
+    deadline: float | None = None,
 ) -> tuple[WorkerChainCommit, bittensor.Neuron]:
     # Retry transient upstream-node errors (e.g. SubstrateRequestException
     # "Internal error" from get_chain_head, WS disconnects, timeouts). Without
@@ -299,7 +300,9 @@ def get_chain_commits(
     # archive node has pruned the requested historical block.
     # A head read is pinned to one block number: with `block=None` every page
     # resolves head separately, and a load-balanced endpoint can route it to a
-    # backend that has not seen that header yet (UnknownBlock).
+    # backend that has not seen that header yet (UnknownBlock). A backend without
+    # the hash answers null, which bittensor caches and reads as head, so it is
+    # checked. `deadline` (time.monotonic()) ends retries, not a hung RPC.
     max_retries = _CHAIN_READ_MAX_RETRIES
     backoff_s = _CHAIN_READ_BACKOFF_S
     head_read = block is None
@@ -311,8 +314,10 @@ def get_chain_commits(
     for attempt in range(max_retries + 1):
         try:
             if fetch_block is None:
-                fetch_block = reader.get_current_block()
+                fetch_block = reader.get_current_block() - 1
                 head_pinned = True
+            if not reader.determine_block_hash(fetch_block):
+                raise (SubstrateRequestException or RuntimeError)(f"UnknownBlock: no hash for block {fetch_block}")
             all_commitments = reader.get_all_commitments(
                 netuid=config.chain.netuid, block=fetch_block,
             )
@@ -337,7 +342,8 @@ def get_chain_commits(
                 fetch_block -= 1
                 step_backs += 1
 
-            if attempt < max_retries and _is_retryable_chain_error(err):
+            in_time = deadline is None or time.monotonic() < deadline
+            if attempt < max_retries and in_time and _is_retryable_chain_error(err):
                 endpoint = getattr(subtensor, "chain_endpoint", None) or config.chain.network
                 lite = config.chain.lite_network
                 if head_read and attempt + 1 >= 3 and lite and lite != config.chain.network:
