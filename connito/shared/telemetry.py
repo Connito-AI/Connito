@@ -374,6 +374,18 @@ VALIDATOR_BG_EVAL_RECYCLE_TOTAL = Counter(
     "validator_bg_eval_recycle_total",
     "Times bg-eval dropped its eval_base_model after a stuck-lock streak",
 )
+VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL = Counter(
+    "validator_round_freeze_retries_total",
+    "Round freeze attempts that failed and were retried inside Submission",
+)
+VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL = Counter(
+    "validator_round_freeze_failures_total",
+    "Round freezes that never succeeded before Submission ended",
+)
+VALIDATOR_ROUNDS_SKIPPED_TOTAL = Counter(
+    "validator_rounds_skipped_total",
+    "Rounds the validator skipped instead of evaluating",
+)
 
 # Miner (Gauges)
 MINER_TRAINING_LOSS = Gauge("miner_training_loss", "Local model training loss", ["expert_group"])

@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, NamedTuple
+from typing import TYPE_CHECKING, Callable, Iterable, NamedTuple
 
 from connito.shared.app_logging import structlog
-from connito.shared.telemetry import set_round_progress
+from connito.shared.telemetry import (
+    VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL,
+    VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL,
+    VALIDATOR_ROUNDS_SKIPPED_TOTAL,
+    set_round_progress,
+)
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
@@ -878,3 +884,41 @@ class RoundRef:
             old = self.current
             self.current = new_current
             return old
+
+
+_FREEZE_RETRY_BACKOFF_S = 12.0  # one block
+
+
+def _count(*counters) -> None:
+    try:
+        for counter in counters:
+            counter.inc()
+    except Exception as e:
+        logger.debug("freeze telemetry failed", error=str(e))
+
+
+class FrozenRound(NamedTuple):
+    new_round: Round
+    metagraph: object
+
+
+def freeze_before_deadline(
+    fetch_metagraph: Callable[[], object], *, deadline: float, **freeze_kwargs,
+) -> FrozenRound | None:
+    """Fetch the metagraph and freeze until it works or `deadline` (time.monotonic()) passes; None means skip."""
+    round_id = freeze_kwargs.get("round_id")
+    attempt = 0
+    while True:
+        try:
+            metagraph = fetch_metagraph()
+            return FrozenRound(Round.freeze(metagraph=metagraph, **freeze_kwargs), metagraph)
+        except Exception as e:
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error("round skipped: freeze failed", round_id=round_id, attempts=attempt, error=str(e))
+                _count(VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL, VALIDATOR_ROUNDS_SKIPPED_TOTAL)
+                return None
+            logger.warning("Round freeze failed; retrying", round_id=round_id, attempt=attempt, error=str(e))
+            _count(VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL)
+            time.sleep(min(_FREEZE_RETRY_BACKOFF_S, remaining))

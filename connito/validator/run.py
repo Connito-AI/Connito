@@ -87,6 +87,7 @@ from connito.shared.hf_distribute import (
     resolve_hf_repo_ids,
 )
 from connito.shared.cycle import (
+    BITTENSOR_BLOCK_TIME_SECONDS,
     PhaseManager,
     PhaseNames,
     check_phase_expired,
@@ -109,7 +110,7 @@ from connito.validator.evaluator import (
     finalize_round_scores,
     load_model_from_path,
 )
-from connito.validator.round import Round, RoundRef
+from connito.validator.round import Round, RoundRef, freeze_before_deadline
 HF_CHAIN_REVISION_LENGTH = 7
 
 
@@ -1284,6 +1285,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # the unit of work for the rest of the lifecycle: the download
             # worker picks up its roster, the eval worker scores it.
             phase_response = wait_till(config, PhaseNames.submission)
+            freeze_deadline = time.monotonic() + phase_response.blocks_remaining_in_phase * BITTENSOR_BLOCK_TIME_SECONDS
 
             logger.info(
                 "(0) Submission phase entered — freezing round",
@@ -1326,16 +1328,17 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # `last_update` / `weights` view is stale by a full submission
             # period. Re-fetching here gives `Round.freeze` the most recent
             # chain-weight and staleness signals available.
-            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
 
             # (0) Lock and prioritize: build the round roster in A -> B -> C
             # order, then the previous round's A/B carry-over, then a
             # staleness tail (see Round.freeze). Capture the seed and pin the
-            # shard the round is scored against.
-            new_round = Round.freeze(
+            # shard the round is scored against. Retried to the end of Submission: no commit
+            # phase runs inside it, so a late freeze reads the commitments an on-time one would.
+            frozen = freeze_before_deadline(
+                lambda: lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False),
+                deadline=freeze_deadline,
                 config=config,
                 subtensor=subtensor,
-                metagraph=metagraph,
                 base_shard=state.base_shard,
                 round_id=phase_response.phase_start_block,
                 submission_block_range=(
@@ -1352,6 +1355,19 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 score_aggregator=score_aggregator,
                 checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
+            if frozen is None:
+                # Drop the finalized round so the loop top cannot finalize it again, and
+                # keep the per-cycle task check the skipped tail would have run.
+                round_ref.current = None
+                wait_till(config, PhaseNames.train)
+                if _maybe_switch_task(
+                    config, state,
+                    eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
+                    round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
+                ):
+                    current_model_hash = None
+                continue
+            new_round, metagraph = frozen
 
             # Publish the active round id to Prometheus so external
             # aggregators can key per-miner score / val_loss readings to
