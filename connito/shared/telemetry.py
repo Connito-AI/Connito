@@ -378,10 +378,6 @@ VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL = Counter(
     "validator_round_freeze_retries_total",
     "Round freeze attempts that failed and were retried inside Submission",
 )
-VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL = Counter(
-    "validator_round_freeze_failures_total",
-    "Round freezes that never succeeded before Submission ended",
-)
 VALIDATOR_ROUNDS_SKIPPED_TOTAL = Counter(
     "validator_rounds_skipped_total",
     "Rounds the validator skipped instead of evaluating",
