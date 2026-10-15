@@ -277,7 +277,7 @@ def driver(tmp_path):
     with patch.multiple(run_mod, **stubs), \
             patch("connito.validator.distribute.publish_round_baseline"), \
             patch("connito.validator.distribute.publish_round_podium"):
-        yield SimpleNamespace(run=lambda: run_mod.run(0, 1, config), refs=refs, **stubs)
+        yield SimpleNamespace(run=lambda: run_mod.run(0, 1, config), refs=refs, lite=lite, **stubs)
 
 
 def _script(*, stop_at: tuple[int, str]):
@@ -334,20 +334,27 @@ def test_skip_that_overran_into_merge_goes_straight_to_validator_commit(driver):
     assert driver.refs[0].current is cycle_two.new_round
 
 
-def test_skipped_round_does_not_refinalize_the_previous_round(driver):
+def test_skipped_round_is_not_refinalized_and_stale_weights_fall_back(driver):
     wait_till, state = _script(stop_at=(3, PhaseNames.validate))
     driver.wait_till.side_effect = wait_till
     round_a = _frozen(1000, weights_submitted=False)
     driver.freeze_before_deadline.side_effect = [round_a, None, _frozen(3000)]
-    finalized_at: list[int] = []
-    driver.finalize_round_scores.side_effect = lambda **kw: finalized_at.append(state["cycle"])
+    calls: list[tuple[str, int]] = []
+    driver.finalize_round_scores.side_effect = lambda **kw: calls.append(("finalize", state["cycle"]))
+    submitter = driver.ChainSubmitter.return_value
+    submitter.async_submit_weight.side_effect = lambda *a: calls.append(("round_weights", state["cycle"]))
+    submitter.async_submit_fallback_weights.side_effect = lambda: calls.append(("fallback", state["cycle"]))
+    # last_update stays 0: weights are fresh until cycle 3, when weight_age 1000 > cycle_length 100.
+    driver.lite.get_current_block.side_effect = lambda: 1000 if state["cycle"] >= 3 else 0
     with pytest.raises(KeyboardInterrupt):
         driver.run()
 
     assert driver.freeze_before_deadline.call_count == 3
-    driver.finalize_round_scores.assert_called_once()
     assert driver.finalize_round_scores.call_args.kwargs["round_obj"] is round_a.new_round
-    assert finalized_at == [2]
+    assert submitter.async_submit_weight.call_args.args[0] is round_a.new_round
+    # Round A is finalized and weighted once; after the skip, stale weights take the
+    # fallback (equal split plus owner share), never a re-run of round A.
+    assert calls == [("finalize", 2), ("round_weights", 2), ("fallback", 3)]
 
 
 def test_unexpected_error_in_the_loop_exits_non_zero(driver):
