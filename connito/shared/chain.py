@@ -47,6 +47,8 @@ _WEIGHT_SUBMIT_BACKOFF_S: float = 2.0
 # timeout) that would otherwise crash the validator at Round.freeze.
 _CHAIN_READ_MAX_RETRIES: int = 5
 _CHAIN_READ_BACKOFF_S: float = 2.0
+# Blocks a pinned head read may step back when the endpoint lacks its header.
+_HEAD_STEP_BACK_MAX: int = 2
 
 # How many miner UIDs the peer-consensus fallback emits even-weight to.
 # Matches the validator's `weight_group_1_size` default so the fallback
@@ -259,6 +261,30 @@ def commit_status(
     return data_dict
 
 
+def _is_unknown_block(err: Exception) -> bool:
+    msg = str(err)
+    return "UnknownBlock" in msg or "Header was not found" in msg
+
+
+def _is_retryable_chain_error(err: Exception) -> bool:
+    """Transient upstream-node failure worth a reconnect and another read."""
+    if isinstance(err, TimeoutError) or _is_unknown_block(err):
+        return True
+    if SubstrateRequestException is not None and isinstance(err, SubstrateRequestException):
+        return True
+    if ConnectionClosedError is not None and isinstance(err, ConnectionClosedError):
+        return True
+    msg = str(err)
+    return "Internal error" in msg or "keepalive ping timeout" in msg or "ConnectionClosedError" in msg
+
+
+def _close_quietly(subtensor: bittensor.Subtensor) -> None:
+    try:
+        subtensor.close()
+    except Exception as e:
+        logger.debug("Failed to close replaced subtensor", error=str(e))
+
+
 def get_chain_commits(
     config: WorkerConfig,
     subtensor: bittensor.Subtensor,
@@ -270,24 +296,33 @@ def get_chain_commits(
     # "Internal error" from get_chain_head, WS disconnects, timeouts). Without
     # this, a single bad RPC response at Round.freeze kills the validator.
     # The "State discarded" branch is a one-shot fallback to head when the
-    # archive node has pruned the requested historical block — it's tracked
-    # separately so it doesn't burn retry budget.
+    # archive node has pruned the requested historical block.
+    # A head read is pinned to one block number: with `block=None` every page
+    # resolves head separately, and a load-balanced endpoint can route it to a
+    # backend that has not seen that header yet (UnknownBlock).
     max_retries = _CHAIN_READ_MAX_RETRIES
     backoff_s = _CHAIN_READ_BACKOFF_S
+    head_read = block is None
     fetch_block = block
+    head_pinned = False
+    step_backs = 0
+    reader = subtensor
 
     for attempt in range(max_retries + 1):
         try:
-            all_commitments = subtensor.get_all_commitments(
+            if fetch_block is None:
+                fetch_block = reader.get_current_block()
+                head_pinned = True
+            all_commitments = reader.get_all_commitments(
                 netuid=config.chain.netuid, block=fetch_block,
             )
-            metagraph = subtensor.metagraph(netuid=config.chain.netuid, block=fetch_block)
-            current_block = fetch_block if fetch_block is not None else subtensor.block
+            metagraph = reader.metagraph(netuid=config.chain.netuid, block=fetch_block)
+            current_block = fetch_block
             break
         except Exception as err:
             err_msg = str(err)
 
-            if fetch_block is not None and "State discarded" in err_msg:
+            if not head_pinned and fetch_block is not None and "State discarded" in err_msg:
                 logger.warning(
                     "Historical chain state unavailable on current node; retrying with latest head",
                     requested_block=fetch_block,
@@ -298,31 +333,39 @@ def get_chain_commits(
                 fetch_block = None
                 continue
 
-            retryable = isinstance(err, TimeoutError)
-            if SubstrateRequestException is not None and isinstance(err, SubstrateRequestException):
-                retryable = True
-            if ConnectionClosedError is not None and isinstance(err, ConnectionClosedError):
-                retryable = True
-            if "Internal error" in err_msg or "keepalive ping timeout" in err_msg or "ConnectionClosedError" in err_msg:
-                retryable = True
+            if head_pinned and _is_unknown_block(err) and step_backs < _HEAD_STEP_BACK_MAX:
+                fetch_block -= 1
+                step_backs += 1
 
-            if attempt < max_retries and retryable:
+            if attempt < max_retries and _is_retryable_chain_error(err):
+                endpoint = getattr(subtensor, "chain_endpoint", None) or config.chain.network
+                lite = config.chain.lite_network
+                if head_read and attempt + 1 >= 3 and lite and lite != config.chain.network:
+                    endpoint = lite
                 logger.warning(
                     "get_chain_commits: chain RPC failed; retrying",
                     attempt=attempt + 1,
                     max_retries=max_retries,
+                    block=fetch_block,
+                    endpoint=endpoint,
                     error=err_msg,
                 )
                 try:
-                    subtensor = bittensor.Subtensor(network=config.chain.network)
+                    fresh = bittensor.Subtensor(network=endpoint)
                 except Exception as refresh_exc:
-                    logger.warning(
-                        "Failed to refresh archive subtensor", error=str(refresh_exc),
-                    )
+                    logger.warning("Failed to refresh chain subtensor", error=str(refresh_exc))
+                else:
+                    if reader is not subtensor:
+                        _close_quietly(reader)
+                    reader = fresh
                 time.sleep(backoff_s * (attempt + 1))
                 continue
 
+            if reader is not subtensor:
+                _close_quietly(reader)
             raise
+    if reader is not subtensor:
+        _close_quietly(reader)
     max_weight_age = int(config.cycle.cycle_length)
 
     from connito.shared.cycle import get_validator_whitelist_from_api  # noqa: E402 — lazy import to avoid circular dependency with cycle.py
