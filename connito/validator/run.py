@@ -1621,6 +1621,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
         poller.stop()
         cleanup()
         metric_logger.close()
+        raise
 
 
 
