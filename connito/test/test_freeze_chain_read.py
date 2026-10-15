@@ -7,23 +7,22 @@ exited 0 with the round lost. No network: the chain is a fake.
 
 from __future__ import annotations
 
-import ast
-import inspect
-import textwrap
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from connito.shared import chain as chain_mod
+from connito.shared.cycle import PhaseNames
 from connito.shared.telemetry import (
-    VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL,
     VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL,
     VALIDATOR_ROUNDS_SKIPPED_TOTAL,
 )
 from connito.validator import round as round_mod
+from connito.validator import run as run_mod
 
 HEAD = 5000
+PIN = HEAD - 1  # one behind head, so a lagging backend still has the header
 ARCHIVE = "wss://archive.example:443"
 
 try:
@@ -50,6 +49,13 @@ class _FakeSubtensor:
     def get_current_block(self) -> int:
         return HEAD
 
+    def determine_block_hash(self, block):
+        self.shared["hash_blocks"].append(block)
+        if self.shared["null_hashes"] > 0:
+            self.shared["null_hashes"] -= 1
+            return None
+        return f"0x{block:x}"
+
     def get_all_commitments(self, *, netuid, block):
         self.shared["commit_blocks"].append(block)
         if self.shared["fail_reads"] > 0:
@@ -72,9 +78,10 @@ def _config(lite_network: str = "finney") -> SimpleNamespace:
     )
 
 
-def _read(fail_reads: int, *, block=None, lite_network="finney"):
+def _read(fail_reads: int, *, block=None, lite_network="finney", null_hashes=0, deadline=None):
     """Run get_chain_commits against a fake chain; return what it touched."""
-    shared = {"fail_reads": fail_reads, "commit_blocks": [], "metagraph_blocks": []}
+    shared = {"fail_reads": fail_reads, "null_hashes": null_hashes,
+              "commit_blocks": [], "metagraph_blocks": [], "hash_blocks": []}
     caller = _FakeSubtensor(ARCHIVE, shared=shared)
     created: list[_FakeSubtensor] = []
 
@@ -86,22 +93,31 @@ def _read(fail_reads: int, *, block=None, lite_network="finney"):
     with patch.object(chain_mod.bittensor, "Subtensor", side_effect=_new), \
             patch.object(chain_mod.time, "sleep"), \
             patch("connito.shared.cycle.get_validator_whitelist_from_api", return_value=set()):
-        result = chain_mod.get_chain_commits(_config(lite_network), caller, block=block)
+        result = chain_mod.get_chain_commits(_config(lite_network), caller, block=block, deadline=deadline)
     return SimpleNamespace(result=result, caller=caller, created=created, **shared)
 
 
 def test_head_read_pins_one_block_for_commitments_and_metagraph():
     out = _read(0)
-    assert out.commit_blocks == [HEAD]
-    assert out.metagraph_blocks == [HEAD]
+    assert out.commit_blocks == [PIN]
+    assert out.metagraph_blocks == [PIN]
     assert out.created == []
+
+
+def test_null_block_hash_is_not_read_as_head():
+    # A backend without the block answers null, and bittensor would then query head.
+    out = _read(0, null_hashes=1)
+    assert out.hash_blocks == [PIN, PIN - 1]
+    assert out.commit_blocks == [PIN - 1]
+    assert out.metagraph_blocks == [PIN - 1]
+    assert [s.chain_endpoint for s in out.created] == [ARCHIVE]
 
 
 def test_unknown_block_steps_back_and_reconnects_to_the_callers_endpoint():
     out = _read(2)
-    assert out.commit_blocks == [HEAD, HEAD - 1, HEAD - 2]
+    assert out.commit_blocks == [PIN, PIN - 1, PIN - 2]
     # The metagraph is read at the block whose commitments succeeded.
-    assert out.metagraph_blocks == [HEAD - 2]
+    assert out.metagraph_blocks == [PIN - 2]
     assert [s.chain_endpoint for s in out.created] == [ARCHIVE, ARCHIVE]
     # Every subtensor this function made is closed; the caller's is not.
     assert all(s.closed for s in out.created)
@@ -110,8 +126,8 @@ def test_unknown_block_steps_back_and_reconnects_to_the_callers_endpoint():
 
 def test_step_back_stops_after_two_blocks_and_head_read_falls_back_to_lite():
     out = _read(4)
-    assert out.commit_blocks == [HEAD, HEAD - 1, HEAD - 2, HEAD - 2, HEAD - 2]
-    assert out.metagraph_blocks == [HEAD - 2]
+    assert out.commit_blocks == [PIN, PIN - 1, PIN - 2, PIN - 2, PIN - 2]
+    assert out.metagraph_blocks == [PIN - 2]
     assert [s.chain_endpoint for s in out.created] == [ARCHIVE, ARCHIVE, "finney", "finney"]
 
 
@@ -132,6 +148,14 @@ def test_read_that_never_recovers_raises_after_retries():
         _read(100)
 
 
+def test_passed_deadline_stops_retries():
+    with pytest.raises(Exception, match="UnknownBlock"):
+        _read(1, deadline=0.0)
+    with patch.object(chain_mod.time, "monotonic", return_value=0.0):
+        out = _read(1, deadline=1.0)
+    assert out.commit_blocks == [PIN, PIN - 1]
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 1000.0
@@ -143,13 +167,15 @@ class _Clock:
         self.now += seconds
 
 
-def _freeze(fail_times: int, *, deadline_s: float):
+def _freeze(fail_times: int, *, deadline_s: float, freeze_takes_s: float = 0.0):
     """Drive freeze_before_deadline with a Round.freeze failing `fail_times` times."""
     clock = _Clock()
-    calls = {"freeze": 0, "metagraph": 0}
+    calls = {"freeze": 0, "metagraph": 0, "deadlines": set()}
 
     def fake_freeze(**kwargs):
         calls["freeze"] += 1
+        calls["deadlines"].add(kwargs["deadline"])
+        clock.now += freeze_takes_s
         if calls["freeze"] <= fail_times:
             raise _unknown_block()
         return SimpleNamespace(round_id=kwargs["round_id"], metagraph=kwargs["metagraph"])
@@ -168,11 +194,11 @@ def _freeze(fail_times: int, *, deadline_s: float):
 
 
 def _counts():
-    return tuple(c._value.get() for c in (
-        VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL,
-        VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL,
-        VALIDATOR_ROUNDS_SKIPPED_TOTAL,
-    ))
+    return tuple(c._value.get() for c in (VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL, VALIDATOR_ROUNDS_SKIPPED_TOTAL))
+
+
+def _delta(before):
+    return tuple(a - b for a, b in zip(_counts(), before, strict=True))
 
 
 def test_freeze_retries_inside_submission_and_refetches_the_metagraph():
@@ -181,9 +207,10 @@ def test_freeze_retries_inside_submission_and_refetches_the_metagraph():
     assert frozen.new_round.round_id == 17728
     # The round was built from the metagraph fetched on the attempt that succeeded.
     assert frozen.metagraph == "metagraph-4" == frozen.new_round.metagraph
-    assert calls == {"freeze": 4, "metagraph": 4}
-    retries, failures, skipped = (a - b for a, b in zip(_counts(), before, strict=True))
-    assert (retries, failures, skipped) == (3, 0, 0)
+    assert (calls["freeze"], calls["metagraph"]) == (4, 4)
+    # Each attempt's chain reads stop retrying at the same deadline.
+    assert calls["deadlines"] == {1600.0}
+    assert _delta(before) == (3, 0)
 
 
 def test_freeze_that_never_recovers_skips_the_round_at_the_deadline():
@@ -192,38 +219,105 @@ def test_freeze_that_never_recovers_skips_the_round_at_the_deadline():
     assert frozen is None
     # 60 s of 12 s backoffs: the deadline ends it, not an attempt cap.
     assert calls["freeze"] == 6
-    retries, failures, skipped = (a - b for a, b in zip(_counts(), before, strict=True))
-    assert (retries, failures, skipped) == (5, 1, 1)
+    assert _delta(before) == (5, 1)
+
+
+def test_freeze_finishing_after_the_deadline_skips_the_round():
+    before = _counts()
+    frozen, _ = _freeze(0, deadline_s=60, freeze_takes_s=61)
+    assert frozen is None
+    assert _delta(before) == (0, 1)
 
 
 def test_freeze_counters_never_raise_into_the_caller():
     broken = SimpleNamespace(inc=lambda: (_ for _ in ()).throw(RuntimeError("registry")))
     with patch.object(round_mod, "VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL", broken), \
-            patch.object(round_mod, "VALIDATOR_ROUND_FREEZE_FAILURES_TOTAL", broken), \
             patch.object(round_mod, "VALIDATOR_ROUNDS_SKIPPED_TOTAL", broken):
         frozen, _ = _freeze(10_000, deadline_s=30)
     assert frozen is None
 
 
-def _run_tree() -> ast.FunctionDef:
-    from connito.validator import run as run_mod
+@pytest.fixture
+def driver(tmp_path):
+    """run() with every collaborator before and inside the loop stubbed; `wait_till` is scripted per test."""
+    config = MagicMock()
+    for name in ("base_checkpoint_path", "checkpoint_path", "miner_submission_path"):
+        setattr(config.ckpt, name, str(tmp_path / name))
+    config.log.base_metric_path = str(tmp_path / "metrics")
+    config.run.record_cuda_mem_history = False
+    config.evaluation.background_worker_enabled = False
+    config.evaluation.enable_round_group_construction = False
+    config.cycle.cycle_length = 100
+    lite = MagicMock()
+    lite.get_current_block.return_value = 0
+    lite.metagraph.return_value.last_update.__getitem__.return_value.item.return_value = 0
+    refs: list[round_mod.RoundRef] = []
 
-    return ast.parse(textwrap.dedent(inspect.getsource(run_mod.run))).body[0]
+    def _round_ref():
+        refs.append(round_mod.RoundRef())
+        return refs[-1]
 
-
-def test_skipped_freeze_returns_to_the_loop_top():
-    skip = next(
-        node for node in ast.walk(_run_tree())
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "frozen is None"
+    stubs = {name: MagicMock() for name in (
+        "TelemetryManager", "resolve_telemetry_port", "validate_hf_distribution_config", "ChainSubmitter",
+        "MetricLogger", "get_base_tokenizer", "setup_training", "MinerScoreAggregator", "SystemStatePoller",
+        "PhaseManager", "get_blocks_from_previous_phase_from_api", "_sync_lite_metagraph", "set_validator_identity",
+        "ValidatorChainCommit", "SignedModelHashChainCommit", "ModelCheckpoint", "_round_commit", "cleanup",
+        "check_phase_expired", "prune_submissions_outside_window", "finalize_round_scores", "get_status",
+        "wait_till", "freeze_before_deadline",
+    )}
+    stubs.update(
+        setup_chain_worker=MagicMock(return_value=(MagicMock(), MagicMock(), lite)),
+        resolve_score_path=MagicMock(return_value=tmp_path / "scores.json"),
+        prune_miner_submission_files=MagicMock(return_value=[]),
+        resolve_hf_repo_ids=MagicMock(return_value=(None, "repo")),
+        observer_mode_enabled=MagicMock(return_value=True),
+        _maybe_switch_task=MagicMock(return_value=False),
+        RoundRef=_round_ref,
     )
-    assert isinstance(skip.body[-1], ast.Continue)
-    assert "round_ref.current = None" in ast.unparse(skip)
+    with patch.multiple(run_mod, **stubs):
+        yield SimpleNamespace(run=lambda: run_mod.run(0, 1, config), refs=refs, **stubs)
 
 
-def test_unexpected_error_in_the_loop_exits_non_zero():
-    handler = next(
-        h for node in ast.walk(_run_tree()) if isinstance(node, ast.Try)
-        for h in node.handlers if h.type is not None and ast.unparse(h.type) == "Exception"
-        and any("Quit training" in ast.unparse(s) for s in h.body)
-    )
-    assert isinstance(handler.body[-1], ast.Raise) and handler.body[-1].exc is None
+def _script(*, stop_at: tuple[int, str]):
+    """wait_till for a run of cycles; raises KeyboardInterrupt at (cycle, phase)."""
+    state = {"cycle": 0, "seen": []}
+
+    def wait_till(config, phase, block_offset=0):
+        if phase == PhaseNames.miner_commit_1 and block_offset == -5:
+            state["cycle"] += 1
+        state["seen"].append((state["cycle"], phase))
+        if (state["cycle"], phase) == stop_at:
+            raise KeyboardInterrupt
+        start = 1000 * state["cycle"]
+        return SimpleNamespace(phase_start_block=start, phase_end_block=start + 10, cycle_length=100,
+                               cycle_index=state["cycle"], blocks_remaining_in_phase=10)
+    return wait_till, state
+
+
+def test_skipped_round_runs_the_rest_of_the_cycle_and_the_next_round_freezes(driver):
+    wait_till, state = _script(stop_at=(2, PhaseNames.validate))
+    driver.wait_till.side_effect = wait_till
+    cycle_two = MagicMock(round_id=2000)
+    driver.freeze_before_deadline.side_effect = [
+        None, round_mod.FrozenRound(cycle_two, MagicMock(hotkeys=[])),
+    ]
+    with pytest.raises(KeyboardInterrupt):
+        driver.run()
+
+    assert driver.freeze_before_deadline.call_count == 2
+    assert driver.refs[0].current is cycle_two
+    driver.finalize_round_scores.assert_not_called()
+    cycle_one = [phase for cycle, phase in state["seen"] if cycle == 1]
+    assert cycle_one[-5:] == [
+        PhaseNames.merge, PhaseNames.validator_commit_1, PhaseNames.validator_commit_2,
+        PhaseNames.train, PhaseNames.miner_commit_1,
+    ]
+    driver.SignedModelHashChainCommit.assert_called_once()
+    driver._maybe_switch_task.assert_called_once()
+
+
+def test_unexpected_error_in_the_loop_exits_non_zero(driver):
+    driver.wait_till.side_effect = RuntimeError("cycle-api down")
+    with pytest.raises(RuntimeError, match="cycle-api down"):
+        driver.run()
+    driver.ChainSubmitter.return_value.stop.assert_called_once()
