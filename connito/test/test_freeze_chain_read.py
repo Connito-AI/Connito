@@ -263,7 +263,7 @@ def driver(tmp_path):
         "PhaseManager", "get_blocks_from_previous_phase_from_api", "_sync_lite_metagraph", "set_validator_identity",
         "ValidatorChainCommit", "SignedModelHashChainCommit", "ModelCheckpoint", "_round_commit", "cleanup",
         "check_phase_expired", "prune_submissions_outside_window", "finalize_round_scores", "get_status",
-        "wait_till", "freeze_before_deadline",
+        "wait_till", "freeze_before_deadline", "build_submission_uid_weights",
     )}
     stubs.update(
         setup_chain_worker=MagicMock(return_value=(MagicMock(), MagicMock(), lite)),
@@ -274,18 +274,27 @@ def driver(tmp_path):
         _maybe_switch_task=MagicMock(return_value=False),
         RoundRef=_round_ref,
     )
-    with patch.multiple(run_mod, **stubs):
+    with patch.multiple(run_mod, **stubs), \
+            patch("connito.validator.distribute.publish_round_baseline"), \
+            patch("connito.validator.distribute.publish_round_podium"):
         yield SimpleNamespace(run=lambda: run_mod.run(0, 1, config), refs=refs, **stubs)
 
 
 def _script(*, stop_at: tuple[int, str]):
-    """wait_till for a run of cycles; raises KeyboardInterrupt at (cycle, phase)."""
-    state = {"cycle": 0, "seen": []}
+    """wait_till for a run of cycles; raises KeyboardInterrupt at (cycle, phase).
+
+    `state["passed"]` holds phases the chain is already past this cycle; a wait for
+    one of them would sleep to the next cycle, so it is recorded as an overrun.
+    """
+    state = {"cycle": 0, "seen": [], "passed": set(), "overruns": []}
 
     def wait_till(config, phase, block_offset=0):
         if phase == PhaseNames.miner_commit_1 and block_offset == -5:
             state["cycle"] += 1
+            state["passed"] = set()
         state["seen"].append((state["cycle"], phase))
+        if phase in state["passed"]:
+            state["overruns"].append((state["cycle"], phase))
         if (state["cycle"], phase) == stop_at:
             raise KeyboardInterrupt
         start = 1000 * state["cycle"]
@@ -294,26 +303,51 @@ def _script(*, stop_at: tuple[int, str]):
     return wait_till, state
 
 
-def test_skipped_round_runs_the_rest_of_the_cycle_and_the_next_round_freezes(driver):
+def _frozen(round_id: int, **fields) -> round_mod.FrozenRound:
+    return round_mod.FrozenRound(MagicMock(round_id=round_id, **fields), MagicMock(hotkeys=[]))
+
+
+def test_skip_that_overran_into_merge_goes_straight_to_validator_commit(driver):
     wait_till, state = _script(stop_at=(2, PhaseNames.validate))
     driver.wait_till.side_effect = wait_till
-    cycle_two = MagicMock(round_id=2000)
-    driver.freeze_before_deadline.side_effect = [
-        None, round_mod.FrozenRound(cycle_two, MagicMock(hotkeys=[])),
-    ]
+    cycle_two = _frozen(2000)
+
+    def freeze(*args, **kwargs):
+        if state["cycle"] == 1:
+            state["passed"] = {PhaseNames.validate, PhaseNames.merge}
+            return None
+        return cycle_two
+
+    driver.freeze_before_deadline.side_effect = freeze
     with pytest.raises(KeyboardInterrupt):
         driver.run()
 
-    assert driver.freeze_before_deadline.call_count == 2
-    assert driver.refs[0].current is cycle_two
-    driver.finalize_round_scores.assert_not_called()
+    assert state["overruns"] == []
     cycle_one = [phase for cycle, phase in state["seen"] if cycle == 1]
-    assert cycle_one[-5:] == [
-        PhaseNames.merge, PhaseNames.validator_commit_1, PhaseNames.validator_commit_2,
+    assert cycle_one[cycle_one.index(PhaseNames.submission) + 1:] == [
+        PhaseNames.validator_commit_1, PhaseNames.validator_commit_2,
         PhaseNames.train, PhaseNames.miner_commit_1,
     ]
     driver.SignedModelHashChainCommit.assert_called_once()
     driver._maybe_switch_task.assert_called_once()
+    assert driver.freeze_before_deadline.call_count == 2
+    assert driver.refs[0].current is cycle_two.new_round
+
+
+def test_skipped_round_does_not_refinalize_the_previous_round(driver):
+    wait_till, state = _script(stop_at=(3, PhaseNames.validate))
+    driver.wait_till.side_effect = wait_till
+    round_a = _frozen(1000, weights_submitted=False)
+    driver.freeze_before_deadline.side_effect = [round_a, None, _frozen(3000)]
+    finalized_at: list[int] = []
+    driver.finalize_round_scores.side_effect = lambda **kw: finalized_at.append(state["cycle"])
+    with pytest.raises(KeyboardInterrupt):
+        driver.run()
+
+    assert driver.freeze_before_deadline.call_count == 3
+    driver.finalize_round_scores.assert_called_once()
+    assert driver.finalize_round_scores.call_args.kwargs["round_obj"] is round_a.new_round
+    assert finalized_at == [2]
 
 
 def test_unexpected_error_in_the_loop_exits_non_zero(driver):
