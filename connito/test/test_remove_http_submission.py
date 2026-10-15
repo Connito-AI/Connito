@@ -166,7 +166,7 @@ def test_fetch_model_does_not_issue_http_when_hf_succeeds(tmp_path):
                       return_value=ChainCheckpoints(checkpoints=[chain_checkpoint])), \
          patch.object(shared_model, "download_checkpoint_from_hf_with_timeout", side_effect=fake_hf_download), \
          patch.object(shared_model, "delete_old_checkpoints"), \
-         patch.object(ChainCheckpoint, "validate", return_value=True), \
+         patch.object(ChainCheckpoint, "validate", autospec=True, return_value=True) as validate, \
          patch("requests.get", side_effect=AssertionError("HTTP distribute must not happen")), \
          patch("requests.post", side_effect=AssertionError("HTTP submission must not happen")):
         result = shared_model.fetch_model_from_chain_validator(
@@ -175,10 +175,12 @@ def test_fetch_model_does_not_issue_http_when_hf_succeeds(tmp_path):
             subtensor=SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner"),
             wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey")),
             expert_group_ids=[0],
-            expert_group_assignment={},
+            expected={"spec": "residual"},
         )
 
     assert result is chain_checkpoint
+    # The download is checked against the residual spec the caller passed.
+    validate.assert_called_once_with(chain_checkpoint, {"spec": "residual"})
 
 
 def test_fetch_model_does_not_issue_http_when_hf_fails(tmp_path):
@@ -221,10 +223,46 @@ def test_fetch_model_does_not_issue_http_when_hf_fails(tmp_path):
             subtensor=SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner"),
             wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address="miner-hotkey")),
             expert_group_ids=[0],
-            expert_group_assignment={},
+            expected={},
         )
 
     assert result is None
+
+
+@pytest.mark.parametrize("failure", ["download fails", "validation fails", "no HF coordinates"])
+def test_a_failed_fetch_leaves_no_folder_a_miner_could_start_from(tmp_path, failure):
+    """An empty or refused uid_* folder would be the newest checkpoint on disk."""
+    from connito.shared import model as shared_model
+
+    config = SimpleNamespace(
+        chain=SimpleNamespace(netuid=102),
+        ckpt=SimpleNamespace(validator_checkpoint_path=tmp_path / "validator_checkpoint", checkpoint_topk=2),
+        hf=SimpleNamespace(token_env_var="HF_TOKEN"),
+    )
+    config.ckpt.validator_checkpoint_path.mkdir(parents=True)
+    coords = {} if failure == "no HF coordinates" else {"hf_repo_id": "owner/repo", "hf_revision": "abcdef0"}
+    chain_checkpoint = ChainCheckpoint(uid=7, hotkey="validator-hotkey", global_ver=42, model_hash="abcd",
+                                       signed_model_hash="signed", expert_group=0, **coords)
+
+    def fake_hf_download(**kwargs):
+        if failure == "download fails":
+            (Path(kwargs["dest_dir"]) / kwargs["filenames"][0]).write_bytes(b"partial")
+            raise RuntimeError("hf down")
+        (Path(kwargs["dest_dir"]) / kwargs["filenames"][0]).write_bytes(b"hf-bytes")
+
+    with patch.object(shared_model, "build_chain_checkpoints_from_previous_phase",
+                      return_value=ChainCheckpoints(checkpoints=[chain_checkpoint])), \
+         patch.object(shared_model, "download_checkpoint_from_hf_with_timeout", side_effect=fake_hf_download), \
+         patch.object(shared_model.time, "sleep"), \
+         patch.object(ChainCheckpoint, "validate", return_value=False):
+        result = shared_model.fetch_model_from_chain_validator(
+            current_model_meta=None, config=config,
+            subtensor=SimpleNamespace(block=123, get_subnet_owner_hotkey=lambda netuid: "owner"),
+            wallet=None, expert_group_ids=[0], expected={},
+        )
+
+    assert result is None
+    assert list(config.ckpt.validator_checkpoint_path.iterdir()) == []
 
 
 def test_hf_upload_failure_logs_at_error_level(caplog):

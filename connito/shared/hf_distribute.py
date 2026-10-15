@@ -163,7 +163,7 @@ def upload_checkpoint_to_hf(
     # Default uploads expert-group shards only (both `.pt` and `.safetensors`
     # during the migration window). `model_shared.*` is intentionally excluded
     # from the default: it's no longer persisted or distributed; every
-    # participant reconstructs backbone state from `config.model.model_path`
+    # participant reconstructs backbone state from the model family's pinned checkpoint
     # at startup. Callers that need different behavior can override
     # `allow_patterns` explicitly.
     default_allow_patterns = [
@@ -380,7 +380,7 @@ def download_checkpoint_from_hf(
     rather than the whole repo, since a validator may publish every expert
     group and a given miner only needs one. `model_shared.*` is no longer
     distributed; backbone state is reconstructed from
-    `config.model.model_path` at instantiation.
+    the model family's pinned checkpoint at instantiation.
     """
     resolved_token = _resolve_token(token, token_env_var)
     dest_dir.mkdir(parents=True, exist_ok=True)

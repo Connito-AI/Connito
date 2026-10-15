@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
 import string
@@ -13,7 +12,17 @@ import bittensor
 import fsspec
 import torch
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    ValidationError,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
@@ -142,7 +151,7 @@ class BaseConfig(BaseModel):
     def from_path(cls, path: str | Path) -> "BaseConfig":
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return cls(**data)
+        return cls.model_validate(data)
 
 
 # ---------------------------
@@ -192,16 +201,14 @@ class ModelCfg(BaseConfig):
     # `quantization` and `quantization_validator` are locked so the fleet cannot
     # drift into validators scoring under different scopes, which breaks
     # cross-validator val_loss comparability. `quantization_miner` is not locked
-    # — it only affects that miner's own VRAM.
+    # — it only affects that miner's own VRAM. `family` is locked because every
+    # node must load the same checkpoint.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "model_path", "base_arch_model", "quantization", "quantization_validator",
+        "family", "quantization", "quantization_validator",
     })
-    model_path: str = "deepseek-ai/DeepSeek-V2-Lite"
-    base_arch_model: str = "deepseek-ai/DeepSeek-V2-Lite"
+    # A key of `modeling.families.FAMILIES`, which pins the checkpoint and its revision.
+    family: Literal["qwen3_5_moe", "deepseek_v2"] = "qwen3_5_moe"
     foundation: bool = True
-    torch_compile: bool = False
-    attn_implementation: str = "sdpa"
-    precision: str = "fp16-mixed"
     device: str = "cuda"
     # fp8 weight-only storage for modules a role never trains. `quantization`
     # picks the format, the per-role fields pick the scope. See
@@ -210,23 +217,16 @@ class ModelCfg(BaseConfig):
     # Not locked: a miner trades VRAM against training fidelity on its own box,
     # and the choice affects nobody else's scoring.
     quantization_miner: str = "all"
-    # "all" fleet-wide. Locked, so every validator scores under the identical
-    # scope; a mixed fleet would make val_loss incomparable across validators.
-    quantization_validator: str = "all"
+    # Locked, so every validator scores under one scope and val_loss stays comparable across validators.
+    # Measured on Qwen vs bf16: "experts" +0.0006 nats, "all" +0.0018 for only 1.3 GiB less.
+    quantization_validator: str = "experts"
 
     @model_validator(mode="after")
     def _validate_quantization(self) -> ModelCfg:
-        # Imported here: quantization.py -> expert_manager.py -> config.py.
-        from connito.shared.modeling.quantization import SCOPES
-
         if self.quantization not in ("off", "fp8"):
             raise ValueError(
                 f"model.quantization must be 'off' or 'fp8', got {self.quantization!r}"
             )
-        for field in ("quantization_miner", "quantization_validator"):
-            value = getattr(self, field)
-            if value not in SCOPES:
-                raise ValueError(f"model.{field} must be one of {SCOPES}, got {value!r}")
         return self
 
 
@@ -264,14 +264,8 @@ class DatasetSourceCfg(BaseConfig):
     # travels from the owner API to every miner and validator, so the
     # grammar it may use is narrower than `str.format` allows.
     text_template: str | None = None
-    # Authorize HF's `load_dataset` to execute the dataset repo's custom
-    # builder script. Required for sources that ship a `<name>.py` loader
-    # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
-    # malicious dataset can't piggyback through a globally-enabled flag —
-    # operators consent to executing remote code one dataset at a time.
-    # Pin the source's revision via `eval_source_revision_pin` when
-    # turning this on to bound the surface to a reviewed SHA.
-    trust_remote_code: bool = False
+    # c4 replay rows: the miner trains its residual not to fire on them.
+    replay: bool = False
     # Seeded shard pick without a `_KNOWN_SOURCES` entry: this source's shard
     # list with a row count per shard, precomputed at the revision pinned in
     # `eval_source_revision_pin` (required alongside this) and shipped with the
@@ -362,7 +356,6 @@ class DataCfg(BaseConfig):
     dataset_name: str = "allenai/c4"
     data_dir: str | None = 'en'
     dataset_sources: list[DatasetSourceCfg] | None = None
-    batch_size: PositiveInt = 4
     sequence_length: PositiveInt = 1024
     per_device_train_batch_size: PositiveInt = 1
     world_size: int = 10
@@ -484,37 +477,12 @@ class DataloaderCfg(BaseConfig):
     world_size: int = 10  # number of distinct data shards (typically = number of validators)
 
 
-class MoECfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "num_experts", "num_worker_groups", "num_experts_per_tok", "partial_topk", "full_topk",
-    })
-    interleave: bool = True
-    num_experts: PositiveInt = 8
-    num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 6
-    # DeepSeek-V2-Lite's own `num_experts_per_tok`, matching `partial_topk`.
-    # Read by `mycelia.get_base_model` whenever `partial=False`, where it is the
-    # only thing that sets routing width — a wrong value routes at the wrong
-    # width and raises nothing.
-    full_topk: PositiveInt = 6
-    aux_load_balance: bool = True
-    router_aux_loss_coef: float = 1.0
-    # The model the miner trains. "full" holds every routed expert and routes
-    # natively at `full_topk` — the model validators score. "partial" holds
-    # only the active and helper groups and fits smaller GPUs. Only the active
-    # group trains either way. Replaces `partial_moe`, which nothing read: a
-    # new name, so configs written with that field still get this default.
-    miner_topology: Literal["full", "partial"] = "full"
-    num_worker_groups: PositiveInt = 2
-
-
 class OptimizerCfg(BaseConfig):
     lr: float = 1e-4
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
     # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
-    #   32 -> torch.optim.AdamW, fp32 state (default). Fits DeepSeek-V2-Lite
-    #         2Fnat on a 47GB A6000 at sequence_length 1024.
+    #   32 -> torch.optim.AdamW, fp32 state (default), 8 bytes per trainable param.
     #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
     #         an alternative when running fp32 at a larger sequence_length.
     # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
@@ -522,7 +490,9 @@ class OptimizerCfg(BaseConfig):
 
 
 class ParallelismCfg(BaseConfig):
-    gradient_accumulation_steps: PositiveInt = 4
+    # Rows per forward. 2 x 2 fits the L40S at seq 4096 under either fp8 scope; "all" also fits 4 x 1, barely.
+    micro_batch_size: PositiveInt = 2
+    gradient_accumulation_steps: PositiveInt = 2
     global_opt_interval: PositiveInt = 100
     world_size: PositiveInt = 1
     port: PositiveInt = 29500
@@ -550,7 +520,6 @@ class CheckpointCfg(BaseConfig):
     # checkpoint_path rather than disabling resume, which is no longer honored.
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
     resume_from_ckpt: bool = True
-    strict_sharding: bool = False
     base_checkpoint_path: Path = Path("checkpoints/miner")
     checkpoint_path: Path | None = None
     checkpoint_interval: PositiveInt | None = None
@@ -562,9 +531,8 @@ class CheckpointCfg(BaseConfig):
     download_concurrency: PositiveInt = 1
     # When True, skip the chain-fetch of the validator's latest checkpoint
     # AND the on-disk overlay in get_model_from_checkpoint. The model returns
-    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
-    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
-    # backbone). Overrides resume_from_ckpt.
+    # with pretrained base weights only — useful for cold-start experiments
+    # (LR sweeps starting from the base backbone). Overrides resume_from_ckpt.
     use_pretrained_only: bool = False
     # When True (default) the miner's inner-opt-step loop calls the
     # "(5) Reload Model" branch that re-runs setup_training if it finds a
@@ -658,13 +626,27 @@ class OwnerCheckpointCfg(CheckpointCfg):
     base_checkpoint_path: Path = Path("checkpoints/owner")
 
 
+class ResidualCfg(BaseConfig):
+    """The task's residual experts: K per MoE block, gate threshold A and temperature τ."""
+
+    k: PositiveInt
+    threshold: float = Field(gt=0, lt=1)  # compared with a sigmoid output
+    temperature: PositiveFloat
+
+    @model_validator(mode="after")
+    def _gate_can_open(self) -> ResidualCfg:
+        # q ≥ sigmoid(−A/τ), which is exactly 0 in fp32 from about 88; a token with q = 0 gives its expert no gradient.
+        ratio = self.threshold / self.temperature
+        if ratio >= 80:
+            raise ValueError(f"residual threshold / temperature must be below 80, got {ratio:g}")
+        return self
+
+
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    # -1 signals "not assigned to a functioning slot" — the group is defined
-    # (has an expert_assignment.json) but is not yet mapped to a stable
-    # runtime slot. Default -1 avoids silent clashes with an already-in-use
-    # slot (e.g. exp_math permanently owns 0) when the field is forgotten.
-    group_id: int = -1
+    # Required: it is the expert group every chain commit names, so a forgotten one must not default into a slot.
+    group_id: NonNegativeInt
+    residual: ResidualCfg
 
 
 class TaskCfg(BaseConfig):
@@ -676,30 +658,10 @@ class TaskCfg(BaseConfig):
     # unchanged, its authority just moved from a code constant to the API, so a
     # new task no longer needs a release. The value here is the fallback used
     # when the API is unreachable.
-    #
-    # `helper_group_id` and `routing_mode` stay locked for the natural-routing
-    # (2Fnat) consensus contract and are independent of the dataset.
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "helper_group_id", "routing_mode",
-    })
-    expert_group_name: str = "exp_nemotron_c4"
-    load_all_expert_groups: bool = False
+    expert_group_name: str = "exp_pmc_residual"
     base_path: Path = Path("expert_groups")
     path: Path | None = None
-    exp: ExpertCfg = Field(default_factory=ExpertCfg)
-    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
-    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
-    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
-    # frozen-helper slot). Set to None to disable the pairing — the routing
-    # branch self-gates and falls through to masked-topk.
-    helper_group_id: int | None = 2
-    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
-    # is the default: base gate runs unmasked, natural picks landing in the
-    # trainable set are kept as-is, non-trainable picks get replaced by the
-    # token's top-scoring helper. Falls back to masked-topk automatically when
-    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
-    # to force the pre-2Fnat behavior.
-    routing_mode: str = "natural_with_fallback"
+    exp: ExpertCfg | None = None  # set from the task's config.yaml by model_post_init
 
 
 # ---------------------------
@@ -718,7 +680,6 @@ class WorkerConfig(BaseConfig):
     run: RunCfg = Field(default_factory=RunCfg)
     chain: ChainCfg = Field(default_factory=ChainCfg)
     model: ModelCfg = Field(default_factory=ModelCfg)
-    moe: MoECfg = Field(default_factory=MoECfg)
     ckpt: CheckpointCfg = Field(default_factory=CheckpointCfg)
     hf: HfCfg = Field(default_factory=HfCfg)
     sched: ScheduleCfg = Field(default_factory=ScheduleCfg)
@@ -745,19 +706,20 @@ class WorkerConfig(BaseConfig):
         # Derive paths
         self._refresh_paths()
 
-        # Load per-task overrides. A task this node has not got — the owner
-        # named one it has not fetched yet — falls back to the shipped default
-        # here, at construction, where raising would be a crash loop before
-        # anything can ask the API or fetch the task. A live switch has a task
-        # to stay on, so `switch_active_task` gets no such fallback.
+        # Load per-task overrides. A task this node has not got, or cannot load
+        # (one materialized for an older release), falls back to the shipped
+        # default here, at construction, where raising would be a crash loop
+        # before anything can ask the API or fetch the task. A live switch has
+        # a task to stay on, so `switch_active_task` gets no such fallback.
         try:
             self._update_by_task()
-        except FileNotFoundError as e:
+        # YAMLError and UnicodeDecodeError: a truncated, hand-edited or corrupt config.yaml.
+        except (FileNotFoundError, ValidationError, yaml.YAMLError, UnicodeDecodeError) as e:
             fallback = type(self.task).model_fields["expert_group_name"].default
             if self.task.expert_group_name == fallback:
                 raise
             logger.error(
-                "No task definition on disk — falling back to the shipped default",
+                "Task not loadable — falling back to the shipped default",
                 task=self.task.expert_group_name, error=str(e), fallback=fallback,
             )
             self._update_by_task(expert_group_name=fallback)
@@ -858,11 +820,15 @@ class WorkerConfig(BaseConfig):
         try:
             self._update_by_task(expert_group_name=expert_group_name)
         except Exception:
-            self.task.expert_group_name = previous_name
-            self.task.exp = previous_exp
-            self._refresh_paths()
+            self.restore_task(previous_name, previous_exp)
             raise
         self._ensure_runtime_dirs()
+
+    def restore_task(self, expert_group_name: str, exp: ExpertCfg) -> None:
+        """Put back a task this config was on, from memory: no file is read, so it cannot fail."""
+        self.task.expert_group_name = expert_group_name
+        self.task.exp = exp
+        self._refresh_paths()
 
     def _fill_wallet_data(self) -> None:
         if self.chain.hotkey_ss58 and self.chain.coldkey_ss58:
@@ -896,7 +862,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
     def from_path(
@@ -1149,15 +1115,24 @@ class MinerConfig(WorkerConfig):
     role: str = "miner"
     local_par: ParallelismCfg = Field(default_factory=ParallelismCfg)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accumulation_from_before_micro_batch(cls, data: Any) -> Any:
+        """A YAML from before micro_batch_size accumulated 1-row micro-batches; take the new default instead."""
+        local_par = data.get("local_par") if isinstance(data, dict) else None
+        if not isinstance(local_par, dict) or "micro_batch_size" in local_par:
+            return data
+        if "gradient_accumulation_steps" in local_par:
+            logger.warning(
+                "Ignoring local_par.gradient_accumulation_steps from before micro_batch_size; add "
+                "local_par.micro_batch_size to keep your own gradient_accumulation_steps",
+                ignored=local_par["gradient_accumulation_steps"],
+            )
+        # Persisted by from_path's rewrite; without auto_update or a TTY it is redone on every load.
+        return data | {"local_par": {k: v for k, v in local_par.items() if k != "gradient_accumulation_steps"}}
+
     @model_validator(mode="after")
     def _derive_all(self):
-        # derive grad accumulation if user explicitly set 0
-        if self.local_par.gradient_accumulation_steps == 0:
-            effective_batch = self.task.exp.data.batch_size
-            device_batch = self.task.exp.data.per_device_train_batch_size
-            g = math.ceil(effective_batch / (device_batch * self.local_par.world_size))
-            self.local_par.gradient_accumulation_steps = max(1, int(g))
-
         goi = self.local_par.global_opt_interval
         frac = 0.2
 
@@ -1170,6 +1145,15 @@ class MinerConfig(WorkerConfig):
 
         return self
 
+    @model_validator(mode="after")
+    def _validate_quantization_miner(self):
+        # Only a miner reads it. quantization_validator is locked: a stale value is reset on load, not refused.
+        from connito.shared.modeling.quantization import SCOPES  # quantization -> families -> config
+
+        if self.model.quantization_miner not in SCOPES:
+            raise ValueError(f"model.quantization_miner must be one of {SCOPES}, got {self.model.quantization_miner!r}")
+        return self
+
 
 class ValidatorRunCfg(RunCfg):
     averager_step_timeout_sec: int = 60  # seconds to wait for averager group formation (1 min)
@@ -1179,7 +1163,9 @@ class ValidatorRunCfg(RunCfg):
 
 class EvalCfg(BaseConfig):
     _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
-        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n"
+        "top_k_miners_to_merge", "top_k_miners_to_reward", "score_window", "foreground_top_n",
+        "max_replay_loss_increase", "replay_loss_weight", "task_usage_weight", "task_usage_target",
+        "replay_usage_weight",
     })
     top_k_miners_to_merge: int = 1    # top-N miners whose gradients are merged into global model
     top_k_miners_to_reward: int = 3   # top-N miners who receive chain weights (proportional to score after normalization)
@@ -1188,6 +1174,14 @@ class EvalCfg(BaseConfig):
     background_worker_enabled: bool = True
     per_miner_download_timeout_sec: PositiveInt = 180
     per_miner_eval_timeout_sec: PositiveInt = 300
+    # c4 isolation gate: a miner whose replay loss rises more than this above the base's is never ranked.
+    max_replay_loss_increase: NonNegativeFloat = 0.02
+    # raw = (task_base − task) − a·max(0, c4 − c4_base) − b·|task_usage − target| − c·c4_usage
+    # score = raw − the base's raw on its own baseline evals (only its usage terms), so the base scores 0
+    replay_loss_weight: NonNegativeFloat = 1.0  # a
+    task_usage_weight: NonNegativeFloat = 1.0  # b
+    task_usage_target: NonNegativeFloat = 0.2  # target
+    replay_usage_weight: NonNegativeFloat = 1.0  # c
     # Round-group construction scheme. When true, Round.freeze() partitions
     # the roster into validation Groups A (3) / B (10) / C (17) with
     # |A|+|B|=13, holds B and C for 8 cycles, and emits weight Group 1

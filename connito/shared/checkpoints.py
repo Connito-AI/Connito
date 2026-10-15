@@ -9,13 +9,16 @@ from typing import Any
 
 import bittensor
 import fsspec
-import torch
 from fsspec.generic import GenericFileSystem
 from pydantic import BaseModel, ConfigDict, Field
 
 from connito.shared.app_logging import structlog
-from connito.shared.checkpoint_helper import compile_full_state_dict_from_path
-from connito.shared.expert_manager import get_layer_expert_id
+from connito.shared.checkpoint_helper import (
+    TensorSpec,
+    compile_full_state_dict_from_path,
+    group_shard,
+    verify_residual_shard,
+)
 from connito.shared.helper import (
     MINER_CHECKPOINT_SUFFIXES,
     get_model_hash,
@@ -36,11 +39,6 @@ from connito.shared.chain import (
     SignedModelHashChainCommit,
     WorkerChainCommit,
     get_chain_commits,
-)
-from connito.shared.expert_manager import (
-    ExpertManager,
-    get_layer_expert_id,
-    ExpertAssignments
 )
 
 logger = structlog.get_logger(__name__)
@@ -85,8 +83,7 @@ class ModelCheckpoint(BaseModel):
     hash_required: bool = False
     hash_verified: bool = False
 
-    expert_group_check_required: bool = False
-    expert_group_verified: bool = False
+    shard_verified: bool = False
 
     def __eq__(self, other: object) -> bool:
         try:
@@ -197,91 +194,21 @@ class ModelCheckpoint(BaseModel):
 
         return self.signature_verified
 
-    def _verify_expert_group(self, state_dict: dict | None, expert_group_assignment: ExpertAssignments) -> bool:
-        if not self.expert_group_check_required:
-            self.expert_group_verified = True
-            return True
-
-        if state_dict is None:
-            self.expert_group_verified = False
-            return False
-
-        if len(state_dict) == 0:
-            logger.warning(
-                "expert group verification failed: empty model_state_dict",
-                expert_group=self.expert_group,
-                hotkey=self.hotkey,
-            )
-            self.expert_group_verified = False
-            return self.expert_group_verified
-
-        allowed_layers = expert_group_assignment.get(self.expert_group, {})
-        routed_expert_key_count = 0
-        for name, tensor in state_dict.items():
-            # Check for non-finite weights (NaN, Inf)
-            if torch.is_tensor(tensor) and torch.is_floating_point(tensor) and not torch.isfinite(tensor).all():
-                non_finite_count = (~torch.isfinite(tensor)).sum().item()
-                logger.warning("expert group verification failed: non-finite weights detected", key=name, non_finite_count=non_finite_count, total_elements=tensor.numel())
-                self.expert_group_verified = False
-                return self.expert_group_verified
-
-            layer_id, expert_id = get_layer_expert_id(name)
-            if layer_id is None or expert_id is None:
-                self.expert_group_verified = False
-                return self.expert_group_verified
-
-            routed_expert_key_count += 1
-
-            # `org_expert_id` only — matching `my_expert_id` too let a
-            # submission smuggle in any expert with a global id in 0..K-1.
-            expert_id_mapping = allowed_layers.get(layer_id, [])
-            allowed_expert_ids = {int(org_expert_id) for _, org_expert_id in expert_id_mapping}
-            if int(expert_id) not in allowed_expert_ids:
-                logger.debug(
-                    "Expert group verification mismatch",
-                    expert_group=self.expert_group,
-                    layer_id=layer_id,
-                    expert_id=int(expert_id),
-                    allowed_expert_id_sample=sorted(list(allowed_expert_ids))[:10],
-                    param_name=name,
-                )
-                self.expert_group_verified = False
-                return self.expert_group_verified
-
-        if routed_expert_key_count == 0:
-            logger.warning(
-                "expert group verification failed: no routed expert params in submitted checkpoint",
-                expert_group=self.expert_group,
-                hotkey=self.hotkey,
-            )
-            self.expert_group_verified = False
-            return self.expert_group_verified
-
-        self.expert_group_verified = True
-        
-        return self.expert_group_verified
-
-    def validate(self, expert_group_assignment: ExpertAssignments | None) -> bool:
-
-        # --- verify signature ---
+    def validate(self, expected: dict[str, TensorSpec]) -> bool:
+        """The signature, then the shard against the residual spec (header first), then its hash."""
         self._verify_signature()
 
-        # --- get state dict ---
         if self.path is None:
             logger.warning("Hash verification failed: missing checkpoint path", checkpoint=self)
             return False
-    
-        state_dict = compile_full_state_dict_from_path(self.path, expert_groups=[self.expert_group])
-        
-        # --- verify hash ---
-        self._verify_hash(state_dict = state_dict)
 
-        # --- verify expert group ---
-        if expert_group_assignment is not None:
-            self._verify_expert_group(state_dict = state_dict, expert_group_assignment = expert_group_assignment)
-        
-        return self.validated()
-    
+        state_dict = verify_residual_shard(group_shard(self.path, self.expert_group), expected)
+        self.shard_verified = state_dict is not None
+        if state_dict is not None:
+            self._verify_hash(state_dict=state_dict)
+
+        return self.shard_verified and self.validated()
+
     def validated(self) -> bool:
         if self.expired():
             hk = self.hotkey[:6] if self.hotkey else None
@@ -294,10 +221,6 @@ class ModelCheckpoint(BaseModel):
         if self.hash_required and not self.hash_verified:
             hk = self.hotkey[:6] if self.hotkey else None
             logger.debug("Checkpoint rejected — hash not verified", hotkey=hk)
-            return False
-        if self.expert_group_check_required and not self.expert_group_verified:
-            hk = self.hotkey[:6] if self.hotkey else None
-            logger.debug("Checkpoint rejected — expert group not verified", hotkey=hk)
             return False
 
         return True
@@ -682,7 +605,6 @@ def build_chain_checkpoints(
                     hf_revision=getattr(commit, "hf_revision", None),
                     signature_required=True,
                     hash_required=True,
-                    expert_group_check_required=True,
                 )
             )
         except Exception as e:
@@ -969,32 +891,18 @@ def prune_submissions_outside_window(
     return deleted_files
 
 
+def local_checkpoints_best_first(primary_dir: Path, secondary_dir: Path | None = None) -> list[ModelCheckpoint]:
+    """Every checkpoint in the two folders, newest (global_ver, inner_opt) first."""
+    checkpoints = build_local_checkpoints(primary_dir, role="miner").checkpoints
+    if secondary_dir is not None:
+        checkpoints = [*checkpoints, *build_local_checkpoints(secondary_dir, role="validator").checkpoints]
+    return ModelCheckpoints(checkpoints=checkpoints).ordered()
+
+
 def select_best_checkpoint(
     primary_dir: Path, secondary_dir: Path | None = None, resume: bool = True
 ) -> ModelCheckpoint | None:
     if not resume:
         return None
-
-    primary = build_local_checkpoints(primary_dir, role="miner")
-
-    if secondary_dir is None:
-        combined = Checkpoints(
-            local=primary,
-            chain=ChainCheckpoints(checkpoints=[]),
-        )
-        ordered = combined.ordered()
-        return ordered[0] if ordered else None
-
-    secondary = build_local_checkpoints(secondary_dir, role="validator")
-    combined_local = ModelCheckpoints(checkpoints=[*primary.checkpoints, *secondary.checkpoints])
-
-    combined = Checkpoints(
-        local=combined_local,
-        chain=ChainCheckpoints(checkpoints=[]),
-    )
-
-    for ckpt in combined.ordered():
-        if ckpt.active():
-            return ckpt
-
-    return None
+    ordered = local_checkpoints_best_first(primary_dir, secondary_dir)
+    return ordered[0] if ordered else None

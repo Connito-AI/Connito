@@ -2,10 +2,10 @@
 
 Active only inside the (3) window: from end of Validate(K) to end of
 Train(K+1). Pulls UIDs from `Round.downloaded_pool` and runs
-`evaluate_one_miner` against `eval_base_model`, whose expert weights are
-reloaded once per round from `round.base_shard`. The backbone is frozen
-(`model.freeze_parameters`), so the shard plus a pretrained backbone is
-the whole base — nothing else has to be carried between rounds.
+`evaluate_one_miner` against `eval_base_model`, whose residual is
+reloaded once per round from `round.base_shard`. The base never
+trains, so the shard plus the pretrained base is the whole model —
+nothing else has to be carried between rounds.
 
 GPU-lock yielding invariant: `gpu_eval_lock` is acquired only for the
 narrow `load_state_dict` and `evaluate_one_miner` calls. It MUST NOT be
@@ -16,27 +16,34 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
 
 from connito.shared.app_logging import structlog
+from connito.shared.checkpoint_helper import TensorSpec
 from connito.shared.helper import load_state_dict_from_path
+from connito.shared.modeling.residual import residual_shapes
 from connito.shared.telemetry import (
     VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
     VALIDATOR_BG_EVAL_RECYCLE_TOTAL,
     VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS,
     VALIDATOR_BG_WORKER_PAUSED,
+    inc_error,
     note_round_series,
     set_baseline_loss,
 )
 from connito.validator.evaluator import (
     EVAL_MAX_BATCHES,
+    REPLAY_EVAL_TOKENS,
     cleanup_non_top_submissions,
     evaluate_one_miner_sync,
+    usage_penalties,
 )
 from connito.validator.round import RoundRef
 
@@ -70,6 +77,11 @@ DATALOADER_BUILD_RETRY_DELAYS_SEC: tuple[float, ...] = (0.0, 10.0, 30.0)
 logger = structlog.get_logger(__name__)
 
 
+class RoundBatches(NamedTuple):
+    task: list
+    replay: list | None  # None when the task has no replay source
+
+
 class BackgroundEvalWorker(threading.Thread):
     def __init__(
         self,
@@ -81,7 +93,6 @@ class BackgroundEvalWorker(threading.Thread):
         merge_phase_active: threading.Event,
         eval_window_active: threading.Event,
         gpu_eval_lock: threading.Lock,
-        expert_group_assignment,
         stop_event: threading.Event | None = None,
         poll_interval_sec: float = 2.0,
         stuck_lock_recycle_threshold: int = DEFAULT_STUCK_LOCK_RECYCLE_THRESHOLD,
@@ -94,10 +105,6 @@ class BackgroundEvalWorker(threading.Thread):
         self.merge_phase_active = merge_phase_active
         self.eval_window_active = eval_window_active
         self.gpu_eval_lock = gpu_eval_lock
-        # Private so the only way in is `set_expert_group_assignment`. No
-        # lock, unlike `_eval_base_model` below: a bare rebind, and the
-        # window guard keeps the swap out of an in-flight eval.
-        self._expert_group_assignment = expert_group_assignment
         self.stop_event = stop_event or threading.Event()
         self.poll_interval_sec = poll_interval_sec
         self.stuck_lock_recycle_threshold = stuck_lock_recycle_threshold
@@ -108,16 +115,22 @@ class BackgroundEvalWorker(threading.Thread):
         self._eval_base_model_lock = threading.Lock()
         self._loaded_round_id: int | None = None
         self._loaded_baseline_loss: float | None = None
-        # The round's base shard key set — what every submission must equal,
-        # since miners are loaded into the one model in place. None until a
-        # base shard has been loaded (cold start), when the check is skipped.
-        self._expected_expert_keys: set[str] | None = None
+        # The residual spec every submission must equal, since miners are
+        # loaded into the one model in place. Read from config at each round
+        # load, so it follows a task switch.
+        self._expected: dict[str, TensorSpec] | None = None
         # Round-scoped cache of materialized eval batches. Built once in
         # `_load_round_base` from the streaming dataloader, then
         # iterated by every miner's eval this round. Same combined seed
         # → same batches, so per-miner re-streaming was wasted work AND
         # the trigger for the HF-stall lock-leak.
         self._cached_batches: list | None = None
+        # The c4 replay split and the base's loss on it, for the isolation gate; both
+        # None when the task has no replay source or the replay baseline is not finite.
+        self._replay_batches: list | None = None
+        self._loaded_baseline_replay_loss: float | None = None
+        # The base's own raw score (its gate-usage terms); every miner's score is measured from it.
+        self._loaded_base_raw_score = 0.0
         # Stuck-lock detection: incremented every iteration that observes
         # `gpu_eval_lock` held at the top-of-loop assertion, reset to 0
         # on any successful (or even attempted) eval iteration. When the
@@ -134,7 +147,7 @@ class BackgroundEvalWorker(threading.Thread):
         """Hand the worker a model to use as its eval base.
 
         Called by the main loop at round freeze, so the worker doesn't need
-        to re-fetch and re-construct the model from chain. Expert weights are
+        to re-fetch and re-construct the model from chain. The residual is
         reloaded per round from `round.base_shard`, so what matters here is
         the architecture, not the current weights.
         """
@@ -146,20 +159,6 @@ class BackgroundEvalWorker(threading.Thread):
     def has_eval_base_model(self) -> bool:
         with self._eval_base_model_lock:
             return self._eval_base_model is not None
-
-    def set_expert_group_assignment(self, assignment) -> None:
-        """Point the worker at a different expert group's assignment.
-
-        Refuses while the eval window is open: `validate_miner_submission`
-        checks expert-group ownership, so a swap mid-round rejects every
-        submission and writes score=0 for the whole roster.
-        """
-        if self.eval_window_active.is_set():
-            raise RuntimeError(
-                "refusing to swap expert_group_assignment while the eval window "
-                "is open; clear eval_window_active and finalize the round first"
-            )
-        self._expert_group_assignment = assignment
 
     # ---------------- Thread body ----------------
     def run(self) -> None:
@@ -262,6 +261,7 @@ class BackgroundEvalWorker(threading.Thread):
                 del self._eval_base_model
                 self._eval_base_model = None
                 self._cached_batches = None
+                self._replay_batches = None
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -297,10 +297,11 @@ class BackgroundEvalWorker(threading.Thread):
         """Load the round's baseline shard into our GPU eval_base_model,
         materialize the round's eval batches once, and compute baseline.
 
-        The shard is the active group's pretrained experts, written at boot.
-        Every other parameter is frozen for the life of the subnet, so
-        `strict=False` with the backbone left alone rebuilds the base exactly,
-        whatever the previous round left in the model.
+        The shard is the validator's own residual (`down_proj` = 0), written
+        at boot and at each task switch. It replaces whatever residual the
+        previous round's last miner left, so the baseline is the base exactly.
+        It is loaded directly, never verified: the untrained-expert rule
+        would refuse it by design.
 
         Holds `gpu_eval_lock` only for the duration of `load_state_dict`
         and the baseline forward pass. The dataloader is *materialized*
@@ -312,7 +313,7 @@ class BackgroundEvalWorker(threading.Thread):
         """
         # Lazy imports keep this module loadable without the heavy
         # datasets/pandas chain at module-import time (helps tests).
-        from connito.shared.dataloader import get_dataloader, materialize_batches
+        from connito.shared.dataloader import get_dataloader, materialize_batches, materialize_by_tokens
         from connito.shared.evaluate import evaluate_model
 
         # Drop any previous round's cached batches before loading the new
@@ -320,11 +321,15 @@ class BackgroundEvalWorker(threading.Thread):
         # for a full 50-batch window — leaking it across rounds compounds
         # under restart-replay scenarios.
         self._cached_batches = None
+        self._replay_batches = None
+        self._loaded_baseline_replay_loss = None
+        self._loaded_base_raw_score = 0.0  # stays 0 on a fallback round, scored against 100.0 alone
+        self._expected = None
 
         def _load() -> None:
+            self._expected = residual_shapes(self.config)
             shard = round_obj.base_shard
             sd = load_state_dict_from_path(str(shard))
-            self._expected_expert_keys = set(sd)
             with self.gpu_eval_lock:
                 incompatible = self._eval_base_model.load_state_dict(sd, strict=False)
                 if torch.cuda.is_available():
@@ -338,7 +343,12 @@ class BackgroundEvalWorker(threading.Thread):
                     round_id=round_obj.round_id, path=str(shard),
                 )
 
-        await asyncio.to_thread(_load)
+        try:
+            await asyncio.to_thread(_load)
+        except Exception as e:
+            # Not restored, so no baseline can be measured; the eval thread must outlive it.
+            self._fall_back(round_obj, "round base shard failed to load", e)
+            return
 
         # Build the dataloader and pull all batches into RAM up-front.
         # Both steps are wrapped in to_thread so the event loop stays
@@ -348,18 +358,25 @@ class BackgroundEvalWorker(threading.Thread):
         # wedges) typically resolve in seconds; bounded retry keeps the
         # round in normal scoring mode without dragging it into
         # degraded mode on the first failed attempt.
-        def _build_and_materialize() -> list:
-            dl = get_dataloader(
+        data = self.config.task.exp.data
+        has_replay = any(src.replay for src in data.dataset_sources or [])
+
+        def _loader(replay: bool):
+            return get_dataloader(
                 config=self.config,
                 tokenizer=self.tokenizer,
                 seed=round_obj.seed,
                 rank=0,
                 world_size=self.config.dataloader.world_size,
+                replay=replay,
             )
-            try:
-                return materialize_batches(dl, EVAL_MAX_BATCHES)
-            finally:
-                del dl
+
+        def _build_and_materialize() -> RoundBatches:
+            return RoundBatches(
+                task=materialize_batches(_loader(False), EVAL_MAX_BATCHES),
+                replay=(materialize_by_tokens(_loader(True), REPLAY_EVAL_TOKENS, data.sequence_length)
+                        if has_replay else None),
+            )
 
         last_error: Exception | None = None
         for attempt, delay in enumerate(DATALOADER_BUILD_RETRY_DELAYS_SEC):
@@ -372,7 +389,7 @@ class BackgroundEvalWorker(threading.Thread):
                 )
                 await asyncio.sleep(delay)
             try:
-                self._cached_batches = await asyncio.to_thread(_build_and_materialize)
+                self._cached_batches, self._replay_batches = await asyncio.to_thread(_build_and_materialize)
                 last_error = None
                 break
             except Exception as e:
@@ -385,42 +402,67 @@ class BackgroundEvalWorker(threading.Thread):
                 )
 
         if last_error is not None:
-            logger.warning(
-                "bg-eval: dataloader build exhausted retries; using fallback baseline",
-                attempts=len(DATALOADER_BUILD_RETRY_DELAYS_SEC),
-                error=str(last_error),
-            )
             self._cached_batches = None
-            self._loaded_baseline_loss = 100.0
-            self._loaded_round_id = round_obj.round_id
+            self._fall_back(round_obj, "dataloader build exhausted retries", last_error)
             return
+        if not has_replay:
+            logger.warning("bg-eval: task has no replay source; isolation gate off", round_id=round_obj.round_id)
 
-        def _baseline() -> float:
+        def _baseline(batches: list, max_batches: int | None) -> dict[str, float]:
             with self.gpu_eval_lock:
-                metrics = evaluate_model(
-                    0, self._eval_base_model, self._cached_batches,
-                    self.device, EVAL_MAX_BATCHES, None,
-                )
-            return float(metrics.get("val_loss", 100))
+                return evaluate_model(0, self._eval_base_model, batches, self.device, max_batches, None)
 
+        # A task with a replay source whose c4 check cannot run publishes nothing: each case raises into the fallback.
+        base_usage: dict[str, float] = {}
         try:
-            self._loaded_baseline_loss = await asyncio.to_thread(_baseline)
+            if has_replay and not self._replay_batches:
+                raise ValueError("the c4 replay split is empty")
+            task = await asyncio.to_thread(_baseline, self._cached_batches, EVAL_MAX_BATCHES)
+            self._loaded_baseline_loss = float(task.get("val_loss", 100))
+            base_usage["task"] = float(task.get("gate_usage", 0.0))
+            if not math.isfinite(self._loaded_baseline_loss):
+                raise ValueError("task baseline is not finite")  # every score would be non-finite
+            if has_replay:
+                replay = await asyncio.to_thread(_baseline, self._replay_batches, None)
+                if not math.isfinite(replay["val_loss"]) or replay.get("nan_batches", 0) > 0:
+                    raise ValueError("the replay baseline has non-finite batches")
+                self._loaded_baseline_replay_loss = float(replay["val_loss"])
+                base_usage["replay"] = float(replay.get("gate_usage", 0.0))
+            # The base has no task gain or c4 rise against itself; only its gate-usage terms remain.
+            self._loaded_base_raw_score = -sum(usage_penalties(self.config.evaluation, base_usage).values())
             # Feeds the dashboard's baseline trend. Only the measured path
             # publishes: both fallbacks park the value at 100.0, and a
             # sentinel in the series reads as a real regression.
-            set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss)
+            set_baseline_loss(round_obj.round_id, self._loaded_baseline_loss, self._loaded_base_raw_score)
         except Exception as e:
-            logger.warning("bg-eval: baseline failed; using fallback", error=str(e))
-            self._loaded_baseline_loss = 100.0
+            self._fall_back(round_obj, "baseline failed", e)
 
         self._loaded_round_id = round_obj.round_id
         logger.info(
             "bg-eval: round snapshot loaded",
             round_id=round_obj.round_id,
             baseline_loss=round(self._loaded_baseline_loss or 0.0, 4),
+            baseline_replay_loss=self._loaded_baseline_replay_loss,
             cached_batches=(
                 len(self._cached_batches) if self._cached_batches is not None else 0
             ),
+            replay_batches=len(self._replay_batches or []),
+            replay_tokens=sum(int(b["attention_mask"].sum()) for b in self._replay_batches or []),
+            **{f"baseline_{split}_usage": round(value, 4) for split, value in base_usage.items()},
+            base_raw_score=round(self._loaded_base_raw_score, 6),
+        )
+
+    def _fall_back(self, round_obj, reason: str, error: Exception) -> None:
+        """Score the round against the 100.0 fallback baseline, from which no winner is published."""
+        self._loaded_baseline_loss = 100.0
+        self._loaded_baseline_replay_loss = None
+        self._loaded_round_id = round_obj.round_id
+        round_obj.baseline_fallback = True
+        inc_error(component="bg_eval", kind="baseline_fallback")
+        logger.warning(
+            "bg-eval: round on the fallback baseline; no winner will be published",
+            round_id=round_obj.round_id, path=str(round_obj.base_shard), reason=reason, error=str(error),
+            exc_info=error,
         )
 
     async def _evaluate_one(self, round_obj, *, uid: int, hotkey: str) -> None:
@@ -447,22 +489,33 @@ class BackgroundEvalWorker(threading.Thread):
             round_obj.release_claim(uid)
             return
 
+        if self._expected is None:
+            # No spec this round is the validator's fault: an operational failure, never `bad_residual_shard`.
+            logger.warning("bg-eval: no residual spec this round; not scoring", uid=uid, round_id=round_obj.round_id)
+            round_obj.mark_failed(uid)
+            round_obj.publish_progress()
+            self._prune_non_top(round_obj)
+            return
+
         timeout = float(self.config.evaluation.per_miner_eval_timeout_sec)
         baseline = self._loaded_baseline_loss if self._loaded_baseline_loss is not None else 100.0
 
         # Verify the on-disk submission against the chain commit (signed
-        # hash, hash, expert-group ownership, NaN/Inf scan) BEFORE the
-        # GPU eval. Off-spec submissions are dropped.
+        # hash, residual spec, NaN/Inf scan, hash) BEFORE the GPU eval.
+        # Off-spec submissions are dropped.
         from connito.shared.telemetry import inc_error
-        from connito.validator.evaluator import validate_miner_submission
+        from connito.validator.evaluator import (
+            _VALIDATION_FAIL_TO_REASON,
+            _record_eval_failure,
+            validate_miner_submission,
+        )
 
         fail_reason = await asyncio.to_thread(
             validate_miner_submission,
             round_obj=round_obj,
             uid=uid,
             model_path=path,
-            expert_group_assignment=self._expert_group_assignment,
-            expected_keys=self._expected_expert_keys,
+            expected=self._expected,
         )
         if fail_reason is not None:
             logger.warning(
@@ -472,6 +525,7 @@ class BackgroundEvalWorker(threading.Thread):
                 reason=fail_reason,
             )
             inc_error(component="bg_eval", kind="validation")
+            _record_eval_failure(uid, _VALIDATION_FAIL_TO_REASON.get(fail_reason, "unknown"))
             # `mark_validation_failed` puts this UID into both
             # `failed_uids` (claim-blocking) and `validation_failed_uids`
             # so finalize writes score=0 for it. Operational failures
@@ -527,6 +581,9 @@ class BackgroundEvalWorker(threading.Thread):
                     round_id=round_obj.round_id,
                     deadline_monotonic=deadline,
                     cached_batches=self._cached_batches,
+                    replay_batches=self._replay_batches,
+                    baseline_replay_loss=self._loaded_baseline_replay_loss,
+                    base_raw_score=self._loaded_base_raw_score,
                 )
 
         try:
@@ -630,6 +687,9 @@ class BackgroundEvalWorker(threading.Thread):
         self._loaded_round_id = None
         self._loaded_baseline_loss = None
         self._cached_batches = None
+        self._replay_batches = None
+        self._loaded_baseline_replay_loss = None
+        self._loaded_base_raw_score = 0.0
         self._stuck_lock_streak = 0
         try:
             VALIDATOR_BG_EVAL_STUCK_LOCK_ITERATIONS.set(0)

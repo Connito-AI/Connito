@@ -48,13 +48,14 @@ is why `.dockerignore` lives at the repo root.
 
 [`connito/validator/docker/Dockerfile`](../connito/validator/docker/Dockerfile):
 
-1. Base: `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`. Pin via the
-   `CUDA_IMAGE` build arg.
+1. Base: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04`. Pin via the
+   `CUDA_IMAGE` build arg. CUDA 12.8 needs NVIDIA driver ≥ 570 on the
+   Linux host; a validator on an older driver cannot start this image.
 2. System deps: Python 3.10, build tools, git (kept for source builds; no
    VCS-pinned requirements remain), curl (for the healthcheck).
-3. `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124`.
+3. `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128`.
    Torch is pinned in `requirements.txt`; the extra index just makes
-   sure pip picks up the cu124 binary wheel instead of the CPU one.
+   sure pip picks up the cu128 binary wheel instead of the CPU one.
    **This is the layer to watch.** It's slow, fat, and the most likely
    thing to break when a dep is bumped.
 4. Copy `pyproject.toml`, `README.md`, `LICENSE`, `connito/`.
@@ -322,7 +323,7 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 
 # Verify:
-docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu22.04 nvidia-smi
 ```
 
 This is the same installation the operator doc walks through at
@@ -379,7 +380,7 @@ docker run --rm --gpus all \
 Anything that touches the image is effectively a deploy. Minimum bar:
 
 1. **Build succeeds locally.** `docker build -f connito/validator/docker/Dockerfile .`
-   This catches dep resolution failures (the cu124 wheel availability
+   This catches dep resolution failures (the cu128 wheel availability
    thing — see "Known landmines" below).
 2. **Entrypoint imports cleanly.** Run the smoke test from the dev loop
    above. Catches missing `__init__.py` exports, circular imports
@@ -475,11 +476,11 @@ When in doubt: announce it, then push.
 
 ## Known landmines
 
-- **`torch==2.10.0` + cu124.** The pin in `requirements.txt` only works
-  if PyTorch has actually published a `cu124` wheel for that version on
+- **`torch==2.10.0` + cu128.** The pin in `requirements.txt` only works
+  if PyTorch has actually published a `cu128` wheel for that version on
   the day you build. If it hasn't, the build fails at the pip install
   step. Fixes:
-  - Bump `torch` to a version that does have a cu124 wheel.
+  - Bump `torch` to a version that does have a cu128 wheel.
   - Or change `--extra-index-url` in the Dockerfile to a different
     `cu1xx` index.
   - Always do a `--no-cache` local build when bumping torch.

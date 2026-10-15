@@ -7,7 +7,7 @@ fix: `Round.freeze` persisting the base parameters it snapshots, and
 
 The base is the load-bearing part. A resumed miner must be scored against
 the same base as one scored before the restart, because
-`delta = max(0, baseline - val_loss)` is only comparable within a single base.
+the task gain `baseline - val_loss` is only comparable within a single base.
 Every round's base is the pretrained shard the boot wrote, so a journal that
 names anything else must refuse the resume rather than degrade it.
 
@@ -18,6 +18,7 @@ chain reads, no network. Run with
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -444,3 +445,33 @@ def test_journal_seed_is_backward_compatible():
     journal = rj.RoundJournal.from_json(raw)
     assert journal.seed == ""
     assert journal.round_id == ROUND_ID
+
+
+def test_a_round_resumed_on_the_fallback_baseline_publishes_no_winner(tmp_path):
+    """Its scores were measured against 100.0, so every journaled one is positive."""
+    _freeze(checkpoint_path=tmp_path)
+    _seed_journal(tmp_path, scores={1: 240.0}, baseline_fallback=True)
+
+    _, round_ref, _, _ = _resume(tmp_path)
+
+    assert round_ref.current.baseline_winner_uid() is None
+    assert rj.load(rj.journal_path_for(tmp_path, ROUND_ID)).baseline_fallback is True
+
+
+def test_a_journal_written_before_the_fallback_flag_still_loads():
+    payload = rj.RoundJournal(round_id=ROUND_ID, uid_to_hotkey={}, scores={}, scored_uids=(), failed_uids=(),
+                              validation_failed_uids=(), freeze_zero_uids=(), freeze_zero_hotkeys={}).to_json()
+    raw = json.loads(payload)
+    del raw["baseline_fallback"]
+
+    assert rj.RoundJournal.from_json(json.dumps(raw)).baseline_fallback is False
+
+
+def test_a_c4_gate_failure_survives_the_journal_round_trip():
+    payload = rj.RoundJournal(round_id=ROUND_ID, uid_to_hotkey={1: "m1"}, scores={1: float("-inf"), 2: -0.2},
+                              scored_uids=(1, 2), failed_uids=(), validation_failed_uids=(), freeze_zero_uids=(),
+                              freeze_zero_hotkeys={}, uid_to_val_loss={1: float("inf")}).to_json()
+
+    restored = rj.RoundJournal.from_json(payload)
+    assert restored.scores == {1: float("-inf"), 2: -0.2}
+    assert restored.uid_to_val_loss == {1: float("inf")}

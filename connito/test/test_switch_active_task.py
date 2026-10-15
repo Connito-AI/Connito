@@ -12,18 +12,22 @@ from pathlib import Path
 import pytest
 import yaml
 
-from connito.shared.config import MinerConfig
+from connito.shared.config import ExpertCfg, MinerConfig, ResidualCfg
 
 # The locked default. The task the config is constructed on must use this
 # name or `check_and_prompt_locked` resets it out from under the fixture.
-SHIPPED = "exp_nemotron_c4"
+SHIPPED = "exp_pmc_residual"
 OTHER = "exp_switch_target"
 
 
-def _task_dir(root: Path, name: str, group_id: int) -> None:
+def _task_dir(root: Path, name: str, group_id: int | None, residual: bool = True) -> None:
     """A task folder shaped like `expert_groups/<name>/`."""
     body = yaml.safe_load(Path(f"expert_groups/{SHIPPED}/config.yaml").read_text())
     body["group_id"] = group_id
+    if group_id is None:
+        del body["group_id"]
+    if not residual:
+        del body["residual"]
     d = root / "expert_groups" / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "config.yaml").write_text(yaml.safe_dump(body))
@@ -104,3 +108,55 @@ def test_switching_to_the_current_task_is_a_no_op(config: MinerConfig) -> None:
 
     assert config.task.expert_group_name == SHIPPED
     assert config.task.exp.group_id == 4
+
+
+def test_a_task_without_residual_settings_is_refused_and_rolled_back(
+    config: MinerConfig, tmp_path: Path,
+) -> None:
+    """K, A and τ are protocol values; a task that does not serve them cannot be trained or scored."""
+    _task_dir(tmp_path, "exp_no_residual", group_id=8, residual=False)
+    before = (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp)
+
+    with pytest.raises(ValueError, match="residual"):
+        config.switch_active_task("exp_no_residual")
+
+    assert (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp) == before
+
+
+@pytest.mark.parametrize("group_id", [-1, None], ids=["sentinel", "missing"])
+def test_a_task_without_a_real_group_id_is_refused_and_rolled_back(
+    config: MinerConfig, tmp_path: Path, group_id: int | None,
+) -> None:
+    """Every chain commit names the task's group; a forgotten or sentinel one must not reach a commit."""
+    _task_dir(tmp_path, "exp_no_group", group_id=group_id)
+    before = (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp)
+
+    with pytest.raises(ValueError, match="group_id"):
+        config.switch_active_task("exp_no_group")
+
+    assert (config.task.expert_group_name, config.task.path, config.ckpt.checkpoint_path, config.task.exp) == before
+
+
+def test_the_shipped_task_serves_its_protocol_values() -> None:
+    exp = ExpertCfg.from_path(Path(f"expert_groups/{SHIPPED}/config.yaml"))
+
+    assert exp.residual == ResidualCfg(k=1, threshold=0.8, temperature=0.05)
+    assert {s.path: s.replay for s in exp.data.dataset_sources} == {
+        "TomTBT/pmc_open_access_section": False,
+        "allenai/c4": True,
+    }
+
+
+@pytest.mark.parametrize("threshold", [0.0, 1.0, 1.5])
+def test_a_threshold_outside_the_gate_range_is_refused(threshold: float) -> None:
+    """A is compared with a sigmoid; at 0 or 1 the gate is always open or always shut."""
+    with pytest.raises(ValueError):
+        ResidualCfg(k=1, threshold=threshold, temperature=0.05)
+
+
+def test_a_gate_that_fp32_could_shut_for_good_is_refused() -> None:
+    """Past A/τ ≈ 88 a token with r near 0 gets q = 0 exactly in fp32, and an honest down_proj can stay all zero."""
+    with pytest.raises(ValueError, match="below 80"):
+        ResidualCfg(k=1, threshold=0.8, temperature=0.01)
+
+    assert ResidualCfg(k=1, threshold=0.79, temperature=0.01).threshold == 0.79

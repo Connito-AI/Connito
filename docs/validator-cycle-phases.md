@@ -27,7 +27,6 @@ The validator's main loop is a single `while True:` (`run.py:657`) inside a `try
 
 Top-of-loop housekeeping and the validator's own seed commit:
 
-- **(0) Peer resync if excluded last cycle.** If `_participated_in_merge` was `False` at the end of the previous cycle (no valid gradient → skipped allreduce), pull a fresh model from a peer validator via `reload_model_inplace`. (`run.py:663-683`)
 - **Set `global_opt_step = phase_response.phase_start_block`.** This is the version stamp used by checkpoints and chain commits this cycle.
 - **Stale-weights fallback.** Fetch the metagraph for this cycle, find the validator's UID, and if `block - last_update > cycle_length`, call `_submit_fallback_weights(...)` so the validator does not get deregistered for going dark. (`run.py:693-700`)
 - **`commit_status(ValidatorChainCommit(model_hash=current_model_hash, global_ver=global_opt_step, expert_group=...))`** (`run.py:702-711`). Re-publishes the model hash committed at the end of last cycle (set in step 7 below) so miners and peer validators see a fresh chain heartbeat for this cycle. The `(0) Commit new seed for next validation` log line is metaphorical — `ValidatorChainCommit` has a `miner_seed` field (`shared/chain.py:55`) but it is not populated here; the actual evaluation seed is derived later via `get_combined_validator_seed(config, subtensor)` at submission time. On the very first cycle after a restart, `current_model_hash` is `None` (set at `run.py:651`).

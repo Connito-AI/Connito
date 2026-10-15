@@ -1,6 +1,6 @@
 # Subnet 102 — Distributed Mixture-of-Experts
 
-Subnet 102 is a **Bittensor subnet** for collaborative, decentralized training of large language models using a Mixture-of-Experts (MoE) architecture. Rather than training a single monolithic model on one machine, the network splits the model into expert groups distributed across many independent miners. Validators coordinate the process, aggregate contributions, and score miners to drive TAO rewards.
+Subnet 102 is a **Bittensor subnet** for collaborative, decentralized training of large language models using a Mixture-of-Experts (MoE) architecture. Miners train small residual experts beside a frozen base model (Qwen3.6-35B-A3B); validators score each miner's residual against the pretrained base, publish each round's best as the next round's starting point, and set weights that drive TAO rewards.
 
 ## Documentation
 

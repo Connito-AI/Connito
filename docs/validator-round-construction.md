@@ -77,8 +77,8 @@ Along the way it builds:
   need to hold a metagraph reference to translate UID→hotkey.
 - `uid_to_chain_checkpoint: dict[int, ChainCheckpoint]` — per-UID
   `ChainCheckpoint` snapshot captured at freeze time so the eval path
-  can run `validate(expert_group_assignment=...)` (signature, hash,
-  expert-group ownership, NaN/Inf scan) without re-issuing chain RPCs.
+  can run `validate(expected=...)` (signature, exact residual spec, hash)
+  without re-issuing chain RPCs.
 - `assigned_with_valid_ckpt: set[str]` — hotkeys whose chain checkpoint
   has both an `hf_repo_id` and an `hf_revision`. Used by step 3.
 
@@ -244,7 +244,7 @@ Mutable fields (all `field(default_factory=...)`, lock-guarded):
   invariant in bg-eval prevents the "worker blocks on a gate while
   holding the round lock" deadlock pattern.
 - **`uid_to_chain_checkpoint` is captured at freeze.** Eval validates
-  signature / expert-group / hash / NaN-Inf against this snapshot
+  signature / residual spec / hash against this snapshot
   rather than re-issuing chain RPCs per miner. A miner that re-commits
   mid-round is not re-validated against the new commit until next
   round's freeze.

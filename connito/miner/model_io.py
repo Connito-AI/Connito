@@ -21,7 +21,6 @@ from connito.shared.checkpoints import (
     ModelCheckpoint,
     select_best_checkpoint,
 )
-from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
 from connito.shared.task_sync import ensure_active_task, resolve_active_task_name, sync_active_task
 from connito.shared.chain import setup_chain_worker
@@ -32,6 +31,7 @@ from connito.shared.hf_distribute import (
     upload_checkpoint_to_hf,
 )
 from connito.shared.model import fetch_model_from_chain_validator
+from connito.shared.modeling.residual import residual_shapes
 from connito.shared.telemetry import inc_error
 
 # Short SHA prefix written to the chain. Matches the validator convention so
@@ -161,9 +161,9 @@ def download_worker(
                 subtensor,
                 wallet,
                 expert_group_ids=[config.task.exp.group_id],
-                # Per job, like the group id above: a table built at startup
-                # would filter by the old group after a task switch.
-                expert_group_assignment=ExpertManager(config).expert_group_assignment,
+                # Per job, like the group id above: a spec read at startup
+                # would hold the old task's K after a task switch.
+                expected=residual_shapes(config),
             )
 
             if (

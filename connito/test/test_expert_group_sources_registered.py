@@ -9,9 +9,8 @@ place fails only on the seeded shard-pick path — which means:
 
   - it passes every other test in this repo, none of which enumerate
     `expert_groups/`;
-  - it passes `expert_groups/build_expert_assignment.py`, which calls
-    `get_dataloader` with `seed=None` and so never reaches the pick;
-  - it passes miner training, for the same reason;
+  - it passes miner training, which calls `get_dataloader` with
+    `seed=None` and so never reaches the pick;
   - and it fails for the first time on a VALIDATOR, mid-round, with a
     `KeyError`, three retries apart, dropping that round to an unscored
     baseline of 100.0.
@@ -48,29 +47,13 @@ def test_expert_groups_directory_is_discoverable():
 def test_group_sources_have_shard_pick_policies(group_dir: Path):
     """A deployable group using seeded shard pick must name only registered sources.
 
-    Two exemptions, both narrow and both load-bearing:
-
-    A negative `group_id` is a sentinel meaning "not assigned to a functioning
-    slot". `ExpertManager` refuses such a group as the active task outright
-    (`expert_manager.py`, "assign a real (non-negative) group_id ... before
-    using it as a trainable task"), so it cannot reach a validator's eval path.
-    Exempting it is what gives this test its teeth: `exp_metamath_p02` names an
-    unregistered source today, and this assertion fires the moment somebody
-    gives that group a real id — which is exactly the edit that would otherwise
-    take scoring down.
-
-    A group that explicitly opts out of the seeded path never reaches
-    `pick_shard_for_source`. The opt-out must be explicit, because
+    One exemption, narrow and load-bearing: a group that explicitly opts out of
+    the seeded path never reaches `pick_shard_for_source`. The opt-out must be explicit, because
     `eval_source_seeded_shard_pick` defaults to True: silence means the group
     IS on the pick path.
     """
     cfg = ExpertCfg.from_path(group_dir / "config.yaml")
 
-    if cfg.group_id < 0:
-        pytest.skip(
-            f"{group_dir.name} has sentinel group_id={cfg.group_id}; "
-            f"ExpertManager refuses it as an active task"
-        )
     if not cfg.data.eval_source_seeded_shard_pick:
         pytest.skip(f"{group_dir.name} opts out of seeded shard pick")
 
