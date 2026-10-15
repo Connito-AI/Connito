@@ -1323,17 +1323,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
                     current_cohort_state = None
 
-            # Refresh metagraph immediately before freezing. The earlier
-            # fetch happened during MinerCommit1 (~80 blocks ago), so its
-            # `last_update` / `weights` view is stale by a full submission
-            # period. Re-fetching here gives `Round.freeze` the most recent
-            # chain-weight and staleness signals available.
-
             # (0) Lock and prioritize: build the round roster in A -> B -> C
             # order, then the previous round's A/B carry-over, then a
             # staleness tail (see Round.freeze). Capture the seed and pin the
-            # shard the round is scored against. Retried to the end of Submission: no commit
-            # phase runs inside it, so a late freeze reads the commitments an on-time one would.
+            # shard the round is scored against. The metagraph is re-fetched
+            # per attempt: the MinerCommit1 one is ~80 blocks stale by now.
+            # Retried to the end of Submission: no commit phase runs inside
+            # it, so a late freeze reads the commitments an on-time one would.
             frozen = freeze_before_deadline(
                 lambda: lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False),
                 deadline=freeze_deadline,
@@ -1356,135 +1352,127 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                 checkpoint_path=Path(config.ckpt.checkpoint_path),
             )
             if frozen is None:
-                # Drop the finalized round so the loop top cannot finalize it again, and
-                # keep the per-cycle task check the skipped tail would have run.
+                # The previous round is finalized; the loop top must not finalize it again.
                 round_ref.current = None
-                wait_till(config, PhaseNames.train)
-                if _maybe_switch_task(
-                    config, state,
-                    eval_window_active=eval_window_active, merge_phase_active=merge_phase_active,
-                    round_ref=round_ref, gpu_eval_lock=gpu_eval_lock,
-                ):
-                    current_model_hash = None
-                continue
-            new_round, metagraph = frozen
+            else:
+                new_round, metagraph = frozen
 
-            # Publish the active round id to Prometheus so external
-            # aggregators can key per-miner score / val_loss readings to
-            # a specific round without parsing labels off the lifecycle
-            # gauge. Best-effort.
-            try:
-                VALIDATOR_CURRENT_ROUND_ID.set(float(new_round.round_id))
-            except Exception:
-                pass
-
-            # Dashboard telemetry: publish per-miner cohort group, this
-            # validator's assignment role, and last-observed-commit block for
-            # the round we just froze. All values are read off `new_round` (no
-            # extra chain/RPC work) and emitted for EVERY metagraph uid so the
-            # gateway sees a fresh value per miner each round — stale group /
-            # assignment membership never lingers across cohort epochs. One
-            # broad try/except: telemetry must never break the round loop.
-            try:
-                _group_code_by_uid: dict[int, int] = {}
-                for _uid in new_round.validation_group_a:
-                    _group_code_by_uid[int(_uid)] = 1
-                for _uid in new_round.validation_group_b:
-                    _group_code_by_uid[int(_uid)] = 2
-                for _uid in new_round.validation_group_c:
-                    _group_code_by_uid[int(_uid)] = 3
-
-                _roster_set = {int(u) for u in new_round.background_uids}
-
-                # Tail = miners on this validator's roster but outside the
-                # formal A/B/C tiers. Distinct from code 0 ("none"), which
-                # means no roster status at all. The dashboard uses this to
-                # render "evaluated opportunistically" instead of leaving
-                # these miners indistinguishable from unrostered ones.
-                for _uid in _roster_set - _group_code_by_uid.keys():
-                    _group_code_by_uid[_uid] = 4
-
-                for _uid in range(len(metagraph.hotkeys)):
-                    set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
-                    # Role 1 (foreground) is retired; every rostered miner is 2.
-                    set_miner_assignment_role(_uid, 2 if _uid in _roster_set else 0)
-
-                # Last block at which we confirmed a miner's valid chain commit.
-                for _uid, _ckpt in new_round.uid_to_chain_checkpoint.items():
-                    if getattr(_ckpt, "hf_repo_id", None) and getattr(_ckpt, "hf_revision", None):
-                        set_miner_last_observed_commit_block(int(_uid), new_round.round_id)
-
-                VALIDATOR_COHORT_EPOCH.set(float(new_round.cohort_epoch))
-            except Exception as _e:
-                logger.warning("Failed to emit dashboard round telemetry", error=str(_e))
-
-            # Persist the (possibly newly advanced) cohort state to disk
-            # BEFORE round_ref.swap so a crash between freeze and swap can
-            # replay deterministically (the next process picks up the same
-            # cohort epoch and groups).
-            if config.evaluation.enable_round_group_construction and new_round.cohort_state is not None:
+                # Publish the active round id to Prometheus so external
+                # aggregators can key per-miner score / val_loss readings to
+                # a specific round without parsing labels off the lifecycle
+                # gauge. Best-effort.
                 try:
-                    cohort_state_module.persist_atomic(
-                        cohort_state_path, new_round.cohort_state
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Failed to persist cohort_state.json",
-                        error=str(e),
-                        path=str(cohort_state_path),
-                    )
-            # Belt-and-suspenders: drop any leftover submission file whose
-            # block falls outside this round's window. The end-of-cycle
-            # prune is normally enough, but a validator restart that
-            # crashed mid-cycle (or any path that skips that prune) leaves
-            # stale .pt files behind — bg-download's find_submission_for_hotkey
-            # would then short-circuit the fresh fetch and publish the
-            # stale path, which gather_validation_job silently rejects.
-            try:
-                deleted = prune_submissions_outside_window(
-                    folder_path=config.ckpt.miner_submission_path,
-                    submission_block_range=new_round.submission_block_range,
-                )
-                if deleted:
-                    logger.info(
-                        "Pruned out-of-window submissions at round freeze",
-                        deleted=len(deleted),
-                        round_id=new_round.round_id,
+                    VALIDATOR_CURRENT_ROUND_ID.set(float(new_round.round_id))
+                except Exception:
+                    pass
+
+                # Dashboard telemetry: publish per-miner cohort group, this
+                # validator's assignment role, and last-observed-commit block for
+                # the round we just froze. All values are read off `new_round` (no
+                # extra chain/RPC work) and emitted for EVERY metagraph uid so the
+                # gateway sees a fresh value per miner each round — stale group /
+                # assignment membership never lingers across cohort epochs. One
+                # broad try/except: telemetry must never break the round loop.
+                try:
+                    _group_code_by_uid: dict[int, int] = {}
+                    for _uid in new_round.validation_group_a:
+                        _group_code_by_uid[int(_uid)] = 1
+                    for _uid in new_round.validation_group_b:
+                        _group_code_by_uid[int(_uid)] = 2
+                    for _uid in new_round.validation_group_c:
+                        _group_code_by_uid[int(_uid)] = 3
+
+                    _roster_set = {int(u) for u in new_round.background_uids}
+
+                    # Tail = miners on this validator's roster but outside the
+                    # formal A/B/C tiers. Distinct from code 0 ("none"), which
+                    # means no roster status at all. The dashboard uses this to
+                    # render "evaluated opportunistically" instead of leaving
+                    # these miners indistinguishable from unrostered ones.
+                    for _uid in _roster_set - _group_code_by_uid.keys():
+                        _group_code_by_uid[_uid] = 4
+
+                    for _uid in range(len(metagraph.hotkeys)):
+                        set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
+                        # Role 1 (foreground) is retired; every rostered miner is 2.
+                        set_miner_assignment_role(_uid, 2 if _uid in _roster_set else 0)
+
+                    # Last block at which we confirmed a miner's valid chain commit.
+                    for _uid, _ckpt in new_round.uid_to_chain_checkpoint.items():
+                        if getattr(_ckpt, "hf_repo_id", None) and getattr(_ckpt, "hf_revision", None):
+                            set_miner_last_observed_commit_block(int(_uid), new_round.round_id)
+
+                    VALIDATOR_COHORT_EPOCH.set(float(new_round.cohort_epoch))
+                except Exception as _e:
+                    logger.warning("Failed to emit dashboard round telemetry", error=str(_e))
+
+                # Persist the (possibly newly advanced) cohort state to disk
+                # BEFORE round_ref.swap so a crash between freeze and swap can
+                # replay deterministically (the next process picks up the same
+                # cohort epoch and groups).
+                if config.evaluation.enable_round_group_construction and new_round.cohort_state is not None:
+                    try:
+                        cohort_state_module.persist_atomic(
+                            cohort_state_path, new_round.cohort_state
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to persist cohort_state.json",
+                            error=str(e),
+                            path=str(cohort_state_path),
+                        )
+                # Belt-and-suspenders: drop any leftover submission file whose
+                # block falls outside this round's window. The end-of-cycle
+                # prune is normally enough, but a validator restart that
+                # crashed mid-cycle (or any path that skips that prune) leaves
+                # stale .pt files behind — bg-download's find_submission_for_hotkey
+                # would then short-circuit the fresh fetch and publish the
+                # stale path, which gather_validation_job silently rejects.
+                try:
+                    deleted = prune_submissions_outside_window(
+                        folder_path=config.ckpt.miner_submission_path,
                         submission_block_range=new_round.submission_block_range,
                     )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to prune out-of-window submissions at round freeze",
-                    error=str(exc),
-                )
-            round_ref.swap(new_current=new_round)
-            download_window_closed.clear()
-            # bg-eval needs an architecture template and an open window; the
-            # round's residual comes from `round.base_shard`. Mirrors the
-            # resume path. Opening here rather than after Merge gives the
-            # worker the whole round now that nothing else competes for the GPU.
-            if eval_worker is not None and not eval_worker.has_eval_base_model():
-                eval_worker.set_eval_base_model(state.eval_model)
-            eval_window_active.set()
-            try:
-                note_round_series(new_round.round_id)
-                new_round.lifecycle_step = 0
-                VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
-                # Seed the progress counters at freeze so the round exists in
-                # the metric from the moment it is frozen (scored=0, failed=0,
-                # pending=roster) instead of appearing only once the first
-                # evaluation lands. Consumers that switch on "newest round with
-                # a non-zero scored value" are unaffected by the zero.
-                new_round.publish_progress()
-            except Exception:
-                pass
+                    if deleted:
+                        logger.info(
+                            "Pruned out-of-window submissions at round freeze",
+                            deleted=len(deleted),
+                            round_id=new_round.round_id,
+                            submission_block_range=new_round.submission_block_range,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to prune out-of-window submissions at round freeze",
+                        error=str(exc),
+                    )
+                round_ref.swap(new_current=new_round)
+                download_window_closed.clear()
+                # bg-eval needs an architecture template and an open window; the
+                # round's residual comes from `round.base_shard`. Mirrors the
+                # resume path. Opening here rather than after Merge gives the
+                # worker the whole round now that nothing else competes for the GPU.
+                if eval_worker is not None and not eval_worker.has_eval_base_model():
+                    eval_worker.set_eval_base_model(state.eval_model)
+                eval_window_active.set()
+                try:
+                    note_round_series(new_round.round_id)
+                    new_round.lifecycle_step = 0
+                    VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
+                    # Seed the progress counters at freeze so the round exists in
+                    # the metric from the moment it is frozen (scored=0, failed=0,
+                    # pending=roster) instead of appearing only once the first
+                    # evaluation lands. Consumers that switch on "newest round with
+                    # a non-zero scored value" are unaffected by the zero.
+                    new_round.publish_progress()
+                except Exception:
+                    pass
 
-            try:
-                note_round_series(new_round.round_id)
-                new_round.lifecycle_step = 2
-                VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
-            except Exception:
-                pass
+                try:
+                    note_round_series(new_round.round_id)
+                    new_round.lifecycle_step = 2
+                    VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
+                except Exception:
+                    pass
 
             phase_response = wait_till(config, PhaseNames.validate)
 
@@ -1506,12 +1494,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             check_phase_expired(lite_subtensor, phase_response)
             phase_response = wait_till(config, PhaseNames.merge)
 
-            try:
-                note_round_series(new_round.round_id)
-                new_round.lifecycle_step = 3
-                VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
-            except Exception:
-                pass
+            if frozen is not None:
+                try:
+                    note_round_series(new_round.round_id)
+                    new_round.lifecycle_step = 3
+                    VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
+                except Exception:
+                    pass
 
             check_phase_expired(lite_subtensor, phase_response)
 
