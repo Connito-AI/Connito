@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, NamedTuple
+from typing import TYPE_CHECKING, Callable, Iterable, NamedTuple
 
 from connito.shared.app_logging import structlog
-from connito.shared.telemetry import set_round_progress
+from connito.shared.cycle import BITTENSOR_BLOCK_TIME_SECONDS
+from connito.shared.telemetry import (
+    VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL,
+    VALIDATOR_ROUNDS_SKIPPED_TOTAL,
+    set_round_progress,
+)
 
 if TYPE_CHECKING:
     from connito.shared.checkpoints import ChainCheckpoint
@@ -210,6 +216,7 @@ class Round:
         score_aggregator: "MinerScoreAggregator | None" = None,
         checkpoint_path: "Path | None" = None,
         advance_cohort: bool = True,
+        deadline: float | None = None,
     ) -> "Round":
         """Build a Round at Submission-phase start.
 
@@ -233,10 +240,10 @@ class Round:
         # the global subtensor lock. Same for the metagraph already passed in
         # by the caller — `get_validator_miner_assignment` reuses it instead
         # of re-fetching head-block state.
-        commits = get_chain_commits(config, subtensor)
+        commits = get_chain_commits(config, subtensor, deadline=deadline)
         seed = get_combined_validator_seed(config, subtensor, commits=commits)
         assignment_result = get_validator_miner_assignment(
-            config, subtensor, commits=commits, metagraph=metagraph,
+            config, subtensor, commits=commits, metagraph=metagraph, deadline=deadline,
         )
         assignment = assignment_result.assignment
         my_assignment_set = set(assignment.get(config.chain.hotkey_ss58, []))
@@ -878,3 +885,49 @@ class RoundRef:
             old = self.current
             self.current = new_current
             return old
+
+
+def _count(*counters) -> None:
+    try:
+        for counter in counters:
+            counter.inc()
+    except Exception as e:
+        logger.debug("freeze telemetry failed", error=str(e))
+
+
+class FrozenRound(NamedTuple):
+    new_round: Round
+    metagraph: object
+
+
+def freeze_before_deadline(
+    fetch_metagraph: Callable[[], object], *, deadline: float, **freeze_kwargs,
+) -> FrozenRound | None:
+    """Fetch the metagraph and freeze until it works or `deadline` (time.monotonic()) passes; None means skip.
+
+    The deadline also ends chain-read retries inside an attempt, but not a single hung RPC.
+    """
+    round_id = freeze_kwargs.get("round_id")
+    attempt = 0
+    while True:
+        try:
+            metagraph = fetch_metagraph()
+            frozen = FrozenRound(Round.freeze(metagraph=metagraph, deadline=deadline, **freeze_kwargs), metagraph)
+        except Exception as e:
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error("round skipped: freeze failed", round_id=round_id, attempts=attempt,
+                             error=str(e), exc_info=True)
+                _count(VALIDATOR_ROUNDS_SKIPPED_TOTAL)
+                return None
+            logger.warning("Round freeze failed; retrying", round_id=round_id, attempt=attempt, error=str(e))
+            _count(VALIDATOR_ROUND_FREEZE_RETRIES_TOTAL)
+            time.sleep(min(BITTENSOR_BLOCK_TIME_SECONDS, remaining))
+            continue
+        if time.monotonic() > deadline:
+            # Using it would run Validate late; the next cycle freezes on time.
+            logger.error("round skipped: freeze finished after Submission", round_id=round_id, attempts=attempt + 1)
+            _count(VALIDATOR_ROUNDS_SKIPPED_TOTAL)
+            return None
+        return frozen

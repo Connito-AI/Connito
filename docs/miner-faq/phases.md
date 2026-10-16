@@ -26,7 +26,7 @@ If `cycle-api.connito.ai` is unreachable, `get_phase_from_api` returns
 `None` after retrying with backoff (`api_retries = 5`, `api_backoff_sec = 2`).
 A miner's phase waits keep polling and resume when the API answers. A
 validator waiting for the run-up to MinerCommit1 exits instead (log
-`Quit training`, exit code 0) and recovers when it is restarted after the API
+`Quit training`, non-zero exit code) and recovers when it is restarted after the API
 is back; see `troubleshooting.md`, "cycle-api unreachable: the validator
 exits, the miner waits".
 
