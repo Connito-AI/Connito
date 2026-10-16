@@ -387,7 +387,7 @@ Quit training
 AttributeError: 'NoneType' object has no attribute 'phase_name'
 ```
 
-The process shuts its workers down and exits with code 0. Under the operator
+The process shuts its workers down and exits with a non-zero code. Under the operator
 compose file (`restart: unless-stopped`) Docker restarts the container; it
 boots in about 70 s and finalizes the interrupted round from its journal:
 scores already recorded are kept, but it publishes no winner for that round
@@ -410,7 +410,7 @@ round's commits.
 `curl -i https://cycle-api.connito.ai/get_phase` from another network). If
 only your host gets a 403, see "HTTP 403 from `cycle-api.connito.ai`". Run the
 validator under the compose file, or another supervisor that restarts it on
-any exit, including exit code 0.
+any exit.
 
 Code: `connito/shared/cycle.py:wait_till`, `connito/shared/cycle.py:should_act`,
 `connito/shared/helper.py:get_with_retry`, `connito/validator/run.py` (the
