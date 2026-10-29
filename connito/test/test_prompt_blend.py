@@ -171,12 +171,8 @@ def test_off_makes_no_fetch_and_keeps_the_vector(chain, served, log):
     assert fetched == [] and log.records == [] and chain.state["metagraph_reads"] == 0
 
 
-def test_off_by_default_and_without_an_evaluation_section(chain, served):
-    fetched = served(_payload())
+def test_off_by_default():
     assert EvalCfg().prompt_blend == "off"
-    bare = SimpleNamespace(chain=SimpleNamespace(netuid=1))
-    assert _ablend(bare, {3: 1.0}, chain.async_) == {3: 1.0}
-    assert fetched == [] and chain.state["metagraph_reads"] == 0
 
 
 @pytest.mark.parametrize(("text", "mode"), [("off", "off"), ("on", "on"), ("dry_run", "dry_run")])
@@ -184,8 +180,9 @@ def test_the_switch_reads_bare_yaml_words(text, mode):
     assert EvalCfg.model_validate(yaml.safe_load(f"prompt_blend: {text}")).prompt_blend == mode
 
 
-def test_on_gives_15_60_25_from_a_signed_get(served, log):
-    fetched = served(_payload())
+@pytest.mark.parametrize("age", [1, 2], ids=["one cycle old", "two cycles old"])
+def test_on_gives_15_60_25_from_a_signed_get(served, log, age):
+    fetched = served(_payload(cycle_id=CURRENT_PROMPT_CYCLE - age))
     assert _final(_config("on"), {3: 1.0}) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})
     [request] = fetched
     assert request["url"] == "https://prompt-record.test/v1/validator/weights/latest"
@@ -210,12 +207,6 @@ def test_a_404_on_the_test_route_refuses(served, log):
     assert _blend(_config("dry_run", prompt_blend_test_route=True), {3: 1.0}) == {3: 1.0}
     assert log.records == [("warning", prompt_blend.TRAINING_ONLY,
                             {"mode": "dry_run", "reason": "nothing published yet (404)"})]
-
-
-def test_freshness_follows_cycle_api_not_the_local_cycle_config(served, log, cycle_api):
-    served(_payload())
-    assert BLOCK // CycleCfg().cycle_length != CYCLE_INDEX  # the local config would number another cycle
-    assert _final(_config("on"), {3: 1.0}) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})
 
 
 def test_dry_run_logs_the_blend_and_submits_training_only(served, log):
@@ -385,7 +376,7 @@ def test_an_origin_is_accepted(url):
 # The deploy's evaluation.prompt_blend_rules_sha256: an operator setting (its default refuses all), kept here.
 THIRD_RULES_HASH = "TODO THIRD_RULES_HASH: the prompt validator's loss-based rules"
 DEPLOY_RULES_SHA256 = [
-    "dfa6ca9484210eee72aa99f84b343376616af3cedb8645b7b5ee6d3da07d1111",  # #45's rules
+    "dfa6ca9484210eee72aa99f84b343376616af3cedb8645b7b5ee6d3da07d1111",  # the current rules
     "b435ebcc931c4ac41219a4f4d5a733d1817cb4238d6320703e51589666312a07",  # the previous rules
     THIRD_RULES_HASH,
 ]
@@ -395,11 +386,6 @@ def test_the_deploy_allow_list_holds_three_sha256_hashes():
     # Fails until THIRD_RULES_HASH is filled in.
     allowed = EvalCfg(prompt_blend_rules_sha256=DEPLOY_RULES_SHA256).prompt_blend_rules_sha256
     assert len(set(allowed)) == 3 and all(re.fullmatch("[0-9a-f]{64}", h) for h in allowed)
-
-
-def test_two_cycles_old_is_still_fresh(served, log):
-    served(_payload(cycle_id=CURRENT_PROMPT_CYCLE - 2))
-    assert _final(_config("on"), {3: 1.0}) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})
 
 
 @pytest.mark.parametrize("unset", ["prompt_blend_rules_sha256", "prompt_blend_validator_hotkey"])

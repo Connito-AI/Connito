@@ -21,7 +21,7 @@ from connito.shared.helper import get_with_retry
 
 logger = structlog.get_logger(__name__)
 
-WEIGHTS_ROUTE = "/v1/validator/weights/latest"  # prompt-record #68: signed, validators and the owner
+WEIGHTS_ROUTE = "/v1/validator/weights/latest"  # signed; validators, registered miners and the owner
 TEST_WEIGHTS_ROUTE = "/v1/test/validator/weights/latest"  # the same on the server's test tables
 FETCH_TIMEOUT_S = 5  # per connect or read
 READ_BYTES = 4096  # read in small pieces, so the deadline is checked while a server trickles
@@ -63,7 +63,7 @@ def _number(value) -> float:
 
 
 def parse_prompt_weights(payload) -> PromptWeights:
-    """prompt-record's latest weights (#68): {cycle_id, validator_hotkey, published_at, rules_sha256,
+    """prompt-record's latest weights: {cycle_id, validator_hotkey, published_at, rules_sha256,
     weights: {hotkey: w}, total, prompt_weights, prompt_total}. Only `weights` is used, not normalized; the prompt
     miners' `prompt_weights` and `prompt_total` are not read."""
     if not isinstance(payload, dict):
@@ -190,11 +190,6 @@ def _compact(weights: dict[int, float]) -> dict[int, float]:
     return {uid: round(w, 4) for uid, w in sorted(weights.items(), key=lambda kv: -kv[1]) if w > 0}
 
 
-def prompt_blend_mode(config) -> str:
-    # A config with no evaluation section (a test's stand-in) is off.
-    return getattr(getattr(config, "evaluation", None), "prompt_blend", "off")
-
-
 def blend_prompt_weights(config, wallet, train: dict[int, float], metagraph, deadline: float) -> dict[int, float]:
     """The miner weights to submit: `train` unless the switch is on and the published prompt weights pass every check.
 
@@ -240,7 +235,7 @@ async def ablend_prompt_weights(config, wallet, train: dict[int, float], async_s
 
     A thread still running past it may run on briefly, silent.
     """
-    mode = prompt_blend_mode(config)
+    mode = config.evaluation.prompt_blend
     if mode == "off":
         return train
     deadline = time.monotonic() + BLEND_DEADLINE_S

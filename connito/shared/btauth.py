@@ -6,9 +6,6 @@ import threading
 import time
 from collections.abc import Callable
 
-# signer(method, target, body) -> the auth headers for that request
-Signer = Callable[[str, str, bytes], dict[str, str]]
-
 
 def btauth_payload(method: str, target: str, body: bytes, nonce_ns: int, hotkey_ss58: str) -> bytes:
     """The signed bytes: `http_auth.build_payload` for an sr25519 key, bound to no receiver ("-")."""
@@ -17,8 +14,8 @@ def btauth_payload(method: str, target: str, body: bytes, nonce_ns: int, hotkey_
     return "\n".join(lines).encode()
 
 
-def wallet_signer(wallet) -> Signer:
-    """Sign with the wallet's hotkey, each request with a nonce above the last (btauth/1 refuses a reused one)."""
+def wallet_signer(wallet) -> Callable[[str, str, bytes], dict[str, str]]:
+    """sign(method, target, body) -> its auth headers, with a nonce above the last (btauth/1 refuses a reused one)."""
     lock, last = threading.Lock(), [0]
 
     def sign(method: str, target: str, body: bytes) -> dict[str, str]:
