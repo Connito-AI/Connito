@@ -7,6 +7,7 @@ import string
 import sys
 from pathlib import Path
 from typing import Any, ClassVar, Iterable, Literal
+from urllib.parse import urlsplit
 
 import bittensor
 import fsspec
@@ -21,6 +22,7 @@ from pydantic import (
     PositiveFloat,
     PositiveInt,
     ValidationError,
+    field_validator,
     model_validator,
 )
 from pydantic.fields import FieldInfo
@@ -1209,6 +1211,31 @@ class EvalCfg(BaseConfig):
     # "delete-your-model-and-keep-earning" hole; set False to restore the
     # legacy EMA-preserving behavior.
     repo_unavailable_is_miner_fault: bool = True
+    # Blend the prompt validator's weights, read from prompt-record, into every weight submission: off (no fetch),
+    # dry_run (fetch, blend and log, submit training only) or on. See connito/validator/prompt_blend.py.
+    prompt_blend: Literal["off", "dry_run", "on"] = "off"
+    prompt_blend_share: float = Field(0.2, ge=0, le=1)  # the prompt validator's share of the miner weights
+    prompt_blend_url: str = "https://dataless-api.connito.ai"  # prompt-record, the origin with no path
+    prompt_blend_rules_sha256: list[str] = Field(default_factory=list)  # accepted rules hashes; empty refuses all
+    prompt_blend_validator_hotkey: str = ""  # the prompt validator that must have published; empty refuses all
+    prompt_blend_test_route: bool = False  # read prompt-record's /v1/test copy, for a dry run; no freshness check
+
+    @field_validator("prompt_blend", mode="before")
+    @classmethod
+    def _yaml_switch(cls, value):
+        # YAML 1.1 reads a bare off / on as a bool.
+        return {False: "off", True: "on"}.get(value, value) if isinstance(value, bool) else value
+
+    @field_validator("prompt_blend_url")
+    @classmethod
+    def _https(cls, url: str) -> str:
+        # The response isn't signed: TLS is what keeps the weights from being rewritten in transit. An origin only,
+        # since the route's path is signed as sent.
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or \
+                parts.path not in ("", "/") or parts.query or parts.fragment or url.endswith(("?", "#")):
+            raise ValueError(f"prompt_blend_url must be an https origin with no path, got {url!r}")
+        return url
 
 
 class ValidatorConfig(WorkerConfig):

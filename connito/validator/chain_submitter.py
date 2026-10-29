@@ -38,6 +38,7 @@ from connito.shared.chain import (
     reserve_subnet_owner_share,
     submit_weights_async,
 )
+from connito.validator.prompt_blend import ablend_prompt_weights
 from connito.validator.round import Round
 
 logger = structlog.get_logger(__name__)
@@ -216,6 +217,7 @@ class ChainSubmitter:
     ) -> bool:
         # Reserve a fixed share for the subnet owner before submission.
         # `build_submission_uid_weights` produces miner-only weights; we
+        # blend in the prompt validator's (behind `prompt_blend`) and
         # inject the owner share here so the wire submission always
         # carries it (matching the fallback path). Applied before
         # `submit_weights_async` runs its own filter/top_k/normalize —
@@ -223,7 +225,12 @@ class ChainSubmitter:
         # tight `top_k` could drop the 5% share and would need a fix
         # there before being enabled.
         uid_weights = reserve_subnet_owner_share(
-            {int(uid): float(w) for uid, w in uid_weights.items()},
+            await ablend_prompt_weights(
+                self.config,
+                self.wallet,
+                {int(uid): float(w) for uid, w in uid_weights.items()},
+                self._async_subtensor,
+            ),
         )
         nonzero = sum(1 for v in uid_weights.values() if v > 0)
         logger.info(
