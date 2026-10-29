@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import http.server
 import json
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -377,6 +378,21 @@ def test_the_url_must_be_an_https_origin(url):
                                  "https://prompt-record.test:8443"])
 def test_an_origin_is_accepted(url):
     assert EvalCfg(prompt_blend_url=url).prompt_blend_url == url
+
+
+# The deploy's evaluation.prompt_blend_rules_sha256: an operator setting (its default refuses all), kept here.
+THIRD_RULES_HASH = "TODO THIRD_RULES_HASH: the prompt validator's loss-based rules"
+DEPLOY_RULES_SHA256 = [
+    "dfa6ca9484210eee72aa99f84b343376616af3cedb8645b7b5ee6d3da07d1111",  # #45's rules
+    "b435ebcc931c4ac41219a4f4d5a733d1817cb4238d6320703e51589666312a07",  # the previous rules
+    THIRD_RULES_HASH,
+]
+
+
+def test_the_deploy_allow_list_holds_three_sha256_hashes():
+    # Fails until THIRD_RULES_HASH is filled in.
+    allowed = EvalCfg(prompt_blend_rules_sha256=DEPLOY_RULES_SHA256).prompt_blend_rules_sha256
+    assert len(set(allowed)) == 3 and all(re.fullmatch("[0-9a-f]{64}", h) for h in allowed)
 
 
 def test_two_cycles_old_is_still_fresh(served, log):
