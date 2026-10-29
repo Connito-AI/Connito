@@ -240,8 +240,9 @@ def test_hotkeys_missing_from_the_metagraph_are_dropped(served, log):
     assert log.records[0][2]["dropped_off_metagraph"] == 2
 
 
-def test_validator_uids_and_our_own_are_dropped(served, log):
+def test_validator_uids_and_our_own_are_dropped(served, log, cycle_api):
     served(_payload(weights={"hk1": 1.0, "hk2": 1.0, "hk6": 1.0}))
+    cycle_api["whitelist"] = ["hk2"]  # so only the self-exclusion drops hk1
     assert reserve_subnet_owner_share(_blend(_config("on"), {3: 1.0})) == pytest.approx(
         {3: 0.60, 6: 0.15, 0: 0.25}
     )
@@ -311,9 +312,10 @@ def test_cycle_api_unreachable_falls_back(served, log, cycle_api):
     assert log.records[0][2]["reason"] == "cycle-api unreachable"
 
 
-def test_a_whitelist_outage_refuses(served, log, cycle_api):
+@pytest.mark.parametrize("whitelist", [None, [], {"hk2": 1}], ids=["outage", "empty", "not a list"])
+def test_a_whitelist_outage_refuses(served, log, cycle_api, whitelist):
     served(_payload())
-    cycle_api["whitelist"] = None
+    cycle_api["whitelist"] = whitelist
     assert _blend(_config("on"), {3: 1.0}) == {3: 1.0}
     assert log.records[0][2]["reason"] == "validator whitelist unavailable"
 
@@ -556,7 +558,7 @@ def test_round_submission_blends(chain, served, log, monkeypatch, mode, expected
     monkeypatch.setattr(chain_submitter_mod, "submit_weights_async", fake_submit)
     round_obj = SimpleNamespace(round_id=7, weights_submitted=False)
     assert asyncio.run(_submitter(_config(mode), chain.async_)._submit_weight_one(round_obj, {"3": 1.0})) is True
-    assert submitted == [pytest.approx(expected)]
+    assert submitted == [expected if mode != "on" else pytest.approx(expected)]  # off and dry_run exactly
     assert round_obj.weights_submitted is True
     blending = mode != "off"
     assert len(fetched) == chain.state["metagraph_reads"] == int(blending)
