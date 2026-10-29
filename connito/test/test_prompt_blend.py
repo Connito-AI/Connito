@@ -374,16 +374,14 @@ def test_an_origin_is_accepted(url):
 
 
 # The deploy's evaluation.prompt_blend_rules_sha256: an operator setting (its default refuses all), kept here.
-THIRD_RULES_HASH = "TODO THIRD_RULES_HASH: the prompt validator's loss-based rules"
 DEPLOY_RULES_SHA256 = [
-    "dfa6ca9484210eee72aa99f84b343376616af3cedb8645b7b5ee6d3da07d1111",  # the current rules
-    "b435ebcc931c4ac41219a4f4d5a733d1817cb4238d6320703e51589666312a07",  # the previous rules
-    THIRD_RULES_HASH,
+    "289db8f2d4066927f119e232df3a68551bc4d66aa974c54aee15f5f21abb6dae",  # the loss-based rules
+    "dfa6ca9484210eee72aa99f84b343376616af3cedb8645b7b5ee6d3da07d1111",
+    "b435ebcc931c4ac41219a4f4d5a733d1817cb4238d6320703e51589666312a07",
 ]
 
 
 def test_the_deploy_allow_list_holds_three_sha256_hashes():
-    # Fails until THIRD_RULES_HASH is filled in.
     allowed = EvalCfg(prompt_blend_rules_sha256=DEPLOY_RULES_SHA256).prompt_blend_rules_sha256
     assert len(set(allowed)) == 3 and all(re.fullmatch("[0-9a-f]{64}", h) for h in allowed)
 
