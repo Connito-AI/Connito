@@ -132,7 +132,7 @@ def current_prompt_cycle(config) -> int:
 def _validator_uids(config, uid_of: dict[str, int]) -> set[int]:
     # Unlike get_validator_whitelist_from_api, an outage refuses rather than reading as no validators.
     whitelist = _cycle_api(config, "/get_validator_whitelist")
-    if whitelist is None:
+    if not isinstance(whitelist, list) or not whitelist:
         raise BlendRefused("validator whitelist unavailable")
     return {uid_of[hk] for hk in whitelist if hk in uid_of}
 
