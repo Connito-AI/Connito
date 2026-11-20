@@ -205,8 +205,10 @@ def test_the_test_route_is_signed_as_sent_and_skips_freshness(served, log, cycle
 def test_a_404_on_the_test_route_refuses(served, log):
     served(_Response(404, [b'{"detail": "no_published_cycle"}']))
     assert _blend(_config("dry_run", prompt_blend_test_route=True), {3: 1.0}) == {3: 1.0}
-    assert log.records == [("warning", prompt_blend.TRAINING_ONLY,
-                            {"mode": "dry_run", "reason": "nothing published yet (404)"})]
+    [(level, event, fields)] = log.records
+    assert list(fields.pop("timings")) == ["fetch"]
+    assert (level, event, fields) == ("warning", prompt_blend.TRAINING_ONLY,
+                                      {"mode": "dry_run", "reason": "nothing published yet (404)"})
 
 
 def test_dry_run_logs_the_blend_and_submits_training_only(served, log):
@@ -523,6 +525,7 @@ def _submitter(config, subtensor) -> ChainSubmitter:
     submitter.observer = False
     submitter._submit_lock = None
     submitter._async_subtensor = subtensor
+    submitter._prompt_cache = None
     return submitter
 
 
@@ -546,3 +549,275 @@ def test_round_submission_blends(chain, served, log, monkeypatch, mode, expected
     assert round_obj.weights_submitted is True
     blending = mode != "off"
     assert len(fetched) == chain.state["metagraph_reads"] == int(blending)
+
+
+# --- The cache and the prefetch (prompt_blend_cache_max_age_s) --------------------------------------------------------
+
+DAY_S = 86_400
+
+
+def test_the_cache_is_off_by_default():
+    assert EvalCfg().prompt_blend_cache_max_age_s == 0
+
+
+def test_each_step_is_timed(served, log, chain):
+    served(_payload())
+    _ablend(_config("on"), {3: 1.0}, chain.async_)
+    [(level, _, fields)] = log.records
+    assert level == "info" and list(fields["timings"]) == ["metagraph", "fetch", "cycle_api", "whitelist"]
+    assert "source" not in fields  # no cache: the line as before, plus its timings
+
+
+def _cache(config, monkeypatch, age_s: float = 0.0) -> prompt_blend.PromptCache:
+    """A cache holding the served payload, prefetched `age_s` ago."""
+    cache = prompt_blend.PromptCache()
+    now = time.time()
+    monkeypatch.setattr(prompt_blend.time, "time", lambda: now - age_s)
+    prompt_blend.prefetch_prompt_weights(config, WALLET, cache)
+    monkeypatch.setattr(prompt_blend.time, "time", lambda: now)
+    return cache
+
+
+def _cblend(config, cache, train=None):
+    return prompt_blend.blend_prompt_weights(config, WALLET, train or {3: 1.0}, _Metagraph(), time.monotonic() + 15,
+                                             cache=cache)
+
+
+def test_a_prefetch_logs_its_cycle_and_timings(served, log):
+    served(_payload())
+    prompt_blend.prefetch_prompt_weights(_config("on", prompt_blend_cache_max_age_s=DAY_S), WALLET,
+                                         prompt_blend.PromptCache())
+    [(level, event, fields)] = log.records
+    assert (level, event, fields["cycle_id"]) == ("info", "prompt blend: prefetched", CURRENT_PROMPT_CYCLE - 1)
+    assert list(fields["timings"]) == ["fetch", "cycle_api", "whitelist"]
+
+
+def test_a_failed_prefetch_keeps_the_cache(served, log, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=100)
+    served(requests.ConnectionError("refused"))
+    prompt_blend.prefetch_prompt_weights(config, WALLET, cache)
+    assert log.records[-1][:2] == ("warning", "prompt blend: prefetch failed")
+    assert cache.get(config.evaluation, DAY_S)[1] == pytest.approx(100, abs=1)
+
+
+def test_a_fresh_prefetch_blends_without_a_fetch(served, log, cycle_api, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    fetched = served(_payload())
+    cache = _cache(config, monkeypatch, age_s=60)
+    fetched.clear(), cycle_api["calls"].clear()
+    assert reserve_subnet_owner_share(_cblend(config, cache)) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})
+    assert fetched == [] and cycle_api["calls"] == []
+    assert (log.records[-1][2]["source"], log.records[-1][2]["age_s"]) == ("prefetch", 60)
+
+
+def test_a_stale_prefetch_is_fetched_again_and_refreshed(served, log, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    fetched = served(_payload())
+    cache = _cache(config, monkeypatch, age_s=prompt_blend.PREFETCH_FRESH_S + 1)
+    fetched.clear()
+    assert _final(config, {3: 1.0}) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})  # no cache: a plain fetch
+    _cblend(config, cache)
+    assert len(fetched) == 2 and log.records[-1][2]["source"] == "fetch"
+    assert cache.get(config.evaluation, 5)[1] < 5  # the fetch refreshed it
+
+
+_UNREACHABLE = {
+    "connection refused": requests.ConnectionError("refused"),
+    "timed out": requests.Timeout("slow"),
+    "a 502": _Response(502, [b""]),
+    "rate limited (429)": _Response(429, [b""]),
+}
+
+
+@pytest.mark.parametrize("answer", list(_UNREACHABLE.values()), ids=list(_UNREACHABLE))
+def test_no_answer_in_time_reuses_the_cache_within_its_age(served, log, monkeypatch, answer):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=3 * 3600)
+    served(answer)
+    assert reserve_subnet_owner_share(_cblend(config, cache)) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})
+    warning, info = log.records[-2:]
+    assert warning[:2] == ("warning", "prompt blend: no answer in time, using the cached prompt weights")
+    assert (warning[2]["cycle_id"], warning[2]["age_s"]) == (CURRENT_PROMPT_CYCLE - 1, 3 * 3600)
+    assert (info[2]["source"], info[2]["age_s"]) == ("cache", 3 * 3600)
+
+
+@pytest.mark.parametrize(("what", "unreachable"), [
+    ("cycle-api", "value"), ("the whitelist", "whitelist"),
+])
+def test_cycle_api_with_no_answer_reuses_the_cache(served, log, cycle_api, monkeypatch, what, unreachable):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=3 * 3600)
+    cycle_api[unreachable] = None
+    assert _cblend(config, cache) != {3: 1.0}
+    assert log.records[-1][2]["source"] == "cache"
+
+
+def test_the_cache_past_its_age_submits_training_only(served, log, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=3600)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=3601)
+    served(requests.ConnectionError("refused"))
+    assert _cblend(config, cache) == {3: 1.0}
+    reason = log.records[-1][2]["reason"]
+    assert reason.startswith("fetch failed: ConnectionError; cache: cached 3601 s ago, not within 3600 s")
+
+
+def test_the_cache_is_aged_by_prompt_cycles(served, log, monkeypatch):
+    # Two cycles old when fetched: a prompt cycle later it would be three, past MAX_AGE_PROMPT_CYCLES.
+    config = _config("on", prompt_blend_cache_max_age_s=172_800)
+    served(_payload(cycle_id=CURRENT_PROMPT_CYCLE - 2))
+    cache = _cache(config, monkeypatch, age_s=prompt_blend.PROMPT_CYCLE_S + 60)
+    served(requests.Timeout("slow"))
+    assert _cblend(config, cache) == {3: 1.0}
+    assert "too far from the current prompt cycle" in log.records[-1][2]["reason"]
+
+
+def test_a_rules_hash_no_longer_allowed_refuses_the_cache(served, log, monkeypatch):
+    served(_payload())
+    cache = _cache(_config("on", prompt_blend_cache_max_age_s=DAY_S), monkeypatch, age_s=60)
+    served(requests.ConnectionError("refused"))
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S, prompt_blend_rules_sha256=["c" * 64])
+    assert _cblend(config, cache) == {3: 1.0}
+    assert log.records[-1][2]["reason"].endswith(f"cache: rules_sha256 {'a' * 64} not allowed")
+
+
+_CONTENT = {k: _REFUSALS[k] for k in ("nothing published (404)", "not JSON", "total disagrees", "rules not allowed",
+                                      "another validator", "older than 2 prompt cycles", "all zero")}
+
+
+@pytest.mark.parametrize("answer", list(_CONTENT.values()), ids=list(_CONTENT))
+def test_a_payload_failing_a_check_never_falls_back_to_the_cache(served, log, monkeypatch, answer):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=prompt_blend.PREFETCH_FRESH_S + 1)  # stale: the submission fetches
+    served(answer)
+    assert _cblend(config, cache) == {3: 1.0}
+    assert log.records[-1][:2] == ("warning", prompt_blend.TRAINING_ONLY)
+    assert "cache" not in log.records[-1][2]["reason"]
+
+
+def test_an_empty_whitelist_never_falls_back_to_the_cache(served, log, cycle_api, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=prompt_blend.PREFETCH_FRESH_S + 1)
+    cycle_api["whitelist"] = []
+    assert _cblend(config, cache) == {3: 1.0}
+    assert log.records[-1][2]["reason"] == "validator whitelist unavailable"
+
+
+def test_the_cache_is_mapped_on_the_current_metagraph(served, log, cycle_api, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload(weights={"hk5": 1.0, "hk6": 1.0}))
+    cache = _cache(config, monkeypatch, age_s=60)
+    metagraph = _Metagraph()
+    metagraph.hotkeys[6] = "hk-new"  # uid 6 re-registered since the prefetch
+    metagraph.hotkeys[5], metagraph.hotkeys[7] = "hk7", "hk5"  # hk5 moved to uid 7
+    blended = prompt_blend.blend_prompt_weights(config, WALLET, {3: 1.0}, metagraph, time.monotonic() + 15,
+                                                cache=cache)
+    assert blended == pytest.approx({3: 0.8, 7: 0.2})
+    assert log.records[-1][2]["dropped_off_metagraph"] == 1
+
+
+def test_a_missed_deadline_names_its_step_and_falls_back_to_the_cache(chain, served, log, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=prompt_blend.PREFETCH_FRESH_S + 1)
+
+    def hang(*args, **kwargs):
+        time.sleep(0.5)
+        return _Response(200, [json.dumps(_payload()).encode()])
+
+    monkeypatch.setattr(requests, "get", hang)
+    monkeypatch.setattr(prompt_blend, "BLEND_DEADLINE_S", 0.1)
+    monkeypatch.setattr(prompt_blend, "DEADLINE_GRACE_S", 0.05)
+    result = asyncio.run(prompt_blend.ablend_prompt_weights(config, WALLET, {3: 1.0}, chain.async_, cache))
+    assert reserve_subnet_owner_share(result) == pytest.approx({3: 0.60, 6: 0.15, 0: 0.25})
+    warning = next(r for r in log.records if r[1].startswith("prompt blend: no answer in time"))
+    assert (warning[2]["reason"], warning[2]["step"]) == ("past the 0.1 s deadline", "fetch")
+    [blended] = [r for r in log.records if r[1] == "prompt blend: submitting blended weights"]
+    assert blended[2]["source"] == "cache"
+    assert log.records[-1][:2] == ("debug", "prompt blend: result discarded after the deadline")  # the thread, later
+
+
+def test_a_missed_deadline_with_no_cache_names_its_step(chain, served, log, monkeypatch):
+    def hang(*args, **kwargs):
+        time.sleep(0.5)
+        return _Response(200, [json.dumps(_payload()).encode()])
+
+    served(_payload())
+    monkeypatch.setattr(requests, "get", hang)
+    monkeypatch.setattr(prompt_blend, "BLEND_DEADLINE_S", 0.1)
+    monkeypatch.setattr(prompt_blend, "DEADLINE_GRACE_S", 0.05)
+    assert _ablend(_config("on"), {3: 1.0}, chain.async_) == {3: 1.0}
+    warning = next(r for r in log.records if r[0] == "warning")
+    assert (warning[2]["reason"], warning[2]["step"]) == ("past the 0.1 s deadline", "fetch")
+    assert "metagraph" in warning[2]["timings"]
+
+
+def test_a_slow_metagraph_is_named_and_the_cache_cannot_stand_in(served, log, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    cache = _cache(config, monkeypatch, age_s=60)
+    monkeypatch.setattr(prompt_blend, "BLEND_DEADLINE_S", 0.1)
+
+    async def slow_metagraph(**kwargs):
+        await asyncio.sleep(1)
+
+    result = asyncio.run(prompt_blend.ablend_prompt_weights(config, WALLET, {3: 1.0},
+                                                            SimpleNamespace(metagraph=slow_metagraph), cache))
+    assert result == {3: 1.0}
+    assert log.records[-1][2]["step"] == "metagraph"
+
+
+@pytest.mark.parametrize(("mode", "max_age", "prefetches"), [
+    ("off", DAY_S, False), ("on", 0, False), ("on", DAY_S, True), ("dry_run", DAY_S, True),
+])
+def test_the_submitter_prefetches_only_with_the_blend_and_the_cache_on(monkeypatch, mode, max_age, prefetches):
+    started: list = []
+
+    class _Runner:
+        def __init__(self, name):
+            pass
+
+        def run(self, coro):
+            coro.close()
+
+        def submit(self, coro):
+            started.append(coro.__qualname__)
+            coro.close()
+
+    monkeypatch.setattr(chain_submitter_mod, "AsyncRunner", _Runner)
+    monkeypatch.setattr(chain_submitter_mod.bittensor, "AsyncSubtensor", lambda network: SimpleNamespace())
+    config = _config(mode, prompt_blend_cache_max_age_s=max_age)
+    config.chain = SimpleNamespace(netuid=1, lite_network=None, network="test")
+    submitter = ChainSubmitter(config, WALLET)
+    assert (submitter._prompt_cache is not None) is prefetches
+    assert started == (["ChainSubmitter._prefetch_prompt_weights"] if prefetches else [])
+
+
+def test_the_prefetch_loop_fills_the_cache(served, log, monkeypatch):
+    config = _config("on", prompt_blend_cache_max_age_s=DAY_S)
+    served(_payload())
+    submitter = _submitter(config, None)
+    submitter._prompt_cache = prompt_blend.PromptCache()
+    monkeypatch.setattr(chain_submitter_mod, "PREFETCH_EVERY_S", 0.01)
+
+    async def two_rounds():
+        task = asyncio.create_task(submitter._prefetch_prompt_weights())
+        await asyncio.sleep(0.2)
+        task.cancel()
+
+    asyncio.run(two_rounds())
+    assert sum(1 for r in log.records if r[1] == "prompt blend: prefetched") >= 2
+    assert submitter._prompt_cache.get(config.evaluation, 5)[0].published.cycle_id == CURRENT_PROMPT_CYCLE - 1
+
+
+def test_the_cache_max_age_is_bounded():
+    with pytest.raises(ValidationError):
+        EvalCfg(prompt_blend_cache_max_age_s=-1)
+    with pytest.raises(ValidationError):
+        EvalCfg(prompt_blend_cache_max_age_s=172_801)
