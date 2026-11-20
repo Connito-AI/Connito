@@ -38,7 +38,12 @@ from connito.shared.chain import (
     reserve_subnet_owner_share,
     submit_weights_async,
 )
-from connito.validator.prompt_blend import ablend_prompt_weights
+from connito.validator.prompt_blend import (
+    PREFETCH_EVERY_S,
+    PromptCache,
+    ablend_prompt_weights,
+    prefetch_prompt_weights,
+)
 from connito.validator.round import Round
 
 logger = structlog.get_logger(__name__)
@@ -95,6 +100,7 @@ class ChainSubmitter:
         self.post_submit_delay_s = post_submit_delay_s
 
         self.observer = observer_mode_enabled()
+        self._prompt_cache: PromptCache | None = None
         if self.observer:
             logger.warning(
                 "OBSERVER MODE — this validator will submit no chain extrinsic",
@@ -124,6 +130,16 @@ class ChainSubmitter:
                 self._runner.run(init())
             except Exception as e:
                 logger.warning("ChainSubmitter: AsyncSubtensor.initialize() failed", error=str(e))
+        evaluation = config.evaluation
+        if evaluation.prompt_blend != "off" and evaluation.prompt_blend_cache_max_age_s > 0:
+            self._prompt_cache = PromptCache()
+            self._runner.submit(self._prefetch_prompt_weights())
+
+    async def _prefetch_prompt_weights(self) -> None:
+        """Keeps the prompt blend's cache fresh, so a submission needn't fetch inside its deadline."""
+        while True:
+            await asyncio.to_thread(prefetch_prompt_weights, self.config, self.wallet, self._prompt_cache)
+            await asyncio.sleep(PREFETCH_EVERY_S)
 
     def _get_lock(self) -> asyncio.Lock:
         if self._submit_lock is None:
@@ -230,6 +246,7 @@ class ChainSubmitter:
                 self.wallet,
                 {int(uid): float(w) for uid, w in uid_weights.items()},
                 self._async_subtensor,
+                self._prompt_cache,
             ),
         )
         nonzero = sum(1 for v in uid_weights.values() if v > 0)
