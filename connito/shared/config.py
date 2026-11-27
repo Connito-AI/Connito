@@ -1219,6 +1219,9 @@ class EvalCfg(BaseConfig):
     prompt_blend_rules_sha256: list[str] = Field(default_factory=list)  # accepted rules hashes; empty refuses all
     prompt_blend_validator_hotkey: str = ""  # the prompt validator that must have published; empty refuses all
     prompt_blend_test_route: bool = False  # read prompt-record's /v1/test copy, for a dry run; no freshness check
+    # Above 0: fetch the prompt weights in the background, and when a submission's own fetch gets no answer in time,
+    # reuse the last ones that passed every check if fetched within this many seconds. 0 fetches at submission only.
+    prompt_blend_cache_max_age_s: float = Field(0, ge=0, le=172_800)
 
     @field_validator("prompt_blend", mode="before")
     @classmethod

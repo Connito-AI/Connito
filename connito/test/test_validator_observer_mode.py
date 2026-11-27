@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from connito.shared.config import EvalCfg
 from connito.validator.chain_submitter import (
     OBSERVER_ENV,
     ChainSubmitter,
@@ -162,6 +163,7 @@ def test_live_validator_still_submits(monkeypatch):
     monkeypatch.delenv(OBSERVER_ENV, raising=False)
     config = SimpleNamespace(
         chain=SimpleNamespace(lite_network="finney", network="finney"),
+        evaluation=EvalCfg(),
     )
     wallet = MagicMock()
 
